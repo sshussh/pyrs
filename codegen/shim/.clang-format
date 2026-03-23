@@ -1,0 +1,100 @@
+# clang-format 22
+# based on Google style with adjustments toward C++ Core Guidelines
+# https://clang.llvm.org/docs/ClangFormatStyleOptions.html
+
+BasedOnStyle: Google
+
+Language: Cpp
+Standard: c++23
+
+# indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+IndentCaseLabels: true
+IndentPPDirectives: BeforeHash
+NamespaceIndentation: None
+
+# line length
+ColumnLimit: 100
+
+# braces - always attach, K&R style
+BreakBeforeBraces: Attach
+
+# spacing
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInAngles: Never
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceBeforeSquareBrackets: false
+SpaceBeforeRangeBasedForLoopColon: true
+
+# pointers and references - attach to type (int* p, not int *p)
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+# alignment - avoid magic columns that break on refactor
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignConsecutiveMacros: false
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 1
+
+# includes - grouped and sorted
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  # 1. project headers ("lib.hh")
+  - Regex: '^"'
+    Priority: 1
+  # 2. LLVM headers (<llvm/...>)
+  - Regex: "^<llvm/"
+    Priority: 2
+  # 3. system headers (<cstdint>, <iostream>, etc.)
+  - Regex: "^<"
+    Priority: 3
+
+# function arguments / parameters - don't bin-pack, one per line if they don't fit
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+BinPackArguments: false
+BinPackParameters: false
+
+# short constructs
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: All
+AllowShortLoopsOnASingleLine: false
+
+# modern C++ features
+SpaceBeforeCpp11BracedList: false
+Cpp11BracedListStyle: true
+
+# extern "C" blocks - don't indent contents
+IndentExternBlock: NoIndent
+
+# constructor initializer lists
+BreakConstructorInitializers: BeforeColon
+ConstructorInitializerIndentWidth: 4
+PackConstructorInitializers: Never
+
+# template declarations
+AlwaysBreakTemplateDeclarations: Yes
+
+# trailing return types
+AlwaysBreakAfterReturnType: None
+
+# penalties
+PenaltyBreakBeforeFirstCallParameter: 19
+PenaltyBreakComment: 300
+PenaltyBreakFirstLessLess: 120
+PenaltyBreakString: 1000
+PenaltyExcessCharacter: 1000000
+PenaltyReturnTypeOnItsOwnLine: 60

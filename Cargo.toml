@@ -1,0 +1,11 @@
+[workspace]
+resolver="3"
+members = [
+    "cli",
+    "common",
+    "lexer",
+    "parser",
+    "semantic",
+    "ir",
+    "codegen",
+]

@@ -1,0 +1,12 @@
+[package]
+name = "pyrs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path="../common" }
+lexer = { path="../lexer" }
+parser = { path="../parser" }
+semantic = { path="../semantic" }
+ir = { path="../ir" }
+codegen = { path="../codegen" }
