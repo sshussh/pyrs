@@ -2,3 +2,6 @@
 name="lexer"
 version="0.1.0"
 edition="2024"
+
+[dependencies]
+logos = { version= "0.16.1", default-features = false, features = ["export_derive"] }
