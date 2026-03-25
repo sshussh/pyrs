@@ -10,3 +10,5 @@ parser = { path="../parser" }
 semantic = { path="../semantic" }
 ir = { path="../ir" }
 codegen = { path="../codegen" }
+
+clap = { version = "4.6.0", default-features = false, features = ["std", "derive", "help", "usage"] }
