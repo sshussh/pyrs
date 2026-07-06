@@ -2,3 +2,8 @@
 name="semantic"
 version="0.1.0"
 edition="2024"
+
+[dependencies]
+common = { path = "../common" }
+parser = { path = "../parser" }
+ir = { path = "../ir" }

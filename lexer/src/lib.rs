@@ -1,14 +1,51 @@
+//! Scanner: wraps `logos` with a state machine for Python's semantic
+//! whitespace. Emits `(Token, Span)` pairs; `Indent`/`Dedent` tokens are
+//! synthesized from a visual-width indent stack, blank/comment-only lines
+//! are insignificant, and newlines inside parentheses are suppressed
+//! (implicit line joining).
+
 use std::collections::VecDeque;
 
+use common::{Diagnostic, Phase, Span};
 use logos::Logos;
 
 pub fn ping() -> String {
     String::from("pong")
 }
 
-#[derive(Logos, Debug, PartialEq, Eq)]
+fn unescape(slice: &str) -> String {
+    // strip the surrounding quotes, then process escapes
+    let inner = &slice[1..slice.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('0') => out.push('\0'),
+            Some('\\') => out.push('\\'),
+            Some('\'') => out.push('\''),
+            Some('"') => out.push('"'),
+            // unknown escape: keep it verbatim, like CPython
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+#[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\f]+")] // skip basic horizontal whitespace
 #[logos(skip(r"#[^\n]*", allow_greedy = true))] // skip comments
+#[logos(skip r"\\\r?\n")] // explicit line joining with backslash
 pub enum Token {
     // keywords
     #[token("and")]
@@ -84,27 +121,89 @@ pub enum Token {
     #[token("with")]
     With,
     #[token("yield")]
-    Yeild,
+    Yield,
 
-    // types
+    // builtin type names (reserved so annotations and casts are unambiguous)
     #[token("int")]
     Int,
     #[token("float")]
     Float,
+    #[token("bool")]
+    Bool,
 
     // Literals
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
+    #[regex(r"[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<i64>().ok())]
     Intlit(i64),
+    #[regex(r"([0-9][0-9_]*\.[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?", |lex| lex.slice().replace('_', "").parse::<f64>().ok())]
+    #[regex(r"[0-9][0-9_]*[eE][+-]?[0-9]+", |lex| lex.slice().replace('_', "").parse::<f64>().ok())]
+    Floatlit(f64),
+    #[regex(r#""([^"\\\n]|\\.)*""#, |lex| unescape(lex.slice()))]
+    #[regex(r#"'([^'\\\n]|\\.)*'"#, |lex| unescape(lex.slice()))]
+    Strlit(String),
+
+    // operators
+    #[token("+")]
+    Plus,
+    #[token("-")]
+    Minus,
+    #[token("*")]
+    Star,
+    #[token("**")]
+    DoubleStar,
+    #[token("/")]
+    Slash,
+    #[token("//")]
+    DoubleSlash,
+    #[token("%")]
+    Percent,
+    #[token("=")]
+    Eq,
+    #[token("==")]
+    EqEq,
+    #[token("!=")]
+    NotEq,
+    #[token("<")]
+    Lt,
+    #[token("<=")]
+    LtEq,
+    #[token(">")]
+    Gt,
+    #[token(">=")]
+    GtEq,
+    #[token("+=")]
+    PlusEq,
+    #[token("-=")]
+    MinusEq,
+    #[token("*=")]
+    StarEq,
+    #[token("/=")]
+    SlashEq,
+    #[token("//=")]
+    DoubleSlashEq,
+    #[token("%=")]
+    PercentEq,
 
     // symbols
     #[token("(")]
     LParen,
     #[token(")")]
     RParen,
+    #[token("[")]
+    LBracket,
+    #[token("]")]
+    RBracket,
+    #[token("{")]
+    LBrace,
+    #[token("}")]
+    RBrace,
     #[token(":")]
     Colon,
+    #[token(",")]
+    Comma,
+    #[token(".")]
+    Dot,
     #[token("->")]
     Arrow,
 
@@ -114,15 +213,109 @@ pub enum Token {
     Indent,
     Dedent,
 
-    #[token("EOF")]
     EOF,
+}
+
+impl Token {
+    /// Human-readable name for error messages.
+    pub fn describe(&self) -> String {
+        match self {
+            Token::Ident(name) => format!("identifier '{name}'"),
+            Token::Intlit(v) => format!("integer literal {v}"),
+            Token::Floatlit(v) => format!("float literal {v}"),
+            Token::Strlit(_) => "string literal".to_string(),
+            Token::Newline => "end of line".to_string(),
+            Token::Indent => "indent".to_string(),
+            Token::Dedent => "dedent".to_string(),
+            Token::EOF => "end of file".to_string(),
+            other => format!("'{}'", token_text(other)),
+        }
+    }
+}
+
+fn token_text(token: &Token) -> &'static str {
+    match token {
+        Token::And => "and",
+        Token::As => "as",
+        Token::Assert => "assert",
+        Token::Async => "async",
+        Token::Await => "await",
+        Token::Break => "break",
+        Token::Case => "case",
+        Token::Class => "class",
+        Token::Continue => "continue",
+        Token::Def => "def",
+        Token::Del => "del",
+        Token::Elif => "elif",
+        Token::Else => "else",
+        Token::Except => "except",
+        Token::False => "False",
+        Token::Finally => "finally",
+        Token::For => "for",
+        Token::From => "from",
+        Token::Global => "global",
+        Token::If => "if",
+        Token::Import => "import",
+        Token::In => "in",
+        Token::Is => "is",
+        Token::Lambda => "lambda",
+        Token::Match => "match",
+        Token::None => "None",
+        Token::Nonlocal => "nonlocal",
+        Token::Not => "not",
+        Token::Or => "or",
+        Token::Pass => "pass",
+        Token::Raise => "raise",
+        Token::Return => "return",
+        Token::True => "True",
+        Token::Try => "try",
+        Token::While => "while",
+        Token::With => "with",
+        Token::Yield => "yield",
+        Token::Int => "int",
+        Token::Float => "float",
+        Token::Bool => "bool",
+        Token::Plus => "+",
+        Token::Minus => "-",
+        Token::Star => "*",
+        Token::DoubleStar => "**",
+        Token::Slash => "/",
+        Token::DoubleSlash => "//",
+        Token::Percent => "%",
+        Token::Eq => "=",
+        Token::EqEq => "==",
+        Token::NotEq => "!=",
+        Token::Lt => "<",
+        Token::LtEq => "<=",
+        Token::Gt => ">",
+        Token::GtEq => ">=",
+        Token::PlusEq => "+=",
+        Token::MinusEq => "-=",
+        Token::StarEq => "*=",
+        Token::SlashEq => "/=",
+        Token::DoubleSlashEq => "//=",
+        Token::PercentEq => "%=",
+        Token::LParen => "(",
+        Token::RParen => ")",
+        Token::LBracket => "[",
+        Token::RBracket => "]",
+        Token::LBrace => "{",
+        Token::RBrace => "}",
+        Token::Colon => ":",
+        Token::Comma => ",",
+        Token::Dot => ".",
+        Token::Arrow => "->",
+        _ => "?",
+    }
 }
 
 pub struct Lexer<'a> {
     inner: logos::Lexer<'a, Token>,
     indent_stack: Vec<usize>,
-    pending: VecDeque<Token>,
-    emit_eof: bool,
+    pending: VecDeque<(Token, Span)>,
+    paren_depth: usize,
+    emitted_eof: bool,
+    last_was_newline: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -131,114 +324,181 @@ impl<'a> Lexer<'a> {
             inner: Token::lexer(source),
             indent_stack: vec![0],
             pending: VecDeque::new(),
-            emit_eof: false,
+            paren_depth: 0,
+            emitted_eof: false,
+            // suppress newlines at the very start of the file
+            last_was_newline: true,
         }
-    }
-
-    fn calc_indent(&self, input: &str) -> (usize, usize) {
-        let mut width = 0;
-        let mut consumed = 0;
-        for char in input.chars() {
-            match char {
-                ' ' => {
-                    width += 1;
-                    consumed += char.len_utf8();
-                }
-                '\t' => {
-                    width += 8;
-                    consumed += char.len_utf8();
-                }
-                _ => break,
-            }
-        }
-        (width, consumed)
     }
 }
 
+/// Visual width (spaces = 1, tabs = 8) and bytes consumed of the leading
+/// indentation of `input`.
+fn calc_indent(input: &str) -> (usize, usize) {
+    let mut width = 0;
+    let mut consumed = 0;
+    for char in input.chars() {
+        match char {
+            ' ' => {
+                width += 1;
+                consumed += char.len_utf8();
+            }
+            '\t' => {
+                width += 8;
+                consumed += char.len_utf8();
+            }
+            _ => break,
+        }
+    }
+    (width, consumed)
+}
+
 impl<'a> Iterator for Lexer<'a> {
-    type Item = Token;
+    type Item = Result<(Token, Span), Diagnostic>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // drain any queued Indents/Dendents
-        if let Some(token) = self.pending.pop_front() {
-            return Some(token);
+        // drain any queued Indents/Dedents first
+        if let Some((token, span)) = self.pending.pop_front() {
+            self.last_was_newline = token == Token::Newline;
+            return Some(Ok((token, span)));
         }
 
-        // fetch the next raw token from Logos
-        let result = self.inner.next();
+        loop {
+            let result = self.inner.next();
+            let span = Span::from(self.inner.span());
 
-        match result {
-            Some(Ok(Token::Newline)) => {
-                let remainder = self.inner.remainder();
-                let (visual_width, consumed) = self.calc_indent(remainder);
+            match result {
+                Some(Ok(Token::Newline)) => {
+                    // implicit line joining: newlines inside brackets are
+                    // insignificant
+                    if self.paren_depth > 0 {
+                        continue;
+                    }
 
-                self.inner.bump(consumed);
+                    // measure the indentation of the next line
+                    let (visual_width, consumed) = calc_indent(self.inner.remainder());
+                    self.inner.bump(consumed);
+                    let line_start = self.inner.span().end;
+                    let mark = Span::new(line_start, line_start);
 
-                let current_indent = *self.indent_stack.last().unwrap();
+                    match self.inner.remainder().chars().next() {
+                        // blank or comment-only line: no indent handling, no
+                        // newline; the newline ending the *last* such line
+                        // does the work
+                        Some('\n') | Some('\r') | Some('#') => continue,
+                        // end of input: emit a final newline if meaningful;
+                        // EOF handling closes open blocks
+                        Option::None => {
+                            if self.last_was_newline {
+                                continue;
+                            }
+                            self.last_was_newline = true;
+                            return Some(Ok((Token::Newline, span)));
+                        }
+                        Some(_) => {}
+                    }
 
-                if visual_width > current_indent {
-                    // moving deeper, push to stack and emit Indent
-                    self.indent_stack.push(visual_width);
-                    self.pending.push_back(Token::Indent);
-                    Some(Token::Newline)
-                } else if visual_width < current_indent {
-                    // moving back out, pop until we hit the matching level
-                    while let Some(&top) = self.indent_stack.last() {
-                        if visual_width < top {
-                            self.indent_stack.pop();
-                            self.pending.push_back(Token::Dedent);
-                        } else if visual_width > top {
-                            // ERROR: the user dedented to a level that doesn't exist
-                            panic!("indentation error: dedent past current level");
-                        } else {
-                            break;
+                    let current_indent = *self.indent_stack.last().unwrap();
+
+                    if visual_width > current_indent {
+                        // moving deeper: push to stack and queue an Indent
+                        self.indent_stack.push(visual_width);
+                        self.pending.push_back((Token::Indent, mark));
+                    } else if visual_width < current_indent {
+                        // moving out: pop until we hit the matching level
+                        while let Some(&top) = self.indent_stack.last() {
+                            if visual_width < top {
+                                self.indent_stack.pop();
+                                self.pending.push_back((Token::Dedent, mark));
+                            } else if visual_width > top {
+                                return Some(Err(Diagnostic::new(
+                                    Phase::Lex,
+                                    "unindent does not match any outer indentation level",
+                                    mark,
+                                )));
+                            } else {
+                                break;
+                            }
                         }
                     }
-                    // return the first Dedent, others stay in "pending"
-                    // self.pending.pop_front().or(Some(Token::Newline))
-                    self.pending.push_front(Token::Newline);
-                    self.pending.pop_front()
-                } else {
-                    Some(Token::Newline)
+
+                    // a newline right after another newline (e.g. leading
+                    // blank lines) is redundant; still drain any queued
+                    // indent tokens
+                    if self.last_was_newline {
+                        match self.pending.pop_front() {
+                            Some((token, span)) => {
+                                self.last_was_newline = token == Token::Newline;
+                                return Some(Ok((token, span)));
+                            }
+                            Option::None => continue,
+                        }
+                    }
+                    self.last_was_newline = true;
+                    return Some(Ok((Token::Newline, span)));
                 }
-            }
-            Some(Ok(token)) => Some(token),
-            Some(Err(_)) => {
-                panic!(
-                    "Lexer error: unexpected token {:?}",
-                    self.inner.slice(),
-                )
-            }
-            None => {
-                // handle EOF
-                if !self.emit_eof {
-                    self.emit_eof = true;
-                    // close remaining blocks
+                Some(Ok(token)) => {
+                    match token {
+                        Token::LParen | Token::LBracket | Token::LBrace => {
+                            self.paren_depth += 1;
+                        }
+                        Token::RParen | Token::RBracket | Token::RBrace => {
+                            self.paren_depth = self.paren_depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                    self.last_was_newline = false;
+                    return Some(Ok((token, span)));
+                }
+                Some(Err(())) => {
+                    return Some(Err(Diagnostic::new(
+                        Phase::Lex,
+                        format!("unexpected character {:?}", self.inner.slice()),
+                        span,
+                    )));
+                }
+                Option::None => {
+                    if self.emitted_eof {
+                        return Option::None;
+                    }
+                    self.emitted_eof = true;
+                    let end = Span::new(self.inner.source().len(), self.inner.source().len());
+                    // close any blocks still open at end of input
                     while self.indent_stack.len() > 1 {
                         self.indent_stack.pop();
-                        self.pending.push_back(Token::Dedent);
+                        self.pending.push_back((Token::Dedent, end));
                     }
-                    self.pending.push_back(Token::EOF);
-                    self.pending.pop_front()
-                } else {
-                    None
+                    self.pending.push_back((Token::EOF, end));
+                    let (token, span) = self.pending.pop_front().unwrap();
+                    return Some(Ok((token, span)));
                 }
             }
         }
     }
+}
+
+/// Lex the entire source, stopping at the first error.
+pub fn lex(source: &str) -> Result<Vec<(Token, Span)>, Diagnostic> {
+    Lexer::new(source).collect()
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
 
+    /// Token kinds only, spans stripped — keeps assertions readable.
+    fn kinds(code: &str) -> Vec<Token> {
+        lex(code)
+            .expect("lexing failed")
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
+    }
+
     #[test]
     fn test_lexer() {
-        let code = "def main():\n    return 5";
-        let lexer = Lexer::new(code);
-
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("def main():\n    return 5"),
             vec![
                 Token::Def,
                 Token::Ident("main".to_string()),
@@ -257,10 +517,9 @@ mod test {
 
     #[test]
     fn test_keywords() {
-        let code = "and as assert async await break case class continue def del elif else except False finally for from global if import in is lambda match None nonlocal not or raise return True try while with";
-        let lexer = Lexer::new(code);
+        let code = "and as assert async await break case class continue def del elif else except False finally for from global if import in is lambda match None nonlocal not or raise return True try while with yield";
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds(code),
             vec![
                 Token::And,
                 Token::As,
@@ -297,6 +556,7 @@ mod test {
                 Token::Try,
                 Token::While,
                 Token::With,
+                Token::Yield,
                 Token::EOF,
             ]
         );
@@ -304,20 +564,16 @@ mod test {
 
     #[test]
     fn test_types() {
-        let code = "int float";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
-            vec![Token::Int, Token::Float, Token::EOF]
+            kinds("int float bool"),
+            vec![Token::Int, Token::Float, Token::Bool, Token::EOF]
         );
     }
 
     #[test]
     fn test_ident() {
-        let code = "foo bar _baz _abc123";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("foo bar _baz _abc123"),
             vec![
                 Token::Ident("foo".to_string()),
                 Token::Ident("bar".to_string()),
@@ -330,14 +586,73 @@ mod test {
 
     #[test]
     fn test_int_literal() {
-        let code = "0 42 1000";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("0 42 1000 1_000_000"),
             vec![
                 Token::Intlit(0),
                 Token::Intlit(42),
                 Token::Intlit(1000),
+                Token::Intlit(1_000_000),
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_float_literal() {
+        assert_eq!(
+            kinds("1.5 0.25 2. .5 1e3 2.5e-2"),
+            vec![
+                Token::Floatlit(1.5),
+                Token::Floatlit(0.25),
+                Token::Floatlit(2.0),
+                Token::Floatlit(0.5),
+                Token::Floatlit(1000.0),
+                Token::Floatlit(0.025),
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_string_literal() {
+        assert_eq!(
+            kinds(r#""hello" 'world' "a\nb" "q\"q""#),
+            vec![
+                Token::Strlit("hello".to_string()),
+                Token::Strlit("world".to_string()),
+                Token::Strlit("a\nb".to_string()),
+                Token::Strlit("q\"q".to_string()),
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_operators() {
+        assert_eq!(
+            kinds("+ - * ** / // % = == != < <= > >= += -= *= /= //= %="),
+            vec![
+                Token::Plus,
+                Token::Minus,
+                Token::Star,
+                Token::DoubleStar,
+                Token::Slash,
+                Token::DoubleSlash,
+                Token::Percent,
+                Token::Eq,
+                Token::EqEq,
+                Token::NotEq,
+                Token::Lt,
+                Token::LtEq,
+                Token::Gt,
+                Token::GtEq,
+                Token::PlusEq,
+                Token::MinusEq,
+                Token::StarEq,
+                Token::SlashEq,
+                Token::DoubleSlashEq,
+                Token::PercentEq,
                 Token::EOF,
             ]
         );
@@ -345,10 +660,8 @@ mod test {
 
     #[test]
     fn test_symbols() {
-        let code = "()()(:)";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("()()(:)"),
             vec![
                 Token::LParen,
                 Token::RParen,
@@ -364,10 +677,8 @@ mod test {
 
     #[test]
     fn test_comment_skipped() {
-        let code = "def main(): # this is a comment\n    return 5";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("def main(): # this is a comment\n    return 5"),
             vec![
                 Token::Def,
                 Token::Ident("main".to_string()),
@@ -386,10 +697,8 @@ mod test {
 
     #[test]
     fn test_newline_no_indent_change() {
-        let code = "foo\nbar";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("foo\nbar"),
             vec![
                 Token::Ident("foo".to_string()),
                 Token::Newline,
@@ -401,10 +710,8 @@ mod test {
 
     #[test]
     fn test_single_indent_dedent() {
-        let code = "if True:\n    pass\n";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("if True:\n    pass\n"),
             vec![
                 Token::If,
                 Token::True,
@@ -421,10 +728,8 @@ mod test {
 
     #[test]
     fn test_nested_indent_dedent() {
-        let code = "def foo():\n    if True:\n        return 1\n";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("def foo():\n    if True:\n        return 1\n"),
             vec![
                 Token::Def,
                 Token::Ident("foo".to_string()),
@@ -450,10 +755,8 @@ mod test {
 
     #[test]
     fn test_multiple_dedents() {
-        let code = "def foo():\n    if True:\n        return 1\n    return 2\n";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("def foo():\n    if True:\n        return 1\n    return 2\n"),
             vec![
                 Token::Def,
                 Token::Ident("foo".to_string()),
@@ -482,10 +785,8 @@ mod test {
 
     #[test]
     fn test_eof_closes_open_blocks() {
-        let code = "def foo():\n    return 1";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("def foo():\n    return 1"),
             vec![
                 Token::Def,
                 Token::Ident("foo".to_string()),
@@ -504,10 +805,8 @@ mod test {
 
     #[test]
     fn test_tab_indent() {
-        let code = "def foo():\n\treturn 1";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("def foo():\n\treturn 1"),
             vec![
                 Token::Def,
                 Token::Ident("foo".to_string()),
@@ -526,10 +825,8 @@ mod test {
 
     #[test]
     fn test_crlf_newline() {
-        let code = "foo\r\nbar";
-        let lexer = Lexer::new(code);
         assert_eq!(
-            lexer.collect::<Vec<_>>(),
+            kinds("foo\r\nbar"),
             vec![
                 Token::Ident("foo".to_string()),
                 Token::Newline,
@@ -540,10 +837,103 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "indentation error: dedent past current level")]
-    fn test_invalid_dedent_panics() {
+    fn test_blank_lines_inside_block() {
+        // blank lines must not produce indent/dedent churn
+        assert_eq!(
+            kinds("if True:\n    x = 1\n\n    y = 2\n"),
+            vec![
+                Token::If,
+                Token::True,
+                Token::Colon,
+                Token::Newline,
+                Token::Indent,
+                Token::Ident("x".to_string()),
+                Token::Eq,
+                Token::Intlit(1),
+                Token::Newline,
+                Token::Ident("y".to_string()),
+                Token::Eq,
+                Token::Intlit(2),
+                Token::Newline,
+                Token::Dedent,
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comment_only_line() {
+        assert_eq!(
+            kinds("x = 1\n# a comment\ny = 2\n"),
+            vec![
+                Token::Ident("x".to_string()),
+                Token::Eq,
+                Token::Intlit(1),
+                Token::Newline,
+                Token::Ident("y".to_string()),
+                Token::Eq,
+                Token::Intlit(2),
+                Token::Newline,
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_leading_blank_lines() {
+        assert_eq!(
+            kinds("\n\nx = 1\n"),
+            vec![
+                Token::Ident("x".to_string()),
+                Token::Eq,
+                Token::Intlit(1),
+                Token::Newline,
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_newline_in_parens_ignored() {
+        assert_eq!(
+            kinds("foo(1,\n    2)\n"),
+            vec![
+                Token::Ident("foo".to_string()),
+                Token::LParen,
+                Token::Intlit(1),
+                Token::Comma,
+                Token::Intlit(2),
+                Token::RParen,
+                Token::Newline,
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_invalid_dedent_is_error() {
         let code = "def foo():\n    if True:\n        return 1\n  return 2\n";
-        let lexer = Lexer::new(code);
-        let _ = lexer.collect::<Vec<_>>();
+        let result = lex(code);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("unindent"));
+    }
+
+    #[test]
+    fn test_unexpected_char_is_error() {
+        let result = lex("x = 1 ?\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_spans_point_into_source() {
+        let code = "abc = 42";
+        let tokens = lex(code).unwrap();
+        let (token, span) = &tokens[0];
+        assert_eq!(*token, Token::Ident("abc".to_string()));
+        assert_eq!(&code[span.start..span.end], "abc");
+        let (token, span) = &tokens[2];
+        assert_eq!(*token, Token::Intlit(42));
+        assert_eq!(&code[span.start..span.end], "42");
     }
 }

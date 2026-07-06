@@ -11,41 +11,67 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Lex the input file
+    /// Tokenize the input file and dump the tokens
     Lex(LexCommand),
 
-    /// Parse the input file
+    /// Parse the input file and dump the AST
     Parse(ParseCommand),
 
-    /// Compile the input file
+    /// Compile the input file to a native executable
     Compile(CompileCommand),
+
+    /// Compile the input file and run it immediately
+    Run(RunCommand),
 }
 
 #[derive(Debug, Args)]
 pub struct LexCommand {
-    #[command(flatten)]
-    pub io: Io,
-}
-
-#[derive(Debug, Args)]
-pub struct ParseCommand {
-    #[command(flatten)]
-    pub io: Io,
-}
-
-#[derive(Debug, Args)]
-pub struct CompileCommand {
-    #[command(flatten)]
-    pub io: Io,
-}
-
-#[derive(Debug, Args)]
-pub struct Io {
     /// Input file path
     #[arg(short, long)]
     pub input: path::PathBuf,
 
-    /// Output file path
+    /// Output file path (defaults to stdout)
+    #[arg(short, long)]
+    pub output: Option<path::PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ParseCommand {
+    /// Input file path
+    #[arg(short, long)]
+    pub input: path::PathBuf,
+
+    /// Output file path (defaults to stdout)
+    #[arg(short, long)]
+    pub output: Option<path::PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct CompileCommand {
+    /// Input file path
+    #[arg(short, long)]
+    pub input: path::PathBuf,
+
+    /// Output executable path
     #[arg(short, long, default_value = "a.out")]
     pub output: path::PathBuf,
+
+    /// Optimization level (0-3)
+    #[arg(short = 'O', long = "opt-level", default_value_t = 2)]
+    pub opt_level: u8,
+
+    /// Also write the generated LLVM IR next to the output (<output>.ll)
+    #[arg(long)]
+    pub emit_llvm: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RunCommand {
+    /// Input file path
+    #[arg(short, long)]
+    pub input: path::PathBuf,
+
+    /// Optimization level (0-3)
+    #[arg(short = 'O', long = "opt-level", default_value_t = 2)]
+    pub opt_level: u8,
 }

@@ -4,6 +4,12 @@ version="0.1.0"
 edition="2024"
 links = "codegen_shim"
 
-[build-dependencies]
+[dependencies]
 ir = { path = "../ir" }
+
+[dev-dependencies]
+parser = { path = "../parser" }
+semantic = { path = "../semantic" }
+
+[build-dependencies]
 cmake = "0.1.57"
