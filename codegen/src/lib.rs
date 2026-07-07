@@ -11,7 +11,7 @@
 
 pub mod emit;
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 
 pub use emit::emit_llvm_ir;
@@ -84,7 +84,10 @@ mod tests {
     #[test]
     fn emits_function_and_main() {
         let ll = lower("def add(a: int, b: int) -> int:\n    return a + b\n\nprint(add(1, 2))\n");
-        assert!(ll.contains("define i64 @pyrs_add(i64 %p.a, i64 %p.b)"), "{ll}");
+        assert!(
+            ll.contains("define i64 @pyrs_add(i64 %p.a, i64 %p.b)"),
+            "{ll}"
+        );
         assert!(ll.contains("define i32 @main()"), "{ll}");
         assert!(ll.contains("call void @pyrs___main__()"), "{ll}");
         assert!(ll.contains("call void @pyrs_print_int"), "{ll}");
@@ -107,7 +110,8 @@ mod tests {
 
     #[test]
     fn short_circuit_uses_phi() {
-        let ll = lower("def f(a: bool, b: bool) -> bool:\n    return a and b\nprint(f(True, False))\n");
+        let ll =
+            lower("def f(a: bool, b: bool) -> bool:\n    return a and b\nprint(f(True, False))\n");
         assert!(ll.contains("phi i1"), "{ll}");
     }
 

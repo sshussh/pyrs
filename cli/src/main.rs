@@ -25,8 +25,7 @@ fn run(args: cli::Cli) -> Result<i32, String> {
     match args.command {
         cli::Command::Lex(cmd) => {
             let source = read_source(&cmd.input)?;
-            let tokens = lexer::lex(&source)
-                .map_err(|d| render_diag(&d, &cmd.input, &source))?;
+            let tokens = lexer::lex(&source).map_err(|d| render_diag(&d, &cmd.input, &source))?;
             let mut text = String::new();
             for (token, _) in &tokens {
                 match token {
@@ -41,8 +40,8 @@ fn run(args: cli::Cli) -> Result<i32, String> {
         }
         cli::Command::Parse(cmd) => {
             let source = read_source(&cmd.input)?;
-            let module = parser::parse(&source)
-                .map_err(|d| render_diag(&d, &cmd.input, &source))?;
+            let module =
+                parser::parse(&source).map_err(|d| render_diag(&d, &cmd.input, &source))?;
             write_output(&format!("{module:#?}\n"), cmd.output.as_deref())?;
             Ok(0)
         }
@@ -53,12 +52,11 @@ fn run(args: cli::Cli) -> Result<i32, String> {
         cli::Command::Run(cmd) => {
             let workdir = temp_workdir()?;
             let exe = workdir.join("program");
-            let result = compile(&cmd.input, &exe, cmd.opt_level, false)
-                .and_then(|()| {
-                    process::Command::new(&exe)
-                        .status()
-                        .map_err(|e| format!("failed to run compiled program: {e}"))
-                });
+            let result = compile(&cmd.input, &exe, cmd.opt_level, false).and_then(|()| {
+                process::Command::new(&exe)
+                    .status()
+                    .map_err(|e| format!("failed to run compiled program: {e}"))
+            });
             let _ = fs::remove_dir_all(&workdir);
             let status = result?;
             Ok(status.code().unwrap_or(1))
@@ -126,8 +124,9 @@ fn render_diag(diag: &Diagnostic, path: &Path, source: &str) -> String {
 
 fn write_output(text: &str, output: Option<&Path>) -> Result<(), String> {
     match output {
-        Some(path) => fs::write(path, text)
-            .map_err(|e| format!("failed to write {}: {e}", path.display())),
+        Some(path) => {
+            fs::write(path, text).map_err(|e| format!("failed to write {}: {e}", path.display()))
+        }
         None => io::stdout()
             .write_all(text.as_bytes())
             .map_err(|e| format!("failed to write to stdout: {e}")),

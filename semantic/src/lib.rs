@@ -611,7 +611,10 @@ fn lower_aug_assign(
 ) -> SResult<()> {
     match target {
         // desugar `x op= v` into `x = x op v`
-        ast::AssignTarget::Name { name, span: name_span } => {
+        ast::AssignTarget::Name {
+            name,
+            span: name_span,
+        } => {
             let current_ty = *ctx
                 .locals
                 .get(name)
@@ -660,8 +663,8 @@ fn lower_aug_assign(
             };
             let right = lower_expr(value, ctx)?;
             let combined = lower_binary(op, current, right, span)?;
-            let combined = coerce(combined, elem.ty(), span, "list element assignment")
-                .map_err(|e| {
+            let combined =
+                coerce(combined, elem.ty(), span, "list element assignment").map_err(|e| {
                     Diagnostic::new(
                         Phase::Semantic,
                         format!("{}; a list element's type cannot change", e.message),
@@ -788,10 +791,7 @@ fn lower_for_range(
 ) -> SResult<()> {
     if args.is_empty() || args.len() > 3 {
         return Err(err(
-            format!(
-                "range() takes 1 to 3 arguments ({} given)",
-                args.len()
-            ),
+            format!("range() takes 1 to 3 arguments ({} given)", args.len()),
             range_span,
         ));
     }
@@ -1114,10 +1114,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 ir::Ty::Str => ir::Ty::Str,
                 ir::Ty::List(e) => ir::Ty::List(e),
                 other => {
-                    return Err(err(
-                        format!("'{other}' object cannot be sliced"),
-                        base.span,
-                    ));
+                    return Err(err(format!("'{other}' object cannot be sliced"), base.span));
                 }
             };
             let lo_ir = match lo {
@@ -1416,8 +1413,7 @@ fn lower_call(
     let mut lowered_args = Vec::new();
     for (i, (arg, &expected)) in args.iter().zip(&sig.params).enumerate() {
         // `f([])` / `f([1, 2])` use the parameter's element type
-        let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected)
-        {
+        let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected) {
             lower_list_lit(items, Some(elem), arg.span, ctx)?
         } else {
             lower_expr(arg, ctx)?
@@ -1594,17 +1590,16 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
         // trap at runtime. Floats use llvm.pow.
         ast::BinOp::Pow => {
             let (l, r, ty) = unify_numeric(l, r, span, &describe)?;
-            let (l, r, ty) = if ty == ir::Ty::Int
-                && matches!(r.kind, ir::ExprKind::ConstInt(k) if k < 0)
-            {
-                let to_float = |e: ir::Expr| ir::Expr {
-                    ty: ir::Ty::Float,
-                    kind: ir::ExprKind::IntToFloat(Box::new(e)),
+            let (l, r, ty) =
+                if ty == ir::Ty::Int && matches!(r.kind, ir::ExprKind::ConstInt(k) if k < 0) {
+                    let to_float = |e: ir::Expr| ir::Expr {
+                        ty: ir::Ty::Float,
+                        kind: ir::ExprKind::IntToFloat(Box::new(e)),
+                    };
+                    (to_float(l), to_float(r), ir::Ty::Float)
+                } else {
+                    (l, r, ty)
                 };
-                (to_float(l), to_float(r), ir::Ty::Float)
-            } else {
-                (l, r, ty)
-            };
             Ok(ir::Expr {
                 ty,
                 kind: ir::ExprKind::Binary {
@@ -1687,10 +1682,7 @@ fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResu
         }
         ir::Ty::List(elem) => coerce(l, elem.ty(), span, "'in' operand")?,
         other => {
-            return Err(err(
-                format!("'{other}' does not support 'in'"),
-                span,
-            ));
+            return Err(err(format!("'{other}' does not support 'in'"), span));
         }
     };
     let contains = ir::Expr {
@@ -1732,10 +1724,7 @@ fn lower_str_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SRe
             let (s, n) = if l.ty == ir::Ty::Str { (l, r) } else { (r, l) };
             let n = promote_numeric(n, span, "string repetition")?;
             if n.ty != ir::Ty::Int {
-                return Err(err(
-                    "a string can only be multiplied by an int",
-                    span,
-                ));
+                return Err(err("a string can only be multiplied by an int", span));
             }
             Ok(ir::Expr {
                 ty: ir::Ty::Str,
@@ -1824,7 +1813,11 @@ mod tests {
     fn analyze_ok(src: &str) -> ir::Module {
         match analyze_src(src) {
             Ok(m) => m,
-            Err(e) => panic!("analyze failed: {}\n{}", e.message, e.render("test.py", src)),
+            Err(e) => panic!(
+                "analyze failed: {}\n{}",
+                e.message,
+                e.render("test.py", src)
+            ),
         }
     }
 
@@ -1901,7 +1894,10 @@ print(fib(10))
         };
         assert!(matches!(
             body.kind,
-            ir::ExprKind::Binary { op: ir::BinOp::And, .. }
+            ir::ExprKind::Binary {
+                op: ir::BinOp::And,
+                ..
+            }
         ));
     }
 
@@ -2167,9 +2163,7 @@ print(count([]))
 
     #[test]
     fn contains_types_correctly() {
-        let m = analyze_ok(
-            "b = \"ell\" in \"hello\"\nc = 2 in [1, 2]\nd = 5 not in [1, 2]\n",
-        );
+        let m = analyze_ok("b = \"ell\" in \"hello\"\nc = 2 in [1, 2]\nd = 5 not in [1, 2]\n");
         let entry = find_func(&m, ENTRY_NAME);
         let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
             panic!();

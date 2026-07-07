@@ -113,9 +113,7 @@ impl Parser {
                 Ok(())
             }
             Token::Dedent | Token::EOF => Ok(()),
-            Token::Comma => Err(self.error(
-                "tuples and multiple assignment are not supported yet",
-            )),
+            Token::Comma => Err(self.error("tuples and multiple assignment are not supported yet")),
             other => Err(self.error(format!(
                 "expected end of line after statement, found {}",
                 other.describe()
@@ -231,13 +229,14 @@ impl Parser {
         if self.peek() == &Token::Colon {
             // annotated assignment: `x: ty = value` (names only)
             let ExprKind::Name(_) = expr.kind else {
-                return Err(self.error(
-                    "type annotations are only allowed on plain variable names",
-                ));
+                return Err(self.error("type annotations are only allowed on plain variable names"));
             };
             self.advance();
             let annotation = self.parse_type_name("after ':' in annotated assignment")?;
-            self.expect(Token::Eq, "after type annotation (declarations require a value)")?;
+            self.expect(
+                Token::Eq,
+                "after type annotation (declarations require a value)",
+            )?;
             let value = self.parse_expr()?;
             let span = expr.span.to(value.span);
             let target = self.expr_to_target(expr)?;
@@ -292,7 +291,11 @@ impl Parser {
             (Token::Ident(name), span) => Ok((name, span)),
             (other, span) => Err(Diagnostic::new(
                 Phase::Parse,
-                format!("expected identifier {}, found {}", context, other.describe()),
+                format!(
+                    "expected identifier {}, found {}",
+                    context,
+                    other.describe()
+                ),
                 span,
             )),
         }
@@ -590,9 +593,7 @@ impl Parser {
                 .iter()
                 .any(|(op, _)| matches!(op, BinOp::In | BinOp::NotIn))
         {
-            return Err(self.error(
-                "'in' cannot be combined with other comparisons in a chain",
-            ));
+            return Err(self.error("'in' cannot be combined with other comparisons in a chain"));
         }
         match rest.len() {
             0 => Ok(first),
@@ -926,7 +927,10 @@ impl Parser {
             }
             Token::LBrace => Err(self.error("dicts and sets are not supported yet")),
             Token::Lambda => Err(self.error("'lambda' is not supported yet")),
-            other => Err(self.error(format!("expected an expression, found {}", other.describe()))),
+            other => Err(self.error(format!(
+                "expected an expression, found {}",
+                other.describe()
+            ))),
         }
     }
 }
@@ -1164,9 +1168,7 @@ mod tests {
 
     #[test]
     fn parses_if_elif_else() {
-        let m = parse_ok(
-            "if x < 1:\n    y = 1\nelif x < 2:\n    y = 2\nelse:\n    y = 3\n",
-        );
+        let m = parse_ok("if x < 1:\n    y = 1\nelif x < 2:\n    y = 2\nelse:\n    y = 3\n");
         let StmtKind::If { branches, orelse } = &m.body[0].kind else {
             panic!("expected If");
         };
@@ -1187,7 +1189,10 @@ mod tests {
     #[test]
     fn parses_for_loop() {
         let m = parse_ok("for i in range(10):\n    print(i)\n");
-        let StmtKind::For { var, iter, body, .. } = &m.body[0].kind else {
+        let StmtKind::For {
+            var, iter, body, ..
+        } = &m.body[0].kind
+        else {
             panic!("expected For");
         };
         assert_eq!(var, "i");
@@ -1202,7 +1207,12 @@ mod tests {
             panic!("expected Assign");
         };
         // 1 + (2 * 3)
-        let ExprKind::Binary { op: BinOp::Add, right, .. } = &value.kind else {
+        let ExprKind::Binary {
+            op: BinOp::Add,
+            right,
+            ..
+        } = &value.kind
+        else {
             panic!("expected Add at top, got {:?}", value.kind);
         };
         assert!(matches!(
@@ -1218,7 +1228,12 @@ mod tests {
             panic!("expected Assign");
         };
         // 2 ** (3 ** 2)
-        let ExprKind::Binary { op: BinOp::Pow, left, right } = &value.kind else {
+        let ExprKind::Binary {
+            op: BinOp::Pow,
+            left,
+            right,
+        } = &value.kind
+        else {
             panic!("expected Pow at top, got {:?}", value.kind);
         };
         assert!(matches!(left.kind, ExprKind::Int(2)));
@@ -1235,7 +1250,11 @@ mod tests {
             panic!("expected Assign");
         };
         // -(2 ** 2)
-        let ExprKind::Unary { op: UnaryOp::Neg, operand } = &value.kind else {
+        let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } = &value.kind
+        else {
             panic!("expected Neg at top, got {:?}", value.kind);
         };
         assert!(matches!(
@@ -1250,10 +1269,21 @@ mod tests {
         let StmtKind::Assign { value, .. } = &m.body[0].kind else {
             panic!("expected Assign");
         };
-        let ExprKind::Binary { op: BinOp::Pow, right, .. } = &value.kind else {
+        let ExprKind::Binary {
+            op: BinOp::Pow,
+            right,
+            ..
+        } = &value.kind
+        else {
             panic!("expected Pow, got {:?}", value.kind);
         };
-        assert!(matches!(right.kind, ExprKind::Unary { op: UnaryOp::Neg, .. }));
+        assert!(matches!(
+            right.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1274,10 +1304,7 @@ mod tests {
         let StmtKind::Assign { value, .. } = &m.body[0].kind else {
             panic!("expected Assign");
         };
-        assert!(matches!(
-            value.kind,
-            ExprKind::Binary { op: BinOp::Lt, .. }
-        ));
+        assert!(matches!(value.kind, ExprKind::Binary { op: BinOp::Lt, .. }));
     }
 
     #[test]
@@ -1292,7 +1319,10 @@ mod tests {
     #[test]
     fn parses_list_annotation() {
         let m = parse_ok("xs: list[int] = []\n");
-        let StmtKind::Assign { annotation, value, .. } = &m.body[0].kind else {
+        let StmtKind::Assign {
+            annotation, value, ..
+        } = &m.body[0].kind
+        else {
             panic!("expected Assign");
         };
         assert_eq!(*annotation, Some(TypeName::List(ElemName::Int)));
@@ -1373,14 +1403,20 @@ mod tests {
         };
         assert!(matches!(
             value.kind,
-            ExprKind::Cast { ty: TypeName::Float, .. }
+            ExprKind::Cast {
+                ty: TypeName::Float,
+                ..
+            }
         ));
         let StmtKind::Assign { value, .. } = &m.body[1].kind else {
             panic!("expected Assign");
         };
         assert!(matches!(
             value.kind,
-            ExprKind::Cast { ty: TypeName::Str, .. }
+            ExprKind::Cast {
+                ty: TypeName::Str,
+                ..
+            }
         ));
     }
 
@@ -1460,16 +1496,16 @@ def f(n: int) -> int:
         let StmtKind::Assign { value, .. } = &m.body[0].kind else {
             panic!();
         };
-        assert!(matches!(
-            value.kind,
-            ExprKind::Binary { op: BinOp::In, .. }
-        ));
+        assert!(matches!(value.kind, ExprKind::Binary { op: BinOp::In, .. }));
         let StmtKind::Assign { value, .. } = &m.body[1].kind else {
             panic!();
         };
         assert!(matches!(
             value.kind,
-            ExprKind::Binary { op: BinOp::NotIn, .. }
+            ExprKind::Binary {
+                op: BinOp::NotIn,
+                ..
+            }
         ));
     }
 

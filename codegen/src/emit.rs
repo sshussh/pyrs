@@ -406,9 +406,7 @@ impl Emitter {
                     let v = self.emit_expr(arg);
                     match arg.ty {
                         Ty::Int => self.line(format!("call void @pyrs_print_int(i64 {v})")),
-                        Ty::Float => {
-                            self.line(format!("call void @pyrs_print_float(double {v})"))
-                        }
+                        Ty::Float => self.line(format!("call void @pyrs_print_float(double {v})")),
                         Ty::Bool => {
                             let ext = self.tmp();
                             self.line(format!("{ext} = zext i1 {v} to i32"));
@@ -533,10 +531,7 @@ impl Emitter {
                     String::new()
                 } else {
                     let t = self.tmp();
-                    self.line(format!(
-                        "{t} = call {} @{callee}({args_str})",
-                        lty(expr.ty)
-                    ));
+                    self.line(format!("{t} = call {} @{callee}({args_str})", lty(expr.ty)));
                     t
                 }
             }
@@ -550,11 +545,8 @@ impl Emitter {
                         t
                     }
                     Ty::List(elem) => {
-                        let addr = self.emit_list_elem_addr(
-                            &b,
-                            &i,
-                            "IndexError: list index out of range",
-                        );
+                        let addr =
+                            self.emit_list_elem_addr(&b, &i, "IndexError: list index out of range");
                         let slot = self.tmp();
                         self.line(format!("{slot} = load i64, ptr {addr}"));
                         self.value_from_slot(&slot, elem.ty())
@@ -604,7 +596,9 @@ impl Emitter {
                 let l = self.emit_expr(list);
                 let i = self.emit_expr(index);
                 let slot = self.tmp();
-                self.line(format!("{slot} = call i64 @pyrs_list_pop(ptr {l}, i64 {i})"));
+                self.line(format!(
+                    "{slot} = call i64 @pyrs_list_pop(ptr {l}, i64 {i})"
+                ));
                 self.value_from_slot(&slot, expr.ty)
             }
             ExprKind::ListLit(items) => {
@@ -656,7 +650,9 @@ impl Emitter {
                 self.start_block(&ok2_l);
                 let t = self.tmp();
                 // saturating: still defined if the finite value exceeds i64
-                self.line(format!("{t} = call i64 @llvm.fptosi.sat.i64.f64(double {v})"));
+                self.line(format!(
+                    "{t} = call i64 @llvm.fptosi.sat.i64.f64(double {v})"
+                ));
                 t
             }
             ExprKind::BoolToInt(inner) => {
@@ -773,9 +769,7 @@ impl Emitter {
                     let ok_l = self.fresh_block("pow.ok");
                     self.line(format!("br i1 {bad}, label %{trap_l}, label %{ok_l}"));
                     self.start_block(&trap_l);
-                    self.emit_die(
-                        "ZeroDivisionError: 0.0 cannot be raised to a negative power",
-                    );
+                    self.emit_die("ZeroDivisionError: 0.0 cannot be raised to a negative power");
                     self.start_block(&ok_l);
                     let t = self.tmp();
                     self.line(format!(
@@ -794,11 +788,7 @@ impl Emitter {
             }
             BinOp::FloorDiv => match ty {
                 Ty::Int => {
-                    self.guard_zero(
-                        &r,
-                        Ty::Int,
-                        "ZeroDivisionError: division by zero",
-                    );
+                    self.guard_zero(&r, Ty::Int, "ZeroDivisionError: division by zero");
                     let safe_r = self.guard_int_min(&l, &r);
                     let (q, r0) = self.emit_divmod(&l, &safe_r);
                     let adj = self.emit_floor_adjust(&r0, &safe_r);
@@ -821,11 +811,7 @@ impl Emitter {
             },
             BinOp::Mod => match ty {
                 Ty::Int => {
-                    self.guard_zero(
-                        &r,
-                        Ty::Int,
-                        "ZeroDivisionError: division by zero",
-                    );
+                    self.guard_zero(&r, Ty::Int, "ZeroDivisionError: division by zero");
                     let safe_r = self.guard_int_min(&l, &r);
                     let r0 = self.tmp();
                     self.line(format!("{r0} = srem i64 {l}, {safe_r}"));
@@ -952,9 +938,10 @@ impl Emitter {
         let is_zero = self.tmp();
         match ty {
             Ty::Int => self.line(format!("{is_zero} = icmp eq i64 {divisor}, 0")),
-            Ty::Float => {
-                self.line(format!("{is_zero} = fcmp oeq double {divisor}, {}", fconst(0.0)))
-            }
+            Ty::Float => self.line(format!(
+                "{is_zero} = fcmp oeq double {divisor}, {}",
+                fconst(0.0)
+            )),
             other => unreachable!("guard_zero on {other:?}"),
         }
         let trap_l = self.fresh_block("div.trap");
@@ -978,7 +965,9 @@ impl Emitter {
         let overflow = self.tmp();
         self.line(format!("{overflow} = and i1 {is_min}, {is_neg1}"));
         let safe = self.tmp();
-        self.line(format!("{safe} = select i1 {overflow}, i64 1, i64 {divisor}"));
+        self.line(format!(
+            "{safe} = select i1 {overflow}, i64 1, i64 {divisor}"
+        ));
         safe
     }
 

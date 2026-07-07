@@ -12,10 +12,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "pyrs-e2e-{tag}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("pyrs-e2e-{tag}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
     }
@@ -56,7 +53,10 @@ fn run_program_expect_fail(tag: &str, source: &str) -> (i32, String) {
         .arg(&src)
         .output()
         .expect("failed to spawn pyrs");
-    assert!(!out.status.success(), "expected failure but program succeeded");
+    assert!(
+        !out.status.success(),
+        "expected failure but program succeeded"
+    );
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -405,10 +405,7 @@ print(greeting[0], greeting[-1])
 print(\"apple\" < \"banana\", \"abc\" == \"abc\", \"abc\" != \"abd\")
 ",
     );
-    assert_eq!(
-        out,
-        "hello, world!\nababab\n13\nh !\nTrue True True\n"
-    );
+    assert_eq!(out, "hello, world!\nababab\n13\nh !\nTrue True True\n");
 }
 
 #[test]
@@ -564,10 +561,7 @@ print(0 ** 0)
 print(2 ** 3 ** 2)
 ",
     );
-    assert_eq!(
-        out,
-        "1024\n1\n-4\n-8\n0.5\n1.4142135623730951\n1\n512\n"
-    );
+    assert_eq!(out, "1024\n1\n-4\n-8\n0.5\n1.4142135623730951\n1\n512\n");
 }
 
 #[test]
@@ -724,19 +718,14 @@ print(-7.5 % 2.0)
 
 #[test]
 fn int_of_nan_and_inf_trap_like_python() {
-    let (code, stderr) = run_program_expect_fail(
-        "intinf",
-        "v = 1e308 * 10\nprint(int(v))\n",
-    );
+    let (code, stderr) = run_program_expect_fail("intinf", "v = 1e308 * 10\nprint(int(v))\n");
     assert_eq!(code, 1);
     assert!(
         stderr.contains("OverflowError: cannot convert float infinity to integer"),
         "stderr: {stderr}"
     );
-    let (code, stderr) = run_program_expect_fail(
-        "intnan",
-        "v = 1e308 * 10\nn = v - v\nprint(int(n))\n",
-    );
+    let (code, stderr) =
+        run_program_expect_fail("intnan", "v = 1e308 * 10\nn = v - v\nprint(int(n))\n");
     assert_eq!(code, 1);
     assert!(
         stderr.contains("ValueError: cannot convert float NaN to integer"),

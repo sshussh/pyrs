@@ -151,7 +151,11 @@ mod tests {
     #[test]
     fn render_points_at_source() {
         let src = "x = 1\ny = oops\n";
-        let d = Diagnostic::new(Phase::Semantic, "name 'oops' is not defined", Span::new(10, 14));
+        let d = Diagnostic::new(
+            Phase::Semantic,
+            "name 'oops' is not defined",
+            Span::new(10, 14),
+        );
         let rendered = d.render("test.py", src);
         assert!(rendered.contains("test.py:2:5"));
         assert!(rendered.contains("y = oops"));

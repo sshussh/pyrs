@@ -76,9 +76,15 @@ pub struct Stmt {
 /// The left-hand side of an assignment.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignTarget {
-    Name { name: String, span: Span },
+    Name {
+        name: String,
+        span: Span,
+    },
     /// `base[index] = ...`
-    Index { base: Expr, index: Expr },
+    Index {
+        base: Expr,
+        index: Expr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

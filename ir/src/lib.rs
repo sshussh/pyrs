@@ -80,7 +80,10 @@ pub struct Function {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// Store into a local (params included).
-    Assign { name: String, value: Expr },
+    Assign {
+        name: String,
+        value: Expr,
+    },
     /// `base[index] = value` — base is a list.
     IndexAssign {
         base: Expr,
@@ -88,7 +91,10 @@ pub enum Stmt {
         value: Expr,
     },
     /// `list.append(value)`
-    ListAppend { list: Expr, value: Expr },
+    ListAppend {
+        list: Expr,
+        value: Expr,
+    },
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
         orelse: Vec<Stmt>,
@@ -146,7 +152,10 @@ pub enum ExprKind {
         operand: Box<Expr>,
     },
     /// `base[index]`: str → str (one character), list[T] → T.
-    Index { base: Box<Expr>, index: Box<Expr> },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// `base[lo:hi]` (no step). Semantic fills defaults: missing lo → 0,
     /// missing hi → i64::MAX; the runtime clamps Python-style.
     Slice {
