@@ -2,15 +2,21 @@
 //! into the typed IR.
 //!
 //! Typing rules (a statically-typed subset of Python, mypy-flavored):
-//! - `int`, `float`, `bool` values; `bool` is assignable to `int`, and
-//!   `int`/`bool` are assignable to `float` (implicit promotion casts are
-//!   inserted).
+//! - `int`, `float`, `bool`, `str`, `list[T]` values; `bool` is assignable
+//!   to `int`, and `int`/`bool` are assignable to `float` (implicit
+//!   promotion casts are inserted).
 //! - a variable's type is fixed by its first assignment and cannot change.
 //! - `/` is true division and always produces `float`; `//` and `%` follow
-//!   Python's floored semantics.
-//! - conditions accept any numeric/bool value (truthiness).
-//! - `and`/`or`/`not` operate on truthiness and produce `bool`.
-//! - string literals are only supported as `print` arguments.
+//!   Python's floored semantics; `**` on ints yields int (a negative
+//!   exponent traps at runtime), on floats yields float.
+//! - str supports `+` (concat), `*` int (repeat), comparisons, indexing,
+//!   `len()`, and `str(...)` conversions.
+//! - lists are homogeneous; they support indexing (read/write), `len()`,
+//!   `.append(...)`, and iteration; assignment aliases (like Python).
+//! - conditions accept any value with truthiness (numerics `!= 0`,
+//!   str/list `len != 0`); `and`/`or`/`not` produce `bool`.
+//! - `for` iterates `range(...)`, lists, and strings; it desugars to a
+//!   `while` whose `continue` target runs the increment.
 //!
 //! The program entry is the top-level script statements; if there are none
 //! but a zero-parameter `main` is defined, `main()` is called instead.
@@ -33,12 +39,34 @@ fn err(message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic::new(Phase::Semantic, message, span)
 }
 
+fn resolve_elem(e: ast::ElemName) -> ir::Elem {
+    match e {
+        ast::ElemName::Int => ir::Elem::Int,
+        ast::ElemName::Float => ir::Elem::Float,
+        ast::ElemName::Bool => ir::Elem::Bool,
+        ast::ElemName::Str => ir::Elem::Str,
+    }
+}
+
 fn resolve_type(ty: ast::TypeName) -> ir::Ty {
     match ty {
         ast::TypeName::Int => ir::Ty::Int,
         ast::TypeName::Float => ir::Ty::Float,
         ast::TypeName::Bool => ir::Ty::Bool,
+        ast::TypeName::Str => ir::Ty::Str,
+        ast::TypeName::List(e) => ir::Ty::List(resolve_elem(e)),
         ast::TypeName::None => ir::Ty::None,
+    }
+}
+
+fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Elem> {
+    match ty {
+        ir::Ty::Int => Ok(ir::Elem::Int),
+        ir::Ty::Float => Ok(ir::Elem::Float),
+        ir::Ty::Bool => Ok(ir::Elem::Bool),
+        ir::Ty::Str => Ok(ir::Elem::Str),
+        ir::Ty::List(_) => Err(err("nested lists are not supported yet", span)),
+        ir::Ty::None => Err(err("list elements cannot be None", span)),
     }
 }
 
@@ -91,9 +119,14 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
         }
     }
 
-    if funcs.contains_key("print") {
-        let f = func_order.iter().find(|f| f.name == "print").unwrap();
-        return Err(err("cannot redefine the builtin 'print'", f.span));
+    for builtin in ["print", "len", "range"] {
+        if funcs.contains_key(builtin) {
+            let f = func_order.iter().find(|f| f.name == builtin).unwrap();
+            return Err(err(
+                format!("cannot redefine the builtin '{builtin}'"),
+                f.span,
+            ));
+        }
     }
 
     // pass 2: lower every user function
@@ -156,6 +189,18 @@ struct FnCtx<'a> {
     locals: HashMap<String, ir::Ty>,
     locals_order: Vec<(String, ir::Ty)>,
     loop_depth: usize,
+    temp_counter: usize,
+}
+
+impl FnCtx<'_> {
+    /// A compiler-synthesized local. The leading '.' keeps it out of the
+    /// user namespace (Python identifiers cannot start with '.').
+    fn fresh_temp(&mut self, hint: &str, ty: ir::Ty) -> String {
+        self.temp_counter += 1;
+        let name = format!(".{hint}{}", self.temp_counter);
+        self.locals_order.push((name.clone(), ty));
+        name
+    }
 }
 
 fn lower_function(f: &ast::FuncDef, funcs: &HashMap<String, FuncSig>) -> SResult<ir::Function> {
@@ -167,15 +212,13 @@ fn lower_function(f: &ast::FuncDef, funcs: &HashMap<String, FuncSig>) -> SResult
         locals: HashMap::new(),
         locals_order: Vec::new(),
         loop_depth: 0,
+        temp_counter: 0,
     };
 
     for p in &f.params {
         let ty = resolve_type(p.ty);
         if ctx.locals.insert(p.name.clone(), ty).is_some() {
-            return Err(err(
-                format!("duplicate parameter '{}'", p.name),
-                p.span,
-            ));
+            return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
         }
         params.push((p.name.clone(), ty));
     }
@@ -206,14 +249,12 @@ fn lower_function(f: &ast::FuncDef, funcs: &HashMap<String, FuncSig>) -> SResult
 fn lower_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::Stmt>> {
     let mut out = Vec::new();
     for stmt in stmts {
-        if let Some(lowered) = lower_stmt(stmt, ctx)? {
-            out.push(lowered);
-        }
+        lower_stmt(stmt, ctx, &mut out)?;
     }
     Ok(out)
 }
 
-fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx) -> SResult<Option<ir::Stmt>> {
+fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SResult<()> {
     match &stmt.kind {
         ast::StmtKind::FuncDef(f) => Err(err(
             format!(
@@ -222,85 +263,76 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx) -> SResult<Option<ir::Stmt>> {
             ),
             f.span,
         )),
-        ast::StmtKind::Pass => Ok(None),
+        ast::StmtKind::Pass => Ok(()),
         ast::StmtKind::Break => {
             if ctx.loop_depth == 0 {
                 return Err(err("'break' outside of a loop", stmt.span));
             }
-            Ok(Some(ir::Stmt::Break))
+            out.push(ir::Stmt::Break);
+            Ok(())
         }
         ast::StmtKind::Continue => {
             if ctx.loop_depth == 0 {
                 return Err(err("'continue' outside of a loop", stmt.span));
             }
-            Ok(Some(ir::Stmt::Continue))
+            out.push(ir::Stmt::Continue);
+            Ok(())
         }
         ast::StmtKind::Return(value) => {
             match (value, ctx.ret) {
-                (None, ir::Ty::None) => Ok(Some(ir::Stmt::Return(None))),
-                (None, expected) => Err(err(
-                    format!(
-                        "function '{}' must return a value of type {}",
-                        ctx.fn_name, expected
-                    ),
-                    stmt.span,
-                )),
+                (None, ir::Ty::None) => out.push(ir::Stmt::Return(None)),
+                (None, expected) => {
+                    return Err(err(
+                        format!(
+                            "function '{}' must return a value of type {}",
+                            ctx.fn_name, expected
+                        ),
+                        stmt.span,
+                    ));
+                }
                 (Some(e), ir::Ty::None) => {
                     // `return None` is fine in a None function
                     if matches!(e.kind, ast::ExprKind::NoneLit) {
-                        return Ok(Some(ir::Stmt::Return(None)));
+                        out.push(ir::Stmt::Return(None));
+                        return Ok(());
                     }
-                    Err(err(
+                    return Err(err(
                         format!(
                             "function '{}' does not declare a return type; \
                              annotate it (e.g. 'def {}(...) -> int:') to return a value",
                             ctx.fn_name, ctx.fn_name
                         ),
                         e.span,
-                    ))
+                    ));
                 }
                 (Some(e), expected) => {
-                    let value = lower_expr(e, ctx)?;
-                    let value = coerce(value, expected, e.span, "return value")?;
-                    Ok(Some(ir::Stmt::Return(Some(value))))
+                    // `return []` needs the declared type for inference
+                    let value = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) =
+                        (&e.kind, expected)
+                    {
+                        lower_list_lit(items, Some(elem), e.span, ctx)?
+                    } else {
+                        let v = lower_expr(e, ctx)?;
+                        coerce(v, expected, e.span, "return value")?
+                    };
+                    out.push(ir::Stmt::Return(Some(value)));
                 }
             }
+            Ok(())
         }
         ast::StmtKind::Assign {
-            name,
-            name_span,
+            target,
             annotation,
             value,
-        } => {
-            let lowered = lower_assign(name, *name_span, *annotation, value, ctx)?;
-            Ok(Some(lowered))
-        }
-        ast::StmtKind::AugAssign {
-            name,
-            name_span,
-            op,
-            value,
-        } => {
-            // desugar `x op= v` into `x = x op v`, reusing the binary logic
-            let current_ty = *ctx.locals.get(name).ok_or_else(|| {
-                err(format!("name '{name}' is not defined"), *name_span)
-            })?;
-            let left = ir::Expr {
-                ty: current_ty,
-                kind: ir::ExprKind::Local(name.clone()),
-            };
-            let right = lower_expr(value, ctx)?;
-            let combined = lower_binary(*op, left, right, stmt.span)?;
-            let combined = coerce_assign(combined, current_ty, name, stmt.span)?;
-            Ok(Some(ir::Stmt::Assign {
-                name: name.clone(),
-                value: combined,
-            }))
+        } => lower_assign(target, *annotation, value, ctx, out),
+        ast::StmtKind::AugAssign { target, op, value } => {
+            lower_aug_assign(target, *op, value, stmt.span, ctx, out)
         }
         ast::StmtKind::ExprStmt(e) => {
             // print is a statement-level builtin
             if let ast::ExprKind::Call { func, args, .. } = &e.kind
                 && func == "print"
+                && !ctx.funcs.contains_key("print")
             {
                 let mut lowered_args = Vec::new();
                 for (i, arg) in args.iter().enumerate() {
@@ -313,10 +345,24 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx) -> SResult<Option<ir::Stmt>> {
                     }
                     lowered_args.push(a);
                 }
-                return Ok(Some(ir::Stmt::Print(lowered_args)));
+                out.push(ir::Stmt::Print(lowered_args));
+                return Ok(());
+            }
+            // xs.append(v) is a statement in the IR
+            if let ast::ExprKind::MethodCall {
+                base,
+                method,
+                method_span,
+                args,
+            } = &e.kind
+            {
+                let stmt = lower_method_stmt(base, method, *method_span, args, ctx)?;
+                out.push(stmt);
+                return Ok(());
             }
             let lowered = lower_expr(e, ctx)?;
-            Ok(Some(ir::Stmt::ExprStmt(lowered)))
+            out.push(ir::Stmt::ExprStmt(lowered));
+            Ok(())
         }
         ast::StmtKind::If { branches, orelse } => {
             let mut lowered_branches = Vec::new();
@@ -326,26 +372,180 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx) -> SResult<Option<ir::Stmt>> {
                 lowered_branches.push((c, b));
             }
             let lowered_orelse = lower_block(orelse, ctx)?;
-            Ok(Some(ir::Stmt::If {
+            out.push(ir::Stmt::If {
                 branches: lowered_branches,
                 orelse: lowered_orelse,
-            }))
+            });
+            Ok(())
         }
         ast::StmtKind::While { cond, body } => {
             let c = lower_condition(cond, ctx)?;
             ctx.loop_depth += 1;
             let b = lower_block(body, ctx);
             ctx.loop_depth -= 1;
-            Ok(Some(ir::Stmt::While { cond: c, body: b? }))
+            out.push(ir::Stmt::While {
+                cond: c,
+                body: b?,
+                step: vec![],
+            });
+            Ok(())
+        }
+        ast::StmtKind::For {
+            var,
+            var_span,
+            iter,
+            body,
+        } => lower_for(var, *var_span, iter, body, ctx, out),
+    }
+}
+
+/// `xs.append(v)` / `xs.pop(...)` in statement position.
+fn lower_method_stmt(
+    base: &ast::Expr,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Stmt> {
+    let base_ir = lower_expr(base, ctx)?;
+    let ir::Ty::List(elem) = base_ir.ty else {
+        return Err(err(
+            format!("'{}' has no method '{method}'", base_ir.ty),
+            method_span,
+        ));
+    };
+    match method {
+        "append" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!("append() takes exactly one argument ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let value = lower_expr(&args[0], ctx)?;
+            let value = coerce(value, elem.ty(), args[0].span, "append() argument")?;
+            Ok(ir::Stmt::ListAppend {
+                list: base_ir,
+                value,
+            })
+        }
+        // pop as a statement discards the popped value
+        "pop" => {
+            let pop = lower_list_pop(base_ir, elem, args, method_span, ctx)?;
+            Ok(ir::Stmt::ExprStmt(pop))
+        }
+        _ => Err(err(
+            format!(
+                "list method '{method}' is not supported yet (only 'append' \
+                 and 'pop')"
+            ),
+            method_span,
+        )),
+    }
+}
+
+fn lower_list_pop(
+    list: ir::Expr,
+    elem: ir::Elem,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let index = match args {
+        [] => int_const(-1),
+        [arg] => {
+            let i = lower_expr(arg, ctx)?;
+            coerce(i, ir::Ty::Int, arg.span, "pop() index")?
+        }
+        _ => {
+            return Err(err(
+                format!("pop() takes at most one argument ({} given)", args.len()),
+                method_span,
+            ));
+        }
+    };
+    Ok(ir::Expr {
+        ty: elem.ty(),
+        kind: ir::ExprKind::ListPop {
+            list: Box::new(list),
+            index: Box::new(index),
+        },
+    })
+}
+
+fn lower_assign(
+    target: &ast::AssignTarget,
+    annotation: Option<ast::TypeName>,
+    value: &ast::Expr,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    match target {
+        ast::AssignTarget::Name { name, span } => {
+            let ann_ty = annotation.map(resolve_type);
+
+            // `xs: list[int] = [...]` / `= []`: propagate the element type
+            let lowered = if let (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem))) =
+                (&value.kind, ann_ty)
+            {
+                lower_list_lit(items, Some(elem), value.span, ctx)?
+            } else {
+                lower_expr(value, ctx)?
+            };
+
+            let stmt = bind_name(name, *span, ann_ty, lowered, value.span, ctx)?;
+            out.push(stmt);
+            Ok(())
+        }
+        ast::AssignTarget::Index { base, index } => {
+            let (list_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
+            let value_ir = lower_expr(value, ctx)?;
+            let value_ir = coerce(value_ir, elem.ty(), value.span, "list element assignment")?;
+            out.push(ir::Stmt::IndexAssign {
+                base: list_ir,
+                index: index_ir,
+                value: value_ir,
+            });
+            Ok(())
         }
     }
 }
 
-fn lower_assign(
+/// Check and lower the target of `base[index] = ...`.
+fn lower_index_target(
+    base: &ast::Expr,
+    index: &ast::Expr,
+    ctx: &mut FnCtx,
+) -> SResult<(ir::Expr, ir::Elem, ir::Expr)> {
+    let base_ir = lower_expr(base, ctx)?;
+    let elem = match base_ir.ty {
+        ir::Ty::List(e) => e,
+        ir::Ty::Str => {
+            return Err(err(
+                "'str' object does not support item assignment (strings are \
+                 immutable)",
+                base.span,
+            ));
+        }
+        other => {
+            return Err(err(
+                format!("'{other}' object does not support item assignment"),
+                base.span,
+            ));
+        }
+    };
+    let index_ir = lower_expr(index, ctx)?;
+    let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "list index")?;
+    Ok((base_ir, elem, index_ir))
+}
+
+/// Bind `name = value_ir`, inferring or checking the variable's type.
+fn bind_name(
     name: &str,
     name_span: Span,
-    annotation: Option<ast::TypeName>,
-    value: &ast::Expr,
+    annotation: Option<ir::Ty>,
+    value_ir: ir::Expr,
+    value_span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Stmt> {
     if ctx.funcs.contains_key(name) {
@@ -355,11 +555,8 @@ fn lower_assign(
         ));
     }
 
-    let lowered = lower_expr(value, ctx)?;
-
     let target_ty = match (annotation, ctx.locals.get(name).copied()) {
-        (Some(ann), existing) => {
-            let ann_ty = resolve_type(ann);
+        (Some(ann_ty), existing) => {
             if ann_ty == ir::Ty::None {
                 return Err(err("cannot declare a variable of type None", name_span));
             }
@@ -377,28 +574,21 @@ fn lower_assign(
             ann_ty
         }
         (None, Some(existing)) => existing,
-        (None, None) => match lowered.ty {
+        (None, None) => match value_ir.ty {
             ir::Ty::None => {
                 return Err(err(
                     format!(
                         "cannot assign to '{name}': the expression has no value \
                          (returns None)"
                     ),
-                    value.span,
-                ));
-            }
-            ir::Ty::Str => {
-                return Err(err(
-                    "str variables are not supported yet; string literals can \
-                     only be printed",
-                    value.span,
+                    value_span,
                 ));
             }
             ty => ty,
         },
     };
 
-    let value_expr = coerce_assign(lowered, target_ty, name, value.span)?;
+    let value_expr = coerce_assign(value_ir, target_ty, name, value_span)?;
 
     if !ctx.locals.contains_key(name) {
         ctx.locals.insert(name.to_string(), target_ty);
@@ -411,13 +601,365 @@ fn lower_assign(
     })
 }
 
-/// Coerce `value` for assignment into a variable of type `target`.
-fn coerce_assign(
-    value: ir::Expr,
-    target: ir::Ty,
-    name: &str,
+fn lower_aug_assign(
+    target: &ast::AssignTarget,
+    op: ast::BinOp,
+    value: &ast::Expr,
     span: Span,
-) -> SResult<ir::Expr> {
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    match target {
+        // desugar `x op= v` into `x = x op v`
+        ast::AssignTarget::Name { name, span: name_span } => {
+            let current_ty = *ctx
+                .locals
+                .get(name)
+                .ok_or_else(|| err(format!("name '{name}' is not defined"), *name_span))?;
+            let left = ir::Expr {
+                ty: current_ty,
+                kind: ir::ExprKind::Local(name.clone()),
+            };
+            let right = lower_expr(value, ctx)?;
+            let combined = lower_binary(op, left, right, span)?;
+            let combined = coerce_assign(combined, current_ty, name, span)?;
+            out.push(ir::Stmt::Assign {
+                name: name.clone(),
+                value: combined,
+            });
+            Ok(())
+        }
+        // `xs[i] op= v`: evaluate base and index once via temps
+        ast::AssignTarget::Index { base, index } => {
+            let (list_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
+            let list_ty = list_ir.ty;
+            let base_t = ctx.fresh_temp("aug.base", list_ty);
+            let idx_t = ctx.fresh_temp("aug.idx", ir::Ty::Int);
+            out.push(ir::Stmt::Assign {
+                name: base_t.clone(),
+                value: list_ir,
+            });
+            out.push(ir::Stmt::Assign {
+                name: idx_t.clone(),
+                value: index_ir,
+            });
+            let base_local = ir::Expr {
+                ty: list_ty,
+                kind: ir::ExprKind::Local(base_t),
+            };
+            let idx_local = ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(idx_t),
+            };
+            let current = ir::Expr {
+                ty: elem.ty(),
+                kind: ir::ExprKind::Index {
+                    base: Box::new(base_local.clone()),
+                    index: Box::new(idx_local.clone()),
+                },
+            };
+            let right = lower_expr(value, ctx)?;
+            let combined = lower_binary(op, current, right, span)?;
+            let combined = coerce(combined, elem.ty(), span, "list element assignment")
+                .map_err(|e| {
+                    Diagnostic::new(
+                        Phase::Semantic,
+                        format!("{}; a list element's type cannot change", e.message),
+                        e.span,
+                    )
+                })?;
+            out.push(ir::Stmt::IndexAssign {
+                base: base_local,
+                index: idx_local,
+                value: combined,
+            });
+            Ok(())
+        }
+    }
+}
+
+// ---- for loops ----
+
+fn lower_for(
+    var: &str,
+    var_span: Span,
+    iter: &ast::Expr,
+    body: &[ast::Stmt],
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    // `for i in range(...)` — lazy, no list is materialized
+    if let ast::ExprKind::Call { func, args, .. } = &iter.kind
+        && func == "range"
+        && !ctx.funcs.contains_key("range")
+    {
+        return lower_for_range(var, var_span, args, iter.span, body, ctx, out);
+    }
+
+    // general case: iterate a list or a string by index
+    let seq = lower_expr(iter, ctx)?;
+    let elem_ty = match seq.ty {
+        ir::Ty::List(e) => e.ty(),
+        ir::Ty::Str => ir::Ty::Str,
+        other => {
+            return Err(err(format!("'{other}' object is not iterable"), iter.span));
+        }
+    };
+
+    let seq_ty = seq.ty;
+    let seq_t = ctx.fresh_temp("for.seq", seq_ty);
+    let idx_t = ctx.fresh_temp("for.idx", ir::Ty::Int);
+    out.push(ir::Stmt::Assign {
+        name: seq_t.clone(),
+        value: seq,
+    });
+    out.push(ir::Stmt::Assign {
+        name: idx_t.clone(),
+        value: int_const(0),
+    });
+
+    let seq_local = ir::Expr {
+        ty: seq_ty,
+        kind: ir::ExprKind::Local(seq_t),
+    };
+    let idx_local = ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Local(idx_t.clone()),
+    };
+
+    // cond: idx < len(seq) — length is re-read every iteration, so
+    // appending inside the loop extends it (like Python)
+    let cond = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Binary {
+            op: ir::BinOp::Lt,
+            left: Box::new(idx_local.clone()),
+            right: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(seq_local.clone())),
+            }),
+        },
+    };
+
+    // var = seq[idx] as the first statement of the body
+    let element = ir::Expr {
+        ty: elem_ty,
+        kind: ir::ExprKind::Index {
+            base: Box::new(seq_local),
+            index: Box::new(idx_local.clone()),
+        },
+    };
+    let bind = bind_name(var, var_span, None, element, var_span, ctx)?;
+
+    ctx.loop_depth += 1;
+    let user_body = lower_block(body, ctx);
+    ctx.loop_depth -= 1;
+    let mut loop_body = vec![bind];
+    loop_body.extend(user_body?);
+
+    let step = vec![ir::Stmt::Assign {
+        name: idx_t,
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(idx_local),
+                right: Box::new(int_const(1)),
+            },
+        },
+    }];
+
+    out.push(ir::Stmt::While {
+        cond,
+        body: loop_body,
+        step,
+    });
+    Ok(())
+}
+
+fn lower_for_range(
+    var: &str,
+    var_span: Span,
+    args: &[ast::Expr],
+    range_span: Span,
+    body: &[ast::Stmt],
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(err(
+            format!(
+                "range() takes 1 to 3 arguments ({} given)",
+                args.len()
+            ),
+            range_span,
+        ));
+    }
+
+    let mut lowered: Vec<ir::Expr> = Vec::new();
+    for a in args {
+        let v = lower_expr(a, ctx)?;
+        lowered.push(coerce(v, ir::Ty::Int, a.span, "range() argument")?);
+    }
+    let (start, stop, step) = match lowered.len() {
+        1 => (int_const(0), lowered.remove(0), int_const(1)),
+        2 => {
+            let stop = lowered.remove(1);
+            (lowered.remove(0), stop, int_const(1))
+        }
+        _ => {
+            let step = lowered.remove(2);
+            let stop = lowered.remove(1);
+            (lowered.remove(0), stop, step)
+        }
+    };
+
+    // the loop variable must be an int
+    if let Some(&existing) = ctx.locals.get(var)
+        && existing != ir::Ty::Int
+    {
+        return Err(err(
+            format!(
+                "loop variable '{var}' already has type {existing}, but \
+                 range() yields int"
+            ),
+            var_span,
+        ));
+    }
+
+    // stop is evaluated once, up front (like Python)
+    let stop_t = ctx.fresh_temp("range.stop", ir::Ty::Int);
+    out.push(ir::Stmt::Assign {
+        name: stop_t.clone(),
+        value: stop,
+    });
+    let stop_local = ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Local(stop_t),
+    };
+
+    let var_local = ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Local(var.to_string()),
+    };
+
+    // constant steps get a simple condition; dynamic steps need a zero
+    // check and a direction-aware condition
+    let (cond, step_value) = match step.kind {
+        ir::ExprKind::ConstInt(0) => {
+            return Err(err("range() arg 3 must not be zero", range_span));
+        }
+        ir::ExprKind::ConstInt(k) => {
+            let op = if k > 0 { ir::BinOp::Lt } else { ir::BinOp::Gt };
+            let cond = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op,
+                    left: Box::new(var_local.clone()),
+                    right: Box::new(stop_local),
+                },
+            };
+            (cond, int_const(k))
+        }
+        _ => {
+            let step_t = ctx.fresh_temp("range.step", ir::Ty::Int);
+            out.push(ir::Stmt::Assign {
+                name: step_t.clone(),
+                value: step,
+            });
+            let step_local = ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(step_t),
+            };
+            out.push(ir::Stmt::If {
+                branches: vec![(
+                    int_cmp(ir::BinOp::Eq, step_local.clone(), int_const(0)),
+                    vec![ir::Stmt::Die(
+                        "ValueError: range() arg 3 must not be zero".to_string(),
+                    )],
+                )],
+                orelse: vec![],
+            });
+            // (step > 0 and var < stop) or (step < 0 and var > stop)
+            let up = bool_and(
+                int_cmp(ir::BinOp::Gt, step_local.clone(), int_const(0)),
+                int_cmp(ir::BinOp::Lt, var_local.clone(), stop_local.clone()),
+            );
+            let down = bool_and(
+                int_cmp(ir::BinOp::Lt, step_local.clone(), int_const(0)),
+                int_cmp(ir::BinOp::Gt, var_local.clone(), stop_local),
+            );
+            let cond = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Or,
+                    left: Box::new(up),
+                    right: Box::new(down),
+                },
+            };
+            (cond, step_local)
+        }
+    };
+
+    // var = start
+    let bind = bind_name(var, var_span, None, start, var_span, ctx)?;
+    out.push(bind);
+
+    ctx.loop_depth += 1;
+    let loop_body = lower_block(body, ctx);
+    ctx.loop_depth -= 1;
+
+    let step_stmt = ir::Stmt::Assign {
+        name: var.to_string(),
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(var_local),
+                right: Box::new(step_value),
+            },
+        },
+    };
+
+    out.push(ir::Stmt::While {
+        cond,
+        body: loop_body?,
+        step: vec![step_stmt],
+    });
+    Ok(())
+}
+
+fn int_const(v: i64) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::ConstInt(v),
+    }
+}
+
+fn int_cmp(op: ir::BinOp, l: ir::Expr, r: ir::Expr) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Binary {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        },
+    }
+}
+
+fn bool_and(l: ir::Expr, r: ir::Expr) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Binary {
+            op: ir::BinOp::And,
+            left: Box::new(l),
+            right: Box::new(r),
+        },
+    }
+}
+
+/// Coerce `value` for assignment into a variable of type `target`.
+fn coerce_assign(value: ir::Expr, target: ir::Ty, name: &str, span: Span) -> SResult<ir::Expr> {
     coerce(value, target, span, &format!("assignment to '{name}'")).map_err(|e| {
         Diagnostic::new(
             Phase::Semantic,
@@ -470,7 +1012,7 @@ fn lower_condition(cond: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
 fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
     match value.ty {
         ir::Ty::Bool => Ok(value),
-        ir::Ty::Int | ir::Ty::Float => Ok(ir::Expr {
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Str | ir::Ty::List(_) => Ok(ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::ToBool(Box::new(value)),
         }),
@@ -483,10 +1025,7 @@ fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
 
 fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     match &expr.kind {
-        ast::ExprKind::Int(v) => Ok(ir::Expr {
-            ty: ir::Ty::Int,
-            kind: ir::ExprKind::ConstInt(*v),
-        }),
+        ast::ExprKind::Int(v) => Ok(int_const(*v)),
         ast::ExprKind::Float(v) => Ok(ir::Expr {
             ty: ir::Ty::Float,
             kind: ir::ExprKind::ConstFloat(*v),
@@ -518,52 +1057,129 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 Err(err(format!("name '{name}' is not defined"), expr.span))
             }
         }
+        ast::ExprKind::ListLit(items) => lower_list_lit(items, None, expr.span, ctx),
+        ast::ExprKind::Index { base, index } => {
+            let base_ir = lower_expr(base, ctx)?;
+            let result_ty = match base_ir.ty {
+                ir::Ty::List(e) => e.ty(),
+                ir::Ty::Str => ir::Ty::Str,
+                other => {
+                    return Err(err(
+                        format!("'{other}' object is not subscriptable"),
+                        base.span,
+                    ));
+                }
+            };
+            let index_ir = lower_expr(index, ctx)?;
+            let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "index")?;
+            Ok(ir::Expr {
+                ty: result_ty,
+                kind: ir::ExprKind::Index {
+                    base: Box::new(base_ir),
+                    index: Box::new(index_ir),
+                },
+            })
+        }
+        ast::ExprKind::MethodCall {
+            base,
+            method,
+            method_span,
+            args,
+        } => {
+            let base_ir = lower_expr(base, ctx)?;
+            if let ir::Ty::List(elem) = base_ir.ty {
+                match method.as_str() {
+                    // pop returns the removed element
+                    "pop" => {
+                        return lower_list_pop(base_ir, elem, args, *method_span, ctx);
+                    }
+                    "append" => {
+                        return Err(err(
+                            "list.append(...) returns None and cannot be used \
+                             in an expression",
+                            *method_span,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Err(err(
+                format!("'{}' has no method '{method}'", base_ir.ty),
+                *method_span,
+            ))
+        }
+        ast::ExprKind::Slice { base, lo, hi } => {
+            let base_ir = lower_expr(base, ctx)?;
+            let ty = match base_ir.ty {
+                ir::Ty::Str => ir::Ty::Str,
+                ir::Ty::List(e) => ir::Ty::List(e),
+                other => {
+                    return Err(err(
+                        format!("'{other}' object cannot be sliced"),
+                        base.span,
+                    ));
+                }
+            };
+            let lo_ir = match lo {
+                Some(e) => {
+                    let v = lower_expr(e, ctx)?;
+                    coerce(v, ir::Ty::Int, e.span, "slice bound")?
+                }
+                Option::None => int_const(0),
+            };
+            let hi_ir = match hi {
+                Some(e) => {
+                    let v = lower_expr(e, ctx)?;
+                    coerce(v, ir::Ty::Int, e.span, "slice bound")?
+                }
+                // "missing" upper bound; the runtime clamps to len
+                Option::None => int_const(i64::MAX),
+            };
+            Ok(ir::Expr {
+                ty,
+                kind: ir::ExprKind::Slice {
+                    base: Box::new(base_ir),
+                    lo: Box::new(lo_ir),
+                    hi: Box::new(hi_ir),
+                },
+            })
+        }
+        ast::ExprKind::JoinedStr(parts) => {
+            let mut result: Option<ir::Expr> = Option::None;
+            for part in parts {
+                let piece = match part {
+                    ast::FStringPart::Literal(s) => ir::Expr {
+                        ty: ir::Ty::Str,
+                        kind: ir::ExprKind::ConstStr(s.clone()),
+                    },
+                    ast::FStringPart::Expr(e) => {
+                        let v = lower_expr(e, ctx)?;
+                        // reuse str() conversion rules
+                        lower_cast(ast::TypeName::Str, v, e.span)?
+                    }
+                };
+                result = Some(match result {
+                    Option::None => piece,
+                    Some(acc) => ir::Expr {
+                        ty: ir::Ty::Str,
+                        kind: ir::ExprKind::Binary {
+                            op: ir::BinOp::Add,
+                            left: Box::new(acc),
+                            right: Box::new(piece),
+                        },
+                    },
+                });
+            }
+            Ok(result.unwrap_or(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::ConstStr(String::new()),
+            }))
+        }
         ast::ExprKind::Call {
             func,
             func_span,
             args,
-        } => {
-            if func == "print" {
-                return Err(err(
-                    "print(...) does not return a value and cannot be used \
-                     in an expression",
-                    expr.span,
-                ));
-            }
-            let sig = ctx
-                .funcs
-                .get(func)
-                .cloned()
-                .ok_or_else(|| err(format!("function '{func}' is not defined"), *func_span))?;
-            if args.len() != sig.params.len() {
-                return Err(err(
-                    format!(
-                        "function '{func}' takes {} argument(s) but {} were given",
-                        sig.params.len(),
-                        args.len()
-                    ),
-                    expr.span,
-                ));
-            }
-            let mut lowered_args = Vec::new();
-            for (i, (arg, &expected)) in args.iter().zip(&sig.params).enumerate() {
-                let a = lower_expr(arg, ctx)?;
-                let a = coerce(
-                    a,
-                    expected,
-                    arg.span,
-                    &format!("argument {} of '{func}'", i + 1),
-                )?;
-                lowered_args.push(a);
-            }
-            Ok(ir::Expr {
-                ty: sig.ret,
-                kind: ir::ExprKind::Call {
-                    func: func.clone(),
-                    args: lowered_args,
-                },
-            })
-        }
+        } => lower_call(func, *func_span, args, expr.span, ctx),
         ast::ExprKind::Cast { ty, arg } => {
             let value = lower_expr(arg, ctx)?;
             lower_cast(*ty, value, arg.span)
@@ -583,6 +1199,18 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 }
                 ast::UnaryOp::Neg => {
                     let value = promote_numeric(value, operand.span, "unary '-'")?;
+                    // fold negated literals into constants so negative range
+                    // steps and exponents are statically visible
+                    match value.kind {
+                        ir::ExprKind::ConstInt(v) => return Ok(int_const(v.wrapping_neg())),
+                        ir::ExprKind::ConstFloat(v) => {
+                            return Ok(ir::Expr {
+                                ty: ir::Ty::Float,
+                                kind: ir::ExprKind::ConstFloat(-v),
+                            });
+                        }
+                        _ => {}
+                    }
                     let ty = value.ty;
                     Ok(ir::Expr {
                         ty,
@@ -593,6 +1221,10 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     })
                 }
             }
+        }
+        ast::ExprKind::Compare { first, rest } => {
+            let first_ir = lower_expr(first, ctx)?;
+            lower_compare_chain(first_ir, rest, expr.span, ctx)
         }
         ast::ExprKind::Binary { op, left, right } => {
             // and/or take truthiness operands and short-circuit
@@ -618,6 +1250,193 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             lower_binary(*op, l, r, expr.span)
         }
     }
+}
+
+/// `a < b <= c`: each middle operand is bound to a temp (evaluated once)
+/// and the chain becomes short-circuit `and`s, exactly like Python.
+fn lower_compare_chain(
+    prev: ir::Expr,
+    rest: &[(ast::BinOp, ast::Expr)],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let (op, operand) = &rest[0];
+    let cur = lower_expr(operand, ctx)?;
+
+    if rest.len() == 1 {
+        return lower_binary(*op, prev, cur, span);
+    }
+
+    let cur_ty = cur.ty;
+    let temp = ctx.fresh_temp("cmp", cur_ty);
+    let temp_local = ir::Expr {
+        ty: cur_ty,
+        kind: ir::ExprKind::Local(temp.clone()),
+    };
+
+    let head = lower_binary(*op, prev, temp_local.clone(), span)?;
+    let tail = lower_compare_chain(temp_local, &rest[1..], span, ctx)?;
+
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Let {
+            name: temp,
+            value: Box::new(cur),
+            body: Box::new(bool_and(head, tail)),
+        },
+    })
+}
+
+fn lower_list_lit(
+    items: &[ast::Expr],
+    expected: Option<ir::Elem>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if items.is_empty() {
+        let elem = expected.ok_or_else(|| {
+            err(
+                "cannot infer the element type of an empty list; annotate the \
+                 variable, e.g. 'xs: list[int] = []'",
+                span,
+            )
+        })?;
+        return Ok(ir::Expr {
+            ty: ir::Ty::List(elem),
+            kind: ir::ExprKind::ListLit(vec![]),
+        });
+    }
+
+    let mut lowered = Vec::new();
+    for item in items {
+        lowered.push((lower_expr(item, ctx)?, item.span));
+    }
+
+    let elem = match expected {
+        Some(e) => e,
+        None => {
+            // numeric join: any float → float; bool widens to int if mixed
+            let mut ty = lowered[0].0.ty;
+            for (item, item_span) in &lowered[1..] {
+                ty = join_elem_types(ty, item.ty).ok_or_else(|| {
+                    err(
+                        format!(
+                            "list elements must share one type; found {} and {}",
+                            ty, item.ty
+                        ),
+                        *item_span,
+                    )
+                })?;
+            }
+            elem_of(ty, span)?
+        }
+    };
+
+    let mut coerced = Vec::new();
+    for (item, item_span) in lowered {
+        coerced.push(coerce(item, elem.ty(), item_span, "list element")?);
+    }
+
+    Ok(ir::Expr {
+        ty: ir::Ty::List(elem),
+        kind: ir::ExprKind::ListLit(coerced),
+    })
+}
+
+fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
+    match (a, b) {
+        _ if a == b => Some(a),
+        (ir::Ty::Float, ir::Ty::Int)
+        | (ir::Ty::Int, ir::Ty::Float)
+        | (ir::Ty::Float, ir::Ty::Bool)
+        | (ir::Ty::Bool, ir::Ty::Float) => Some(ir::Ty::Float),
+        (ir::Ty::Int, ir::Ty::Bool) | (ir::Ty::Bool, ir::Ty::Int) => Some(ir::Ty::Int),
+        _ => Option::None,
+    }
+}
+
+fn lower_call(
+    func: &str,
+    func_span: Span,
+    args: &[ast::Expr],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if !ctx.funcs.contains_key(func) {
+        match func {
+            "print" => {
+                return Err(err(
+                    "print(...) does not return a value and cannot be used \
+                     in an expression",
+                    span,
+                ));
+            }
+            "len" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("len() takes exactly one argument ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(&args[0], ctx)?;
+                if !matches!(arg.ty, ir::Ty::Str | ir::Ty::List(_)) {
+                    return Err(err(
+                        format!("object of type '{}' has no len()", arg.ty),
+                        args[0].span,
+                    ));
+                }
+                return Ok(ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Len(Box::new(arg)),
+                });
+            }
+            "range" => {
+                return Err(err(
+                    "range(...) is only supported as the iterable of a 'for' loop",
+                    span,
+                ));
+            }
+            _ => {
+                return Err(err(format!("function '{func}' is not defined"), func_span));
+            }
+        }
+    }
+
+    let sig = ctx.funcs.get(func).cloned().unwrap();
+    if args.len() != sig.params.len() {
+        return Err(err(
+            format!(
+                "function '{func}' takes {} argument(s) but {} were given",
+                sig.params.len(),
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let mut lowered_args = Vec::new();
+    for (i, (arg, &expected)) in args.iter().zip(&sig.params).enumerate() {
+        // `f([])` / `f([1, 2])` use the parameter's element type
+        let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected)
+        {
+            lower_list_lit(items, Some(elem), arg.span, ctx)?
+        } else {
+            lower_expr(arg, ctx)?
+        };
+        let a = coerce(
+            a,
+            expected,
+            arg.span,
+            &format!("argument {} of '{func}'", i + 1),
+        )?;
+        lowered_args.push(a);
+    }
+    Ok(ir::Expr {
+        ty: sig.ret,
+        kind: ir::ExprKind::Call {
+            func: func.to_string(),
+            args: lowered_args,
+        },
+    })
 }
 
 fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Expr> {
@@ -654,12 +1473,29 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
         },
         ast::TypeName::Bool => match value.ty {
             ir::Ty::Bool => Ok(value),
-            ir::Ty::Int | ir::Ty::Float => Ok(ir::Expr {
+            ir::Ty::Int | ir::Ty::Float | ir::Ty::Str | ir::Ty::List(_) => Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::ToBool(Box::new(value)),
             }),
             other => Err(err(format!("bool() cannot convert {other}"), span)),
         },
+        ast::TypeName::Str => match value.ty {
+            ir::Ty::Str => Ok(value),
+            ir::Ty::Int => Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::IntToStr(Box::new(value)),
+            }),
+            ir::Ty::Float => Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::FloatToStr(Box::new(value)),
+            }),
+            ir::Ty::Bool => Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::BoolToStr(Box::new(value)),
+            }),
+            other => Err(err(format!("str() cannot convert {other} yet"), span)),
+        },
+        ast::TypeName::List(_) => Err(err("list(...) conversions are not supported", span)),
         ast::TypeName::None => Err(err("None is not a conversion", span)),
     }
 }
@@ -713,13 +1549,18 @@ fn unify_numeric(
 fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
     let describe = format!("operator '{op}'");
 
-    // friendlier message for strings before the generic numeric error
+    // membership tests work on str and list; check before type dispatch
+    if matches!(op, ast::BinOp::In | ast::BinOp::NotIn) {
+        return lower_contains(op, l, r, span);
+    }
+
+    // ---- string operations ----
     if l.ty == ir::Ty::Str || r.ty == ir::Ty::Str {
+        return lower_str_binary(op, l, r, span);
+    }
+    if matches!(l.ty, ir::Ty::List(_)) || matches!(r.ty, ir::Ty::List(_)) {
         return Err(err(
-            format!(
-                "{describe} is not supported for str yet; string literals can \
-                 only be printed"
-            ),
+            format!("{describe} is not supported for lists yet"),
             span,
         ));
     }
@@ -743,6 +1584,31 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
                 ty,
                 kind: ir::ExprKind::Binary {
                     op: ir_op,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+            })
+        }
+        // int ** int stays int, except a negative constant exponent which
+        // is a float in Python (2 ** -1 == 0.5); dynamic negative exponents
+        // trap at runtime. Floats use llvm.pow.
+        ast::BinOp::Pow => {
+            let (l, r, ty) = unify_numeric(l, r, span, &describe)?;
+            let (l, r, ty) = if ty == ir::Ty::Int
+                && matches!(r.kind, ir::ExprKind::ConstInt(k) if k < 0)
+            {
+                let to_float = |e: ir::Expr| ir::Expr {
+                    ty: ir::Ty::Float,
+                    kind: ir::ExprKind::IntToFloat(Box::new(e)),
+                };
+                (to_float(l), to_float(r), ir::Ty::Float)
+            } else {
+                (l, r, ty)
+            };
+            Ok(ir::Expr {
+                ty,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Pow,
                     left: Box::new(l),
                     right: Box::new(r),
                 },
@@ -777,19 +1643,10 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
         | ast::BinOp::Gt
         | ast::BinOp::GtEq => {
             let (l, r, _) = unify_numeric(l, r, span, &describe)?;
-            let ir_op = match op {
-                ast::BinOp::Eq => ir::BinOp::Eq,
-                ast::BinOp::NotEq => ir::BinOp::Ne,
-                ast::BinOp::Lt => ir::BinOp::Lt,
-                ast::BinOp::LtEq => ir::BinOp::Le,
-                ast::BinOp::Gt => ir::BinOp::Gt,
-                ast::BinOp::GtEq => ir::BinOp::Ge,
-                _ => unreachable!(),
-            };
             Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::Binary {
-                    op: ir_op,
+                    op: comparison_ir_op(op),
                     left: Box::new(l),
                     right: Box::new(r),
                 },
@@ -798,6 +1655,123 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
         ast::BinOp::And | ast::BinOp::Or => {
             unreachable!("and/or are handled in lower_expr")
         }
+        ast::BinOp::In | ast::BinOp::NotIn => {
+            unreachable!("in/not-in are handled above")
+        }
+    }
+}
+
+fn comparison_ir_op(op: ast::BinOp) -> ir::BinOp {
+    match op {
+        ast::BinOp::Eq => ir::BinOp::Eq,
+        ast::BinOp::NotEq => ir::BinOp::Ne,
+        ast::BinOp::Lt => ir::BinOp::Lt,
+        ast::BinOp::LtEq => ir::BinOp::Le,
+        ast::BinOp::Gt => ir::BinOp::Gt,
+        ast::BinOp::GtEq => ir::BinOp::Ge,
+        _ => unreachable!("not a comparison"),
+    }
+}
+
+/// `needle in haystack` / `not in`: substring test or list membership.
+fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    let needle = match r.ty {
+        ir::Ty::Str => {
+            if l.ty != ir::Ty::Str {
+                return Err(err(
+                    format!("'in <str>' requires a str on the left, found {}", l.ty),
+                    span,
+                ));
+            }
+            l
+        }
+        ir::Ty::List(elem) => coerce(l, elem.ty(), span, "'in' operand")?,
+        other => {
+            return Err(err(
+                format!("'{other}' does not support 'in'"),
+                span,
+            ));
+        }
+    };
+    let contains = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Contains {
+            needle: Box::new(needle),
+            haystack: Box::new(r),
+        },
+    };
+    if op == ast::BinOp::NotIn {
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Unary {
+                op: ir::UnOp::Not,
+                operand: Box::new(contains),
+            },
+        });
+    }
+    Ok(contains)
+}
+
+fn lower_str_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match op {
+        // "a" + "b"
+        ast::BinOp::Add if l.ty == ir::Ty::Str && r.ty == ir::Ty::Str => Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(l),
+                right: Box::new(r),
+            },
+        }),
+        ast::BinOp::Add => Err(err(
+            "can only concatenate str to str; use str(...) to convert",
+            span,
+        )),
+        // "ab" * 3 / 3 * "ab" — the count is normalized to the right
+        ast::BinOp::Mul => {
+            let (s, n) = if l.ty == ir::Ty::Str { (l, r) } else { (r, l) };
+            let n = promote_numeric(n, span, "string repetition")?;
+            if n.ty != ir::Ty::Int {
+                return Err(err(
+                    "a string can only be multiplied by an int",
+                    span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Mul,
+                    left: Box::new(s),
+                    right: Box::new(n),
+                },
+            })
+        }
+        // lexicographic comparisons
+        ast::BinOp::Eq
+        | ast::BinOp::NotEq
+        | ast::BinOp::Lt
+        | ast::BinOp::LtEq
+        | ast::BinOp::Gt
+        | ast::BinOp::GtEq => {
+            if l.ty != ir::Ty::Str || r.ty != ir::Ty::Str {
+                return Err(err(
+                    format!("'{}' is not comparable with '{}'", l.ty, r.ty),
+                    span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: comparison_ir_op(op),
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+            })
+        }
+        other => Err(err(
+            format!("operator '{other}' is not supported for str"),
+            span,
+        )),
     }
 }
 
@@ -810,13 +1784,15 @@ fn block_returns(stmts: &[ir::Stmt]) -> bool {
 fn stmt_returns(stmt: &ir::Stmt) -> bool {
     match stmt {
         ir::Stmt::Return(_) => true,
+        // Die exits the process; the path cannot fall through
+        ir::Stmt::Die(_) => true,
         ir::Stmt::If { branches, orelse } => {
             !orelse.is_empty()
                 && branches.iter().all(|(_, body)| block_returns(body))
                 && block_returns(orelse)
         }
         // `while True:` without a break never falls through
-        ir::Stmt::While { cond, body } => {
+        ir::Stmt::While { cond, body, .. } => {
             matches!(cond.kind, ir::ExprKind::ConstBool(true)) && !loop_breaks(body)
         }
         _ => false,
@@ -874,7 +1850,6 @@ print(fib(10))
         assert_eq!(m.entry, ENTRY_NAME);
         let fib = find_func(&m, "fib");
         assert_eq!(fib.ret, ir::Ty::Int);
-        assert_eq!(fib.params, vec![("n".to_string(), ir::Ty::Int)]);
         let entry = find_func(&m, ENTRY_NAME);
         assert!(matches!(entry.body[0], ir::Stmt::Print(_)));
     }
@@ -887,10 +1862,6 @@ print(fib(10))
             panic!("expected Assign");
         };
         assert_eq!(value.ty, ir::Ty::Float);
-        let ir::ExprKind::Binary { left, .. } = &value.kind else {
-            panic!("expected Binary");
-        };
-        assert!(matches!(left.kind, ir::ExprKind::IntToFloat(_)));
     }
 
     #[test]
@@ -904,51 +1875,186 @@ print(fib(10))
     }
 
     #[test]
-    fn floor_division_of_ints_stays_int() {
-        let m = analyze_ok("x = 7 // 2\n");
+    fn pow_int_stays_int_pow_float_is_float() {
+        let m = analyze_ok("a = 2 ** 10\nb = 2.0 ** 10\n");
         let entry = find_func(&m, ENTRY_NAME);
         let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+    }
+
+    #[test]
+    fn chained_comparison_lowers_to_let_and() {
+        let m = analyze_ok("x = 1\nb = 0 < x < 10\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
             panic!("expected Assign");
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        let ir::ExprKind::Let { body, .. } = &value.kind else {
+            panic!("expected Let, got {:?}", value.kind);
+        };
+        assert!(matches!(
+            body.kind,
+            ir::ExprKind::Binary { op: ir::BinOp::And, .. }
+        ));
+    }
+
+    #[test]
+    fn str_variables_and_concat() {
+        let m = analyze_ok("s = \"ab\"\nt = s + \"c\"\nu = s * 3\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert_eq!(entry.locals[0], ("s".to_string(), ir::Ty::Str));
+        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+    }
+
+    #[test]
+    fn str_comparisons_are_bool() {
+        let m = analyze_ok("b = \"a\" < \"b\"\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+    }
+
+    #[test]
+    fn str_cast_and_index_and_len() {
+        let m = analyze_ok("s = str(42)\nc = s[0]\nn = len(s)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(value.kind, ir::ExprKind::IntToStr(_)));
+        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        let ir::Stmt::Assign { value, .. } = &entry.body[2] else {
+            panic!();
         };
         assert_eq!(value.ty, ir::Ty::Int);
     }
 
     #[test]
-    fn int_condition_gets_truthiness_cast() {
-        let m = analyze_ok("x = 5\nwhile x:\n    x = x - 1\n");
+    fn list_literal_infers_type_and_promotes() {
+        let m = analyze_ok("xs = [1, 2.5, True]\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::While { cond, .. } = &entry.body[1] else {
-            panic!("expected While");
+        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+            panic!();
         };
-        assert_eq!(cond.ty, ir::Ty::Bool);
-        assert!(matches!(cond.kind, ir::ExprKind::ToBool(_)));
+        assert_eq!(value.ty, ir::Ty::List(ir::Elem::Float));
     }
 
     #[test]
-    fn locals_are_collected_with_types() {
-        let m = analyze_ok("x = 1\ny = 2.5\nb = True\n");
-        let entry = find_func(&m, ENTRY_NAME);
-        assert_eq!(
-            entry.locals,
-            vec![
-                ("x".to_string(), ir::Ty::Int),
-                ("y".to_string(), ir::Ty::Float),
-                ("b".to_string(), ir::Ty::Bool),
-            ]
-        );
+    fn empty_list_needs_annotation() {
+        let e = analyze_err("xs = []\n");
+        assert!(e.message.contains("annotate"), "{}", e.message);
+        analyze_ok("xs: list[int] = []\n");
     }
 
     #[test]
-    fn entry_calls_main_when_no_script() {
-        let m = analyze_ok("def main():\n    print(1)\n");
+    fn list_index_and_assignment() {
+        let m = analyze_ok("xs = [1, 2]\ny = xs[0]\nxs[1] = 5\n");
         let entry = find_func(&m, ENTRY_NAME);
-        assert!(matches!(
-            &entry.body[0],
-            ir::Stmt::ExprStmt(ir::Expr {
-                kind: ir::ExprKind::Call { func, .. },
-                ..
-            }) if func == "main"
-        ));
+        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(entry.body[2], ir::Stmt::IndexAssign { .. }));
+    }
+
+    #[test]
+    fn list_append_becomes_stmt() {
+        let m = analyze_ok("xs = [1]\nxs.append(2)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(matches!(entry.body[1], ir::Stmt::ListAppend { .. }));
+    }
+
+    #[test]
+    fn augmented_index_assignment_uses_temps() {
+        let m = analyze_ok("xs = [1, 2]\nxs[0] += 5\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        // Assign(list), Assign(.aug.base), Assign(.aug.idx), IndexAssign
+        assert_eq!(entry.body.len(), 4);
+        assert!(matches!(entry.body[3], ir::Stmt::IndexAssign { .. }));
+    }
+
+    #[test]
+    fn for_range_desugars_to_while_with_step() {
+        let m = analyze_ok("for i in range(10):\n    print(i)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        // Assign(.range.stop), Assign(i), While
+        let ir::Stmt::While { step, .. } = &entry.body[2] else {
+            panic!("expected While, got {:?}", entry.body[2]);
+        };
+        assert_eq!(step.len(), 1);
+    }
+
+    #[test]
+    fn for_range_zero_step_is_compile_error() {
+        let e = analyze_err("for i in range(0, 10, 0):\n    print(i)\n");
+        assert!(e.message.contains("zero"), "{}", e.message);
+    }
+
+    #[test]
+    fn for_over_list_binds_elem_type() {
+        let m = analyze_ok("for x in [1.5, 2.5]:\n    print(x)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let has_x_float = entry
+            .locals
+            .iter()
+            .any(|(n, t)| n == "x" && *t == ir::Ty::Float);
+        assert!(has_x_float, "locals: {:?}", entry.locals);
+    }
+
+    #[test]
+    fn for_over_str_binds_str() {
+        let m = analyze_ok("for c in \"abc\":\n    print(c)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let has_c_str = entry
+            .locals
+            .iter()
+            .any(|(n, t)| n == "c" && *t == ir::Ty::Str);
+        assert!(has_c_str, "locals: {:?}", entry.locals);
+    }
+
+    #[test]
+    fn for_over_int_is_error() {
+        let e = analyze_err("for x in 42:\n    print(x)\n");
+        assert!(e.message.contains("not iterable"), "{}", e.message);
+    }
+
+    #[test]
+    fn range_outside_for_is_error() {
+        let e = analyze_err("xs = range(10)\n");
+        assert!(e.message.contains("for"), "{}", e.message);
+    }
+
+    #[test]
+    fn str_and_int_concat_is_error() {
+        let e = analyze_err("x = \"a\" + 1\n");
+        assert!(e.message.contains("concatenate"), "{}", e.message);
+    }
+
+    #[test]
+    fn str_item_assignment_is_error() {
+        let e = analyze_err("s = \"ab\"\ns[0] = \"c\"\n");
+        assert!(e.message.contains("immutable"), "{}", e.message);
+    }
+
+    #[test]
+    fn heterogeneous_list_is_error() {
+        let e = analyze_err("xs = [1, \"a\"]\n");
+        assert!(e.message.contains("share one type"), "{}", e.message);
     }
 
     #[test]
@@ -970,31 +2076,8 @@ print(fib(10))
     }
 
     #[test]
-    fn error_wrong_arg_count() {
-        let e = analyze_err("def f(a: int) -> int:\n    return a\nf(1, 2)\n");
-        assert!(e.message.contains("argument"), "{}", e.message);
-    }
-
-    #[test]
-    fn error_wrong_arg_type() {
-        let e = analyze_err("def f(a: int) -> int:\n    return a\nf(1.5)\n");
-        assert!(e.message.contains("mismatch"), "{}", e.message);
-    }
-
-    #[test]
     fn error_missing_return_path() {
         let e = analyze_err("def f(a: int) -> int:\n    if a:\n        return 1\n");
-        assert!(e.message.contains("without a return"), "{}", e.message);
-    }
-
-    #[test]
-    fn while_true_counts_as_returning() {
-        analyze_ok("def f() -> int:\n    while True:\n        pass\nf()\n");
-    }
-
-    #[test]
-    fn while_true_with_break_does_not_return() {
-        let e = analyze_err("def f() -> int:\n    while True:\n        break\nf()\n");
         assert!(e.message.contains("without a return"), "{}", e.message);
     }
 
@@ -1005,97 +2088,160 @@ print(fib(10))
     }
 
     #[test]
-    fn error_nested_def() {
-        let e = analyze_err("def f():\n    def g():\n        pass\n    pass\nf()\n");
-        assert!(e.message.contains("nested"), "{}", e.message);
+    fn str_truthiness_works() {
+        analyze_ok("s = \"x\"\nif s:\n    print(1)\n");
+        analyze_ok("xs = [1]\nwhile xs:\n    break\n");
     }
 
     #[test]
-    fn error_str_arithmetic() {
-        let e = analyze_err("x = \"a\" + 1\n");
-        assert!(e.message.contains("str"), "{}", e.message);
-    }
-
-    #[test]
-    fn error_print_in_expression() {
-        let e = analyze_err("x = print(1)\n");
-        assert!(e.message.contains("print"), "{}", e.message);
-    }
-
-    #[test]
-    fn error_return_value_from_none_function() {
-        let e = analyze_err("def f():\n    return 5\nf()\n");
-        assert!(e.message.contains("return type"), "{}", e.message);
-    }
-
-    #[test]
-    fn bool_assignable_to_int() {
-        let m = analyze_ok("x: int = True\n");
+    fn entry_calls_main_when_no_script() {
+        let m = analyze_ok("def main():\n    print(1)\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
-            panic!("expected Assign");
-        };
-        assert_eq!(value.ty, ir::Ty::Int);
-        assert!(matches!(value.kind, ir::ExprKind::BoolToInt(_)));
-    }
-
-    #[test]
-    fn casts_lower_correctly() {
-        let m = analyze_ok("x = int(2.9)\ny = float(3)\nb = bool(0)\n");
-        let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
-            panic!();
-        };
-        assert!(matches!(value.kind, ir::ExprKind::FloatToInt(_)));
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
-            panic!();
-        };
-        assert!(matches!(value.kind, ir::ExprKind::IntToFloat(_)));
-        let ir::Stmt::Assign { value, .. } = &entry.body[2] else {
-            panic!();
-        };
-        assert!(matches!(value.kind, ir::ExprKind::ToBool(_)));
-    }
-
-    #[test]
-    fn aug_assign_desugars() {
-        let m = analyze_ok("x = 1\nx += 2\n");
-        let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { name, value } = &entry.body[1] else {
-            panic!("expected Assign");
-        };
-        assert_eq!(name, "x");
         assert!(matches!(
-            value.kind,
-            ir::ExprKind::Binary { op: ir::BinOp::Add, .. }
+            &entry.body[0],
+            ir::Stmt::ExprStmt(ir::Expr {
+                kind: ir::ExprKind::Call { func, .. },
+                ..
+            }) if func == "main"
         ));
     }
 
     #[test]
-    fn error_aug_div_changes_int_type() {
-        // x /= 2 would turn an int into a float
-        let e = analyze_err("x = 4\nx /= 2\n");
-        assert!(e.message.contains("fixed"), "{}", e.message);
+    fn list_params_and_returns() {
+        analyze_ok(
+            "\
+def total(xs: list[int]) -> int:
+    t = 0
+    for x in xs:
+        t += x
+    return t
+
+print(total([1, 2, 3]))
+",
+        );
     }
 
     #[test]
-    fn and_or_produce_bool() {
-        let m = analyze_ok("x = 1 and 2.5 or True\n");
+    fn empty_list_arg_uses_param_type() {
+        analyze_ok(
+            "\
+def count(xs: list[str]) -> int:
+    return len(xs)
+
+print(count([]))
+",
+        );
+    }
+
+    #[test]
+    fn cannot_redefine_builtins() {
+        let e = analyze_err("def len(x: int) -> int:\n    return x\nprint(len(1))\n");
+        assert!(e.message.contains("builtin"), "{}", e.message);
+    }
+
+    #[test]
+    fn slices_type_correctly() {
+        let m = analyze_ok("s = \"hello\"\nt = s[1:3]\nxs = [1, 2, 3]\nys = xs[:2]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        let ir::Stmt::Assign { value, .. } = &entry.body[3] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::List(ir::Elem::Int));
+        // missing bounds are filled with defaults
+        let ir::ExprKind::Slice { lo, hi, .. } = &value.kind else {
+            panic!();
+        };
+        assert!(matches!(lo.kind, ir::ExprKind::ConstInt(0)));
+        assert!(matches!(hi.kind, ir::ExprKind::ConstInt(_)));
+    }
+
+    #[test]
+    fn error_slicing_an_int() {
+        let e = analyze_err("x = 5\ny = x[1:2]\n");
+        assert!(e.message.contains("sliced"), "{}", e.message);
+    }
+
+    #[test]
+    fn contains_types_correctly() {
+        let m = analyze_ok(
+            "b = \"ell\" in \"hello\"\nc = 2 in [1, 2]\nd = 5 not in [1, 2]\n",
+        );
         let entry = find_func(&m, ENTRY_NAME);
         let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
-            panic!("expected Assign");
+            panic!();
         };
-        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(value.kind, ir::ExprKind::Contains { .. }));
+        let ir::Stmt::Assign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        // not in == Not(Contains)
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::Unary { op: ir::UnOp::Not, operand }
+                if matches!(operand.kind, ir::ExprKind::Contains { .. })
+        ));
     }
 
     #[test]
-    fn print_accepts_mixed_args() {
-        let m = analyze_ok("print(1, 2.5, True, \"label\")\n");
+    fn contains_coerces_needle_to_elem_type() {
+        let m = analyze_ok("b = 1 in [1.5, 2.5]\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Print(args) = &entry.body[0] else {
-            panic!("expected Print");
+        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+            panic!();
         };
-        assert_eq!(args.len(), 4);
-        assert_eq!(args[3].ty, ir::Ty::Str);
+        let ir::ExprKind::Contains { needle, .. } = &value.kind else {
+            panic!();
+        };
+        assert_eq!(needle.ty, ir::Ty::Float);
+    }
+
+    #[test]
+    fn error_int_in_str() {
+        let e = analyze_err("b = 5 in \"hello\"\n");
+        assert!(e.message.contains("str on the left"), "{}", e.message);
+    }
+
+    #[test]
+    fn pop_returns_element_type() {
+        let m = analyze_ok("xs = [1.5]\nx = xs.pop()\ny = xs.pop(0)\nxs.pop()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+        assert!(matches!(value.kind, ir::ExprKind::ListPop { .. }));
+        // statement-position pop is allowed and discarded
+        assert!(matches!(entry.body[3], ir::Stmt::ExprStmt(_)));
+    }
+
+    #[test]
+    fn fstring_lowers_to_concat_with_conversions() {
+        let m = analyze_ok("x = 42\ns = f\"x={x}!\"\nprint(s)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        // somewhere in the tree there must be an IntToStr conversion
+        fn has_int_to_str(e: &ir::Expr) -> bool {
+            match &e.kind {
+                ir::ExprKind::IntToStr(_) => true,
+                ir::ExprKind::Binary { left, right, .. } => {
+                    has_int_to_str(left) || has_int_to_str(right)
+                }
+                _ => false,
+            }
+        }
+        assert!(has_int_to_str(value), "{value:?}");
+    }
+
+    #[test]
+    fn error_fstring_of_list() {
+        let e = analyze_err("xs = [1]\ns = f\"{xs}\"\nprint(s)\n");
+        assert!(e.message.contains("convert"), "{}", e.message);
     }
 }
