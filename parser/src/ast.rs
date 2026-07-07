@@ -2,12 +2,23 @@
 
 use common::Span;
 
+/// Element type inside `list[...]` (lists don't nest yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElemName {
+    Int,
+    Float,
+    Bool,
+    Str,
+}
+
 /// A builtin type name as written in annotations (`x: int`, `-> float`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeName {
     Int,
     Float,
     Bool,
+    Str,
+    List(ElemName),
     /// `-> None`: the function returns nothing.
     None,
 }
@@ -18,6 +29,16 @@ impl std::fmt::Display for TypeName {
             TypeName::Int => write!(f, "int"),
             TypeName::Float => write!(f, "float"),
             TypeName::Bool => write!(f, "bool"),
+            TypeName::Str => write!(f, "str"),
+            TypeName::List(e) => {
+                let e = match e {
+                    ElemName::Int => "int",
+                    ElemName::Float => "float",
+                    ElemName::Bool => "bool",
+                    ElemName::Str => "str",
+                };
+                write!(f, "list[{e}]")
+            }
             TypeName::None => write!(f, "None"),
         }
     }
@@ -52,6 +73,14 @@ pub struct Stmt {
     pub span: Span,
 }
 
+/// The left-hand side of an assignment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignTarget {
+    Name { name: String, span: Span },
+    /// `base[index] = ...`
+    Index { base: Expr, index: Expr },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     FuncDef(FuncDef),
@@ -64,18 +93,23 @@ pub enum StmtKind {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    /// `for var in iter:` — iter is `range(...)`, a list, or a str.
+    For {
+        var: String,
+        var_span: Span,
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
     Return(Option<Expr>),
-    /// `name = value` or `name: ty = value`
+    /// `target = value` or `name: ty = value`
     Assign {
-        name: String,
-        name_span: Span,
+        target: AssignTarget,
         annotation: Option<TypeName>,
         value: Expr,
     },
-    /// `name op= value`
+    /// `target op= value`
     AugAssign {
-        name: String,
-        name_span: Span,
+        target: AssignTarget,
         op: BinOp,
         value: Expr,
     },
@@ -96,12 +130,18 @@ pub enum BinOp {
     FloorDiv,
     /// `%` — Python modulo (result takes the sign of the divisor)
     Mod,
+    /// `**` — power, right-associative
+    Pow,
     Eq,
     NotEq,
     Lt,
     LtEq,
     Gt,
     GtEq,
+    /// `in` — substring or list membership
+    In,
+    /// `not in`
+    NotIn,
     And,
     Or,
 }
@@ -115,12 +155,15 @@ impl std::fmt::Display for BinOp {
             BinOp::Div => "/",
             BinOp::FloorDiv => "//",
             BinOp::Mod => "%",
+            BinOp::Pow => "**",
             BinOp::Eq => "==",
             BinOp::NotEq => "!=",
             BinOp::Lt => "<",
             BinOp::LtEq => "<=",
             BinOp::Gt => ">",
             BinOp::GtEq => ">=",
+            BinOp::In => "in",
+            BinOp::NotIn => "not in",
             BinOp::And => "and",
             BinOp::Or => "or",
         };
@@ -134,6 +177,12 @@ pub enum UnaryOp {
     Neg,
     /// `not x`
     Not,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FStringPart {
+    Literal(String),
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,7 +204,29 @@ pub enum ExprKind {
         func_span: Span,
         args: Vec<Expr>,
     },
-    /// `int(x)`, `float(x)`, `bool(x)`
+    /// `obj.method(args)` — currently only list methods.
+    MethodCall {
+        base: Box<Expr>,
+        method: String,
+        method_span: Span,
+        args: Vec<Expr>,
+    },
+    /// `base[index]`
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// `base[lo:hi]` — either bound may be omitted; no step.
+    Slice {
+        base: Box<Expr>,
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
+    },
+    /// `f"..."`: literal chunks interleaved with interpolated expressions.
+    JoinedStr(Vec<FStringPart>),
+    /// `[a, b, c]`
+    ListLit(Vec<Expr>),
+    /// `int(x)`, `float(x)`, `bool(x)`, `str(x)`
     Cast {
         ty: TypeName,
         arg: Box<Expr>,
@@ -164,6 +235,12 @@ pub enum ExprKind {
         op: BinOp,
         left: Box<Expr>,
         right: Box<Expr>,
+    },
+    /// A comparison chain `a < b <= c`: `first` then (op, operand) pairs.
+    /// A single comparison is represented as `Binary`.
+    Compare {
+        first: Box<Expr>,
+        rest: Vec<(BinOp, Expr)>,
     },
     Unary {
         op: UnaryOp,
