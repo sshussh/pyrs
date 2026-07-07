@@ -8,6 +8,12 @@
 //! - division by zero traps with a ZeroDivisionError message instead of UB
 //! - `int(float)` is a saturating conversion (no UB on NaN/overflow)
 //! - `i64::MIN // -1` wraps instead of being UB (select on the divisor)
+//! - `**` on ints uses runtime repeated squaring (negative exponent traps);
+//!   `0.0 ** negative` traps like Python instead of returning inf
+//!
+//! Strings are length-prefixed `{ i64, [n x i8] }` blobs; lists are
+//! `{ len, cap, data }` headers with 8-byte value slots. Both live behind
+//! `ptr` and are managed by the C runtime (allocated, never freed).
 //!
 //! All user symbols are prefixed `pyrs_` so they can never collide with
 //! libc symbols (a user function named `printf` is fine).
@@ -15,7 +21,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use ir::{BinOp, Expr, ExprKind, Function, Module, Stmt, Ty, UnOp};
+use ir::{BinOp, Elem, Expr, ExprKind, Function, Module, Stmt, Ty, UnOp};
 
 pub fn emit_llvm_ir(module: &Module) -> String {
     let mut e = Emitter::default();
@@ -29,6 +35,7 @@ fn lty(ty: Ty) -> &'static str {
         Ty::Float => "double",
         Ty::Bool => "i1",
         Ty::Str => "ptr",
+        Ty::List(_) => "ptr",
         Ty::None => "void",
     }
 }
@@ -40,6 +47,16 @@ fn mangle(name: &str) -> String {
 /// LLVM hexadecimal float syntax: the raw IEEE-754 bits of the double.
 fn fconst(v: f64) -> String {
     format!("0x{:016X}", v.to_bits())
+}
+
+/// Tag values understood by the runtime's `pyrs_print_list`.
+fn elem_tag(elem: Elem) -> u32 {
+    match elem {
+        Elem::Int => 0,
+        Elem::Float => 1,
+        Elem::Bool => 2,
+        Elem::Str => 3,
+    }
 }
 
 fn escape_bytes(s: &str) -> (String, usize) {
@@ -81,10 +98,30 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_float(double)\n");
         out.push_str("declare void @pyrs_print_bool(i32)\n");
         out.push_str("declare void @pyrs_print_str(ptr)\n");
+        out.push_str("declare void @pyrs_print_list(ptr, i32)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_concat(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_repeat(ptr, i64)\n");
+        out.push_str("declare i32 @pyrs_str_cmp(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_index(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_str_from_int(i64)\n");
+        out.push_str("declare ptr @pyrs_str_from_float(double)\n");
+        out.push_str("declare ptr @pyrs_str_from_bool(i32)\n");
+        out.push_str("declare ptr @pyrs_str_slice(ptr, i64, i64)\n");
+        out.push_str("declare i32 @pyrs_str_contains(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_list_new(i64)\n");
+        out.push_str("declare void @pyrs_list_push(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64)\n");
+        out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_list_pop(ptr, i64)\n");
+        out.push_str("declare i64 @pyrs_ipow(i64, i64)\n");
+        out.push_str("declare double @pyrs_ffloordiv(double, double)\n");
+        out.push_str("declare double @pyrs_fmod_floored(double, double)\n");
+        out.push_str("declare double @llvm.fabs.f64(double)\n");
         out.push_str("declare double @llvm.floor.f64(double)\n");
+        out.push_str("declare double @llvm.pow.f64(double, double)\n");
         out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n\n");
         out.push_str(&self.string_defs);
         out.push('\n');
@@ -128,17 +165,136 @@ impl Emitter {
         self.terminated = false;
     }
 
+    /// A string constant as a `{ i64 len, [n x i8] }` global; the pointer
+    /// doubles as the runtime `PyrsStr*`.
     fn intern_string(&mut self, content: &str) -> String {
         if let Some(name) = self.strings.get(content) {
             return name.clone();
         }
         let name = format!("@.str.{}", self.strings.len());
-        let (escaped, len) = escape_bytes(content);
+        let (escaped, storage) = escape_bytes(content);
+        let len = content.len();
         self.string_defs.push_str(&format!(
-            "{name} = private unnamed_addr constant [{len} x i8] c\"{escaped}\"\n"
+            "{name} = private unnamed_addr constant {{ i64, [{storage} x i8] }} \
+             {{ i64 {len}, [{storage} x i8] c\"{escaped}\" }}\n"
         ));
         self.strings.insert(content.to_string(), name.clone());
         name
+    }
+
+    /// Trap like the runtime's check_ref when a str/list local is still
+    /// null (read before assignment).
+    fn emit_ref_check(&mut self, ptr: &str) {
+        let is_null = self.tmp();
+        self.line(format!("{is_null} = icmp eq ptr {ptr}, null"));
+        let trap_l = self.fresh_block("null.trap");
+        let ok_l = self.fresh_block("null.ok");
+        self.line(format!("br i1 {is_null}, label %{trap_l}, label %{ok_l}"));
+        self.start_block(&trap_l);
+        self.emit_die("UnboundLocalError: value used before assignment");
+        self.start_block(&ok_l);
+    }
+
+    /// str and list both lead with an i64 length; load it inline.
+    fn emit_len(&mut self, ptr: &str) -> String {
+        self.emit_ref_check(ptr);
+        let t = self.tmp();
+        self.line(format!("{t} = load i64, ptr {ptr}"));
+        t
+    }
+
+    /// Inline list element addressing: negative-index adjustment, bounds
+    /// check (trapping with `message`), then the slot address. Much faster
+    /// than an out-of-line runtime call in hot loops.
+    fn emit_list_elem_addr(&mut self, hdr: &str, index: &str, message: &str) -> String {
+        let len = self.emit_len(hdr);
+        let neg = self.tmp();
+        self.line(format!("{neg} = icmp slt i64 {index}, 0"));
+        let plus = self.tmp();
+        self.line(format!("{plus} = add i64 {index}, {len}"));
+        let adj = self.tmp();
+        self.line(format!("{adj} = select i1 {neg}, i64 {plus}, i64 {index}"));
+        let below = self.tmp();
+        self.line(format!("{below} = icmp slt i64 {adj}, 0"));
+        let above = self.tmp();
+        self.line(format!("{above} = icmp sge i64 {adj}, {len}"));
+        let oob = self.tmp();
+        self.line(format!("{oob} = or i1 {below}, {above}"));
+        let trap_l = self.fresh_block("idx.trap");
+        let ok_l = self.fresh_block("idx.ok");
+        self.line(format!("br i1 {oob}, label %{trap_l}, label %{ok_l}"));
+        self.start_block(&trap_l);
+        self.emit_die(message);
+        self.start_block(&ok_l);
+        // PyrsList layout: { i64 len; i64 cap; i64* data } — data at +16
+        let data_pp = self.tmp();
+        self.line(format!(
+            "{data_pp} = getelementptr inbounds i8, ptr {hdr}, i64 16"
+        ));
+        let data_p = self.tmp();
+        self.line(format!("{data_p} = load ptr, ptr {data_pp}"));
+        let addr = self.tmp();
+        self.line(format!(
+            "{addr} = getelementptr inbounds i64, ptr {data_p}, i64 {adj}"
+        ));
+        addr
+    }
+
+    /// Trap with `message` and mark the block terminated.
+    fn emit_die(&mut self, message: &str) {
+        let msg = self.intern_string(message);
+        // pyrs_die takes a plain C string: skip the 8-byte length header
+        self.line(format!(
+            "call void @pyrs_die(ptr getelementptr inbounds (i8, ptr {msg}, i64 8))"
+        ));
+        self.line("unreachable");
+        self.terminated = true;
+    }
+
+    // ---- value slots (8-byte list elements) ----
+
+    fn slot_from_value(&mut self, value: &str, ty: Ty) -> String {
+        match ty {
+            Ty::Int => value.to_string(),
+            Ty::Float => {
+                let t = self.tmp();
+                self.line(format!("{t} = bitcast double {value} to i64"));
+                t
+            }
+            Ty::Bool => {
+                let t = self.tmp();
+                self.line(format!("{t} = zext i1 {value} to i64"));
+                t
+            }
+            Ty::Str => {
+                let t = self.tmp();
+                self.line(format!("{t} = ptrtoint ptr {value} to i64"));
+                t
+            }
+            other => unreachable!("no slot representation for {other:?}"),
+        }
+    }
+
+    fn value_from_slot(&mut self, slot: &str, ty: Ty) -> String {
+        match ty {
+            Ty::Int => slot.to_string(),
+            Ty::Float => {
+                let t = self.tmp();
+                self.line(format!("{t} = bitcast i64 {slot} to double"));
+                t
+            }
+            Ty::Bool => {
+                let t = self.tmp();
+                self.line(format!("{t} = trunc i64 {slot} to i1"));
+                t
+            }
+            Ty::Str => {
+                let t = self.tmp();
+                self.line(format!("{t} = inttoptr i64 {slot} to ptr"));
+                t
+            }
+            other => unreachable!("no slot representation for {other:?}"),
+        }
     }
 
     // ---- functions ----
@@ -155,12 +311,14 @@ impl Emitter {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
             self.line(format!("store {} %p.{name}, ptr %v.{name}", lty(*ty)));
         }
-        // all locals up front, zero-initialized (a conditionally-assigned
-        // variable reads as 0/0.0/False instead of being UB)
+        // all locals up front, zero/null-initialized (a conditionally
+        // assigned variable reads as 0/0.0/False/null instead of being UB;
+        // the runtime traps on null str/list use)
         for (name, ty) in &func.locals {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
             let zero = match ty {
                 Ty::Float => fconst(0.0),
+                Ty::Str | Ty::List(_) => "null".to_string(),
                 _ => "0".to_string(),
             };
             self.line(format!("store {} {zero}, ptr %v.{name}", lty(*ty)));
@@ -207,6 +365,24 @@ impl Emitter {
                 let v = self.emit_expr(value);
                 self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
             }
+            Stmt::IndexAssign { base, index, value } => {
+                let b = self.emit_expr(base);
+                let i = self.emit_expr(index);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                let addr = self.emit_list_elem_addr(
+                    &b,
+                    &i,
+                    "IndexError: list assignment index out of range",
+                );
+                self.line(format!("store i64 {slot}, ptr {addr}"));
+            }
+            Stmt::ListAppend { list, value } => {
+                let l = self.emit_expr(list);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                self.line(format!("call void @pyrs_list_push(ptr {l}, i64 {slot})"));
+            }
             Stmt::Return(None) => {
                 self.line("ret void");
                 self.terminated = true;
@@ -218,6 +394,9 @@ impl Emitter {
             }
             Stmt::ExprStmt(expr) => {
                 self.emit_expr(expr);
+            }
+            Stmt::Die(message) => {
+                self.emit_die(message);
             }
             Stmt::Print(args) => {
                 for (i, arg) in args.iter().enumerate() {
@@ -236,6 +415,10 @@ impl Emitter {
                             self.line(format!("call void @pyrs_print_bool(i32 {ext})"));
                         }
                         Ty::Str => self.line(format!("call void @pyrs_print_str(ptr {v})")),
+                        Ty::List(elem) => self.line(format!(
+                            "call void @pyrs_print_list(ptr {v}, i32 {})",
+                            elem_tag(elem)
+                        )),
                         Ty::None => unreachable!("semantic rejects None print args"),
                     }
                 }
@@ -247,13 +430,14 @@ impl Emitter {
                 self.terminated = true;
             }
             Stmt::Continue => {
-                let (cond, _) = self.loops.last().expect("continue outside loop").clone();
-                self.line(format!("br label %{cond}"));
+                let (cont, _) = self.loops.last().expect("continue outside loop").clone();
+                self.line(format!("br label %{cont}"));
                 self.terminated = true;
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, step } => {
                 let cond_l = self.fresh_block("while.cond");
                 let body_l = self.fresh_block("while.body");
+                let step_l = self.fresh_block("while.step");
                 let end_l = self.fresh_block("while.end");
 
                 self.line(format!("br label %{cond_l}"));
@@ -262,12 +446,17 @@ impl Emitter {
                 self.line(format!("br i1 {c}, label %{body_l}, label %{end_l}"));
 
                 self.start_block(&body_l);
-                self.loops.push((cond_l.clone(), end_l.clone()));
+                // continue jumps to the step block (for-loop increment)
+                self.loops.push((step_l.clone(), end_l.clone()));
                 self.emit_block(body);
                 self.loops.pop();
                 if !self.terminated {
-                    self.line(format!("br label %{cond_l}"));
+                    self.line(format!("br label %{step_l}"));
                 }
+
+                self.start_block(&step_l);
+                self.emit_block(step);
+                self.line(format!("br label %{cond_l}"));
 
                 self.start_block(&end_l);
             }
@@ -326,6 +515,11 @@ impl Emitter {
                 self.line(format!("{t} = load {}, ptr %v.{name}", lty(expr.ty)));
                 t
             }
+            ExprKind::Let { name, value, body } => {
+                let v = self.emit_expr(value);
+                self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
+                self.emit_expr(body)
+            }
             ExprKind::Call { func, args } => {
                 let mut arg_list = Vec::new();
                 for arg in args {
@@ -346,6 +540,90 @@ impl Emitter {
                     t
                 }
             }
+            ExprKind::Index { base, index } => {
+                let b = self.emit_expr(base);
+                let i = self.emit_expr(index);
+                match base.ty {
+                    Ty::Str => {
+                        let t = self.tmp();
+                        self.line(format!("{t} = call ptr @pyrs_str_index(ptr {b}, i64 {i})"));
+                        t
+                    }
+                    Ty::List(elem) => {
+                        let addr = self.emit_list_elem_addr(
+                            &b,
+                            &i,
+                            "IndexError: list index out of range",
+                        );
+                        let slot = self.tmp();
+                        self.line(format!("{slot} = load i64, ptr {addr}"));
+                        self.value_from_slot(&slot, elem.ty())
+                    }
+                    other => unreachable!("index on {other:?}"),
+                }
+            }
+            ExprKind::Slice { base, lo, hi } => {
+                let b = self.emit_expr(base);
+                let lo_v = self.emit_expr(lo);
+                let hi_v = self.emit_expr(hi);
+                let callee = match base.ty {
+                    Ty::Str => "pyrs_str_slice",
+                    Ty::List(_) => "pyrs_list_slice",
+                    other => unreachable!("slice on {other:?}"),
+                };
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @{callee}(ptr {b}, i64 {lo_v}, i64 {hi_v})"
+                ));
+                t
+            }
+            ExprKind::Contains { needle, haystack } => {
+                let n = self.emit_expr(needle);
+                let h = self.emit_expr(haystack);
+                let c = self.tmp();
+                match haystack.ty {
+                    Ty::Str => {
+                        self.line(format!(
+                            "{c} = call i32 @pyrs_str_contains(ptr {h}, ptr {n})"
+                        ));
+                    }
+                    Ty::List(elem) => {
+                        let slot = self.slot_from_value(&n, needle.ty);
+                        self.line(format!(
+                            "{c} = call i32 @pyrs_list_contains(ptr {h}, i64 {slot}, i32 {})",
+                            elem_tag(elem)
+                        ));
+                    }
+                    other => unreachable!("contains on {other:?}"),
+                }
+                let t = self.tmp();
+                self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                t
+            }
+            ExprKind::ListPop { list, index } => {
+                let l = self.emit_expr(list);
+                let i = self.emit_expr(index);
+                let slot = self.tmp();
+                self.line(format!("{slot} = call i64 @pyrs_list_pop(ptr {l}, i64 {i})"));
+                self.value_from_slot(&slot, expr.ty)
+            }
+            ExprKind::ListLit(items) => {
+                let l = self.tmp();
+                self.line(format!(
+                    "{l} = call ptr @pyrs_list_new(i64 {})",
+                    items.len()
+                ));
+                for item in items {
+                    let v = self.emit_expr(item);
+                    let slot = self.slot_from_value(&v, item.ty);
+                    self.line(format!("call void @pyrs_list_push(ptr {l}, i64 {slot})"));
+                }
+                l
+            }
+            ExprKind::Len(inner) => {
+                let v = self.emit_expr(inner);
+                self.emit_len(&v)
+            }
             ExprKind::IntToFloat(inner) => {
                 let v = self.emit_expr(inner);
                 let t = self.tmp();
@@ -354,8 +632,30 @@ impl Emitter {
             }
             ExprKind::FloatToInt(inner) => {
                 let v = self.emit_expr(inner);
+                // Python raises on nan/inf instead of converting
+                let is_nan = self.tmp();
+                self.line(format!("{is_nan} = fcmp uno double {v}, {}", fconst(0.0)));
+                let nan_l = self.fresh_block("toint.nan");
+                let ok1_l = self.fresh_block("toint.num");
+                self.line(format!("br i1 {is_nan}, label %{nan_l}, label %{ok1_l}"));
+                self.start_block(&nan_l);
+                self.emit_die("ValueError: cannot convert float NaN to integer");
+                self.start_block(&ok1_l);
+                let abs = self.tmp();
+                self.line(format!("{abs} = call double @llvm.fabs.f64(double {v})"));
+                let is_inf = self.tmp();
+                self.line(format!(
+                    "{is_inf} = fcmp oeq double {abs}, {}",
+                    fconst(f64::INFINITY)
+                ));
+                let inf_l = self.fresh_block("toint.inf");
+                let ok2_l = self.fresh_block("toint.ok");
+                self.line(format!("br i1 {is_inf}, label %{inf_l}, label %{ok2_l}"));
+                self.start_block(&inf_l);
+                self.emit_die("OverflowError: cannot convert float infinity to integer");
+                self.start_block(&ok2_l);
                 let t = self.tmp();
-                // saturating: defined for NaN and out-of-range values
+                // saturating: still defined if the finite value exceeds i64
                 self.line(format!("{t} = call i64 @llvm.fptosi.sat.i64.f64(double {v})"));
                 t
             }
@@ -365,18 +665,49 @@ impl Emitter {
                 self.line(format!("{t} = zext i1 {v} to i64"));
                 t
             }
-            ExprKind::ToBool(inner) => {
+            ExprKind::IntToStr(inner) => {
                 let v = self.emit_expr(inner);
                 let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_str_from_int(i64 {v})"));
+                t
+            }
+            ExprKind::FloatToStr(inner) => {
+                let v = self.emit_expr(inner);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_str_from_float(double {v})"));
+                t
+            }
+            ExprKind::BoolToStr(inner) => {
+                let v = self.emit_expr(inner);
+                let ext = self.tmp();
+                self.line(format!("{ext} = zext i1 {v} to i32"));
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_str_from_bool(i32 {ext})"));
+                t
+            }
+            ExprKind::ToBool(inner) => {
+                let v = self.emit_expr(inner);
                 match inner.ty {
-                    Ty::Int => self.line(format!("{t} = icmp ne i64 {v}, 0")),
+                    Ty::Int => {
+                        let t = self.tmp();
+                        self.line(format!("{t} = icmp ne i64 {v}, 0"));
+                        t
+                    }
                     // une: NaN is truthy, like Python
                     Ty::Float => {
-                        self.line(format!("{t} = fcmp une double {v}, {}", fconst(0.0)))
+                        let t = self.tmp();
+                        self.line(format!("{t} = fcmp une double {v}, {}", fconst(0.0)));
+                        t
                     }
-                    _ => unreachable!("ToBool only applies to numerics"),
+                    // str and list share the leading i64 length field
+                    Ty::Str | Ty::List(_) => {
+                        let len = self.emit_len(&v);
+                        let t = self.tmp();
+                        self.line(format!("{t} = icmp ne i64 {len}, 0"));
+                        t
+                    }
+                    other => unreachable!("ToBool on {other:?}"),
                 }
-                t
             }
             ExprKind::Unary { op, operand } => {
                 let v = self.emit_expr(operand);
@@ -399,6 +730,11 @@ impl Emitter {
             return self.emit_short_circuit(op, left, right);
         }
 
+        // string operations dispatch to the runtime
+        if left.ty == Ty::Str {
+            return self.emit_str_binary(op, left, right);
+        }
+
         let l = self.emit_expr(left);
         let r = self.emit_expr(right);
         let ty = left.ty; // semantic guarantees both sides match
@@ -418,6 +754,37 @@ impl Emitter {
                 self.line(format!("{t} = {instr} {} {l}, {r}", lty(ty)));
                 t
             }
+            BinOp::Pow => match ty {
+                // repeated squaring in the runtime; negative exponent traps
+                Ty::Int => {
+                    let t = self.tmp();
+                    self.line(format!("{t} = call i64 @pyrs_ipow(i64 {l}, i64 {r})"));
+                    t
+                }
+                Ty::Float => {
+                    // Python: 0.0 ** negative raises instead of returning inf
+                    let zb = self.tmp();
+                    self.line(format!("{zb} = fcmp oeq double {l}, {}", fconst(0.0)));
+                    let ne = self.tmp();
+                    self.line(format!("{ne} = fcmp olt double {r}, {}", fconst(0.0)));
+                    let bad = self.tmp();
+                    self.line(format!("{bad} = and i1 {zb}, {ne}"));
+                    let trap_l = self.fresh_block("pow.trap");
+                    let ok_l = self.fresh_block("pow.ok");
+                    self.line(format!("br i1 {bad}, label %{trap_l}, label %{ok_l}"));
+                    self.start_block(&trap_l);
+                    self.emit_die(
+                        "ZeroDivisionError: 0.0 cannot be raised to a negative power",
+                    );
+                    self.start_block(&ok_l);
+                    let t = self.tmp();
+                    self.line(format!(
+                        "{t} = call double @llvm.pow.f64(double {l}, double {r})"
+                    ));
+                    t
+                }
+                other => unreachable!("pow on {other:?}"),
+            },
             // true division: always float (semantic inserted the casts)
             BinOp::Div => {
                 self.guard_zero(&r, Ty::Float, "ZeroDivisionError: division by zero");
@@ -430,7 +797,7 @@ impl Emitter {
                     self.guard_zero(
                         &r,
                         Ty::Int,
-                        "ZeroDivisionError: integer division or modulo by zero",
+                        "ZeroDivisionError: division by zero",
                     );
                     let safe_r = self.guard_int_min(&l, &r);
                     let (q, r0) = self.emit_divmod(&l, &safe_r);
@@ -442,11 +809,12 @@ impl Emitter {
                     t
                 }
                 Ty::Float => {
-                    self.guard_zero(&r, Ty::Float, "ZeroDivisionError: float floor division by zero");
-                    let d = self.tmp();
-                    self.line(format!("{d} = fdiv double {l}, {r}"));
+                    self.guard_zero(&r, Ty::Float, "ZeroDivisionError: division by zero");
+                    // CPython float_divmod semantics live in the runtime
                     let t = self.tmp();
-                    self.line(format!("{t} = call double @llvm.floor.f64(double {d})"));
+                    self.line(format!(
+                        "{t} = call double @pyrs_ffloordiv(double {l}, double {r})"
+                    ));
                     t
                 }
                 other => unreachable!("floordiv on {other:?}"),
@@ -456,7 +824,7 @@ impl Emitter {
                     self.guard_zero(
                         &r,
                         Ty::Int,
-                        "ZeroDivisionError: integer division or modulo by zero",
+                        "ZeroDivisionError: division by zero",
                     );
                     let safe_r = self.guard_int_min(&l, &r);
                     let r0 = self.tmp();
@@ -469,27 +837,12 @@ impl Emitter {
                     t
                 }
                 Ty::Float => {
-                    self.guard_zero(&r, Ty::Float, "ZeroDivisionError: float modulo");
-                    let r0 = self.tmp();
-                    self.line(format!("{r0} = frem double {l}, {r}"));
-                    // Python: nonzero remainder takes the divisor's sign
-                    let rnz = self.tmp();
-                    self.line(format!("{rnz} = fcmp one double {r0}, {}", fconst(0.0)));
-                    let rneg = self.tmp();
-                    self.line(format!("{rneg} = fcmp olt double {r0}, {}", fconst(0.0)));
-                    let bneg = self.tmp();
-                    self.line(format!("{bneg} = fcmp olt double {r}, {}", fconst(0.0)));
-                    let sgn = self.tmp();
-                    self.line(format!("{sgn} = xor i1 {rneg}, {bneg}"));
-                    let adj = self.tmp();
-                    self.line(format!("{adj} = and i1 {rnz}, {sgn}"));
-                    let sel = self.tmp();
-                    self.line(format!(
-                        "{sel} = select i1 {adj}, double {r}, double {}",
-                        fconst(0.0)
-                    ));
+                    self.guard_zero(&r, Ty::Float, "ZeroDivisionError: division by zero");
+                    // CPython float_divmod semantics live in the runtime
                     let t = self.tmp();
-                    self.line(format!("{t} = fadd double {r0}, {sel}"));
+                    self.line(format!(
+                        "{t} = call double @pyrs_fmod_floored(double {l}, double {r})"
+                    ));
                     t
                 }
                 other => unreachable!("mod on {other:?}"),
@@ -530,6 +883,42 @@ impl Emitter {
         }
     }
 
+    /// Binary ops whose left operand is a string.
+    fn emit_str_binary(&mut self, op: BinOp, left: &Expr, right: &Expr) -> String {
+        let l = self.emit_expr(left);
+        let r = self.emit_expr(right);
+        match op {
+            BinOp::Add => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_str_concat(ptr {l}, ptr {r})"));
+                t
+            }
+            // semantic normalizes the int count to the right operand
+            BinOp::Mul => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_str_repeat(ptr {l}, i64 {r})"));
+                t
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let c = self.tmp();
+                self.line(format!("{c} = call i32 @pyrs_str_cmp(ptr {l}, ptr {r})"));
+                let cc = match op {
+                    BinOp::Eq => "eq",
+                    BinOp::Ne => "ne",
+                    BinOp::Lt => "slt",
+                    BinOp::Le => "sle",
+                    BinOp::Gt => "sgt",
+                    BinOp::Ge => "sge",
+                    _ => unreachable!(),
+                };
+                let t = self.tmp();
+                self.line(format!("{t} = icmp {cc} i32 {c}, 0"));
+                t
+            }
+            other => unreachable!("bad str op {other:?}"),
+        }
+    }
+
     fn emit_short_circuit(&mut self, op: BinOp, left: &Expr, right: &Expr) -> String {
         let rhs_l = self.fresh_block("sc.rhs");
         let end_l = self.fresh_block("sc.end");
@@ -560,7 +949,6 @@ impl Emitter {
 
     /// Trap with a ZeroDivisionError when the divisor is zero.
     fn guard_zero(&mut self, divisor: &str, ty: Ty, message: &str) {
-        let msg = self.intern_string(message);
         let is_zero = self.tmp();
         match ty {
             Ty::Int => self.line(format!("{is_zero} = icmp eq i64 {divisor}, 0")),
@@ -573,8 +961,7 @@ impl Emitter {
         let ok_l = self.fresh_block("div.ok");
         self.line(format!("br i1 {is_zero}, label %{trap_l}, label %{ok_l}"));
         self.start_block(&trap_l);
-        self.line(format!("call void @pyrs_die(ptr {msg})"));
-        self.line("unreachable");
+        self.emit_die(message);
         self.start_block(&ok_l);
     }
 
