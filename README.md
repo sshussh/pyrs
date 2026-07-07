@@ -6,6 +6,10 @@ PyRs compiles a statically-typed subset of Python straight to machine code —
 no interpreter, no VM. Compute-bound code runs 45–60× faster than CPython
 (see [Benchmarks](#benchmarks)).
 
+**New here? The [PyRs Guide](docs/GUIDE.md) covers everything**: the CLI,
+the Makefile, the full language reference, every difference from CPython,
+runtime errors, and performance notes.
+
 ```console
 $ cat examples/fib.py
 def fib(n: int) -> int:
