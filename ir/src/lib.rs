@@ -9,6 +9,26 @@ pub fn ping() -> String {
     String::from("pong")
 }
 
+/// Element type of a list. Kept scalar (no nesting) so [`Ty`] stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elem {
+    Int,
+    Float,
+    Bool,
+    Str,
+}
+
+impl Elem {
+    pub fn ty(self) -> Ty {
+        match self {
+            Elem::Int => Ty::Int,
+            Elem::Float => Ty::Float,
+            Elem::Bool => Ty::Bool,
+            Elem::Str => Ty::Str,
+        }
+    }
+}
+
 /// A resolved runtime type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
@@ -17,8 +37,10 @@ pub enum Ty {
     /// 64-bit IEEE-754 float
     Float,
     Bool,
-    /// String constants (only valid in `print` arguments for now)
+    /// Immutable, heap-allocated, length-prefixed string
     Str,
+    /// Growable list of scalar elements
+    List(Elem),
     /// Absence of a value: `None` returns / bare functions
     None,
 }
@@ -30,6 +52,7 @@ impl std::fmt::Display for Ty {
             Ty::Float => write!(f, "float"),
             Ty::Bool => write!(f, "bool"),
             Ty::Str => write!(f, "str"),
+            Ty::List(e) => write!(f, "list[{}]", e.ty()),
             Ty::None => write!(f, "None"),
         }
     }
@@ -48,7 +71,8 @@ pub struct Function {
     pub params: Vec<(String, Ty)>,
     pub ret: Ty,
     /// Every local variable (excluding params) with its type, so codegen
-    /// can emit all allocas up front in the entry block.
+    /// can emit all allocas up front in the entry block. Includes
+    /// compiler-synthesized temporaries (names starting with '.').
     pub locals: Vec<(String, Ty)>,
     pub body: Vec<Stmt>,
 }
@@ -57,19 +81,32 @@ pub struct Function {
 pub enum Stmt {
     /// Store into a local (params included).
     Assign { name: String, value: Expr },
+    /// `base[index] = value` — base is a list.
+    IndexAssign {
+        base: Expr,
+        index: Expr,
+        value: Expr,
+    },
+    /// `list.append(value)`
+    ListAppend { list: Expr, value: Expr },
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
         orelse: Vec<Stmt>,
     },
+    /// A loop. `continue` jumps to `step` (then the condition); a plain
+    /// `while` has an empty `step`, a desugared `for` increments there.
     While {
         cond: Expr,
         body: Vec<Stmt>,
+        step: Vec<Stmt>,
     },
     Return(Option<Expr>),
     /// Evaluate and discard (calls with side effects).
     ExprStmt(Expr),
     /// The `print` builtin: space-separated values, trailing newline.
     Print(Vec<Expr>),
+    /// Abort with a runtime error message (exit code 1).
+    Die(String),
     Break,
     Continue,
 }
@@ -88,6 +125,13 @@ pub enum ExprKind {
     ConstStr(String),
     /// Load a local variable.
     Local(String),
+    /// Evaluate `value`, store it in local `name`, then evaluate `body`.
+    /// Used for compiler temps (e.g. comparison chaining).
+    Let {
+        name: String,
+        value: Box<Expr>,
+        body: Box<Expr>,
+    },
     Call {
         func: String,
         args: Vec<Expr>,
@@ -101,18 +145,49 @@ pub enum ExprKind {
         op: UnOp,
         operand: Box<Expr>,
     },
+    /// `base[index]`: str → str (one character), list[T] → T.
+    Index { base: Box<Expr>, index: Box<Expr> },
+    /// `base[lo:hi]` (no step). Semantic fills defaults: missing lo → 0,
+    /// missing hi → i64::MAX; the runtime clamps Python-style.
+    Slice {
+        base: Box<Expr>,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+    },
+    /// `needle in haystack`: str-in-str substring or element-in-list.
+    /// The needle is already coerced to the element type. Result is Bool.
+    Contains {
+        needle: Box<Expr>,
+        haystack: Box<Expr>,
+    },
+    /// `list.pop(index)`; index defaults to -1 (the last element).
+    ListPop {
+        list: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// A list literal; `ty` is `List(elem)` and items are already coerced.
+    ListLit(Vec<Expr>),
+    /// `len(x)` for str or list.
+    Len(Box<Expr>),
     /// int → float (sitofp)
     IntToFloat(Box<Expr>),
-    /// float → int, truncating toward zero (fptosi, Python's `int()`)
+    /// float → int, truncating toward zero (Python's `int()`)
     FloatToInt(Box<Expr>),
     /// bool → int (zext)
     BoolToInt(Box<Expr>),
-    /// truthiness test: int/float/bool → bool (`x != 0`)
+    /// `str(x)` conversions
+    IntToStr(Box<Expr>),
+    FloatToStr(Box<Expr>),
+    BoolToStr(Box<Expr>),
+    /// truthiness test → bool: numerics `!= 0`, str/list `len != 0`
     ToBool(Box<Expr>),
 }
 
 /// Binary operations. Operand types are encoded in the operand `Expr`s and
 /// are always equal on both sides; comparison results are `Bool`.
+///
+/// On `Str` operands: `Add` is concatenation, `Mul` is repetition (the int
+/// count is always the right operand), comparisons are lexicographic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -124,6 +199,8 @@ pub enum BinOp {
     FloorDiv,
     /// Python modulo (result takes the sign of the divisor).
     Mod,
+    /// `**`: int**int → int (negative exponent traps), float → llvm.pow
+    Pow,
     Eq,
     Ne,
     Lt,
