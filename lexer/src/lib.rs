@@ -130,6 +130,10 @@ pub enum Token {
     Float,
     #[token("bool")]
     Bool,
+    #[token("str")]
+    Str,
+    #[token("list")]
+    List,
 
     // Literals
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
@@ -142,6 +146,11 @@ pub enum Token {
     #[regex(r#""([^"\\\n]|\\.)*""#, |lex| unescape(lex.slice()))]
     #[regex(r#"'([^'\\\n]|\\.)*'"#, |lex| unescape(lex.slice()))]
     Strlit(String),
+    /// f-string raw content, escapes processed but `{`/`}` preserved for
+    /// the parser to split into literal and expression parts
+    #[regex(r#"f"([^"\\\n]|\\.)*""#, |lex| unescape(&lex.slice()[1..]))]
+    #[regex(r#"f'([^'\\\n]|\\.)*'"#, |lex| unescape(&lex.slice()[1..]))]
+    FStrlit(String),
 
     // operators
     #[token("+")]
@@ -184,6 +193,8 @@ pub enum Token {
     DoubleSlashEq,
     #[token("%=")]
     PercentEq,
+    #[token("**=")]
+    DoubleStarEq,
 
     // symbols
     #[token("(")]
@@ -224,6 +235,7 @@ impl Token {
             Token::Intlit(v) => format!("integer literal {v}"),
             Token::Floatlit(v) => format!("float literal {v}"),
             Token::Strlit(_) => "string literal".to_string(),
+            Token::FStrlit(_) => "f-string literal".to_string(),
             Token::Newline => "end of line".to_string(),
             Token::Indent => "indent".to_string(),
             Token::Dedent => "dedent".to_string(),
@@ -275,6 +287,8 @@ fn token_text(token: &Token) -> &'static str {
         Token::Int => "int",
         Token::Float => "float",
         Token::Bool => "bool",
+        Token::Str => "str",
+        Token::List => "list",
         Token::Plus => "+",
         Token::Minus => "-",
         Token::Star => "*",
@@ -295,6 +309,7 @@ fn token_text(token: &Token) -> &'static str {
         Token::SlashEq => "/=",
         Token::DoubleSlashEq => "//=",
         Token::PercentEq => "%=",
+        Token::DoubleStarEq => "**=",
         Token::LParen => "(",
         Token::RParen => ")",
         Token::LBracket => "[",
@@ -565,8 +580,15 @@ mod test {
     #[test]
     fn test_types() {
         assert_eq!(
-            kinds("int float bool"),
-            vec![Token::Int, Token::Float, Token::Bool, Token::EOF]
+            kinds("int float bool str list"),
+            vec![
+                Token::Int,
+                Token::Float,
+                Token::Bool,
+                Token::Str,
+                Token::List,
+                Token::EOF
+            ]
         );
     }
 
@@ -631,7 +653,7 @@ mod test {
     #[test]
     fn test_operators() {
         assert_eq!(
-            kinds("+ - * ** / // % = == != < <= > >= += -= *= /= //= %="),
+            kinds("+ - * ** / // % = == != < <= > >= += -= *= /= //= %= **="),
             vec![
                 Token::Plus,
                 Token::Minus,
@@ -653,6 +675,7 @@ mod test {
                 Token::SlashEq,
                 Token::DoubleSlashEq,
                 Token::PercentEq,
+                Token::DoubleStarEq,
                 Token::EOF,
             ]
         );
