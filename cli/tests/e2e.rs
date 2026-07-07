@@ -339,3 +339,527 @@ print(printf(41))
     );
     assert_eq!(out, "42\n");
 }
+
+// ---- v0.2: for/range, str, lists, **, comparison chaining ----
+
+#[test]
+fn for_range_variants() {
+    let out = run_program(
+        "forrange",
+        "\
+for i in range(4):
+    print(i)
+for i in range(2, 5):
+    print(i)
+for i in range(10, 0, -3):
+    print(i)
+",
+    );
+    assert_eq!(out, "0\n1\n2\n3\n2\n3\n4\n10\n7\n4\n1\n");
+}
+
+#[test]
+fn for_break_continue_and_var_survives() {
+    let out = run_program(
+        "forbreak",
+        "\
+total = 0
+for i in range(100):
+    if i % 2 == 0:
+        continue
+    if i > 8:
+        break
+    total += i
+print(total, i)
+",
+    );
+    // 1+3+5+7 = 16; loop exits at i == 9
+    assert_eq!(out, "16 9\n");
+}
+
+#[test]
+fn for_range_dynamic_zero_step_traps() {
+    let (code, stderr) = run_program_expect_fail(
+        "forzero",
+        "\
+s = 0
+for i in range(0, 10, s):
+    print(i)
+",
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("ValueError"), "stderr: {stderr}");
+}
+
+#[test]
+fn string_variables_and_operations() {
+    let out = run_program(
+        "strops",
+        "\
+name = \"world\"
+greeting = \"hello, \" + name + \"!\"
+print(greeting)
+print(\"ab\" * 3)
+print(len(greeting))
+print(greeting[0], greeting[-1])
+print(\"apple\" < \"banana\", \"abc\" == \"abc\", \"abc\" != \"abd\")
+",
+    );
+    assert_eq!(
+        out,
+        "hello, world!\nababab\n13\nh !\nTrue True True\n"
+    );
+}
+
+#[test]
+fn string_iteration_and_truthiness() {
+    let out = run_program(
+        "striter",
+        "\
+count = 0
+for c in \"hello\":
+    if c == \"l\":
+        count += 1
+print(count)
+s = \"\"
+if s:
+    print(\"truthy\")
+else:
+    print(\"falsy\")
+",
+    );
+    assert_eq!(out, "2\nfalsy\n");
+}
+
+#[test]
+fn str_casts_match_python() {
+    let out = run_program(
+        "strcast",
+        "\
+print(str(42) + \"!\")
+print(str(2.5) + \"!\")
+print(str(True) + \"!\")
+print(str(-7) + \"!\")
+",
+    );
+    assert_eq!(out, "42!\n2.5!\nTrue!\n-7!\n");
+}
+
+#[test]
+fn list_basics() {
+    let out = run_program(
+        "listbasics",
+        "\
+xs = [1, 2, 3]
+print(xs)
+print(len(xs), xs[0], xs[-1])
+xs[1] = 20
+xs.append(4)
+print(xs)
+xs[0] += 100
+print(xs[0])
+",
+    );
+    assert_eq!(out, "[1, 2, 3]\n3 1 3\n[1, 20, 3, 4]\n101\n");
+}
+
+#[test]
+fn list_print_matches_python_repr() {
+    let out = run_program(
+        "listrepr",
+        "\
+print([1.0, 2.5])
+print([True, False])
+print([\"a\", \"b\"])
+xs: list[int] = []
+print(xs)
+",
+    );
+    assert_eq!(out, "[1.0, 2.5]\n[True, False]\n['a', 'b']\n[]\n");
+}
+
+#[test]
+fn list_aliasing_like_python() {
+    let out = run_program(
+        "listalias",
+        "\
+xs = [1, 2, 3]
+ys = xs
+ys[0] = 99
+print(xs[0])
+",
+    );
+    // assignment aliases, like Python
+    assert_eq!(out, "99\n");
+}
+
+#[test]
+fn lists_through_functions() {
+    let out = run_program(
+        "listfunc",
+        "\
+def squares(n: int) -> list[int]:
+    result: list[int] = []
+    for i in range(n):
+        result.append(i * i)
+    return result
+
+def total(xs: list[int]) -> int:
+    t = 0
+    for x in xs:
+        t += x
+    return t
+
+sq = squares(5)
+print(sq)
+print(total(sq))
+",
+    );
+    assert_eq!(out, "[0, 1, 4, 9, 16]\n30\n");
+}
+
+#[test]
+fn list_append_during_iteration_sees_growth() {
+    let out = run_program(
+        "listgrow",
+        "\
+xs = [1, 2, 3]
+for x in xs:
+    if x < 3:
+        xs.append(x * 10)
+    if len(xs) > 6:
+        break
+print(xs)
+",
+    );
+    // matches CPython: iteration re-reads the live length
+    assert_eq!(out, "[1, 2, 3, 10, 20]\n");
+}
+
+#[test]
+fn index_error_traps() {
+    let (code, stderr) = run_program_expect_fail(
+        "indexerr",
+        "\
+xs = [1, 2]
+print(xs[5])
+",
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("IndexError"), "stderr: {stderr}");
+}
+
+#[test]
+fn power_operator_matches_python() {
+    let out = run_program(
+        "power",
+        "\
+print(2 ** 10)
+print(2 ** 0)
+print(-2 ** 2)
+print((-2) ** 3)
+print(2 ** -1)
+print(2.0 ** 0.5)
+print(0 ** 0)
+print(2 ** 3 ** 2)
+",
+    );
+    assert_eq!(
+        out,
+        "1024\n1\n-4\n-8\n0.5\n1.4142135623730951\n1\n512\n"
+    );
+}
+
+#[test]
+fn zero_to_negative_float_power_traps() {
+    let (code, stderr) = run_program_expect_fail("powzero", "x = 0.0\nprint(x ** -1)\n");
+    assert_eq!(code, 1);
+    assert!(stderr.contains("ZeroDivisionError"), "stderr: {stderr}");
+}
+
+#[test]
+fn comparison_chaining() {
+    let out = run_program(
+        "chain",
+        "\
+x = 5
+print(1 < x < 10)
+print(1 < x < 5)
+print(10 > x >= 5)
+print(0 <= x <= 10 == 10)
+",
+    );
+    assert_eq!(out, "True\nFalse\nTrue\nTrue\n");
+}
+
+#[test]
+fn chained_comparison_evaluates_middle_once() {
+    let out = run_program(
+        "chainonce",
+        "\
+def middle() -> int:
+    print(\"evaluated\")
+    return 5
+
+if 1 < middle() < 10:
+    print(\"in range\")
+",
+    );
+    // "evaluated" must appear exactly once
+    assert_eq!(out, "evaluated\nin range\n");
+}
+
+#[test]
+fn chained_comparison_short_circuits() {
+    let out = run_program(
+        "chainshort",
+        "\
+def right() -> int:
+    print(\"right\")
+    return 3
+
+if 5 < 2 < right():
+    print(\"yes\")
+else:
+    print(\"no\")
+",
+    );
+    // 5 < 2 is False, so right() must never run
+    assert_eq!(out, "no\n");
+}
+
+#[test]
+fn negative_int_pow_traps() {
+    let (code, stderr) = run_program_expect_fail(
+        "ipowneg",
+        "\
+e = -1
+print(2 ** e)
+",
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("ValueError"), "stderr: {stderr}");
+}
+
+#[test]
+fn bubble_sort_end_to_end() {
+    let out = run_program(
+        "bubble",
+        "\
+def sort(xs: list[int]) -> list[int]:
+    n = len(xs)
+    for i in range(n):
+        for j in range(0, n - i - 1):
+            if xs[j] > xs[j + 1]:
+                tmp = xs[j]
+                xs[j] = xs[j + 1]
+                xs[j + 1] = tmp
+    return xs
+
+print(sort([5, 2, 9, 1, 7]))
+",
+    );
+    assert_eq!(out, "[1, 2, 5, 7, 9]\n");
+}
+
+// ---- regressions from differential verification vs CPython ----
+
+#[test]
+fn float_repr_uses_fixed_notation_like_python() {
+    let out = run_program(
+        "floatrepr",
+        "\
+print(10.0)
+print(1000000.0)
+print(1e15)
+print(1e16)
+print(1e-4)
+print(1e-5)
+print([10.0, 20.0])
+print(str(100.0))
+",
+    );
+    assert_eq!(
+        out,
+        "10.0\n1000000.0\n1000000000000000.0\n1e+16\n0.0001\n1e-05\n[10.0, 20.0]\n100.0\n"
+    );
+}
+
+#[test]
+fn power_augmented_assignment() {
+    let out = run_program(
+        "poweq",
+        "\
+x = 2
+x **= 10
+print(x)
+f = 1.5
+f **= 2
+print(f)
+xs = [3]
+xs[0] **= 3
+print(xs)
+",
+    );
+    assert_eq!(out, "1024\n2.25\n[27]\n");
+}
+
+#[test]
+fn float_floordiv_mod_signed_zero_and_inf() {
+    let out = run_program(
+        "fdivmod",
+        "\
+big = 1e308 * 10
+print(-1.0 // big)
+print(4.0 % -2.0)
+print(-4.0 % 2.0)
+print(7.0 // 2.0)
+print(-7.5 % 2.0)
+",
+    );
+    // -1.0 // inf == -1.0 and zero remainders take the divisor's sign,
+    // exactly like CPython float_divmod
+    assert_eq!(out, "-1.0\n-0.0\n0.0\n3.0\n0.5\n");
+}
+
+#[test]
+fn int_of_nan_and_inf_trap_like_python() {
+    let (code, stderr) = run_program_expect_fail(
+        "intinf",
+        "v = 1e308 * 10\nprint(int(v))\n",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("OverflowError: cannot convert float infinity to integer"),
+        "stderr: {stderr}"
+    );
+    let (code, stderr) = run_program_expect_fail(
+        "intnan",
+        "v = 1e308 * 10\nn = v - v\nprint(int(n))\n",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: cannot convert float NaN to integer"),
+        "stderr: {stderr}"
+    );
+}
+
+// ---- v0.3: slicing, in/not in, pop, f-strings ----
+
+#[test]
+fn slicing_matches_python() {
+    let out = run_program(
+        "slices",
+        "\
+s = \"hello world\"
+print(s[0:5], s[6:], s[:5], s[-5:], s[:-6], s[8:2])
+xs = [1, 2, 3, 4, 5]
+print(xs[1:3], xs[:2], xs[-2:], xs[4:1], xs[:])
+ys = xs[1:4]
+ys[0] = 99
+print(xs, ys)
+",
+    );
+    assert_eq!(
+        out,
+        "hello world hello world hello \n\
+         [2, 3] [1, 2] [4, 5] [] [1, 2, 3, 4, 5]\n\
+         [1, 2, 3, 4, 5] [99, 3, 4]\n"
+    );
+}
+
+#[test]
+fn membership_tests_match_python() {
+    let out = run_program(
+        "membership",
+        "\
+s = \"hello\"
+print(\"ell\" in s, \"xyz\" in s, \"\" in s)
+xs = [1, 2, 3]
+print(2 in xs, 9 in xs, 9 not in xs)
+print(2.0 in [1.5, 2.0], 1 in [1.0, 2.0])
+print(\"b\" in [\"a\", \"b\"], \"c\" not in [\"a\", \"b\"])
+",
+    );
+    assert_eq!(
+        out,
+        "True False True\nTrue False True\nTrue True\nTrue True\n"
+    );
+}
+
+#[test]
+fn list_pop_matches_python() {
+    let out = run_program(
+        "pop",
+        "\
+st = [10, 20, 30, 40]
+print(st.pop(), st.pop(0), st.pop(-1), st)
+st.pop()
+print(st, len(st))
+",
+    );
+    assert_eq!(out, "40 10 30 [20]\n[] 0\n");
+}
+
+#[test]
+fn pop_traps_match_python() {
+    let (code, stderr) =
+        run_program_expect_fail("popempty", "xs: list[int] = []\nprint(xs.pop())\n");
+    assert_eq!(code, 1);
+    assert!(stderr.contains("pop from empty list"), "stderr: {stderr}");
+}
+
+#[test]
+fn fstrings_match_python() {
+    let out = run_program(
+        "fstrings",
+        "\
+name = \"world\"
+n = 42
+pi = 3.5
+flag = True
+print(f\"hello {name}, n={n}, pi={pi}, flag={flag}!\")
+print(f\"{{escaped}} {n + 1} {name[0:3]} {n in [42]}\")
+print(f\"\")
+print(f\"nested {f'inner {n}'} outer\")
+",
+    );
+    assert_eq!(
+        out,
+        "hello world, n=42, pi=3.5, flag=True!\n\
+         {escaped} 43 wor True\n\n\
+         nested inner 42 outer\n"
+    );
+}
+
+#[test]
+fn fstring_format_spec_is_compile_error() {
+    let dir = TempDir::new("fspec");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "x = 1\nprint(f\"{x:.2f}\")\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("format specifiers"), "stderr: {stderr}");
+}
+
+#[test]
+fn stack_and_queue_via_pop() {
+    let out = run_program(
+        "stack",
+        "\
+def reverse(xs: list[int]) -> list[int]:
+    out: list[int] = []
+    while xs:
+        out.append(xs.pop())
+    return out
+
+print(reverse([1, 2, 3, 4]))
+",
+    );
+    assert_eq!(out, "[4, 3, 2, 1]\n");
+}
