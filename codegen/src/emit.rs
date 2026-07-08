@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use ir::{BinOp, Elem, Expr, ExprKind, Function, Module, Stmt, StrFn, Ty, UnOp};
+use ir::{BinOp, Expr, ExprKind, Function, Module, Stmt, StrFn, Ty, UnOp};
 
 pub fn emit_llvm_ir(module: &Module) -> String {
     let mut e = Emitter::default();
@@ -49,13 +49,18 @@ fn fconst(v: f64) -> String {
     format!("0x{:016X}", v.to_bits())
 }
 
-/// Tag values understood by the runtime's `pyrs_print_list`.
-fn elem_tag(elem: Elem) -> u32 {
-    match elem {
-        Elem::Int => 0,
-        Elem::Float => 1,
-        Elem::Bool => 2,
-        Elem::Str => 3,
+/// Tag values understood by the runtime's `pyrs_print_list` and
+/// `pyrs_list_contains`. Scalars are 0-3; a list element encodes its own
+/// element tag recursively as `4 + 8 * inner`, so `list[list[int]]`
+/// elements carry tag 4 and the runtime recurses.
+fn elem_tag(ty: &Ty) -> u32 {
+    match ty {
+        Ty::Int => 0,
+        Ty::Float => 1,
+        Ty::Bool => 2,
+        Ty::Str => 3,
+        Ty::List(inner) => 4 + 8 * elem_tag(inner),
+        Ty::None => unreachable!("no tag for None"),
     }
 }
 
@@ -131,6 +136,9 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
         out.push_str("declare i64 @pyrs_list_pop(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_input(ptr)\n");
+        out.push_str("declare ptr @pyrs_argv()\n");
+        out.push_str("declare void @pyrs_set_args(i32, ptr)\n");
         out.push_str("declare i64 @pyrs_ipow(i64, i64)\n");
         out.push_str("declare double @pyrs_ffloordiv(double, double)\n");
         out.push_str("declare double @pyrs_fmod_floored(double, double)\n");
@@ -166,7 +174,9 @@ impl Emitter {
         // the real C main: call the entry function and exit 0
         let entry = mangle(&module.entry);
         self.funcs.push_str(&format!(
-            "define i32 @main() {{\nentry:\n  call void @{entry}()\n  ret i32 0\n}}\n\n"
+            "define i32 @main(i32 %argc, ptr %argv) {{\nentry:\n  \
+             call void @pyrs_set_args(i32 %argc, ptr %argv)\n  \
+             call void @{entry}()\n  ret i32 0\n}}\n\n"
         ));
     }
 
@@ -296,7 +306,7 @@ impl Emitter {
                 self.line(format!("{t} = zext i1 {value} to i64"));
                 t
             }
-            Ty::Str => {
+            Ty::Str | Ty::List(_) => {
                 let t = self.tmp();
                 self.line(format!("{t} = ptrtoint ptr {value} to i64"));
                 t
@@ -318,7 +328,7 @@ impl Emitter {
                 self.line(format!("{t} = trunc i64 {slot} to i1"));
                 t
             }
-            Ty::Str => {
+            Ty::Str | Ty::List(_) => {
                 let t = self.tmp();
                 self.line(format!("{t} = inttoptr i64 {slot} to ptr"));
                 t
@@ -552,6 +562,20 @@ impl Emitter {
                 self.line(format!("{t} = load {}, ptr @g.{name}", lty(expr.ty)));
                 t
             }
+            ExprKind::Input { prompt } => {
+                let p = match prompt {
+                    Some(e) => self.emit_expr(e),
+                    Option::None => "null".to_string(),
+                };
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_input(ptr {p})"));
+                t
+            }
+            ExprKind::Argv => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_argv()"));
+                t
+            }
             ExprKind::Let { name, value, body } => {
                 let v = self.emit_expr(value);
                 self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
@@ -588,7 +612,7 @@ impl Emitter {
                             self.emit_list_elem_addr(&b, &i, "IndexError: list index out of range");
                         let slot = self.tmp();
                         self.line(format!("{slot} = load i64, ptr {addr}"));
-                        self.value_from_slot(&slot, elem.ty())
+                        self.value_from_slot(&slot, *elem)
                     }
                     other => unreachable!("index on {other:?}"),
                 }

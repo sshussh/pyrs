@@ -151,6 +151,11 @@ void pyrs_print_list(const PyrsList *l, int tag) {
             pyrs_print_str((const PyrsStr *)slot);
             fputc('\'', stdout);
             break;
+        default:
+            /* tag >= 4: the element is itself a list; decode its element
+             * tag and recurse */
+            pyrs_print_list((const PyrsList *)slot, (tag - 4) / 8);
+            break;
         }
     }
     fputc(']', stdout);
@@ -712,6 +717,60 @@ double pyrs_ffloordiv(double vx, double wx) {
         floordiv = copysign(0.0, vx / wx);
     }
     return floordiv;
+}
+
+/* ---- stdin & command-line arguments ---- */
+
+static int g_argc = 0;
+static char **g_argv = NULL;
+
+void pyrs_set_args(int argc, char **argv) {
+    g_argc = argc;
+    g_argv = argv;
+}
+
+static PyrsStr *str_from_cstr(const char *c) {
+    size_t n = strlen(c);
+    if (n == 0) {
+        return EMPTY_STR;
+    }
+    PyrsStr *r = str_alloc((long long)n);
+    memcpy(r->data, c, n);
+    return r;
+}
+
+/* sys.argv: built once so repeated accesses alias, like Python */
+PyrsList *pyrs_argv(void) {
+    static PyrsList *cached = NULL;
+    if (cached == NULL) {
+        cached = pyrs_list_new(g_argc > 0 ? g_argc : 1);
+        for (int i = 0; i < g_argc; i++) {
+            pyrs_list_push(cached, (long long)str_from_cstr(g_argv[i]));
+        }
+    }
+    return cached;
+}
+
+/* input([prompt]): print the prompt (no newline), read a line, strip the
+ * trailing newline; EOF raises like Python */
+PyrsStr *pyrs_input(const PyrsStr *prompt) {
+    if (prompt != NULL) {
+        pyrs_print_str(prompt);
+        fflush(stdout);
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, stdin);
+    if (n < 0) {
+        pyrs_die("EOFError: EOF when reading a line");
+    }
+    if (n > 0 && line[n - 1] == '\n') {
+        n--;
+    }
+    PyrsStr *r = str_alloc(n);
+    memcpy(r->data, line, (size_t)n);
+    free(line);
+    return r;
 }
 
 /* ---- integer power ---- */

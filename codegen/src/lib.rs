@@ -88,7 +88,10 @@ mod tests {
             ll.contains("define i64 @pyrs_add(i64 %p.a, i64 %p.b)"),
             "{ll}"
         );
-        assert!(ll.contains("define i32 @main()"), "{ll}");
+        assert!(
+            ll.contains("define i32 @main(i32 %argc, ptr %argv)"),
+            "{ll}"
+        );
         assert!(ll.contains("call void @pyrs___main__()"), "{ll}");
         assert!(ll.contains("call void @pyrs_print_int"), "{ll}");
     }
