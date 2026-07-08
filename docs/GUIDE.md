@@ -194,7 +194,7 @@ print(counter)          # 1
 | `float` | IEEE-754 double | |
 | `bool`  | `True` / `False` | assignable where int/float is expected |
 | `str`   | immutable string | heap-allocated, length-prefixed |
-| `list[T]` | growable homogeneous list | `T` is `int`, `float`, `bool`, or `str` — no nesting |
+| `list[T]` | growable homogeneous list | `T` is any type incl. another list (`list[list[float]]`) |
 
 Implicit promotions (mypy-flavored): `bool → int → float`. They apply in
 arithmetic, assignments, arguments, and returns:
@@ -372,8 +372,19 @@ for x in xs:     # iteration re-reads the live length,
 ```
 
 Lists slice with steps too: `xs[::-1]` reverses, `xs[::2]` takes every
-other element. Not supported yet: list `+`/`*`/`==`,
-`insert`/`remove`/`index`/`sort`, nested lists, and slice assignment.
+other element. Lists nest — `grid[i][j]`, `grid[i][j] = v`, and printing
+all work:
+
+```python
+grid = [[1, 2], [3, 4]]
+grid[0][1] = 20
+print(grid)            # [[1, 20], [3, 4]]
+m: list[list[str]] = []
+m.append(["a", "b"])
+```
+
+Not supported yet: list `+`/`*`/`==`, `insert`/`remove`/`index`/`sort`,
+`in` on lists of lists, and slice assignment.
 
 ### Control flow
 
@@ -438,6 +449,8 @@ functions, closures, `lambda`, and redefining a function.
 | `len(x)` | str, list | int |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `global x` | (statement) | write access to a module global |
+| `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |
+| `sys.argv` | needs `import sys` | list[str]; `[0]` is the binary path |
 | `int(x)` | int, float (truncates toward zero), bool | int |
 | `float(x)` | int, float, bool | float |
 | `bool(x)` | int, float, bool, str, list (truthiness) | bool |
@@ -465,6 +478,22 @@ columns) but inconsistent dedents are an error. Number literals accept
 underscores (`1_000_000`), floats accept `1.5`, `.5`, `2.`, `1e3`,
 `2.5e-2`.
 
+### Standard input and arguments
+
+```python
+import sys
+
+name = input("who? ")          # prints the prompt, reads a line
+print(f"hello {name}")
+for arg in sys.argv[1:]:       # arguments after the program name
+    print(arg)
+```
+
+`pyrs run` forwards trailing arguments: `pyrs run -i tool.py a b c`.
+For a compiled binary they're just process arguments: `./tool a b c`.
+`sys.argv[0]` is the binary path (Python shows the script path — the
+only structural difference).
+
 ## 6. Runtime errors
 
 There are no exceptions to catch (yet) — Python-style runtime errors
@@ -480,6 +509,7 @@ print the same message CPython would, then exit with code 1:
 | `ValueError: range() arg 3 must not be zero` | zero range step at runtime |
 | `ValueError: slice step cannot be zero` | zero slice step at runtime |
 | `ValueError: empty separator` | `s.split("")` |
+| `EOFError: EOF when reading a line` | `input()` at end of stdin |
 | `ValueError: cannot convert float NaN to integer` | `int(nan)` |
 | `OverflowError: cannot convert float infinity to integer` | `int(inf)` |
 | `ValueError: integer to a negative power...` | `x ** e` with a dynamic negative int `e` |

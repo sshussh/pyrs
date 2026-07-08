@@ -36,11 +36,12 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.4)
+## The language (v0.5)
 
 A statically-typed Python subset:
 
-- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `list[T]`
+- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `list[T]` —
+  including nested lists (`list[list[float]]` matrices)
 - **Functions:** `def` with mandatory parameter annotations
   (`def f(x: int) -> int:`), recursion, forward references
 - **Statements:** `if`/`elif`/`else`, `while`,
@@ -64,6 +65,8 @@ A statically-typed Python subset:
   assignment aliases like Python
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
+- **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for
+  command-line arguments — compiled programs are real CLI tools
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 
@@ -84,7 +87,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.4): no bigints (int is 64-bit and wraps), `and`/`or`
+Known limits (v0.5): no bigints (int is 64-bit and wraps), `and`/`or`
 return `bool` rather than the operand, `x ** e` with a *dynamic*
 negative int exponent traps (a constant like `2 ** -1` works and gives
 float), int↔float comparisons convert the int to float (exactness loss
@@ -136,13 +139,14 @@ is byte-identical to `python3`'s, then reports best-of-3 wall times:
 
 | benchmark  | workload                                   | python3 | pyrs   | speedup |
 |------------|--------------------------------------------|--------:|-------:|--------:|
-| fib        | recursion, 12M calls (`fib(35)`)           |  1.158s | 0.027s |   42.6× |
-| mandelbrot | float math, 500×500 escape iterations      |  0.953s | 0.018s |   53.9× |
-| nbody      | float + list, 5-body gravity, 100k steps   |  1.379s | 0.008s |  164.4× |
-| primes     | int loops, trial division to 300k          |  0.631s | 0.063s |   10.0× |
-| sort       | list indexing, bubble sort of 5000         |  1.011s | 0.022s |   45.2× |
-| strings    | per-char iteration, 2.6M comparisons       |  0.675s | 0.112s |    6.0× |
-| **total**  |                                            |  5.807s | 0.251s |   23.2× |
+| fib        | recursion, 12M calls (`fib(35)`)           |  1.163s | 0.025s |   45.8× |
+| mandelbrot | float math, 500×500 escape iterations      |  0.944s | 0.017s |   54.8× |
+| matmul     | nested lists, 250×250 matrix multiply      |  0.783s | 0.018s |   44.7× |
+| nbody      | float + list, 5-body gravity, 100k steps   |  1.352s | 0.008s |  172.7× |
+| primes     | int loops, trial division to 300k          |  0.629s | 0.064s |    9.8× |
+| sort       | list indexing, bubble sort of 5000         |  1.008s | 0.022s |   46.6× |
+| strings    | per-char iteration, 2.6M comparisons       |  0.656s | 0.103s |    6.4× |
+| **total**  |                                            |  6.535s | 0.257s |   25.4× |
 
 (Linux, LLVM 22, CPython 3.14; run `./benchmarks/run.sh` to reproduce.)
 
