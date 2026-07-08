@@ -9,27 +9,12 @@ pub fn ping() -> String {
     String::from("pong")
 }
 
-/// Element type of a list. Kept scalar (no nesting) so [`Ty`] stays `Copy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Elem {
-    Int,
-    Float,
-    Bool,
-    Str,
-}
-
-impl Elem {
-    pub fn ty(self) -> Ty {
-        match self {
-            Elem::Int => Ty::Int,
-            Elem::Float => Ty::Float,
-            Elem::Bool => Ty::Bool,
-            Elem::Str => Ty::Str,
-        }
-    }
-}
-
 /// A resolved runtime type.
+///
+/// `List` holds a `&'static` element type (interned via [`list_of`]) so
+/// `Ty` stays `Copy` while types nest arbitrarily (`list[list[int]]`).
+/// The tiny leaked allocations live for the compiler process — fine for a
+/// batch compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
     /// 64-bit signed integer
@@ -39,10 +24,15 @@ pub enum Ty {
     Bool,
     /// Immutable, heap-allocated, length-prefixed string
     Str,
-    /// Growable list of scalar elements
-    List(Elem),
+    /// Growable list; elements may themselves be lists
+    List(&'static Ty),
     /// Absence of a value: `None` returns / bare functions
     None,
+}
+
+/// Intern a list type: `list_of(Ty::Int)` is `list[int]`.
+pub fn list_of(elem: Ty) -> Ty {
+    Ty::List(Box::leak(Box::new(elem)))
 }
 
 impl std::fmt::Display for Ty {
@@ -52,7 +42,7 @@ impl std::fmt::Display for Ty {
             Ty::Float => write!(f, "float"),
             Ty::Bool => write!(f, "bool"),
             Ty::Str => write!(f, "str"),
-            Ty::List(e) => write!(f, "list[{}]", e.ty()),
+            Ty::List(e) => write!(f, "list[{e}]"),
             Ty::None => write!(f, "None"),
         }
     }
@@ -141,6 +131,12 @@ pub enum ExprKind {
     Local(String),
     /// Load a module-level global.
     GlobalLoad(String),
+    /// `input()` / `input(prompt)`: read a line from stdin → str.
+    Input {
+        prompt: Option<Box<Expr>>,
+    },
+    /// `sys.argv` → list[str] (requires `import sys`).
+    Argv,
     /// Evaluate `value`, store it in local `name`, then evaluate `body`.
     /// Used for compiler temps (e.g. comparison chaining).
     Let {
