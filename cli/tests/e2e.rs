@@ -1328,3 +1328,80 @@ fn with_on_non_file_is_compile_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---- list comprehensions ----
+
+#[test]
+fn comprehensions_match_python() {
+    let out = run_program(
+        "listcomp",
+        "\
+print([x * x for x in range(6)])
+print([x for x in range(20) if x % 3 == 0])
+print([c.upper() for c in \"hello\"])
+words = [\"the\", \"quick\", \"brown\", \"fox\"]
+print([w.upper() for w in words if len(w) > 3])
+grid = [[1, 2], [3, 4]]
+print([[v * 10 for v in row] for row in grid])
+print([i for i in range(10, 2, -2)])
+print([q for q in range(0)])
+def make(k: int) -> list[int]:
+    return [j + k for j in range(3)]
+print(make(100))
+",
+    );
+    assert_eq!(
+        out,
+        "[0, 1, 4, 9, 16, 25]\n[0, 3, 6, 9, 12, 15, 18]\n\
+         ['H', 'E', 'L', 'L', 'O']\n['QUICK', 'BROWN']\n\
+         [[10, 20], [30, 40]]\n[10, 8, 6, 4]\n[]\n[100, 101, 102]\n"
+    );
+}
+
+#[test]
+fn comprehension_variable_shadows_but_does_not_leak() {
+    // shadowing restores the outer variable
+    let out = run_program(
+        "compshadow",
+        "\
+x = 99
+doubled = [x * 2 for x in range(4)]
+print(doubled, x)
+",
+    );
+    assert_eq!(out, "[0, 2, 4, 6] 99\n");
+
+    // and a fresh comprehension variable is not defined afterwards
+    let dir = TempDir::new("compleak");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "d = [y * 2 for y in range(4)]\nprint(y)\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("name 'y' is not defined"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn comprehension_multiple_clauses_are_rejected() {
+    let dir = TempDir::new("compmulti");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "m = [i + j for i in range(2) for j in range(2)]\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("comprehension clauses"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

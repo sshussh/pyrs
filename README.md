@@ -60,9 +60,11 @@ A statically-typed Python subset:
   comparisons, indexing, slicing, `in`, iteration, `len()`, `str(x)`
   conversions, and methods: `upper` `lower` `strip` `lstrip` `rstrip`
   `startswith` `endswith` `find` `count` `replace` `split` `join`
-- **Lists:** homogeneous, growable; literals, indexing (read/write),
-  slicing (copies, like Python), `append`/`pop`, `in`, `len`, iteration;
-  assignment aliases like Python
+- **Lists:** homogeneous, growable; literals, comprehensions
+  (`[x * x for x in xs if x > 0]`, with Python 3 scoping — and faster
+  than the equivalent loop: results are pre-sized and appends inlined),
+  indexing (read/write), slicing (copies, like Python), `append`/`pop`,
+  `in`, `len`, iteration; assignment aliases like Python
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
 - **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for
@@ -145,6 +147,7 @@ is byte-identical to `python3`'s, then reports best-of-3 wall times:
 | benchmark  | workload                                   | python3 | pyrs   | speedup |
 |------------|--------------------------------------------|--------:|-------:|--------:|
 | fib        | recursion, 12M calls (`fib(35)`)           |  1.163s | 0.025s |   45.8× |
+| listcomp   | comprehensions, 3M-element map/filter      |  0.570s | 0.033s |   17.0× |
 | mandelbrot | float math, 500×500 escape iterations      |  0.944s | 0.017s |   54.8× |
 | matmul     | nested lists, 250×250 matrix multiply      |  0.783s | 0.018s |   44.7× |
 | nbody      | float + list, 5-body gravity, 100k steps   |  1.352s | 0.008s |  172.7× |
