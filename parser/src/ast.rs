@@ -120,6 +120,9 @@ pub enum StmtKind {
         value: Expr,
     },
     ExprStmt(Expr),
+    /// `global name, ...` — declares that assignments in this function
+    /// target module-level variables.
+    Global(Vec<(String, Span)>),
     Pass,
     Break,
     Continue,
@@ -222,11 +225,12 @@ pub enum ExprKind {
         base: Box<Expr>,
         index: Box<Expr>,
     },
-    /// `base[lo:hi]` — either bound may be omitted; no step.
+    /// `base[lo:hi:step]` — any part may be omitted.
     Slice {
         base: Box<Expr>,
         lo: Option<Box<Expr>>,
         hi: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
     },
     /// `f"..."`: literal chunks interleaved with interpolated expressions.
     JoinedStr(Vec<FStringPart>),

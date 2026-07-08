@@ -191,6 +191,22 @@ impl Parser {
                     span: start,
                 })
             }
+            Token::Global => {
+                self.advance();
+                let mut names = Vec::new();
+                loop {
+                    names.push(self.expect_ident("after 'global'")?);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                let end = names.last().map(|(_, s)| *s).unwrap_or(start);
+                Ok(Stmt {
+                    kind: StmtKind::Global(names),
+                    span: start.to(end),
+                })
+            }
+            Token::Nonlocal => Err(self.error("'nonlocal' is not supported yet")),
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -734,11 +750,13 @@ impl Parser {
                         } else {
                             Some(Box::new(self.parse_expr()?))
                         };
-                        // a trailing empty step (`xs[::]`) is legal Python
-                        // and means the same as no step
-                        if self.eat(&Token::Colon) && self.peek() != &Token::RBracket {
-                            return Err(self.error("slice steps are not supported yet"));
-                        }
+                        // optional third component; empty (`xs[::]`) means
+                        // no step, like Python
+                        let step = if self.eat(&Token::Colon) && self.peek() != &Token::RBracket {
+                            Some(Box::new(self.parse_expr()?))
+                        } else {
+                            None
+                        };
                         let close = self.expect(Token::RBracket, "to close the slice")?;
                         let span = expr.span.to(close);
                         expr = Expr {
@@ -746,6 +764,7 @@ impl Parser {
                                 base: Box::new(expr),
                                 lo: lo.map(Box::new),
                                 hi,
+                                step,
                             },
                             span,
                         };
@@ -1100,13 +1119,16 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
             rebase_spans(base, span);
             rebase_spans(index, span);
         }
-        ExprKind::Slice { base, lo, hi } => {
+        ExprKind::Slice { base, lo, hi, step } => {
             rebase_spans(base, span);
             if let Some(lo) = lo {
                 rebase_spans(lo, span);
             }
             if let Some(hi) = hi {
                 rebase_spans(hi, span);
+            }
+            if let Some(step) = step {
+                rebase_spans(step, span);
             }
         }
         ExprKind::ListLit(items) => {
@@ -1485,9 +1507,40 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn error_slice_step() {
-        let e = parse_err("y = xs[1:5:2]\n");
-        assert!(e.message.contains("step"), "{}", e.message);
+    fn parses_slice_steps() {
+        let m = parse_ok("a = xs[1:5:2]\nb = xs[::-1]\nc = xs[::2]\nd = xs[::]\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        let ExprKind::Slice { lo, hi, step, .. } = &value.kind else {
+            panic!("expected Slice, got {:?}", value.kind);
+        };
+        assert!(lo.is_some() && hi.is_some() && step.is_some());
+        let StmtKind::Assign { value, .. } = &m.body[1].kind else {
+            panic!();
+        };
+        let ExprKind::Slice { lo, hi, step, .. } = &value.kind else {
+            panic!();
+        };
+        assert!(lo.is_none() && hi.is_none() && step.is_some());
+        // empty trailing step means no step
+        let StmtKind::Assign { value, .. } = &m.body[3].kind else {
+            panic!();
+        };
+        assert!(matches!(&value.kind, ExprKind::Slice { step, .. } if step.is_none()));
+    }
+
+    #[test]
+    fn parses_global_statement() {
+        let m = parse_ok("def f():\n    global a, b\n    a = 1\nf()\n");
+        let StmtKind::FuncDef(f) = &m.body[0].kind else {
+            panic!();
+        };
+        let StmtKind::Global(names) = &f.body[0].kind else {
+            panic!("expected Global, got {:?}", f.body[0].kind);
+        };
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].0, "a");
     }
 
     #[test]
