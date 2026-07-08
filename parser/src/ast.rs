@@ -108,9 +108,17 @@ pub enum StmtKind {
     /// `global name, ...` — declares that assignments in this function
     /// target module-level variables.
     Global(Vec<(String, Span)>),
-    /// `import sys` (the only supported import).
+    /// `import module [as alias]`.
     Import {
         module: String,
+        alias: Option<String>,
+        span: Span,
+    },
+    /// `from module import name [as alias], ...`.
+    FromImport {
+        module: String,
+        /// (imported name, optional local alias, span of the name)
+        names: Vec<(String, Option<String>, Span)>,
         span: Span,
     },
     /// `with expr [as name]:` — files only; close() runs on every exit

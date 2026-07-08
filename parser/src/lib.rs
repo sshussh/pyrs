@@ -142,26 +142,8 @@ impl Parser {
             Token::While => self.parse_while(),
             Token::For => self.parse_for(),
             Token::Class => Err(self.error("classes are not supported yet")),
-            Token::Import => {
-                let start = self.peek_span();
-                self.advance();
-                let (module, mspan) = self.expect_ident("after 'import'")?;
-                if self.peek() == &Token::Comma || self.peek() == &Token::As {
-                    return Err(
-                        self.error("only a plain 'import sys' is supported (no aliases or lists)")
-                    );
-                }
-                let stmt = Stmt {
-                    kind: StmtKind::Import {
-                        module,
-                        span: mspan,
-                    },
-                    span: start.to(mspan),
-                };
-                self.expect_stmt_end()?;
-                Ok(stmt)
-            }
-            Token::From => Err(self.error("'from ... import ...' is not supported yet")),
+            Token::Import => self.parse_import(),
+            Token::From => self.parse_from_import(),
             Token::Try | Token::Raise => Err(self.error("exceptions are not supported yet")),
             Token::Match => Err(self.error("'match' statements are not supported yet")),
             Token::With => self.parse_with(),
@@ -494,6 +476,71 @@ impl Parser {
             },
             span: start.to(end),
         })
+    }
+
+    fn parse_import(&mut self) -> PResult<Stmt> {
+        let start = self.expect(Token::Import, "")?;
+        let (module, mspan) = self.expect_ident("after 'import'")?;
+        if self.peek() == &Token::Dot {
+            return Err(self.error("dotted module names (packages) are not supported yet"));
+        }
+        let alias = if self.eat(&Token::As) {
+            Some(self.expect_ident("after 'as'")?.0)
+        } else {
+            None
+        };
+        if self.peek() == &Token::Comma {
+            return Err(self.error(
+                "importing several modules in one statement is not supported yet; \
+                 use one 'import' per line",
+            ));
+        }
+        let stmt = Stmt {
+            kind: StmtKind::Import {
+                module,
+                alias,
+                span: mspan,
+            },
+            span: start.to(mspan),
+        };
+        self.expect_stmt_end()?;
+        Ok(stmt)
+    }
+
+    fn parse_from_import(&mut self) -> PResult<Stmt> {
+        let start = self.expect(Token::From, "")?;
+        let (module, _) = self.expect_ident("after 'from'")?;
+        if self.peek() == &Token::Dot {
+            return Err(self.error("dotted module names (packages) are not supported yet"));
+        }
+        self.expect(Token::Import, "after the module name")?;
+        if self.peek() == &Token::Star {
+            return Err(self.error("'from module import *' is not supported yet"));
+        }
+        let mut names = Vec::new();
+        loop {
+            let (name, name_span) = self.expect_ident("in the import list")?;
+            let alias = if self.eat(&Token::As) {
+                Some(self.expect_ident("after 'as'")?.0)
+            } else {
+                None
+            };
+            names.push((name, alias, name_span));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        let end = self.peek_span();
+        let stmt = Stmt {
+            kind: StmtKind::FromImport {
+                module,
+                names,
+                span: start.to(end),
+            },
+            span: start.to(end),
+        };
+        self.expect_stmt_end()?;
+        Ok(stmt)
     }
 
     fn parse_with(&mut self) -> PResult<Stmt> {
