@@ -142,7 +142,26 @@ impl Parser {
             Token::While => self.parse_while(),
             Token::For => self.parse_for(),
             Token::Class => Err(self.error("classes are not supported yet")),
-            Token::Import | Token::From => Err(self.error("imports are not supported yet")),
+            Token::Import => {
+                let start = self.peek_span();
+                self.advance();
+                let (module, mspan) = self.expect_ident("after 'import'")?;
+                if self.peek() == &Token::Comma || self.peek() == &Token::As {
+                    return Err(
+                        self.error("only a plain 'import sys' is supported (no aliases or lists)")
+                    );
+                }
+                let stmt = Stmt {
+                    kind: StmtKind::Import {
+                        module,
+                        span: mspan,
+                    },
+                    span: start.to(mspan),
+                };
+                self.expect_stmt_end()?;
+                Ok(stmt)
+            }
+            Token::From => Err(self.error("'from ... import ...' is not supported yet")),
             Token::Try | Token::Raise => Err(self.error("exceptions are not supported yet")),
             Token::Match => Err(self.error("'match' statements are not supported yet")),
             Token::With => Err(self.error("'with' statements are not supported yet")),
@@ -338,24 +357,12 @@ impl Parser {
             Token::List => {
                 self.advance();
                 self.expect(Token::LBracket, "after 'list' (e.g. 'list[int]')")?;
-                let elem = match self.peek() {
-                    Token::Int => ElemName::Int,
-                    Token::Float => ElemName::Float,
-                    Token::Bool => ElemName::Bool,
-                    Token::Str => ElemName::Str,
-                    Token::List => {
-                        return Err(self.error("nested lists are not supported yet"));
-                    }
-                    other => {
-                        return Err(self.error(format!(
-                            "expected an element type inside 'list[...]', found {}",
-                            other.describe()
-                        )));
-                    }
-                };
-                self.advance();
+                let elem = self.parse_type_name("inside 'list[...]'")?;
+                if elem == TypeName::None {
+                    return Err(self.error("list elements cannot be None"));
+                }
                 self.expect(Token::RBracket, "to close 'list[...]'")?;
-                Ok(TypeName::List(elem))
+                Ok(TypeName::List(Box::leak(Box::new(elem))))
             }
             Token::None => {
                 self.advance();
@@ -785,12 +792,17 @@ impl Parser {
                     self.advance();
                     let (method, method_span) = self.expect_ident("after '.'")?;
                     if self.peek() != &Token::LParen {
-                        return Err(Diagnostic::new(
-                            Phase::Parse,
-                            "attribute access is not supported; only method calls \
-                             like '.append(...)' are",
-                            method_span,
-                        ));
+                        // bare attribute (e.g. sys.argv) — semantic validates
+                        let span = expr.span.to(method_span);
+                        expr = Expr {
+                            kind: ExprKind::Attribute {
+                                base: Box::new(expr),
+                                attr: method,
+                                attr_span: method_span,
+                            },
+                            span,
+                        };
+                        continue;
                     }
                     self.advance();
                     let args = self.parse_call_args()?;
@@ -1103,6 +1115,12 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
                 rebase_spans(a, span);
             }
         }
+        ExprKind::Attribute {
+            base, attr_span, ..
+        } => {
+            *attr_span = span;
+            rebase_spans(base, span);
+        }
         ExprKind::MethodCall {
             base,
             method_span,
@@ -1347,7 +1365,10 @@ mod tests {
         else {
             panic!("expected Assign");
         };
-        assert_eq!(*annotation, Some(TypeName::List(ElemName::Int)));
+        assert_eq!(
+            *annotation,
+            Some(TypeName::List(Box::leak(Box::new(TypeName::Int))))
+        );
         assert!(matches!(&value.kind, ExprKind::ListLit(items) if items.is_empty()));
     }
 
@@ -1483,9 +1504,15 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn error_nested_list_type() {
-        let e = parse_err("xs: list[list[int]] = []\n");
-        assert!(e.message.contains("nested"), "{}", e.message);
+    fn parses_nested_list_type() {
+        let m = parse_ok("xs: list[list[int]] = []\n");
+        let StmtKind::Assign { annotation, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        let Some(TypeName::List(inner)) = annotation else {
+            panic!("expected list annotation, got {annotation:?}");
+        };
+        assert!(matches!(inner, TypeName::List(e) if **e == TypeName::Int));
     }
 
     #[test]
@@ -1609,9 +1636,25 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn error_attribute_access() {
-        let e = parse_err("y = xs.length\n");
-        assert!(e.message.contains("attribute"), "{}", e.message);
+    fn parses_bare_attribute() {
+        // semantic decides whether the attribute is valid (only sys.argv is)
+        let m = parse_ok("y = sys.argv\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ExprKind::Attribute { attr, .. } if attr == "argv"
+        ));
+    }
+
+    #[test]
+    fn parses_import_sys() {
+        let m = parse_ok("import sys\nprint(len(sys.argv))\n");
+        assert!(matches!(
+            &m.body[0].kind,
+            StmtKind::Import { module, .. } if module == "sys"
+        ));
     }
 
     #[test]

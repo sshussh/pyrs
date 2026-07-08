@@ -2,23 +2,16 @@
 
 use common::Span;
 
-/// Element type inside `list[...]` (lists don't nest yet).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ElemName {
-    Int,
-    Float,
-    Bool,
-    Str,
-}
-
 /// A builtin type name as written in annotations (`x: int`, `-> float`).
+/// `List` interns its element (`&'static`) so the enum stays `Copy` while
+/// types nest (`list[list[int]]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeName {
     Int,
     Float,
     Bool,
     Str,
-    List(ElemName),
+    List(&'static TypeName),
     /// `-> None`: the function returns nothing.
     None,
 }
@@ -30,15 +23,7 @@ impl std::fmt::Display for TypeName {
             TypeName::Float => write!(f, "float"),
             TypeName::Bool => write!(f, "bool"),
             TypeName::Str => write!(f, "str"),
-            TypeName::List(e) => {
-                let e = match e {
-                    ElemName::Int => "int",
-                    ElemName::Float => "float",
-                    ElemName::Bool => "bool",
-                    ElemName::Str => "str",
-                };
-                write!(f, "list[{e}]")
-            }
+            TypeName::List(e) => write!(f, "list[{e}]"),
             TypeName::None => write!(f, "None"),
         }
     }
@@ -123,6 +108,11 @@ pub enum StmtKind {
     /// `global name, ...` — declares that assignments in this function
     /// target module-level variables.
     Global(Vec<(String, Span)>),
+    /// `import sys` (the only supported import).
+    Import {
+        module: String,
+        span: Span,
+    },
     Pass,
     Break,
     Continue,
@@ -213,7 +203,13 @@ pub enum ExprKind {
         func_span: Span,
         args: Vec<Expr>,
     },
-    /// `obj.method(args)` — currently only list methods.
+    /// `obj.attr` without a call — currently only `sys.argv`.
+    Attribute {
+        base: Box<Expr>,
+        attr: String,
+        attr_span: Span,
+    },
+    /// `obj.method(args)` — list and str methods.
     MethodCall {
         base: Box<Expr>,
         method: String,
