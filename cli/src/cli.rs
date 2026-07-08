@@ -74,4 +74,8 @@ pub struct RunCommand {
     /// Optimization level (0-3)
     #[arg(short = 'O', long = "opt-level", default_value_t = 2)]
     pub opt_level: u8,
+
+    /// Arguments passed to the program (visible as sys.argv[1:])
+    #[arg(trailing_var_arg = true)]
+    pub args: Vec<String>,
 }

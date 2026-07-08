@@ -54,6 +54,7 @@ fn run(args: cli::Cli) -> Result<i32, String> {
             let exe = workdir.join("program");
             let result = compile(&cmd.input, &exe, cmd.opt_level, false).and_then(|()| {
                 process::Command::new(&exe)
+                    .args(&cmd.args)
                     .status()
                     .map_err(|e| format!("failed to run compiled program: {e}"))
             });

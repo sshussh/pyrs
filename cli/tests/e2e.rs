@@ -277,7 +277,7 @@ fn compile_produces_standalone_executable() {
 
     // --emit-llvm wrote the IR
     let ll = fs::read_to_string(dir.0.join("prog.ll")).unwrap();
-    assert!(ll.contains("define i32 @main()"));
+    assert!(ll.contains("define i32 @main("));
 }
 
 #[test]
@@ -990,4 +990,136 @@ print(\" \".join(words[::-1]))
         out,
         "the appears 3 times in 8 words\nend the dog lazy the fox quick the\n"
     );
+}
+
+// ---- v0.5: nested lists, input(), sys.argv ----
+
+#[test]
+fn nested_lists_match_python() {
+    let out = run_program(
+        "nested",
+        "\
+grid = [[1, 2, 3], [4, 5, 6]]
+print(grid)
+print(grid[1][2], grid[-1][-1])
+grid[0][0] = 100
+print(grid[0])
+m: list[list[str]] = []
+m.append([\"a\", \"b\"])
+print(m, len(m[0]))
+deep = [[[1], [2]], [[3]]]
+print(deep, deep[0][1][0])
+",
+    );
+    assert_eq!(
+        out,
+        "[[1, 2, 3], [4, 5, 6]]\n6 6\n[100, 2, 3]\n[['a', 'b']] 2\n\
+         [[[1], [2]], [[3]]] 2\n"
+    );
+}
+
+#[test]
+fn matrix_multiply_end_to_end() {
+    let out = run_program(
+        "matmul",
+        "\
+def matmul(a: list[list[int]], b: list[list[int]], n: int) -> list[list[int]]:
+    c: list[list[int]] = []
+    for i in range(n):
+        row: list[int] = []
+        for j in range(n):
+            row.append(0)
+        c.append(row)
+    for i in range(n):
+        for k in range(n):
+            for j in range(n):
+                c[i][j] += a[i][k] * b[k][j]
+    return c
+
+a = [[1, 2], [3, 4]]
+b = [[5, 6], [7, 8]]
+print(matmul(a, b, 2))
+",
+    );
+    assert_eq!(out, "[[19, 22], [43, 50]]\n");
+}
+
+#[test]
+fn argv_and_input_match_python() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let dir = TempDir::new("argvinput");
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "\
+import sys
+print(len(sys.argv) - 1)
+for a in sys.argv[1:]:
+    print(\"arg:\", a)
+name = input(\"name? \")
+print(f\"hello {name}\")
+line = input()
+print(line.upper().split())
+",
+    )
+    .unwrap();
+
+    let mut child = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(&src)
+        .args(["alpha", "beta gamma"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"world\nthe quick fox\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "2\narg: alpha\narg: beta gamma\nname? hello world\n\
+         ['THE', 'QUICK', 'FOX']\n"
+    );
+}
+
+#[test]
+fn input_at_eof_traps_like_python() {
+    use std::process::Stdio;
+    let dir = TempDir::new("inputeof");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "x = input()\nprint(x)\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(&src)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("EOFError"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn import_of_unknown_module_is_error() {
+    let dir = TempDir::new("importerr");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "import os\nprint(1)\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("only 'import sys'"), "stderr: {stderr}");
 }
