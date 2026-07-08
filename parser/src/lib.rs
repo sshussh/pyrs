@@ -960,17 +960,54 @@ impl Parser {
             }
             Token::LBracket => {
                 self.advance();
-                let mut items = Vec::new();
-                if self.peek() != &Token::RBracket {
-                    loop {
-                        items.push(self.parse_expr()?);
-                        if !self.eat(&Token::Comma) {
-                            break;
-                        }
-                        if self.peek() == &Token::RBracket {
-                            break;
-                        }
+                if self.peek() == &Token::RBracket {
+                    let close = self.expect(Token::RBracket, "to close the list literal")?;
+                    return Ok(Expr {
+                        kind: ExprKind::ListLit(vec![]),
+                        span: span.to(close),
+                    });
+                }
+                let first = self.parse_expr()?;
+                // `[elem for var in iter]` — a comprehension
+                if self.peek() == &Token::For {
+                    self.advance();
+                    let (var, var_span) = self.expect_ident("after 'for'")?;
+                    if self.peek() == &Token::Comma {
+                        return Err(
+                            self.error("unpacking multiple loop variables is not supported yet")
+                        );
                     }
+                    self.expect(Token::In, "after the comprehension variable")?;
+                    let iter = self.parse_expr()?;
+                    let cond = if self.eat(&Token::If) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    if matches!(self.peek(), Token::For | Token::If) {
+                        return Err(self.error(
+                            "multiple comprehension clauses are not supported \
+                             yet; nest comprehensions or use a loop",
+                        ));
+                    }
+                    let close = self.expect(Token::RBracket, "to close the comprehension")?;
+                    return Ok(Expr {
+                        kind: ExprKind::ListComp {
+                            elem: Box::new(first),
+                            var,
+                            var_span,
+                            iter: Box::new(iter),
+                            cond,
+                        },
+                        span: span.to(close),
+                    });
+                }
+                let mut items = vec![first];
+                while self.eat(&Token::Comma) {
+                    if self.peek() == &Token::RBracket {
+                        break;
+                    }
+                    items.push(self.parse_expr()?);
                 }
                 let close = self.expect(Token::RBracket, "to close the list literal")?;
                 Ok(Expr {
@@ -1174,6 +1211,20 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
         ExprKind::ListLit(items) => {
             for item in items {
                 rebase_spans(item, span);
+            }
+        }
+        ExprKind::ListComp {
+            elem,
+            var_span,
+            iter,
+            cond,
+            ..
+        } => {
+            *var_span = span;
+            rebase_spans(elem, span);
+            rebase_spans(iter, span);
+            if let Some(c) = cond {
+                rebase_spans(c, span);
             }
         }
         ExprKind::Cast { arg, .. } => rebase_spans(arg, span),

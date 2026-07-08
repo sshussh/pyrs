@@ -239,6 +239,14 @@ pub enum ExprKind {
     JoinedStr(Vec<FStringPart>),
     /// `[a, b, c]`
     ListLit(Vec<Expr>),
+    /// `[elem for var in iter if cond]`
+    ListComp {
+        elem: Box<Expr>,
+        var: String,
+        var_span: Span,
+        iter: Box<Expr>,
+        cond: Option<Box<Expr>>,
+    },
     /// `int(x)`, `float(x)`, `bool(x)`, `str(x)`
     Cast {
         ty: TypeName,
