@@ -53,6 +53,7 @@ fn resolve_type(ty: ast::TypeName) -> ir::Ty {
 fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Ty> {
     match ty {
         ir::Ty::None => Err(err("list elements cannot be None", span)),
+        ir::Ty::File => Err(err("files cannot be stored in lists yet", span)),
         other => Ok(other),
     }
 }
@@ -111,7 +112,7 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
         .iter()
         .any(|s| matches!(&s.kind, ast::StmtKind::Import { module, .. } if module == "sys"));
 
-    for builtin in ["print", "len", "range", "input"] {
+    for builtin in ["print", "len", "range", "input", "open"] {
         if funcs.contains_key(builtin) {
             let f = func_order.iter().find(|f| f.name == builtin).unwrap();
             return Err(err(
@@ -427,6 +428,9 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                             arg.span,
                         ));
                     }
+                    if a.ty == ir::Ty::File {
+                        return Err(err("file objects cannot be printed yet", arg.span));
+                    }
                     lowered_args.push(a);
                 }
                 out.push(ir::Stmt::Print(lowered_args));
@@ -526,11 +530,73 @@ fn lower_method_stmt(
             let call = lower_str_method(base_ir, method, method_span, args, ctx)?;
             Ok(ir::Stmt::ExprStmt(call))
         }
+        ir::Ty::File => {
+            let call = lower_file_method(base_ir, method, method_span, args, ctx)?;
+            Ok(ir::Stmt::ExprStmt(call))
+        }
         other => Err(err(
             format!("'{other}' has no method '{method}'"),
             method_span,
         )),
     }
+}
+
+/// The supported file methods.
+fn lower_file_method(
+    base_ir: ir::Expr,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    use ir::FileFn::*;
+
+    let (func, ret, takes_str_arg) = match method {
+        "read" => (Read, ir::Ty::Str, false),
+        "readline" => (ReadLine, ir::Ty::Str, false),
+        "readlines" => (ReadLines, ir::list_of(ir::Ty::Str), false),
+        "write" => (Write, ir::Ty::Int, true),
+        "close" => (Close, ir::Ty::None, false),
+        _ => {
+            return Err(err(
+                format!(
+                    "file method '{method}' is not supported yet (supported: \
+                     read, readline, readlines, write, close)"
+                ),
+                method_span,
+            ));
+        }
+    };
+
+    let expected_args = usize::from(takes_str_arg);
+    if args.len() != expected_args {
+        return Err(err(
+            format!(
+                "{method}() takes exactly {expected_args} argument(s) ({} given)",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+
+    let mut call_args = vec![base_ir];
+    if takes_str_arg {
+        let a = lower_expr(&args[0], ctx)?;
+        if a.ty != ir::Ty::Str {
+            return Err(err(
+                format!("{method}() expects a str argument, found {}", a.ty),
+                args[0].span,
+            ));
+        }
+        call_args.push(a);
+    }
+    Ok(ir::Expr {
+        ty: ret,
+        kind: ir::ExprKind::FileCall {
+            func,
+            args: call_args,
+        },
+    })
 }
 
 /// The supported `str` methods (ASCII case/whitespace rules).
@@ -1414,6 +1480,16 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     )),
                 },
                 ir::Ty::Str => lower_str_method(base_ir, method, *method_span, args, ctx),
+                ir::Ty::File => {
+                    if method == "close" {
+                        return Err(err(
+                            "file.close() returns None and cannot be used in \
+                             an expression",
+                            *method_span,
+                        ));
+                    }
+                    lower_file_method(base_ir, method, *method_span, args, ctx)
+                }
                 other => Err(err(
                     format!("'{other}' has no method '{method}'"),
                     *method_span,
@@ -1745,6 +1821,57 @@ fn lower_call(
                 return Ok(ir::Expr {
                     ty: ir::Ty::Str,
                     kind: ir::ExprKind::Input { prompt },
+                });
+            }
+            "open" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(err(
+                        format!("open() takes 1 or 2 arguments ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let path = lower_expr(&args[0], ctx)?;
+                if path.ty != ir::Ty::Str {
+                    return Err(err(
+                        format!("open() path must be a str, found {}", path.ty),
+                        args[0].span,
+                    ));
+                }
+                let mode = match args.get(1) {
+                    Some(m) => {
+                        let v = lower_expr(m, ctx)?;
+                        if v.ty != ir::Ty::Str {
+                            return Err(err(
+                                format!("open() mode must be a str, found {}", v.ty),
+                                m.span,
+                            ));
+                        }
+                        // constant modes are validated now, like Python would
+                        // at runtime
+                        if let ir::ExprKind::ConstStr(mode_s) = &v.kind
+                            && !matches!(mode_s.as_str(), "r" | "w" | "a")
+                        {
+                            return Err(err(
+                                format!(
+                                    "invalid mode: '{mode_s}' (supported: 'r', \
+                                     'w', 'a')"
+                                ),
+                                m.span,
+                            ));
+                        }
+                        v
+                    }
+                    Option::None => ir::Expr {
+                        ty: ir::Ty::Str,
+                        kind: ir::ExprKind::ConstStr("r".to_string()),
+                    },
+                };
+                return Ok(ir::Expr {
+                    ty: ir::Ty::File,
+                    kind: ir::ExprKind::Open {
+                        path: Box::new(path),
+                        mode: Box::new(mode),
+                    },
                 });
             }
             _ => {
