@@ -434,6 +434,29 @@ impl Emitter {
                 let slot = self.slot_from_value(&v, value.ty);
                 self.line(format!("call void @pyrs_list_push(ptr {l}, i64 {slot})"));
             }
+            Stmt::ListAppendUnchecked { list, value } => {
+                // capacity was guaranteed at allocation: store the slot at
+                // data[len] and bump len, no call, no check
+                let l = self.emit_expr(list);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                let len = self.tmp();
+                self.line(format!("{len} = load i64, ptr {l}"));
+                let data_pp = self.tmp();
+                self.line(format!(
+                    "{data_pp} = getelementptr inbounds i8, ptr {l}, i64 16"
+                ));
+                let data_p = self.tmp();
+                self.line(format!("{data_p} = load ptr, ptr {data_pp}"));
+                let addr = self.tmp();
+                self.line(format!(
+                    "{addr} = getelementptr inbounds i64, ptr {data_p}, i64 {len}"
+                ));
+                self.line(format!("store i64 {slot}, ptr {addr}"));
+                let newlen = self.tmp();
+                self.line(format!("{newlen} = add i64 {len}, 1"));
+                self.line(format!("store i64 {newlen}, ptr {l}"));
+            }
             Stmt::Return(None) => {
                 self.line("ret void");
                 self.terminated = true;
@@ -759,6 +782,18 @@ impl Emitter {
                     self.line(format!("call void @pyrs_list_push(ptr {l}, i64 {slot})"));
                 }
                 l
+            }
+            ExprKind::ListNew { cap } => {
+                let c = self.emit_expr(cap);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_list_new(i64 {c})"));
+                t
+            }
+            ExprKind::Block { stmts, result } => {
+                for stmt in stmts {
+                    self.emit_stmt(stmt);
+                }
+                self.emit_expr(result)
             }
             ExprKind::Len(inner) => {
                 let v = self.emit_expr(inner);
