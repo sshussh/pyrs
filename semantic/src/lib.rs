@@ -129,13 +129,11 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
         }
     }
 
-    // pass 2: lower every user function
-    let mut lowered = Vec::new();
-    for f in &func_order {
-        lowered.push(lower_function(f, &funcs)?);
-    }
+    // pass 2: lower the entry FIRST — its top-level assignments define the
+    // module globals (and their types) that function bodies may reference
+    let mut globals: HashMap<String, ir::Ty> = HashMap::new();
+    let mut globals_order: Vec<(String, ir::Ty)> = Vec::new();
 
-    // pass 3: build the entry function from top-level statements
     let entry_body: Vec<ast::Stmt> = script.iter().map(|s| (*s).clone()).collect();
     let entry = if !entry_body.is_empty() {
         let entry_def = ast::FuncDef {
@@ -145,7 +143,13 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
             body: entry_body,
             span: Span::default(),
         };
-        lower_function(&entry_def, &funcs)?
+        Some(lower_function(
+            &entry_def,
+            &funcs,
+            &mut globals,
+            &mut globals_order,
+            true,
+        )?)
     } else if let Some(sig) = funcs.get("main") {
         // no top-level code: call main() if it takes no arguments
         if !sig.params.is_empty() {
@@ -154,7 +158,7 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
                 sig.span,
             ));
         }
-        ir::Function {
+        Some(ir::Function {
             name: ENTRY_NAME.to_string(),
             params: vec![],
             ret: ir::Ty::None,
@@ -166,24 +170,48 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
                     args: vec![],
                 },
             })],
-        }
+        })
     } else {
+        // still lower the functions below so their errors surface before
+        // the missing-entry-point complaint
+        None
+    };
+
+    // pass 3: lower every user function with the globals in scope
+    let mut lowered = Vec::new();
+    for f in &func_order {
+        lowered.push(lower_function(
+            f,
+            &funcs,
+            &mut globals,
+            &mut globals_order,
+            false,
+        )?);
+    }
+
+    let Some(entry) = entry else {
         return Err(err(
             "program has no entry point: add top-level statements or define main()",
             Span::default(),
         ));
     };
-
     lowered.push(entry);
 
     Ok(ir::Module {
         funcs: lowered,
+        globals: globals_order,
         entry: ENTRY_NAME.to_string(),
     })
 }
 
 struct FnCtx<'a> {
     funcs: &'a HashMap<String, FuncSig>,
+    globals: &'a mut HashMap<String, ir::Ty>,
+    globals_order: &'a mut Vec<(String, ir::Ty)>,
+    /// The synthesized entry function: its bindings ARE the globals.
+    is_entry: bool,
+    /// Names this function declared with `global`.
+    declared_globals: std::collections::HashSet<String>,
     fn_name: String,
     ret: ir::Ty,
     locals: HashMap<String, ir::Ty>,
@@ -201,12 +229,27 @@ impl FnCtx<'_> {
         self.locals_order.push((name.clone(), ty));
         name
     }
+
+    /// Does an assignment to `name` target a module global here?
+    fn binds_global(&self, name: &str) -> bool {
+        self.is_entry || self.declared_globals.contains(name)
+    }
 }
 
-fn lower_function(f: &ast::FuncDef, funcs: &HashMap<String, FuncSig>) -> SResult<ir::Function> {
+fn lower_function(
+    f: &ast::FuncDef,
+    funcs: &HashMap<String, FuncSig>,
+    globals: &mut HashMap<String, ir::Ty>,
+    globals_order: &mut Vec<(String, ir::Ty)>,
+    is_entry: bool,
+) -> SResult<ir::Function> {
     let mut params = Vec::new();
     let mut ctx = FnCtx {
         funcs,
+        globals,
+        globals_order,
+        is_entry,
+        declared_globals: std::collections::HashSet::new(),
         fn_name: f.name.clone(),
         ret: f.ret.map(resolve_type).unwrap_or(ir::Ty::None),
         locals: HashMap::new(),
@@ -264,6 +307,34 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             f.span,
         )),
         ast::StmtKind::Pass => Ok(()),
+        ast::StmtKind::Global(names) => {
+            // a no-op at module level, like Python
+            if ctx.is_entry {
+                return Ok(());
+            }
+            for (name, span) in names {
+                if ctx.locals.contains_key(name) {
+                    return Err(err(
+                        format!(
+                            "'{name}' is already a parameter or local here; \
+                             the 'global' declaration must come before any use"
+                        ),
+                        *span,
+                    ));
+                }
+                if !ctx.globals.contains_key(name) {
+                    return Err(err(
+                        format!(
+                            "no global '{name}' is assigned at the top level \
+                             of the program"
+                        ),
+                        *span,
+                    ));
+                }
+                ctx.declared_globals.insert(name.clone());
+            }
+            Ok(())
+        }
         ast::StmtKind::Break => {
             if ctx.loop_depth == 0 {
                 return Err(err("'break' outside of a loop", stmt.span));
@@ -399,7 +470,8 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
     }
 }
 
-/// `xs.append(v)` / `xs.pop(...)` in statement position.
+/// Method calls in statement position (`xs.append(v)`, `xs.pop()`,
+/// `s.upper()` with the result discarded).
 fn lower_method_stmt(
     base: &ast::Expr,
     method: &str,
@@ -408,40 +480,169 @@ fn lower_method_stmt(
     ctx: &mut FnCtx,
 ) -> SResult<ir::Stmt> {
     let base_ir = lower_expr(base, ctx)?;
-    let ir::Ty::List(elem) = base_ir.ty else {
-        return Err(err(
-            format!("'{}' has no method '{method}'", base_ir.ty),
-            method_span,
-        ));
-    };
-    match method {
-        "append" => {
-            if args.len() != 1 {
-                return Err(err(
-                    format!("append() takes exactly one argument ({} given)", args.len()),
-                    method_span,
-                ));
+    match base_ir.ty {
+        ir::Ty::List(elem) => match method {
+            "append" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("append() takes exactly one argument ({} given)", args.len()),
+                        method_span,
+                    ));
+                }
+                let value = lower_expr(&args[0], ctx)?;
+                let value = coerce(value, elem.ty(), args[0].span, "append() argument")?;
+                Ok(ir::Stmt::ListAppend {
+                    list: base_ir,
+                    value,
+                })
             }
-            let value = lower_expr(&args[0], ctx)?;
-            let value = coerce(value, elem.ty(), args[0].span, "append() argument")?;
-            Ok(ir::Stmt::ListAppend {
-                list: base_ir,
-                value,
-            })
+            // pop as a statement discards the popped value
+            "pop" => {
+                let pop = lower_list_pop(base_ir, elem, args, method_span, ctx)?;
+                Ok(ir::Stmt::ExprStmt(pop))
+            }
+            _ => Err(err(
+                format!(
+                    "list method '{method}' is not supported yet (only 'append' \
+                     and 'pop')"
+                ),
+                method_span,
+            )),
+        },
+        ir::Ty::Str => {
+            let call = lower_str_method(base_ir, method, method_span, args, ctx)?;
+            Ok(ir::Stmt::ExprStmt(call))
         }
-        // pop as a statement discards the popped value
-        "pop" => {
-            let pop = lower_list_pop(base_ir, elem, args, method_span, ctx)?;
-            Ok(ir::Stmt::ExprStmt(pop))
-        }
-        _ => Err(err(
-            format!(
-                "list method '{method}' is not supported yet (only 'append' \
-                 and 'pop')"
-            ),
+        other => Err(err(
+            format!("'{other}' has no method '{method}'"),
             method_span,
         )),
     }
+}
+
+/// The supported `str` methods (ASCII case/whitespace rules).
+fn lower_str_method(
+    base_ir: ir::Expr,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    use ir::StrFn::*;
+
+    // (runtime function, result type, extra str args expected)
+    let (func, ret, str_args): (ir::StrFn, ir::Ty, usize) = match method {
+        "upper" => (Upper, ir::Ty::Str, 0),
+        "lower" => (Lower, ir::Ty::Str, 0),
+        "strip" => (Strip, ir::Ty::Str, 0),
+        "lstrip" => (Lstrip, ir::Ty::Str, 0),
+        "rstrip" => (Rstrip, ir::Ty::Str, 0),
+        "startswith" => (StartsWith, ir::Ty::Bool, 1),
+        "endswith" => (EndsWith, ir::Ty::Bool, 1),
+        "find" => (Find, ir::Ty::Int, 1),
+        "count" => (Count, ir::Ty::Int, 1),
+        "replace" => (Replace, ir::Ty::Str, 2),
+        "split" => {
+            return lower_str_split(base_ir, args, method_span, ctx);
+        }
+        "join" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!("join() takes exactly one argument ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let parts = lower_expr(&args[0], ctx)?;
+            if parts.ty != ir::Ty::List(ir::Elem::Str) {
+                return Err(err(
+                    format!("join() expects a list[str], found {}", parts.ty),
+                    args[0].span,
+                ));
+            }
+            return Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::StrCall {
+                    func: Join,
+                    args: vec![base_ir, parts],
+                },
+            });
+        }
+        _ => {
+            return Err(err(
+                format!(
+                    "str method '{method}' is not supported yet (supported: \
+                     upper, lower, strip, lstrip, rstrip, startswith, \
+                     endswith, find, count, replace, split, join)"
+                ),
+                method_span,
+            ));
+        }
+    };
+
+    if args.len() != str_args {
+        return Err(err(
+            format!(
+                "{method}() takes exactly {str_args} argument(s) ({} given)",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+    let mut call_args = vec![base_ir];
+    for arg in args {
+        let a = lower_expr(arg, ctx)?;
+        if a.ty != ir::Ty::Str {
+            return Err(err(
+                format!("{method}() expects str arguments, found {}", a.ty),
+                arg.span,
+            ));
+        }
+        call_args.push(a);
+    }
+    Ok(ir::Expr {
+        ty: ret,
+        kind: ir::ExprKind::StrCall {
+            func,
+            args: call_args,
+        },
+    })
+}
+
+fn lower_str_split(
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let (func, call_args) = match args {
+        [] => (ir::StrFn::SplitWs, vec![base_ir]),
+        [sep] => {
+            let s = lower_expr(sep, ctx)?;
+            if s.ty != ir::Ty::Str {
+                return Err(err(
+                    format!("split() separator must be a str, found {}", s.ty),
+                    sep.span,
+                ));
+            }
+            if matches!(&s.kind, ir::ExprKind::ConstStr(c) if c.is_empty()) {
+                return Err(err("empty separator", sep.span));
+            }
+            (ir::StrFn::Split, vec![base_ir, s])
+        }
+        _ => {
+            return Err(err(
+                format!("split() takes at most one argument ({} given)", args.len()),
+                method_span,
+            ));
+        }
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::List(ir::Elem::Str),
+        kind: ir::ExprKind::StrCall {
+            func,
+            args: call_args,
+        },
+    })
 }
 
 fn lower_list_pop(
@@ -540,6 +741,8 @@ fn lower_index_target(
 }
 
 /// Bind `name = value_ir`, inferring or checking the variable's type.
+/// At the top level (or after a `global` declaration) the binding targets
+/// a module global; otherwise it creates/updates a function local.
 fn bind_name(
     name: &str,
     name_span: Span,
@@ -555,7 +758,14 @@ fn bind_name(
         ));
     }
 
-    let target_ty = match (annotation, ctx.locals.get(name).copied()) {
+    let is_global = ctx.binds_global(name);
+    let existing = if is_global {
+        ctx.globals.get(name).copied()
+    } else {
+        ctx.locals.get(name).copied()
+    };
+
+    let target_ty = match (annotation, existing) {
         (Some(ann_ty), existing) => {
             if ann_ty == ir::Ty::None {
                 return Err(err("cannot declare a variable of type None", name_span));
@@ -590,15 +800,25 @@ fn bind_name(
 
     let value_expr = coerce_assign(value_ir, target_ty, name, value_span)?;
 
-    if !ctx.locals.contains_key(name) {
-        ctx.locals.insert(name.to_string(), target_ty);
-        ctx.locals_order.push((name.to_string(), target_ty));
+    if is_global {
+        if !ctx.globals.contains_key(name) {
+            ctx.globals.insert(name.to_string(), target_ty);
+            ctx.globals_order.push((name.to_string(), target_ty));
+        }
+        Ok(ir::Stmt::GlobalAssign {
+            name: name.to_string(),
+            value: value_expr,
+        })
+    } else {
+        if !ctx.locals.contains_key(name) {
+            ctx.locals.insert(name.to_string(), target_ty);
+            ctx.locals_order.push((name.to_string(), target_ty));
+        }
+        Ok(ir::Stmt::Assign {
+            name: name.to_string(),
+            value: value_expr,
+        })
     }
-
-    Ok(ir::Stmt::Assign {
-        name: name.to_string(),
-        value: value_expr,
-    })
 }
 
 fn lower_aug_assign(
@@ -615,20 +835,48 @@ fn lower_aug_assign(
             name,
             span: name_span,
         } => {
-            let current_ty = *ctx
-                .locals
-                .get(name)
-                .ok_or_else(|| err(format!("name '{name}' is not defined"), *name_span))?;
+            let (current_ty, is_global) = if let Some(&t) = ctx.locals.get(name) {
+                (t, false)
+            } else if ctx.binds_global(name) {
+                match ctx.globals.get(name) {
+                    Some(&t) => (t, true),
+                    Option::None => {
+                        return Err(err(format!("name '{name}' is not defined"), *name_span));
+                    }
+                }
+            } else if ctx.globals.contains_key(name) {
+                // Python raises UnboundLocalError at runtime; catch it here
+                return Err(err(
+                    format!(
+                        "cannot modify global '{name}' here; add 'global {name}' \
+                         at the top of the function"
+                    ),
+                    *name_span,
+                ));
+            } else {
+                return Err(err(format!("name '{name}' is not defined"), *name_span));
+            };
             let left = ir::Expr {
                 ty: current_ty,
-                kind: ir::ExprKind::Local(name.clone()),
+                kind: if is_global {
+                    ir::ExprKind::GlobalLoad(name.clone())
+                } else {
+                    ir::ExprKind::Local(name.clone())
+                },
             };
             let right = lower_expr(value, ctx)?;
             let combined = lower_binary(op, left, right, span)?;
             let combined = coerce_assign(combined, current_ty, name, span)?;
-            out.push(ir::Stmt::Assign {
-                name: name.clone(),
-                value: combined,
+            out.push(if is_global {
+                ir::Stmt::GlobalAssign {
+                    name: name.clone(),
+                    value: combined,
+                }
+            } else {
+                ir::Stmt::Assign {
+                    name: name.clone(),
+                    value: combined,
+                }
             });
             Ok(())
         }
@@ -814,8 +1062,13 @@ fn lower_for_range(
         }
     };
 
-    // the loop variable must be an int
-    if let Some(&existing) = ctx.locals.get(var)
+    // the loop variable must be an int (wherever it is bound)
+    let existing_var_ty = if ctx.binds_global(var) {
+        ctx.globals.get(var).copied()
+    } else {
+        ctx.locals.get(var).copied()
+    };
+    if let Some(existing) = existing_var_ty
         && existing != ir::Ty::Int
     {
         return Err(err(
@@ -827,7 +1080,10 @@ fn lower_for_range(
         ));
     }
 
-    // stop is evaluated once, up front (like Python)
+    // Python semantics: iterate a hidden counter and assign the user
+    // variable at the top of each iteration. After exhaustion the variable
+    // holds the last *yielded* value (not one past), an empty range never
+    // assigns it, and mutating it inside the body cannot derail the loop.
     let stop_t = ctx.fresh_temp("range.stop", ir::Ty::Int);
     out.push(ir::Stmt::Assign {
         name: stop_t.clone(),
@@ -837,10 +1093,14 @@ fn lower_for_range(
         ty: ir::Ty::Int,
         kind: ir::ExprKind::Local(stop_t),
     };
-
-    let var_local = ir::Expr {
+    let it_t = ctx.fresh_temp("range.it", ir::Ty::Int);
+    out.push(ir::Stmt::Assign {
+        name: it_t.clone(),
+        value: start,
+    });
+    let it_local = ir::Expr {
         ty: ir::Ty::Int,
-        kind: ir::ExprKind::Local(var.to_string()),
+        kind: ir::ExprKind::Local(it_t.clone()),
     };
 
     // constant steps get a simple condition; dynamic steps need a zero
@@ -855,7 +1115,7 @@ fn lower_for_range(
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::Binary {
                     op,
-                    left: Box::new(var_local.clone()),
+                    left: Box::new(it_local.clone()),
                     right: Box::new(stop_local),
                 },
             };
@@ -880,14 +1140,14 @@ fn lower_for_range(
                 )],
                 orelse: vec![],
             });
-            // (step > 0 and var < stop) or (step < 0 and var > stop)
+            // (step > 0 and it < stop) or (step < 0 and it > stop)
             let up = bool_and(
                 int_cmp(ir::BinOp::Gt, step_local.clone(), int_const(0)),
-                int_cmp(ir::BinOp::Lt, var_local.clone(), stop_local.clone()),
+                int_cmp(ir::BinOp::Lt, it_local.clone(), stop_local.clone()),
             );
             let down = bool_and(
                 int_cmp(ir::BinOp::Lt, step_local.clone(), int_const(0)),
-                int_cmp(ir::BinOp::Gt, var_local.clone(), stop_local),
+                int_cmp(ir::BinOp::Gt, it_local.clone(), stop_local),
             );
             let cond = ir::Expr {
                 ty: ir::Ty::Bool,
@@ -901,21 +1161,22 @@ fn lower_for_range(
         }
     };
 
-    // var = start
-    let bind = bind_name(var, var_span, None, start, var_span, ctx)?;
-    out.push(bind);
+    // var = .it as the first statement of the body
+    let bind = bind_name(var, var_span, None, it_local.clone(), var_span, ctx)?;
 
     ctx.loop_depth += 1;
-    let loop_body = lower_block(body, ctx);
+    let user_body = lower_block(body, ctx);
     ctx.loop_depth -= 1;
+    let mut loop_body = vec![bind];
+    loop_body.extend(user_body?);
 
     let step_stmt = ir::Stmt::Assign {
-        name: var.to_string(),
+        name: it_t,
         value: ir::Expr {
             ty: ir::Ty::Int,
             kind: ir::ExprKind::Binary {
                 op: ir::BinOp::Add,
-                left: Box::new(var_local),
+                left: Box::new(it_local),
                 right: Box::new(step_value),
             },
         },
@@ -923,7 +1184,7 @@ fn lower_for_range(
 
     out.push(ir::Stmt::While {
         cond,
-        body: loop_body?,
+        body: loop_body,
         step: vec![step_stmt],
     });
     Ok(())
@@ -1048,6 +1309,12 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     ty: *ty,
                     kind: ir::ExprKind::Local(name.clone()),
                 })
+            } else if let Some(ty) = ctx.globals.get(name) {
+                // module globals are readable from any function
+                Ok(ir::Expr {
+                    ty: *ty,
+                    kind: ir::ExprKind::GlobalLoad(name.clone()),
+                })
             } else if ctx.funcs.contains_key(name) {
                 Err(err(
                     format!("functions can only be called; add parentheses: '{name}(...)'"),
@@ -1087,28 +1354,28 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             args,
         } => {
             let base_ir = lower_expr(base, ctx)?;
-            if let ir::Ty::List(elem) = base_ir.ty {
-                match method.as_str() {
+            match base_ir.ty {
+                ir::Ty::List(elem) => match method.as_str() {
                     // pop returns the removed element
-                    "pop" => {
-                        return lower_list_pop(base_ir, elem, args, *method_span, ctx);
-                    }
-                    "append" => {
-                        return Err(err(
-                            "list.append(...) returns None and cannot be used \
-                             in an expression",
-                            *method_span,
-                        ));
-                    }
-                    _ => {}
-                }
+                    "pop" => lower_list_pop(base_ir, elem, args, *method_span, ctx),
+                    "append" => Err(err(
+                        "list.append(...) returns None and cannot be used \
+                         in an expression",
+                        *method_span,
+                    )),
+                    _ => Err(err(
+                        format!("'{}' has no method '{method}'", base_ir.ty),
+                        *method_span,
+                    )),
+                },
+                ir::Ty::Str => lower_str_method(base_ir, method, *method_span, args, ctx),
+                other => Err(err(
+                    format!("'{other}' has no method '{method}'"),
+                    *method_span,
+                )),
             }
-            Err(err(
-                format!("'{}' has no method '{method}'", base_ir.ty),
-                *method_span,
-            ))
         }
-        ast::ExprKind::Slice { base, lo, hi } => {
+        ast::ExprKind::Slice { base, lo, hi, step } => {
             let base_ir = lower_expr(base, ctx)?;
             let ty = match base_ir.ty {
                 ir::Ty::Str => ir::Ty::Str,
@@ -1117,20 +1384,32 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     return Err(err(format!("'{other}' object cannot be sliced"), base.span));
                 }
             };
+            // missing bounds are i64::MIN sentinels: their meaning depends
+            // on the step's sign, resolved by the runtime like CPython
             let lo_ir = match lo {
                 Some(e) => {
                     let v = lower_expr(e, ctx)?;
                     coerce(v, ir::Ty::Int, e.span, "slice bound")?
                 }
-                Option::None => int_const(0),
+                Option::None => int_const(i64::MIN),
             };
             let hi_ir = match hi {
                 Some(e) => {
                     let v = lower_expr(e, ctx)?;
                     coerce(v, ir::Ty::Int, e.span, "slice bound")?
                 }
-                // "missing" upper bound; the runtime clamps to len
-                Option::None => int_const(i64::MAX),
+                Option::None => int_const(i64::MIN),
+            };
+            let step_ir = match step {
+                Some(e) => {
+                    let v = lower_expr(e, ctx)?;
+                    let v = coerce(v, ir::Ty::Int, e.span, "slice step")?;
+                    if matches!(v.kind, ir::ExprKind::ConstInt(0)) {
+                        return Err(err("slice step cannot be zero", e.span));
+                    }
+                    v
+                }
+                Option::None => int_const(1),
             };
             Ok(ir::Expr {
                 ty,
@@ -1138,6 +1417,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     base: Box::new(base_ir),
                     lo: Box::new(lo_ir),
                     hi: Box::new(hi_ir),
+                    step: Box::new(step_ir),
                 },
             })
         }
@@ -1851,7 +2131,7 @@ print(fib(10))
     fn int_promotes_to_float_in_mixed_arithmetic() {
         let m = analyze_ok("x = 1 + 2.5\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!("expected Assign");
         };
         assert_eq!(value.ty, ir::Ty::Float);
@@ -1861,7 +2141,7 @@ print(fib(10))
     fn true_division_yields_float() {
         let m = analyze_ok("x = 7 / 2\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!("expected Assign");
         };
         assert_eq!(value.ty, ir::Ty::Float);
@@ -1871,11 +2151,11 @@ print(fib(10))
     fn pow_int_stays_int_pow_float_is_float() {
         let m = analyze_ok("a = 2 ** 10\nb = 2.0 ** 10\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Int);
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Float);
@@ -1885,7 +2165,7 @@ print(fib(10))
     fn chained_comparison_lowers_to_let_and() {
         let m = analyze_ok("x = 1\nb = 0 < x < 10\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!("expected Assign");
         };
         assert_eq!(value.ty, ir::Ty::Bool);
@@ -1905,8 +2185,8 @@ print(fib(10))
     fn str_variables_and_concat() {
         let m = analyze_ok("s = \"ab\"\nt = s + \"c\"\nu = s * 3\n");
         let entry = find_func(&m, ENTRY_NAME);
-        assert_eq!(entry.locals[0], ("s".to_string(), ir::Ty::Str));
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+        assert_eq!(m.globals[0], ("s".to_string(), ir::Ty::Str));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Str);
@@ -1916,7 +2196,7 @@ print(fib(10))
     fn str_comparisons_are_bool() {
         let m = analyze_ok("b = \"a\" < \"b\"\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Bool);
@@ -1926,15 +2206,15 @@ print(fib(10))
     fn str_cast_and_index_and_len() {
         let m = analyze_ok("s = str(42)\nc = s[0]\nn = len(s)\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
         };
         assert!(matches!(value.kind, ir::ExprKind::IntToStr(_)));
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Str);
-        let ir::Stmt::Assign { value, .. } = &entry.body[2] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Int);
@@ -1944,7 +2224,7 @@ print(fib(10))
     fn list_literal_infers_type_and_promotes() {
         let m = analyze_ok("xs = [1, 2.5, True]\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::List(ir::Elem::Float));
@@ -1961,7 +2241,7 @@ print(fib(10))
     fn list_index_and_assignment() {
         let m = analyze_ok("xs = [1, 2]\ny = xs[0]\nxs[1] = 5\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Int);
@@ -2004,23 +2284,20 @@ print(fib(10))
     #[test]
     fn for_over_list_binds_elem_type() {
         let m = analyze_ok("for x in [1.5, 2.5]:\n    print(x)\n");
-        let entry = find_func(&m, ENTRY_NAME);
-        let has_x_float = entry
-            .locals
+        let _ = find_func(&m, ENTRY_NAME);
+        let has_x_float = m
+            .globals
             .iter()
             .any(|(n, t)| n == "x" && *t == ir::Ty::Float);
-        assert!(has_x_float, "locals: {:?}", entry.locals);
+        assert!(has_x_float, "globals: {:?}", m.globals);
     }
 
     #[test]
     fn for_over_str_binds_str() {
         let m = analyze_ok("for c in \"abc\":\n    print(c)\n");
-        let entry = find_func(&m, ENTRY_NAME);
-        let has_c_str = entry
-            .locals
-            .iter()
-            .any(|(n, t)| n == "c" && *t == ir::Ty::Str);
-        assert!(has_c_str, "locals: {:?}", entry.locals);
+        let _ = find_func(&m, ENTRY_NAME);
+        let has_c_str = m.globals.iter().any(|(n, t)| n == "c" && *t == ir::Ty::Str);
+        assert!(has_c_str, "globals: {:?}", m.globals);
     }
 
     #[test]
@@ -2139,20 +2416,21 @@ print(count([]))
     fn slices_type_correctly() {
         let m = analyze_ok("s = \"hello\"\nt = s[1:3]\nxs = [1, 2, 3]\nys = xs[:2]\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Str);
-        let ir::Stmt::Assign { value, .. } = &entry.body[3] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[3] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::List(ir::Elem::Int));
-        // missing bounds are filled with defaults
-        let ir::ExprKind::Slice { lo, hi, .. } = &value.kind else {
+        // missing bounds become i64::MIN sentinels, missing step becomes 1
+        let ir::ExprKind::Slice { lo, hi, step, .. } = &value.kind else {
             panic!();
         };
-        assert!(matches!(lo.kind, ir::ExprKind::ConstInt(0)));
+        assert!(matches!(lo.kind, ir::ExprKind::ConstInt(i64::MIN)));
         assert!(matches!(hi.kind, ir::ExprKind::ConstInt(_)));
+        assert!(matches!(step.kind, ir::ExprKind::ConstInt(1)));
     }
 
     #[test]
@@ -2165,11 +2443,11 @@ print(count([]))
     fn contains_types_correctly() {
         let m = analyze_ok("b = \"ell\" in \"hello\"\nc = 2 in [1, 2]\nd = 5 not in [1, 2]\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
         };
         assert!(matches!(value.kind, ir::ExprKind::Contains { .. }));
-        let ir::Stmt::Assign { value, .. } = &entry.body[2] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
             panic!();
         };
         // not in == Not(Contains)
@@ -2184,7 +2462,7 @@ print(count([]))
     fn contains_coerces_needle_to_elem_type() {
         let m = analyze_ok("b = 1 in [1.5, 2.5]\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[0] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
         };
         let ir::ExprKind::Contains { needle, .. } = &value.kind else {
@@ -2203,7 +2481,7 @@ print(count([]))
     fn pop_returns_element_type() {
         let m = analyze_ok("xs = [1.5]\nx = xs.pop()\ny = xs.pop(0)\nxs.pop()\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Float);
@@ -2216,7 +2494,7 @@ print(count([]))
     fn fstring_lowers_to_concat_with_conversions() {
         let m = analyze_ok("x = 42\ns = f\"x={x}!\"\nprint(s)\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Assign { value, .. } = &entry.body[1] else {
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Str);
