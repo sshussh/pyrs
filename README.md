@@ -36,7 +36,7 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.6)
+## The language (v0.7)
 
 A statically-typed Python subset:
 
@@ -72,6 +72,12 @@ A statically-typed Python subset:
   `.read()`/`.readline()`/`.readlines()`/`.write()`/`.close()`,
   `with open(...) as f:` blocks, and CPython's exact error messages —
   compiled programs are real CLI tools
+- **Modules:** split a program across files — `import utils`,
+  `import utils as u`, `from utils import helper, X as Y`; module
+  functions and globals are visible across files, module bodies run
+  once at the import site (like Python), and imports resolve relative
+  to the entry script's directory. Cycles and missing modules/names are
+  compile errors that point at the offending file
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 
@@ -92,15 +98,17 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.6): no bigints (int is 64-bit and wraps), `and`/`or`
+Known limits (v0.7): no bigints (int is 64-bit and wraps), `and`/`or`
 return `bool` rather than the operand, `x ** e` with a *dynamic*
 negative int exponent traps (a constant like `2 ** -1` works and gives
 float), int↔float comparisons convert the int to float (exactness loss
 past 2^53), list literals coerce mixed numerics to one element type,
 `nan in [nan]` is False (no identity semantics), str methods use ASCII
 case/whitespace rules, heap memory is never freed, files support text
-modes "r"/"w"/"a" only (no `for line in f`, no file-typed
-parameters yet; `with` works for files only), and f-string format
+modes "r"/"w"/"a" only (no `for line in f`, no file-typed parameters
+yet; `with` works for files only), imports are single sibling modules
+only (no packages, `import a.b`, `from m import *`, or relative
+imports), and f-string format
 specs / dicts / tuples / classes / exceptions are not in yet — the
 parser reports "not supported yet" for each.
 

@@ -113,8 +113,10 @@ what pyrs hands to LLVM, readable and diffable.
 $ pyrs run -i prog.py [-O 2]
 ```
 
-Compiles to a temporary directory, executes, cleans up, and exits with
-the program's exit code (0 on success, 1 if the program traps with a
+When the program imports sibling modules, the whole import graph is
+compiled and linked into the one executable. `run` compiles to a
+temporary directory, executes, cleans up, and exits with the program's
+exit code (0 on success, 1 if the program traps with a
 runtime error).
 
 ### `pyrs lex` / `pyrs parse`
@@ -553,6 +555,46 @@ for arg in sys.argv[1:]:       # arguments after the program name
 For a compiled binary they're just process arguments: `./tool a b c`.
 `sys.argv[0]` is the binary path (Python shows the script path — the
 only structural difference).
+
+### Modules
+
+Split a program across files. Imports resolve relative to the entry
+script's directory (exactly like `python main.py`):
+
+```python
+# geometry.py
+PI = 3.14159
+def circle_area(r: float) -> float:
+    return PI * r * r
+
+# main.py
+import geometry
+import geometry as geo          # aliases work
+from geometry import PI         # and `as`: from geometry import PI as pi
+
+print(geometry.circle_area(2.0))
+print(geo.circle_area(3.0), PI)
+```
+
+- `import M` / `import M as A` — reach the module's functions and
+  globals as `M.func(...)` / `M.value`.
+- `from M import a, b as c` — bring names directly into scope.
+- A module's top-level code runs **once**, at the point its first
+  `import` is reached (depth-first, like Python) — so a shared module
+  imported by several files initializes a single time.
+- To mutate another module's global, call a function in that module
+  that uses `global` (assigning `M.x = v` from outside is not
+  supported); `from M import x` then reassigning `x` just makes a local,
+  as in Python.
+
+Errors are compile-time and point at the offending file: importing a
+module that does not exist (`No module named 'foo'`), importing a name a
+module does not define (`cannot import name 'bar' from 'foo'`), and
+import cycles are all rejected.
+
+Not supported yet: packages and dotted names (`import a.b`),
+`from M import *`, relative imports (`from . import x`), importing inside
+a function, and re-assigning another module's attributes.
 
 ## 6. Runtime errors
 

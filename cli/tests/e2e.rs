@@ -1121,7 +1121,7 @@ fn import_of_unknown_module_is_error() {
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("only 'import sys'"), "stderr: {stderr}");
+    assert!(stderr.contains("No module named 'os'"), "stderr: {stderr}");
 }
 
 // ---- v0.6: file I/O ----
@@ -1404,4 +1404,183 @@ fn comprehension_multiple_clauses_are_rejected() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// ---- modules (multi-file imports) ----
+
+/// Write several files into a temp dir and run the root, returning stdout.
+fn run_project(tag: &str, files: &[(&str, &str)], root: &str) -> String {
+    let dir = TempDir::new(tag);
+    for (name, body) in files {
+        fs::write(dir.0.join(name), body).unwrap();
+    }
+    let out = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(dir.0.join(root))
+        .output()
+        .expect("failed to spawn pyrs");
+    assert!(
+        out.status.success(),
+        "pyrs run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Compile a project expecting a compile-time failure; returns stderr.
+fn compile_project_expect_fail(tag: &str, files: &[(&str, &str)], root: &str) -> String {
+    let dir = TempDir::new(tag);
+    for (name, body) in files {
+        fs::write(dir.0.join(name), body).unwrap();
+    }
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(dir.0.join(root))
+        .output()
+        .expect("failed to spawn pyrs");
+    assert!(!out.status.success(), "expected a compile error");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn modules_functions_and_globals_match_python() {
+    let out = run_project(
+        "mod_basic",
+        &[
+            (
+                "mathx.py",
+                "PI = 3.5\n\
+                 def square(n: int) -> int:\n    return n * n\n\
+                 def scale(x: float) -> float:\n    return x * PI\n",
+            ),
+            (
+                "main.py",
+                "import mathx\n\
+                 from mathx import PI as pi_value\n\
+                 print(mathx.square(6))\n\
+                 print(mathx.scale(2.0), pi_value)\n\
+                 print([mathx.square(i) for i in range(4)])\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "36\n7.0 3.5\n[0, 1, 4, 9]\n");
+}
+
+#[test]
+fn module_global_mutated_through_its_own_function() {
+    let out = run_project(
+        "mod_state",
+        &[
+            (
+                "counter.py",
+                "count = 0\n\
+                 def bump(n: int):\n    global count\n    count += n\n\
+                 def get() -> int:\n    return count\n",
+            ),
+            (
+                "main.py",
+                "import counter as c\n\
+                 c.bump(3)\n\
+                 c.bump(4)\n\
+                 print(c.get(), c.count)\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "7 7\n");
+}
+
+#[test]
+fn module_init_runs_once_at_import_site() {
+    // 'a' is imported by both main and b (a diamond); its body runs once,
+    // and 'main start' prints before any init (import-site ordering)
+    let out = run_project(
+        "mod_init",
+        &[
+            ("a.py", "print(\"init a\")\nval = 10\n"),
+            ("b.py", "import a\nprint(\"init b\")\n"),
+            (
+                "main.py",
+                "print(\"main start\")\n\
+                 import a\n\
+                 import b\n\
+                 print(\"main:\", a.val)\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "main start\ninit a\ninit b\nmain: 10\n");
+}
+
+#[test]
+fn transitive_imports_work() {
+    let out = run_project(
+        "mod_trans",
+        &[
+            ("base.py", "def one() -> int:\n    return 1\n"),
+            (
+                "mid.py",
+                "import base\ndef two() -> int:\n    return base.one() + 1\n",
+            ),
+            ("main.py", "import mid\nprint(mid.two())\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn diagnostics_point_at_the_right_file() {
+    let stderr = compile_project_expect_fail(
+        "mod_diag",
+        &[
+            (
+                "helper.py",
+                "def broken(n: int) -> int:\n    x = 1\n    x = 2.5\n    return n\n",
+            ),
+            ("main.py", "import helper\nprint(helper.broken(3))\n"),
+        ],
+        "main.py",
+    );
+    assert!(stderr.contains("helper.py:3"), "stderr: {stderr}");
+    assert!(stderr.contains("type mismatch"), "stderr: {stderr}");
+}
+
+#[test]
+fn missing_module_is_an_error() {
+    let stderr =
+        compile_project_expect_fail("mod_missing", &[("main.py", "import nope\n")], "main.py");
+    assert!(
+        stderr.contains("No module named 'nope'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn missing_imported_name_is_an_error() {
+    let stderr = compile_project_expect_fail(
+        "mod_name",
+        &[("u.py", "x = 5\n"), ("main.py", "from u import nope\n")],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("cannot import name 'nope' from 'u'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn circular_imports_are_rejected() {
+    let stderr = compile_project_expect_fail(
+        "mod_cycle",
+        &[
+            ("a.py", "import b\ndef fa() -> int:\n    return 1\n"),
+            ("b.py", "import a\ndef fb() -> int:\n    return 2\n"),
+            ("main.py", "import a\nprint(a.fa())\n"),
+        ],
+        "main.py",
+    );
+    assert!(stderr.contains("circular import"), "stderr: {stderr}");
 }
