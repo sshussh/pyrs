@@ -12,11 +12,13 @@
  * for short-lived compiled programs, documented as a known limitation.
  */
 
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* layout shared with codegen: leading i64 length, then bytes (+ NUL) */
 typedef struct {
@@ -123,6 +125,41 @@ void pyrs_print_str(const PyrsStr *s) {
     fwrite(s->data, 1, (size_t)s->len, stdout);
 }
 
+/* CPython repr of a str: single quotes unless the string contains a
+ * single quote and no double quote; \\ \' \n \r \t escapes and \xHH
+ * for other control bytes */
+static void print_str_repr(const PyrsStr *s) {
+    int has_single = 0;
+    int has_double = 0;
+    for (long long i = 0; i < s->len; i++) {
+        if (s->data[i] == '\'') {
+            has_single = 1;
+        } else if (s->data[i] == '"') {
+            has_double = 1;
+        }
+    }
+    char quote = (has_single && !has_double) ? '"' : '\'';
+    fputc(quote, stdout);
+    for (long long i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c == (unsigned char)quote || c == '\\') {
+            fputc('\\', stdout);
+            fputc(c, stdout);
+        } else if (c == '\n') {
+            fputs("\\n", stdout);
+        } else if (c == '\r') {
+            fputs("\\r", stdout);
+        } else if (c == '\t') {
+            fputs("\\t", stdout);
+        } else if (c < 0x20 || c == 0x7f) {
+            printf("\\x%02x", c);
+        } else {
+            fputc(c, stdout);
+        }
+    }
+    fputc(quote, stdout);
+}
+
 /* element tags match codegen: 0=int 1=float 2=bool 3=str */
 void pyrs_print_list(const PyrsList *l, int tag) {
     check_ref(l);
@@ -146,10 +183,7 @@ void pyrs_print_list(const PyrsList *l, int tag) {
             fputs(slot ? "True" : "False", stdout);
             break;
         case 3:
-            /* repr-style quotes; escape sequences are not re-escaped */
-            fputc('\'', stdout);
-            pyrs_print_str((const PyrsStr *)slot);
-            fputc('\'', stdout);
+            print_str_repr((const PyrsStr *)slot);
             break;
         default:
             /* tag >= 4: the element is itself a list; decode its element
@@ -717,6 +751,172 @@ double pyrs_ffloordiv(double vx, double wx) {
         floordiv = copysign(0.0, vx / wx);
     }
     return floordiv;
+}
+
+/* ---- files ---- */
+
+typedef struct {
+    FILE *fp;
+    const PyrsStr *name;
+    int readable;
+    int writable;
+    int closed;
+} PyrsFile;
+
+/* uncaught-exception message matching what CPython's traceback ends with */
+static _Noreturn void die_os_error(int err, const PyrsStr *path) {
+    const char *exc;
+    switch (err) {
+    case ENOENT:
+        exc = "FileNotFoundError";
+        break;
+    case EACCES:
+        exc = "PermissionError";
+        break;
+    case EISDIR:
+        exc = "IsADirectoryError";
+        break;
+    default:
+        exc = "OSError";
+        break;
+    }
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s: [Errno %d] %s: '%.*s'", exc, err,
+             strerror(err), (int)path->len, path->data);
+    pyrs_die(buf);
+}
+
+PyrsFile *pyrs_open(const PyrsStr *path, const PyrsStr *mode) {
+    check_ref(path);
+    check_ref(mode);
+
+    int readable = 0;
+    int writable = 0;
+    const char *cmode;
+    if (mode->len == 1 && mode->data[0] == 'r') {
+        cmode = "r";
+        readable = 1;
+    } else if (mode->len == 1 && mode->data[0] == 'w') {
+        cmode = "w";
+        writable = 1;
+    } else if (mode->len == 1 && mode->data[0] == 'a') {
+        cmode = "a";
+        writable = 1;
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof buf, "ValueError: invalid mode: '%.*s'",
+                 (int)mode->len, mode->data);
+        pyrs_die(buf);
+    }
+
+    FILE *fp = fopen(path->data, cmode);
+    if (fp == NULL) {
+        die_os_error(errno, path);
+    }
+    /* Linux fopen("dir", "r") succeeds; Python raises at open() */
+    if (readable) {
+        struct stat st;
+        if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
+            fclose(fp);
+            die_os_error(EISDIR, path);
+        }
+    }
+
+    PyrsFile *f = xmalloc(sizeof(PyrsFile));
+    f->fp = fp;
+    f->name = path;
+    f->readable = readable;
+    f->writable = writable;
+    f->closed = 0;
+    return f;
+}
+
+static void file_check_open(const PyrsFile *f) {
+    check_ref(f);
+    if (f->closed) {
+        pyrs_die("ValueError: I/O operation on closed file.");
+    }
+}
+
+static void file_check_readable(const PyrsFile *f) {
+    file_check_open(f);
+    if (!f->readable) {
+        pyrs_die("io.UnsupportedOperation: not readable");
+    }
+}
+
+/* everything remaining in the file */
+PyrsStr *pyrs_file_read(PyrsFile *f) {
+    file_check_readable(f);
+    size_t cap = 1 << 16;
+    size_t len = 0;
+    char *buf = xmalloc(cap);
+    for (;;) {
+        size_t n = fread(buf + len, 1, cap - len, f->fp);
+        len += n;
+        if (len < cap) {
+            break;
+        }
+        size_t newcap = cap * 2;
+        char *bigger = xmalloc(newcap);
+        memcpy(bigger, buf, len);
+        buf = bigger;
+        cap = newcap;
+    }
+    PyrsStr *r = str_alloc((long long)len);
+    memcpy(r->data, buf, len);
+    return r;
+}
+
+/* one line, keeping the trailing newline; "" at EOF (like Python) */
+PyrsStr *pyrs_file_readline(PyrsFile *f) {
+    file_check_readable(f);
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, f->fp);
+    if (n < 0) {
+        free(line);
+        return EMPTY_STR;
+    }
+    PyrsStr *r = str_alloc(n);
+    memcpy(r->data, line, (size_t)n);
+    free(line);
+    return r;
+}
+
+PyrsList *pyrs_file_readlines(PyrsFile *f) {
+    file_check_readable(f);
+    PyrsList *out = pyrs_list_new(8);
+    for (;;) {
+        PyrsStr *line = pyrs_file_readline(f);
+        if (line->len == 0) {
+            break;
+        }
+        pyrs_list_push(out, (long long)line);
+    }
+    return out;
+}
+
+/* returns the number of characters written, like Python; flushed so data
+ * survives even if close() is never called (nothing is freed anyway) */
+long long pyrs_file_write(PyrsFile *f, const PyrsStr *s) {
+    file_check_open(f);
+    if (!f->writable) {
+        pyrs_die("io.UnsupportedOperation: not writable");
+    }
+    check_ref(s);
+    fwrite(s->data, 1, (size_t)s->len, f->fp);
+    fflush(f->fp);
+    return s->len;
+}
+
+/* idempotent, like Python */
+void pyrs_file_close(PyrsFile *f) {
+    check_ref(f);
+    if (!f->closed) {
+        fclose(f->fp);
+        f->closed = 1;
+    }
 }
 
 /* ---- stdin & command-line arguments ---- */

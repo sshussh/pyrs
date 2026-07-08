@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use ir::{BinOp, Expr, ExprKind, Function, Module, Stmt, StrFn, Ty, UnOp};
+use ir::{BinOp, Expr, ExprKind, FileFn, Function, Module, Stmt, StrFn, Ty, UnOp};
 
 pub fn emit_llvm_ir(module: &Module) -> String {
     let mut e = Emitter::default();
@@ -36,6 +36,7 @@ fn lty(ty: Ty) -> &'static str {
         Ty::Bool => "i1",
         Ty::Str => "ptr",
         Ty::List(_) => "ptr",
+        Ty::File => "ptr",
         Ty::None => "void",
     }
 }
@@ -60,7 +61,7 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Bool => 2,
         Ty::Str => 3,
         Ty::List(inner) => 4 + 8 * elem_tag(inner),
-        Ty::None => unreachable!("no tag for None"),
+        Ty::File | Ty::None => unreachable!("no print tag for {ty:?}"),
     }
 }
 
@@ -139,6 +140,12 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_input(ptr)\n");
         out.push_str("declare ptr @pyrs_argv()\n");
         out.push_str("declare void @pyrs_set_args(i32, ptr)\n");
+        out.push_str("declare ptr @pyrs_open(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_file_read(ptr)\n");
+        out.push_str("declare ptr @pyrs_file_readline(ptr)\n");
+        out.push_str("declare ptr @pyrs_file_readlines(ptr)\n");
+        out.push_str("declare i64 @pyrs_file_write(ptr, ptr)\n");
+        out.push_str("declare void @pyrs_file_close(ptr)\n");
         out.push_str("declare i64 @pyrs_ipow(i64, i64)\n");
         out.push_str("declare double @pyrs_ffloordiv(double, double)\n");
         out.push_str("declare double @pyrs_fmod_floored(double, double)\n");
@@ -160,7 +167,7 @@ impl Emitter {
             let init = match ty {
                 Ty::Float => fconst(0.0),
                 Ty::Bool => "false".to_string(),
-                Ty::Str | Ty::List(_) => "null".to_string(),
+                Ty::Str | Ty::List(_) | Ty::File => "null".to_string(),
                 _ => "0".to_string(),
             };
             self.global_defs.push_str(&format!(
@@ -358,7 +365,7 @@ impl Emitter {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
             let zero = match ty {
                 Ty::Float => fconst(0.0),
-                Ty::Str | Ty::List(_) => "null".to_string(),
+                Ty::Str | Ty::List(_) | Ty::File => "null".to_string(),
                 _ => "0".to_string(),
             };
             self.line(format!("store {} {zero}, ptr %v.{name}", lty(*ty)));
@@ -461,7 +468,9 @@ impl Emitter {
                             "call void @pyrs_print_list(ptr {v}, i32 {})",
                             elem_tag(elem)
                         )),
-                        Ty::None => unreachable!("semantic rejects None print args"),
+                        Ty::File | Ty::None => {
+                            unreachable!("semantic rejects {:?} print args", arg.ty)
+                        }
                     }
                 }
                 self.line("call void @pyrs_print_end()");
@@ -575,6 +584,42 @@ impl Emitter {
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_argv()"));
                 t
+            }
+            ExprKind::Open { path, mode } => {
+                let p = self.emit_expr(path);
+                let m = self.emit_expr(mode);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_open(ptr {p}, ptr {m})"));
+                t
+            }
+            ExprKind::FileCall { func, args } => {
+                let vals: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
+                let args_str = vals
+                    .iter()
+                    .map(|v| format!("ptr {v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match func {
+                    FileFn::Read | FileFn::ReadLine | FileFn::ReadLines => {
+                        let callee = match func {
+                            FileFn::Read => "pyrs_file_read",
+                            FileFn::ReadLine => "pyrs_file_readline",
+                            _ => "pyrs_file_readlines",
+                        };
+                        let t = self.tmp();
+                        self.line(format!("{t} = call ptr @{callee}({args_str})"));
+                        t
+                    }
+                    FileFn::Write => {
+                        let t = self.tmp();
+                        self.line(format!("{t} = call i64 @pyrs_file_write({args_str})"));
+                        t
+                    }
+                    FileFn::Close => {
+                        self.line(format!("call void @pyrs_file_close({args_str})"));
+                        String::new()
+                    }
+                }
             }
             ExprKind::Let { name, value, body } => {
                 let v = self.emit_expr(value);
