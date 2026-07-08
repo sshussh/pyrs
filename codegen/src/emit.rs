@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use ir::{BinOp, Elem, Expr, ExprKind, Function, Module, Stmt, Ty, UnOp};
+use ir::{BinOp, Elem, Expr, ExprKind, Function, Module, Stmt, StrFn, Ty, UnOp};
 
 pub fn emit_llvm_ir(module: &Module) -> String {
     let mut e = Emitter::default();
@@ -82,6 +82,8 @@ struct Emitter {
     /// interned string constants: content → global name
     strings: HashMap<String, String>,
     string_defs: String,
+    /// module-level variable definitions (@g.<name>)
+    global_defs: String,
     tmp: usize,
     blk: usize,
     cur_block: String,
@@ -109,11 +111,24 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_from_int(i64)\n");
         out.push_str("declare ptr @pyrs_str_from_float(double)\n");
         out.push_str("declare ptr @pyrs_str_from_bool(i32)\n");
-        out.push_str("declare ptr @pyrs_str_slice(ptr, i64, i64)\n");
+        out.push_str("declare ptr @pyrs_str_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_str_contains(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_upper(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_lower(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_strip(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_lstrip(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_rstrip(ptr)\n");
+        out.push_str("declare i32 @pyrs_str_startswith(ptr, ptr)\n");
+        out.push_str("declare i32 @pyrs_str_endswith(ptr, ptr)\n");
+        out.push_str("declare i64 @pyrs_str_find(ptr, ptr)\n");
+        out.push_str("declare i64 @pyrs_str_count(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_replace(ptr, ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_split_ws(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_split(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_join(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_list_new(i64)\n");
         out.push_str("declare void @pyrs_list_push(ptr, i64)\n");
-        out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64)\n");
+        out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
         out.push_str("declare i64 @pyrs_list_pop(ptr, i64)\n");
         out.push_str("declare i64 @pyrs_ipow(i64, i64)\n");
@@ -123,6 +138,7 @@ impl Emitter {
         out.push_str("declare double @llvm.floor.f64(double)\n");
         out.push_str("declare double @llvm.pow.f64(double, double)\n");
         out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n\n");
+        out.push_str(&self.global_defs);
         out.push_str(&self.string_defs);
         out.push('\n');
         out.push_str(&self.funcs);
@@ -130,6 +146,20 @@ impl Emitter {
     }
 
     fn emit_module(&mut self, module: &Module) {
+        // module globals, zero/null-initialized; assigned when the entry
+        // function runs its top-level statements
+        for (name, ty) in &module.globals {
+            let init = match ty {
+                Ty::Float => fconst(0.0),
+                Ty::Bool => "false".to_string(),
+                Ty::Str | Ty::List(_) => "null".to_string(),
+                _ => "0".to_string(),
+            };
+            self.global_defs.push_str(&format!(
+                "@g.{name} = internal global {} {init}\n",
+                lty(*ty)
+            ));
+        }
         for func in &module.funcs {
             self.emit_function(func);
         }
@@ -365,6 +395,10 @@ impl Emitter {
                 let v = self.emit_expr(value);
                 self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
             }
+            Stmt::GlobalAssign { name, value } => {
+                let v = self.emit_expr(value);
+                self.line(format!("store {} {v}, ptr @g.{name}", lty(value.ty)));
+            }
             Stmt::IndexAssign { base, index, value } => {
                 let b = self.emit_expr(base);
                 let i = self.emit_expr(index);
@@ -513,6 +547,11 @@ impl Emitter {
                 self.line(format!("{t} = load {}, ptr %v.{name}", lty(expr.ty)));
                 t
             }
+            ExprKind::GlobalLoad(name) => {
+                let t = self.tmp();
+                self.line(format!("{t} = load {}, ptr @g.{name}", lty(expr.ty)));
+                t
+            }
             ExprKind::Let { name, value, body } => {
                 let v = self.emit_expr(value);
                 self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
@@ -554,10 +593,11 @@ impl Emitter {
                     other => unreachable!("index on {other:?}"),
                 }
             }
-            ExprKind::Slice { base, lo, hi } => {
+            ExprKind::Slice { base, lo, hi, step } => {
                 let b = self.emit_expr(base);
                 let lo_v = self.emit_expr(lo);
                 let hi_v = self.emit_expr(hi);
+                let step_v = self.emit_expr(step);
                 let callee = match base.ty {
                     Ty::Str => "pyrs_str_slice",
                     Ty::List(_) => "pyrs_list_slice",
@@ -565,9 +605,46 @@ impl Emitter {
                 };
                 let t = self.tmp();
                 self.line(format!(
-                    "{t} = call ptr @{callee}(ptr {b}, i64 {lo_v}, i64 {hi_v})"
+                    "{t} = call ptr @{callee}(ptr {b}, i64 {lo_v}, i64 {hi_v}, i64 {step_v})"
                 ));
                 t
+            }
+            ExprKind::StrCall { func, args } => {
+                let vals: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
+                // (runtime symbol, returns i1-via-i32, returns i64)
+                let (callee, is_bool, is_int) = match func {
+                    StrFn::Upper => ("pyrs_str_upper", false, false),
+                    StrFn::Lower => ("pyrs_str_lower", false, false),
+                    StrFn::Strip => ("pyrs_str_strip", false, false),
+                    StrFn::Lstrip => ("pyrs_str_lstrip", false, false),
+                    StrFn::Rstrip => ("pyrs_str_rstrip", false, false),
+                    StrFn::StartsWith => ("pyrs_str_startswith", true, false),
+                    StrFn::EndsWith => ("pyrs_str_endswith", true, false),
+                    StrFn::Find => ("pyrs_str_find", false, true),
+                    StrFn::Count => ("pyrs_str_count", false, true),
+                    StrFn::Replace => ("pyrs_str_replace", false, false),
+                    StrFn::SplitWs => ("pyrs_str_split_ws", false, false),
+                    StrFn::Split => ("pyrs_str_split", false, false),
+                    StrFn::Join => ("pyrs_str_join", false, false),
+                };
+                let args_str = vals
+                    .iter()
+                    .map(|v| format!("ptr {v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let t = self.tmp();
+                if is_bool {
+                    self.line(format!("{t} = call i32 @{callee}({args_str})"));
+                    let b = self.tmp();
+                    self.line(format!("{b} = icmp ne i32 {t}, 0"));
+                    b
+                } else if is_int {
+                    self.line(format!("{t} = call i64 @{callee}({args_str})"));
+                    t
+                } else {
+                    self.line(format!("{t} = call ptr @{callee}({args_str})"));
+                    t
+                }
             }
             ExprKind::Contains { needle, haystack } => {
                 let n = self.emit_expr(needle);

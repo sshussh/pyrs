@@ -12,10 +12,11 @@
  * for short-lived compiled programs, documented as a known limitation.
  */
 
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
 /* layout shared with codegen: leading i64 length, then bytes (+ NUL) */
 typedef struct {
@@ -29,6 +30,10 @@ typedef struct {
     long long cap;
     long long *data;
 } PyrsList;
+
+/* used by the str splitters before the list section defines them */
+PyrsList *pyrs_list_new(long long cap);
+void pyrs_list_push(PyrsList *l, long long slot);
 
 _Noreturn void pyrs_die(const char *msg) {
     fflush(stdout);
@@ -238,34 +243,276 @@ PyrsStr *pyrs_str_index(const PyrsStr *s, long long i) {
     return single_char((unsigned char)s->data[i]);
 }
 
-/* clamp a slice bound Python-style: negative counts from the end, then
- * clip to [0, len] */
-static long long clamp_bound(long long i, long long len) {
+/* a substring copy, reusing the interned empty/single-char strings */
+static PyrsStr *str_sub(const PyrsStr *s, long long off, long long n) {
+    if (n <= 0) {
+        return EMPTY_STR;
+    }
+    if (n == 1) {
+        return single_char((unsigned char)s->data[off]);
+    }
+    PyrsStr *r = str_alloc(n);
+    memcpy(r->data, s->data + off, (size_t)n);
+    return r;
+}
+
+/* CPython PySlice_AdjustIndices: resolve one bound against len for the
+ * step's direction; LLONG_MIN encodes a missing bound */
+static long long resolve_slice_bound(long long i, int is_start, long long len, long long step) {
+    if (i == LLONG_MIN) {
+        if (step > 0) {
+            return is_start ? 0 : len;
+        }
+        return is_start ? len - 1 : -1;
+    }
     if (i < 0) {
         i += len;
         if (i < 0) {
-            i = 0;
+            return step > 0 ? 0 : -1;
         }
-    }
-    if (i > len) {
-        i = len;
+    } else if (i >= len) {
+        return step > 0 ? len : len - 1;
     }
     return i;
 }
 
-PyrsStr *pyrs_str_slice(const PyrsStr *s, long long lo, long long hi) {
+static long long slice_count(long long start, long long stop, long long step) {
+    if (step > 0) {
+        return stop > start ? (stop - start + step - 1) / step : 0;
+    }
+    return stop < start ? (stop - start + step + 1) / step : 0;
+}
+
+PyrsStr *pyrs_str_slice(const PyrsStr *s, long long lo, long long hi, long long step) {
     check_ref(s);
-    lo = clamp_bound(lo, s->len);
-    hi = clamp_bound(hi, s->len);
-    if (hi <= lo) {
+    if (step == 0) {
+        pyrs_die("ValueError: slice step cannot be zero");
+    }
+    long long start = resolve_slice_bound(lo, 1, s->len, step);
+    long long stop = resolve_slice_bound(hi, 0, s->len, step);
+    long long n = slice_count(start, stop, step);
+    if (step == 1) {
+        return str_sub(s, start, n);
+    }
+    if (n <= 0) {
         return EMPTY_STR;
     }
-    long long n = hi - lo;
     if (n == 1) {
-        return single_char((unsigned char)s->data[lo]);
+        return single_char((unsigned char)s->data[start]);
     }
     PyrsStr *r = str_alloc(n);
-    memcpy(r->data, s->data + lo, (size_t)n);
+    for (long long i = 0; i < n; i++) {
+        r->data[i] = s->data[start + i * step];
+    }
+    return r;
+}
+
+/* ---- str methods (ASCII case/whitespace rules) ---- */
+
+PyrsStr *pyrs_str_upper(const PyrsStr *s) {
+    check_ref(s);
+    PyrsStr *r = str_alloc(s->len);
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        r->data[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    return r;
+}
+
+PyrsStr *pyrs_str_lower(const PyrsStr *s) {
+    check_ref(s);
+    PyrsStr *r = str_alloc(s->len);
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        r->data[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    return r;
+}
+
+static int is_py_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
+static PyrsStr *strip_impl(const PyrsStr *s, int left, int right) {
+    check_ref(s);
+    long long b = 0;
+    long long e = s->len;
+    if (left) {
+        while (b < e && is_py_space(s->data[b])) {
+            b++;
+        }
+    }
+    if (right) {
+        while (e > b && is_py_space(s->data[e - 1])) {
+            e--;
+        }
+    }
+    return str_sub(s, b, e - b);
+}
+
+PyrsStr *pyrs_str_strip(const PyrsStr *s) {
+    return strip_impl(s, 1, 1);
+}
+PyrsStr *pyrs_str_lstrip(const PyrsStr *s) {
+    return strip_impl(s, 1, 0);
+}
+PyrsStr *pyrs_str_rstrip(const PyrsStr *s) {
+    return strip_impl(s, 0, 1);
+}
+
+int pyrs_str_startswith(const PyrsStr *s, const PyrsStr *pre) {
+    check_ref(s);
+    check_ref(pre);
+    return pre->len <= s->len && memcmp(s->data, pre->data, (size_t)pre->len) == 0;
+}
+
+int pyrs_str_endswith(const PyrsStr *s, const PyrsStr *suf) {
+    check_ref(s);
+    check_ref(suf);
+    return suf->len <= s->len &&
+           memcmp(s->data + s->len - suf->len, suf->data, (size_t)suf->len) == 0;
+}
+
+/* first index of t in s, or -1; the empty needle is found at 0 */
+long long pyrs_str_find(const PyrsStr *s, const PyrsStr *t) {
+    check_ref(s);
+    check_ref(t);
+    if (t->len > s->len) {
+        return -1;
+    }
+    for (long long i = 0; i + t->len <= s->len; i++) {
+        if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* non-overlapping occurrences; Python counts len+1 for an empty needle */
+long long pyrs_str_count(const PyrsStr *s, const PyrsStr *t) {
+    check_ref(s);
+    check_ref(t);
+    if (t->len == 0) {
+        return s->len + 1;
+    }
+    long long n = 0;
+    long long i = 0;
+    while (i + t->len <= s->len) {
+        if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
+            n++;
+            i += t->len;
+        } else {
+            i++;
+        }
+    }
+    return n;
+}
+
+PyrsStr *pyrs_str_replace(const PyrsStr *s, const PyrsStr *old, const PyrsStr *new_s) {
+    check_ref(s);
+    check_ref(old);
+    check_ref(new_s);
+    /* Python: an empty old inserts new between every character */
+    if (old->len == 0) {
+        long long n = s->len + (s->len + 1) * new_s->len;
+        PyrsStr *r = str_alloc(n);
+        char *p = r->data;
+        for (long long i = 0; i < s->len; i++) {
+            memcpy(p, new_s->data, (size_t)new_s->len);
+            p += new_s->len;
+            *p++ = s->data[i];
+        }
+        memcpy(p, new_s->data, (size_t)new_s->len);
+        return r;
+    }
+    long long count = pyrs_str_count(s, old);
+    if (count == 0) {
+        /* immutable, so sharing is safe — but return a copy of the header
+         * shape anyway to keep ownership simple */
+        return str_sub(s, 0, s->len);
+    }
+    long long n = s->len + count * (new_s->len - old->len);
+    PyrsStr *r = str_alloc(n);
+    char *p = r->data;
+    long long i = 0;
+    while (i < s->len) {
+        if (i + old->len <= s->len && memcmp(s->data + i, old->data, (size_t)old->len) == 0) {
+            memcpy(p, new_s->data, (size_t)new_s->len);
+            p += new_s->len;
+            i += old->len;
+        } else {
+            *p++ = s->data[i++];
+        }
+    }
+    return r;
+}
+
+/* split on whitespace runs, skipping empty parts (Python's s.split()) */
+PyrsList *pyrs_str_split_ws(const PyrsStr *s) {
+    check_ref(s);
+    PyrsList *r = pyrs_list_new(4);
+    long long i = 0;
+    while (i < s->len) {
+        while (i < s->len && is_py_space(s->data[i])) {
+            i++;
+        }
+        long long start = i;
+        while (i < s->len && !is_py_space(s->data[i])) {
+            i++;
+        }
+        if (i > start) {
+            pyrs_list_push(r, (long long)str_sub(s, start, i - start));
+        }
+    }
+    return r;
+}
+
+/* split on a nonempty separator, keeping empty parts (Python's
+ * s.split(sep)) */
+PyrsList *pyrs_str_split(const PyrsStr *s, const PyrsStr *sep) {
+    check_ref(s);
+    check_ref(sep);
+    if (sep->len == 0) {
+        pyrs_die("ValueError: empty separator");
+    }
+    PyrsList *r = pyrs_list_new(4);
+    long long start = 0;
+    long long i = 0;
+    while (i + sep->len <= s->len) {
+        if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {
+            pyrs_list_push(r, (long long)str_sub(s, start, i - start));
+            i += sep->len;
+            start = i;
+        } else {
+            i++;
+        }
+    }
+    pyrs_list_push(r, (long long)str_sub(s, start, s->len - start));
+    return r;
+}
+
+PyrsStr *pyrs_str_join(const PyrsStr *sep, const PyrsList *parts) {
+    check_ref(sep);
+    check_ref(parts);
+    if (parts->len == 0) {
+        return EMPTY_STR;
+    }
+    long long total = sep->len * (parts->len - 1);
+    for (long long i = 0; i < parts->len; i++) {
+        total += ((const PyrsStr *)parts->data[i])->len;
+    }
+    PyrsStr *r = str_alloc(total);
+    char *p = r->data;
+    for (long long i = 0; i < parts->len; i++) {
+        if (i > 0) {
+            memcpy(p, sep->data, (size_t)sep->len);
+            p += sep->len;
+        }
+        const PyrsStr *part = (const PyrsStr *)parts->data[i];
+        check_ref(part);
+        memcpy(p, part->data, (size_t)part->len);
+        p += part->len;
+    }
     return r;
 }
 
@@ -360,14 +607,23 @@ void pyrs_list_set(PyrsList *l, long long i, long long slot) {
     l->data[i] = slot;
 }
 
-PyrsList *pyrs_list_slice(const PyrsList *l, long long lo, long long hi) {
+PyrsList *pyrs_list_slice(const PyrsList *l, long long lo, long long hi, long long step) {
     check_ref(l);
-    lo = clamp_bound(lo, l->len);
-    hi = clamp_bound(hi, l->len);
-    long long n = hi > lo ? hi - lo : 0;
+    if (step == 0) {
+        pyrs_die("ValueError: slice step cannot be zero");
+    }
+    long long start = resolve_slice_bound(lo, 1, l->len, step);
+    long long stop = resolve_slice_bound(hi, 0, l->len, step);
+    long long n = slice_count(start, stop, step);
     PyrsList *r = pyrs_list_new(n);
     if (n > 0) {
-        memcpy(r->data, l->data + lo, (size_t)n * sizeof(long long));
+        if (step == 1) {
+            memcpy(r->data, l->data + start, (size_t)n * sizeof(long long));
+        } else {
+            for (long long i = 0; i < n; i++) {
+                r->data[i] = l->data[start + i * step];
+            }
+        }
         r->len = n;
     }
     return r;
