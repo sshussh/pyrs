@@ -450,6 +450,7 @@ functions, closures, `lambda`, and redefining a function.
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `global x` | (statement) | write access to a module global |
 | `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |
+| `open(path[, mode])` | str path, mode "r"/"w"/"a" | file value with read/readline/readlines/write/close |
 | `sys.argv` | needs `import sys` | list[str]; `[0]` is the binary path |
 | `int(x)` | int, float (truncates toward zero), bool | int |
 | `float(x)` | int, float, bool | float |
@@ -477,6 +478,36 @@ Indentation defines blocks; spaces and tabs both work (a tab counts as 8
 columns) but inconsistent dedents are an error. Number literals accept
 underscores (`1_000_000`), floats accept `1.5`, `.5`, `2.`, `1e3`,
 `2.5e-2`.
+
+### Files
+
+`open(path)` (read), `open(path, "w")` (write/truncate), and
+`open(path, "a")` (append) return a file value:
+
+```python
+out = open("report.txt", "w")
+out.write("hello\n")           # returns the character count
+out.close()                    # idempotent, like Python
+
+f = open("report.txt")
+text = f.read()                # everything remaining
+f.close()
+
+for line in open("report.txt").readlines():   # lines keep their '\n'
+    print(line.strip())
+```
+
+`readline()` returns `""` at end of file. Errors match CPython exactly:
+missing files raise `FileNotFoundError: [Errno 2] ...`, operations on a
+closed file raise `ValueError: I/O operation on closed file.`, and
+reading a write-mode file raises `io.UnsupportedOperation: not
+readable`. Writes are flushed immediately, so data survives even if you
+forget `close()`.
+
+Not supported yet: binary modes, `with open(...) as f:`, iterating the
+file object directly (use `.readlines()`), printing file objects, and
+file-typed function parameters (there is no `file` annotation — handles
+are inferred locally).
 
 ### Standard input and arguments
 
@@ -510,6 +541,9 @@ print the same message CPython would, then exit with code 1:
 | `ValueError: slice step cannot be zero` | zero slice step at runtime |
 | `ValueError: empty separator` | `s.split("")` |
 | `EOFError: EOF when reading a line` | `input()` at end of stdin |
+| `FileNotFoundError: [Errno 2] ...` / `PermissionError` / `IsADirectoryError` | `open()` failures |
+| `ValueError: I/O operation on closed file.` | using a closed file |
+| `io.UnsupportedOperation: not readable` / `not writable` | wrong-mode file operations |
 | `ValueError: cannot convert float NaN to integer` | `int(nan)` |
 | `OverflowError: cannot convert float infinity to integer` | `int(inf)` |
 | `ValueError: integer to a negative power...` | `x ** e` with a dynamic negative int `e` |
@@ -571,9 +605,7 @@ deliberate exceptions:
    whitespace (`strip`/`split`) — Python is Unicode-aware.
 9. **Memory is never freed** (no GC yet); fine for short-lived programs,
    a known limitation for long-running ones.
-10. **Str elements print unescaped in list reprs**
-    (`["a'b"]` prints `['a'b']`, Python escapes the quote).
-11. **`float ** float` with a negative base and fractional exponent**
+10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
 
 Not implemented yet (clear compile errors): classes, dicts, sets, tuples,

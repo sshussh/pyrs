@@ -1123,3 +1123,127 @@ fn import_of_unknown_module_is_error() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("only 'import sys'"), "stderr: {stderr}");
 }
+
+// ---- v0.6: file I/O ----
+
+#[test]
+fn file_write_read_roundtrip() {
+    let dir = TempDir::new("fileio");
+    let data = dir.0.join("data.txt").display().to_string();
+    let out = run_program(
+        "fileio",
+        &format!(
+            "\
+path = \"{data}\"
+f = open(path, \"w\")
+n = f.write(\"hello\\n\")
+f.write(\"world\\n\")
+f.close()
+print(n)
+
+r = open(path)
+print(r.read().split())
+r.close()
+
+r2 = open(path)
+print(r2.readline() + \"|\")
+r2.close()
+
+r3 = open(path)
+print(r3.readlines())
+r3.close()
+
+a = open(path, \"a\")
+a.write(\"third\\n\")
+a.close()
+print(len(open(path).readlines()))
+"
+        ),
+    );
+    assert_eq!(
+        out,
+        "6\n['hello', 'world']\nhello\n|\n['hello\\n', 'world\\n']\n3\n"
+    );
+}
+
+#[test]
+fn list_repr_escapes_like_python() {
+    let out = run_program(
+        "represcape",
+        "print([\"a\\nb\", \"don't\", 'say \"hi\"', \"tab\\there\"])\n",
+    );
+    // verified against python3: quote switching + escapes
+    assert_eq!(out, "['a\\nb', \"don't\", 'say \"hi\"', 'tab\\there']\n");
+}
+
+#[test]
+fn file_errors_match_python() {
+    let (code, stderr) = run_program_expect_fail("fnf", "f = open(\"/nonexistent-pyrs-e2e\")\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(
+            "FileNotFoundError: [Errno 2] No such file or directory: \
+             '/nonexistent-pyrs-e2e'"
+        ),
+        "stderr: {stderr}"
+    );
+
+    let dir = TempDir::new("fileerrs");
+    let path = dir.0.join("t.txt").display().to_string();
+    let (_, stderr) = run_program_expect_fail(
+        "closedread",
+        &format!("f = open(\"{path}\", \"w\")\nf.close()\nf.read()\n"),
+    );
+    assert!(
+        stderr.contains("ValueError: I/O operation on closed file."),
+        "stderr: {stderr}"
+    );
+
+    let (_, stderr) = run_program_expect_fail(
+        "notwritable",
+        &format!(
+            "w = open(\"{path}\", \"w\")\nw.close()\n\
+             f = open(\"{path}\")\nf.write(\"x\")\n"
+        ),
+    );
+    assert!(
+        stderr.contains("io.UnsupportedOperation: not writable"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn open_invalid_mode_is_compile_error_when_constant() {
+    let dir = TempDir::new("badmode");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "f = open(\"x\", \"q\")\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid mode: 'q'"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn file_misuse_is_compile_error() {
+    let dir = TempDir::new("filemisuse");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "f = open(\"x\")\nprint(f)\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be printed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

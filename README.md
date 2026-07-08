@@ -36,7 +36,7 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.5)
+## The language (v0.6)
 
 A statically-typed Python subset:
 
@@ -66,7 +66,9 @@ A statically-typed Python subset:
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
 - **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for
-  command-line arguments — compiled programs are real CLI tools
+  command-line arguments; files via `open(path, mode)` with
+  `.read()`/`.readline()`/`.readlines()`/`.write()`/`.close()` and
+  CPython's exact error messages — compiled programs are real CLI tools
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 
@@ -87,13 +89,15 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.5): no bigints (int is 64-bit and wraps), `and`/`or`
+Known limits (v0.6): no bigints (int is 64-bit and wraps), `and`/`or`
 return `bool` rather than the operand, `x ** e` with a *dynamic*
 negative int exponent traps (a constant like `2 ** -1` works and gives
 float), int↔float comparisons convert the int to float (exactness loss
 past 2^53), list literals coerce mixed numerics to one element type,
 `nan in [nan]` is False (no identity semantics), str methods use ASCII
-case/whitespace rules, heap memory is never freed, and f-string format
+case/whitespace rules, heap memory is never freed, files support text
+modes "r"/"w"/"a" only (no `with`, no `for line in f`, no file-typed
+parameters yet), and f-string format
 specs / dicts / tuples / classes / exceptions are not in yet — the
 parser reports "not supported yet" for each.
 
