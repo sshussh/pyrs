@@ -11,6 +11,7 @@ use std::{
 };
 
 mod cli;
+mod modules;
 
 fn main() {
     let args = cli::Cli::parse();
@@ -65,12 +66,26 @@ fn run(args: cli::Cli) -> Result<i32, String> {
     }
 }
 
-/// The full pipeline: source file in, linked native executable out.
+/// The full pipeline: source file(s) in, linked native executable out.
 fn compile(input: &Path, output: &Path, opt_level: u8, emit_llvm: bool) -> Result<(), String> {
-    let source = read_source(input)?;
+    // resolve imports into a topologically-ordered set of modules
+    let loaded = modules::load_program(input).map_err(|e| e.0)?;
+    let inputs: Vec<semantic::ModuleInput> = loaded
+        .iter()
+        .map(|m| semantic::ModuleInput {
+            name: m.name.clone(),
+            ast: &m.ast,
+        })
+        .collect();
 
-    let module = parser::parse(&source).map_err(|d| render_diag(&d, input, &source))?;
-    let ir_module = semantic::analyze(&module).map_err(|d| render_diag(&d, input, &source))?;
+    let ir_module = semantic::analyze_program(&inputs).map_err(|d| {
+        let m = &loaded[d.file.min(loaded.len() - 1)];
+        if d.span == Span::default() {
+            format!("{d}")
+        } else {
+            d.render(&m.display, &m.source)
+        }
+    })?;
     let llvm_ir = codegen::emit_llvm_ir(&ir_module);
 
     if emit_llvm {
