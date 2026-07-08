@@ -96,6 +96,13 @@ pub enum Stmt {
         list: Expr,
         value: Expr,
     },
+    /// Append without a capacity check. Only emitted where the list was
+    /// created with guaranteed-sufficient capacity (comprehension fast
+    /// path); codegen inlines the store + length bump.
+    ListAppendUnchecked {
+        list: Expr,
+        value: Expr,
+    },
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
         orelse: Vec<Stmt>,
@@ -204,6 +211,16 @@ pub enum ExprKind {
     },
     /// A list literal; `ty` is `List(elem)` and items are already coerced.
     ListLit(Vec<Expr>),
+    /// A fresh empty list with the given capacity (comprehension results).
+    ListNew {
+        cap: Box<Expr>,
+    },
+    /// Statements evaluated for effect, then a result expression — the
+    /// hook that lets loops live inside expressions (comprehensions).
+    Block {
+        stmts: Vec<Stmt>,
+        result: Box<Expr>,
+    },
     /// `len(x)` for str or list.
     Len(Box<Expr>),
     /// int → float (sitofp)
