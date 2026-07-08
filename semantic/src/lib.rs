@@ -215,6 +215,10 @@ struct FnCtx<'a> {
     locals_order: Vec<(String, ir::Ty)>,
     loop_depth: usize,
     temp_counter: usize,
+    /// Active comprehension variables: user name → (storage local, type).
+    /// Innermost last. Comprehension variables shadow but never leak
+    /// (Python 3 scoping).
+    comp_renames: Vec<(String, String, ir::Ty)>,
 }
 
 impl FnCtx<'_> {
@@ -255,6 +259,7 @@ fn lower_function(
         locals_order: Vec::new(),
         loop_depth: 0,
         temp_counter: 0,
+        comp_renames: Vec::new(),
     };
 
     for p in &f.params {
@@ -1516,6 +1521,17 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             expr.span,
         )),
         ast::ExprKind::Name(name) => {
+            if let Some((_, storage, ty)) = ctx
+                .comp_renames
+                .iter()
+                .rev()
+                .find(|(user, _, _)| user == name)
+            {
+                return Ok(ir::Expr {
+                    ty: *ty,
+                    kind: ir::ExprKind::Local(storage.clone()),
+                });
+            }
             if let Some(ty) = ctx.locals.get(name) {
                 Ok(ir::Expr {
                     ty: *ty,
@@ -1537,6 +1553,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             }
         }
         ast::ExprKind::ListLit(items) => lower_list_lit(items, None, expr.span, ctx),
+        ast::ExprKind::ListComp {
+            elem,
+            var,
+            var_span,
+            iter,
+            cond,
+        } => lower_list_comp(elem, var, *var_span, iter, cond.as_deref(), expr.span, ctx),
         ast::ExprKind::Index { base, index } => {
             let base_ir = lower_expr(base, ctx)?;
             let result_ty = match base_ir.ty {
@@ -1814,6 +1837,328 @@ fn lower_compare_chain(
             name: temp,
             value: Box::new(cur),
             body: Box::new(bool_and(head, tail)),
+        },
+    })
+}
+
+/// `[elem for var in iter if cond]` desugars to a loop building a list
+/// inside an expression-level Block. The variable lives in a hidden
+/// storage slot (Python 3: it shadows but does not leak). Fast path:
+/// when the produced count is knowable (list/str sources always; range
+/// with a constant step of 1), the result is allocated at full capacity
+/// and appended without per-element capacity checks.
+fn lower_list_comp(
+    elem: &ast::Expr,
+    var: &str,
+    var_span: Span,
+    iter: &ast::Expr,
+    cond: Option<&ast::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let mut stmts: Vec<ir::Stmt> = Vec::new();
+
+    // ---- source setup: yields (per-iteration element expr, loop parts) ----
+    struct Loop {
+        cond: ir::Expr,
+        step: Vec<ir::Stmt>,
+        element: ir::Expr,
+        /// exact or upper-bound capacity when knowable
+        cap: Option<ir::Expr>,
+    }
+
+    let looping: Loop = if let ast::ExprKind::Call { func, args, .. } = &iter.kind
+        && func == "range"
+        && !ctx.funcs.contains_key("range")
+    {
+        if args.is_empty() || args.len() > 3 {
+            return Err(err(
+                format!("range() takes 1 to 3 arguments ({} given)", args.len()),
+                iter.span,
+            ));
+        }
+        let mut lowered: Vec<ir::Expr> = Vec::new();
+        for a in args {
+            let v = lower_expr(a, ctx)?;
+            lowered.push(coerce(v, ir::Ty::Int, a.span, "range() argument")?);
+        }
+        let (start, stop, step) = match lowered.len() {
+            1 => (int_const(0), lowered.remove(0), int_const(1)),
+            2 => {
+                let stop = lowered.remove(1);
+                (lowered.remove(0), stop, int_const(1))
+            }
+            _ => {
+                let step = lowered.remove(2);
+                let stop = lowered.remove(1);
+                (lowered.remove(0), stop, step)
+            }
+        };
+        let stop_t = ctx.fresh_temp("comp.stop", ir::Ty::Int);
+        stmts.push(ir::Stmt::Assign {
+            name: stop_t.clone(),
+            value: stop,
+        });
+        let stop_local = ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Local(stop_t),
+        };
+        let it_t = ctx.fresh_temp("comp.it", ir::Ty::Int);
+        stmts.push(ir::Stmt::Assign {
+            name: it_t.clone(),
+            value: start,
+        });
+        let it_local = ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Local(it_t.clone()),
+        };
+
+        let (loop_cond, step_value, cap) = match step.kind {
+            ir::ExprKind::ConstInt(0) => {
+                return Err(err("range() arg 3 must not be zero", iter.span));
+            }
+            ir::ExprKind::ConstInt(1) => {
+                // presize: cap = max(0, stop - it)
+                let cap_t = ctx.fresh_temp("comp.cap", ir::Ty::Int);
+                stmts.push(ir::Stmt::Assign {
+                    name: cap_t.clone(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Binary {
+                            op: ir::BinOp::Sub,
+                            left: Box::new(stop_local.clone()),
+                            right: Box::new(it_local.clone()),
+                        },
+                    },
+                });
+                let cap_local = ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Local(cap_t.clone()),
+                };
+                stmts.push(ir::Stmt::If {
+                    branches: vec![(
+                        int_cmp(ir::BinOp::Lt, cap_local.clone(), int_const(0)),
+                        vec![ir::Stmt::Assign {
+                            name: cap_t,
+                            value: int_const(0),
+                        }],
+                    )],
+                    orelse: vec![],
+                });
+                (
+                    int_cmp(ir::BinOp::Lt, it_local.clone(), stop_local),
+                    int_const(1),
+                    Some(cap_local),
+                )
+            }
+            ir::ExprKind::ConstInt(k) => {
+                let op = if k > 0 { ir::BinOp::Lt } else { ir::BinOp::Gt };
+                (
+                    int_cmp(op, it_local.clone(), stop_local),
+                    int_const(k),
+                    None,
+                )
+            }
+            _ => {
+                let step_t = ctx.fresh_temp("comp.step", ir::Ty::Int);
+                stmts.push(ir::Stmt::Assign {
+                    name: step_t.clone(),
+                    value: step,
+                });
+                let step_local = ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Local(step_t),
+                };
+                stmts.push(ir::Stmt::If {
+                    branches: vec![(
+                        int_cmp(ir::BinOp::Eq, step_local.clone(), int_const(0)),
+                        vec![ir::Stmt::Die(
+                            "ValueError: range() arg 3 must not be zero".to_string(),
+                        )],
+                    )],
+                    orelse: vec![],
+                });
+                let up = bool_and(
+                    int_cmp(ir::BinOp::Gt, step_local.clone(), int_const(0)),
+                    int_cmp(ir::BinOp::Lt, it_local.clone(), stop_local.clone()),
+                );
+                let down = bool_and(
+                    int_cmp(ir::BinOp::Lt, step_local.clone(), int_const(0)),
+                    int_cmp(ir::BinOp::Gt, it_local.clone(), stop_local),
+                );
+                let cond = ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Or,
+                        left: Box::new(up),
+                        right: Box::new(down),
+                    },
+                };
+                (cond, step_local, None)
+            }
+        };
+        let step_stmt = ir::Stmt::Assign {
+            name: it_t,
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(it_local.clone()),
+                    right: Box::new(step_value),
+                },
+            },
+        };
+        Loop {
+            cond: loop_cond,
+            step: vec![step_stmt],
+            element: it_local,
+            cap,
+        }
+    } else {
+        // list or str: index loop, exact/upper-bound presize via len
+        let seq = lower_expr(iter, ctx)?;
+        let src_elem_ty = match seq.ty {
+            ir::Ty::List(e) => *e,
+            ir::Ty::Str => ir::Ty::Str,
+            other => {
+                return Err(err(format!("'{other}' object is not iterable"), iter.span));
+            }
+        };
+        let seq_ty = seq.ty;
+        let seq_t = ctx.fresh_temp("comp.seq", seq_ty);
+        stmts.push(ir::Stmt::Assign {
+            name: seq_t.clone(),
+            value: seq,
+        });
+        let idx_t = ctx.fresh_temp("comp.idx", ir::Ty::Int);
+        stmts.push(ir::Stmt::Assign {
+            name: idx_t.clone(),
+            value: int_const(0),
+        });
+        let seq_local = ir::Expr {
+            ty: seq_ty,
+            kind: ir::ExprKind::Local(seq_t),
+        };
+        let idx_local = ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Local(idx_t.clone()),
+        };
+        let cond = int_cmp(
+            ir::BinOp::Lt,
+            idx_local.clone(),
+            ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(seq_local.clone())),
+            },
+        );
+        let element = ir::Expr {
+            ty: src_elem_ty,
+            kind: ir::ExprKind::Index {
+                base: Box::new(seq_local.clone()),
+                index: Box::new(idx_local.clone()),
+            },
+        };
+        let step_stmt = ir::Stmt::Assign {
+            name: idx_t,
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(idx_local),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        };
+        // exact capacity without a filter, upper bound with one
+        let cap = ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Len(Box::new(seq_local)),
+        };
+        Loop {
+            cond,
+            step: vec![step_stmt],
+            element,
+            cap: Some(cap),
+        }
+    };
+
+    // ---- hidden storage for the loop variable ----
+    let src_elem_ty = looping.element.ty;
+    ctx.temp_counter += 1;
+    let storage = format!(".comp{}.{var}", ctx.temp_counter);
+    ctx.locals_order.push((storage.clone(), src_elem_ty));
+
+    ctx.comp_renames
+        .push((var.to_string(), storage.clone(), src_elem_ty));
+    let elem_ir = lower_expr(elem, ctx);
+    let cond_ir = match cond {
+        Some(c) => lower_condition(c, ctx).map(Some),
+        Option::None => Ok(Option::None),
+    };
+    ctx.comp_renames.pop();
+    let elem_ir = elem_ir?;
+    let cond_ir = cond_ir?;
+
+    let elem_ty = elem_of(elem_ir.ty, elem.span)?;
+    let _ = var_span;
+
+    // ---- result list ----
+    let presized = looping.cap.is_some();
+    let cap_expr = looping.cap.unwrap_or(int_const(4));
+    let res_t = ctx.fresh_temp("comp.res", ir::list_of(elem_ty));
+    stmts.push(ir::Stmt::Assign {
+        name: res_t.clone(),
+        value: ir::Expr {
+            ty: ir::list_of(elem_ty),
+            kind: ir::ExprKind::ListNew {
+                cap: Box::new(cap_expr),
+            },
+        },
+    });
+    let res_local = ir::Expr {
+        ty: ir::list_of(elem_ty),
+        kind: ir::ExprKind::Local(res_t.clone()),
+    };
+
+    // ---- loop body: var = element; [if cond:] append(elem) ----
+    let append = if presized {
+        ir::Stmt::ListAppendUnchecked {
+            list: res_local.clone(),
+            value: elem_ir,
+        }
+    } else {
+        ir::Stmt::ListAppend {
+            list: res_local.clone(),
+            value: elem_ir,
+        }
+    };
+    let mut body = vec![ir::Stmt::Assign {
+        name: storage,
+        value: looping.element,
+    }];
+    match cond_ir {
+        Some(c) => body.push(ir::Stmt::If {
+            branches: vec![(c, vec![append])],
+            orelse: vec![],
+        }),
+        Option::None => body.push(append),
+    }
+
+    stmts.push(ir::Stmt::While {
+        cond: looping.cond,
+        body,
+        step: looping.step,
+    });
+
+    let _ = span;
+    Ok(ir::Expr {
+        ty: ir::list_of(elem_ty),
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(ir::Expr {
+                ty: ir::list_of(elem_ty),
+                kind: ir::ExprKind::Local(res_t),
+            }),
         },
     })
 }
