@@ -113,6 +113,13 @@ pub enum StmtKind {
         module: String,
         span: Span,
     },
+    /// `with expr [as name]:` — files only; close() runs on every exit
+    /// path out of the body.
+    With {
+        item: Expr,
+        target: Option<(String, Span)>,
+        body: Vec<Stmt>,
+    },
     Pass,
     Break,
     Continue,

@@ -164,7 +164,7 @@ impl Parser {
             Token::From => Err(self.error("'from ... import ...' is not supported yet")),
             Token::Try | Token::Raise => Err(self.error("exceptions are not supported yet")),
             Token::Match => Err(self.error("'match' statements are not supported yet")),
-            Token::With => Err(self.error("'with' statements are not supported yet")),
+            Token::With => self.parse_with(),
             Token::Indent => Err(self.error("unexpected indent")),
             _ => {
                 let stmt = self.parse_simple_stmt()?;
@@ -492,6 +492,28 @@ impl Parser {
                 iter,
                 body,
             },
+            span: start.to(end),
+        })
+    }
+
+    fn parse_with(&mut self) -> PResult<Stmt> {
+        let start = self.expect(Token::With, "")?;
+        let item = self.parse_expr()?;
+        let target = if self.eat(&Token::As) {
+            Some(self.expect_ident("after 'as'")?)
+        } else {
+            None
+        };
+        if self.peek() == &Token::Comma {
+            return Err(self.error(
+                "multiple context managers in one 'with' are not supported \
+                 yet; nest them instead",
+            ));
+        }
+        let body = self.parse_block("'with' body")?;
+        let end = self.peek_span();
+        Ok(Stmt {
+            kind: StmtKind::With { item, target, body },
             span: start.to(end),
         })
     }
