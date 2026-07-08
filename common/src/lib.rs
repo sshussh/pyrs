@@ -62,11 +62,15 @@ impl fmt::Display for Phase {
 }
 
 /// A compiler error tied to a location in the source.
+///
+/// `file` indexes the driver's file table (0 = the entry/root file), so
+/// diagnostics from any module render against the right source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub phase: Phase,
     pub message: String,
     pub span: Span,
+    pub file: usize,
 }
 
 impl Diagnostic {
@@ -75,7 +79,14 @@ impl Diagnostic {
             phase,
             message: message.into(),
             span,
+            file: 0,
         }
+    }
+
+    /// Tag this diagnostic with the file it belongs to.
+    pub fn with_file(mut self, file: usize) -> Self {
+        self.file = file;
+        self
     }
 
     /// Render the diagnostic with a source snippet and caret underline:
