@@ -39,34 +39,21 @@ fn err(message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic::new(Phase::Semantic, message, span)
 }
 
-fn resolve_elem(e: ast::ElemName) -> ir::Elem {
-    match e {
-        ast::ElemName::Int => ir::Elem::Int,
-        ast::ElemName::Float => ir::Elem::Float,
-        ast::ElemName::Bool => ir::Elem::Bool,
-        ast::ElemName::Str => ir::Elem::Str,
-    }
-}
-
 fn resolve_type(ty: ast::TypeName) -> ir::Ty {
     match ty {
         ast::TypeName::Int => ir::Ty::Int,
         ast::TypeName::Float => ir::Ty::Float,
         ast::TypeName::Bool => ir::Ty::Bool,
         ast::TypeName::Str => ir::Ty::Str,
-        ast::TypeName::List(e) => ir::Ty::List(resolve_elem(e)),
+        ast::TypeName::List(e) => ir::list_of(resolve_type(*e)),
         ast::TypeName::None => ir::Ty::None,
     }
 }
 
-fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Elem> {
+fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Ty> {
     match ty {
-        ir::Ty::Int => Ok(ir::Elem::Int),
-        ir::Ty::Float => Ok(ir::Elem::Float),
-        ir::Ty::Bool => Ok(ir::Elem::Bool),
-        ir::Ty::Str => Ok(ir::Elem::Str),
-        ir::Ty::List(_) => Err(err("nested lists are not supported yet", span)),
         ir::Ty::None => Err(err("list elements cannot be None", span)),
+        other => Ok(other),
     }
 }
 
@@ -119,7 +106,12 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
         }
     }
 
-    for builtin in ["print", "len", "range"] {
+    let sys_imported = module
+        .body
+        .iter()
+        .any(|s| matches!(&s.kind, ast::StmtKind::Import { module, .. } if module == "sys"));
+
+    for builtin in ["print", "len", "range", "input"] {
         if funcs.contains_key(builtin) {
             let f = func_order.iter().find(|f| f.name == builtin).unwrap();
             return Err(err(
@@ -149,6 +141,7 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
             &mut globals,
             &mut globals_order,
             true,
+            sys_imported,
         )?)
     } else if let Some(sig) = funcs.get("main") {
         // no top-level code: call main() if it takes no arguments
@@ -186,6 +179,7 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
             &mut globals,
             &mut globals_order,
             false,
+            sys_imported,
         )?);
     }
 
@@ -210,6 +204,8 @@ struct FnCtx<'a> {
     globals_order: &'a mut Vec<(String, ir::Ty)>,
     /// The synthesized entry function: its bindings ARE the globals.
     is_entry: bool,
+    /// Whether the module has `import sys` (enables sys.argv).
+    sys_imported: bool,
     /// Names this function declared with `global`.
     declared_globals: std::collections::HashSet<String>,
     fn_name: String,
@@ -242,6 +238,7 @@ fn lower_function(
     globals: &mut HashMap<String, ir::Ty>,
     globals_order: &mut Vec<(String, ir::Ty)>,
     is_entry: bool,
+    sys_imported: bool,
 ) -> SResult<ir::Function> {
     let mut params = Vec::new();
     let mut ctx = FnCtx {
@@ -249,6 +246,7 @@ fn lower_function(
         globals,
         globals_order,
         is_entry,
+        sys_imported,
         declared_globals: std::collections::HashSet::new(),
         fn_name: f.name.clone(),
         ret: f.ret.map(resolve_type).unwrap_or(ir::Ty::None),
@@ -307,6 +305,21 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             f.span,
         )),
         ast::StmtKind::Pass => Ok(()),
+        ast::StmtKind::Import { module, span } => {
+            if !ctx.is_entry {
+                return Err(err(
+                    "imports are only supported at the top level of the program",
+                    *span,
+                ));
+            }
+            if module != "sys" {
+                return Err(err(
+                    format!("module '{module}' is not available; only 'import sys' is supported"),
+                    *span,
+                ));
+            }
+            Ok(())
+        }
         ast::StmtKind::Global(names) => {
             // a no-op at module level, like Python
             if ctx.is_entry {
@@ -381,7 +394,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     let value = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) =
                         (&e.kind, expected)
                     {
-                        lower_list_lit(items, Some(elem), e.span, ctx)?
+                        lower_list_lit(items, Some(*elem), e.span, ctx)?
                     } else {
                         let v = lower_expr(e, ctx)?;
                         coerce(v, expected, e.span, "return value")?
@@ -490,7 +503,7 @@ fn lower_method_stmt(
                     ));
                 }
                 let value = lower_expr(&args[0], ctx)?;
-                let value = coerce(value, elem.ty(), args[0].span, "append() argument")?;
+                let value = coerce(value, *elem, args[0].span, "append() argument")?;
                 Ok(ir::Stmt::ListAppend {
                     list: base_ir,
                     value,
@@ -498,7 +511,7 @@ fn lower_method_stmt(
             }
             // pop as a statement discards the popped value
             "pop" => {
-                let pop = lower_list_pop(base_ir, elem, args, method_span, ctx)?;
+                let pop = lower_list_pop(base_ir, *elem, args, method_span, ctx)?;
                 Ok(ir::Stmt::ExprStmt(pop))
             }
             _ => Err(err(
@@ -553,7 +566,7 @@ fn lower_str_method(
                 ));
             }
             let parts = lower_expr(&args[0], ctx)?;
-            if parts.ty != ir::Ty::List(ir::Elem::Str) {
+            if parts.ty != ir::list_of(ir::Ty::Str) {
                 return Err(err(
                     format!("join() expects a list[str], found {}", parts.ty),
                     args[0].span,
@@ -637,7 +650,7 @@ fn lower_str_split(
         }
     };
     Ok(ir::Expr {
-        ty: ir::Ty::List(ir::Elem::Str),
+        ty: ir::list_of(ir::Ty::Str),
         kind: ir::ExprKind::StrCall {
             func,
             args: call_args,
@@ -647,7 +660,7 @@ fn lower_str_split(
 
 fn lower_list_pop(
     list: ir::Expr,
-    elem: ir::Elem,
+    elem: ir::Ty,
     args: &[ast::Expr],
     method_span: Span,
     ctx: &mut FnCtx,
@@ -666,7 +679,7 @@ fn lower_list_pop(
         }
     };
     Ok(ir::Expr {
-        ty: elem.ty(),
+        ty: elem,
         kind: ir::ExprKind::ListPop {
             list: Box::new(list),
             index: Box::new(index),
@@ -689,7 +702,7 @@ fn lower_assign(
             let lowered = if let (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem))) =
                 (&value.kind, ann_ty)
             {
-                lower_list_lit(items, Some(elem), value.span, ctx)?
+                lower_list_lit(items, Some(*elem), value.span, ctx)?
             } else {
                 lower_expr(value, ctx)?
             };
@@ -701,7 +714,7 @@ fn lower_assign(
         ast::AssignTarget::Index { base, index } => {
             let (list_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
             let value_ir = lower_expr(value, ctx)?;
-            let value_ir = coerce(value_ir, elem.ty(), value.span, "list element assignment")?;
+            let value_ir = coerce(value_ir, elem, value.span, "list element assignment")?;
             out.push(ir::Stmt::IndexAssign {
                 base: list_ir,
                 index: index_ir,
@@ -717,7 +730,7 @@ fn lower_index_target(
     base: &ast::Expr,
     index: &ast::Expr,
     ctx: &mut FnCtx,
-) -> SResult<(ir::Expr, ir::Elem, ir::Expr)> {
+) -> SResult<(ir::Expr, ir::Ty, ir::Expr)> {
     let base_ir = lower_expr(base, ctx)?;
     let elem = match base_ir.ty {
         ir::Ty::List(e) => e,
@@ -737,7 +750,7 @@ fn lower_index_target(
     };
     let index_ir = lower_expr(index, ctx)?;
     let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "list index")?;
-    Ok((base_ir, elem, index_ir))
+    Ok((base_ir, *elem, index_ir))
 }
 
 /// Bind `name = value_ir`, inferring or checking the variable's type.
@@ -903,7 +916,7 @@ fn lower_aug_assign(
                 kind: ir::ExprKind::Local(idx_t),
             };
             let current = ir::Expr {
-                ty: elem.ty(),
+                ty: elem,
                 kind: ir::ExprKind::Index {
                     base: Box::new(base_local.clone()),
                     index: Box::new(idx_local.clone()),
@@ -912,7 +925,7 @@ fn lower_aug_assign(
             let right = lower_expr(value, ctx)?;
             let combined = lower_binary(op, current, right, span)?;
             let combined =
-                coerce(combined, elem.ty(), span, "list element assignment").map_err(|e| {
+                coerce(combined, elem, span, "list element assignment").map_err(|e| {
                     Diagnostic::new(
                         Phase::Semantic,
                         format!("{}; a list element's type cannot change", e.message),
@@ -950,7 +963,7 @@ fn lower_for(
     // general case: iterate a list or a string by index
     let seq = lower_expr(iter, ctx)?;
     let elem_ty = match seq.ty {
-        ir::Ty::List(e) => e.ty(),
+        ir::Ty::List(e) => *e,
         ir::Ty::Str => ir::Ty::Str,
         other => {
             return Err(err(format!("'{other}' object is not iterable"), iter.span));
@@ -1328,7 +1341,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         ast::ExprKind::Index { base, index } => {
             let base_ir = lower_expr(base, ctx)?;
             let result_ty = match base_ir.ty {
-                ir::Ty::List(e) => e.ty(),
+                ir::Ty::List(e) => *e,
                 ir::Ty::Str => ir::Ty::Str,
                 other => {
                     return Err(err(
@@ -1347,6 +1360,38 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 },
             })
         }
+        ast::ExprKind::Attribute {
+            base,
+            attr,
+            attr_span,
+        } => {
+            if let ast::ExprKind::Name(module) = &base.kind
+                && module == "sys"
+            {
+                if !ctx.sys_imported {
+                    return Err(err(
+                        "name 'sys' is not defined; add 'import sys' at the top \
+                         of the program",
+                        base.span,
+                    ));
+                }
+                if attr == "argv" {
+                    return Ok(ir::Expr {
+                        ty: ir::list_of(ir::Ty::Str),
+                        kind: ir::ExprKind::Argv,
+                    });
+                }
+                return Err(err(
+                    format!("'sys.{attr}' is not supported yet (only sys.argv)"),
+                    *attr_span,
+                ));
+            }
+            Err(err(
+                "attribute access is only supported for 'sys.argv' and \
+                 method calls",
+                *attr_span,
+            ))
+        }
         ast::ExprKind::MethodCall {
             base,
             method,
@@ -1357,7 +1402,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             match base_ir.ty {
                 ir::Ty::List(elem) => match method.as_str() {
                     // pop returns the removed element
-                    "pop" => lower_list_pop(base_ir, elem, args, *method_span, ctx),
+                    "pop" => lower_list_pop(base_ir, *elem, args, *method_span, ctx),
                     "append" => Err(err(
                         "list.append(...) returns None and cannot be used \
                          in an expression",
@@ -1566,7 +1611,7 @@ fn lower_compare_chain(
 
 fn lower_list_lit(
     items: &[ast::Expr],
-    expected: Option<ir::Elem>,
+    expected: Option<ir::Ty>,
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
@@ -1579,7 +1624,7 @@ fn lower_list_lit(
             )
         })?;
         return Ok(ir::Expr {
-            ty: ir::Ty::List(elem),
+            ty: ir::list_of(elem),
             kind: ir::ExprKind::ListLit(vec![]),
         });
     }
@@ -1611,11 +1656,11 @@ fn lower_list_lit(
 
     let mut coerced = Vec::new();
     for (item, item_span) in lowered {
-        coerced.push(coerce(item, elem.ty(), item_span, "list element")?);
+        coerced.push(coerce(item, elem, item_span, "list element")?);
     }
 
     Ok(ir::Expr {
-        ty: ir::Ty::List(elem),
+        ty: ir::list_of(elem),
         kind: ir::ExprKind::ListLit(coerced),
     })
 }
@@ -1673,6 +1718,35 @@ fn lower_call(
                     span,
                 ));
             }
+            "input" => {
+                let prompt = match args {
+                    [] => Option::None,
+                    [p] => {
+                        let v = lower_expr(p, ctx)?;
+                        if v.ty != ir::Ty::Str {
+                            return Err(err(
+                                format!(
+                                    "input() prompt must be a str, found {} \
+                                     (wrap it in str(...))",
+                                    v.ty
+                                ),
+                                p.span,
+                            ));
+                        }
+                        Some(Box::new(v))
+                    }
+                    _ => {
+                        return Err(err(
+                            format!("input() takes at most one argument ({} given)", args.len()),
+                            span,
+                        ));
+                    }
+                };
+                return Ok(ir::Expr {
+                    ty: ir::Ty::Str,
+                    kind: ir::ExprKind::Input { prompt },
+                });
+            }
             _ => {
                 return Err(err(format!("function '{func}' is not defined"), func_span));
             }
@@ -1694,7 +1768,7 @@ fn lower_call(
     for (i, (arg, &expected)) in args.iter().zip(&sig.params).enumerate() {
         // `f([])` / `f([1, 2])` use the parameter's element type
         let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected) {
-            lower_list_lit(items, Some(elem), arg.span, ctx)?
+            lower_list_lit(items, Some(*elem), arg.span, ctx)?
         } else {
             lower_expr(arg, ctx)?
         };
@@ -1960,7 +2034,10 @@ fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResu
             }
             l
         }
-        ir::Ty::List(elem) => coerce(l, elem.ty(), span, "'in' operand")?,
+        ir::Ty::List(ir::Ty::List(_)) => {
+            return Err(err("'in' is not supported for lists of lists yet", span));
+        }
+        ir::Ty::List(elem) => coerce(l, *elem, span, "'in' operand")?,
         other => {
             return Err(err(format!("'{other}' does not support 'in'"), span));
         }
@@ -2227,7 +2304,7 @@ print(fib(10))
         let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
         };
-        assert_eq!(value.ty, ir::Ty::List(ir::Elem::Float));
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Float));
     }
 
     #[test]
@@ -2423,7 +2500,7 @@ print(count([]))
         let ir::Stmt::GlobalAssign { value, .. } = &entry.body[3] else {
             panic!();
         };
-        assert_eq!(value.ty, ir::Ty::List(ir::Elem::Int));
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
         // missing bounds become i64::MIN sentinels, missing step becomes 1
         let ir::ExprKind::Slice { lo, hi, step, .. } = &value.kind else {
             panic!();
