@@ -1,4 +1,4 @@
-// pyrs LLVM shim: textual IR in, native object file out.
+// PyRs LLVM shim: textual IR in, native object file out.
 //
 // Kept deliberately thin: all language knowledge lives on the Rust side;
 // this file only drives LLVM (parse -> verify -> optimize -> emit).

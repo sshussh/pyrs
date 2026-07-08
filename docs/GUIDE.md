@@ -1,10 +1,10 @@
 # The PyRs Guide
 
-Everything pyrs offers and how to use it: the toolchain, the CLI, the
+Everything PyRs offers and how to use it: the toolchain, the CLI, the
 complete language reference, how it differs from CPython, and how to get
 the most speed out of it.
 
-pyrs compiles a statically-typed subset of Python straight to native
+PyRs compiles a statically-typed subset of Python straight to native
 machine code through LLVM. There is no interpreter and no VM at runtime —
 `pyrs compile` hands you a standalone executable.
 
@@ -76,7 +76,7 @@ $ pyrs run -i hello.py                 # or compile-and-run in one step
 fib(30) = 832040
 ```
 
-The executable is standalone — it does not need pyrs or Python to run.
+The executable is standalone — it does not need PyRs or Python to run.
 
 ## 3. The command line
 
@@ -105,7 +105,7 @@ $ pyrs compile -i prog.py -o prog [-O 2] [--emit-llvm]
 | `--emit-llvm`  | also write the generated LLVM IR to `<output>.ll` | off |
 
 `--emit-llvm` is the window into the compiler: the `.ll` file is exactly
-what pyrs hands to LLVM, readable and diffable.
+what PyRs hands to LLVM, readable and diffable.
 
 ### `pyrs run`
 
@@ -145,9 +145,9 @@ $ make ci                           # format check + clippy + tests + parity
 
 ## 5. Language reference
 
-pyrs compiles a statically-typed subset of Python. Valid pyrs programs
+PyRs compiles a statically-typed subset of Python. Valid PyRs programs
 are valid Python programs with the same output — the reverse is not true,
-since pyrs requires type annotations on functions and rejects dynamic
+since PyRs requires type annotations on functions and rejects dynamic
 features (each with a "not supported yet" error naming the feature).
 
 ### Program structure
@@ -315,6 +315,7 @@ String methods (ASCII case/whitespace rules):
 "a,b,,c".split(",")       # ['a', 'b', '', 'c'] — keeps empty parts
 "a b  c".split()          # ['a', 'b', 'c']    — whitespace runs
 "-".join(["a", "b"])      # "a-b"
+"123".isdigit()           # True; "" and non-digits are False
 ```
 
 ### f-strings
@@ -650,7 +651,7 @@ first error.
 
 ## 8. Differences from CPython
 
-Everything pyrs *does* support behaves like Python — these are the known,
+Everything PyRs *does* support behaves like Python — these are the known,
 deliberate exceptions:
 
 1. **`int` is 64-bit** and wraps on overflow; there are no big integers.
@@ -689,7 +690,7 @@ keyword/default arguments, multiple assignment, and unpacking.
 Measured by `make bench` (best of 3, output byte-verified against
 python3 before timing — Linux, LLVM 22, CPython 3.14):
 
-| benchmark  | workload                        | python3 | pyrs   | speedup |
+| benchmark  | workload                        | python3 | PyRs   | speedup |
 |------------|---------------------------------|--------:|-------:|--------:|
 | fib        | recursion, 12M calls            |  1.158s | 0.027s |   42.6× |
 | mandelbrot | float math, 500×500             |  0.953s | 0.018s |   53.9× |
@@ -699,7 +700,7 @@ python3 before timing — Linux, LLVM 22, CPython 3.14):
 | strings    | per-char iteration              |  0.675s | 0.112s |    6.0× |
 | **total**  |                                 |  5.807s | 0.251s |   23.2× |
 
-What makes code fast in pyrs:
+What makes code fast in PyRs:
 
 - **Numeric loops and recursion** compile to the same machine code C
   would get — expect 40–160×.

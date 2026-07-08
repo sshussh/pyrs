@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Benchmark pyrs-compiled binaries against CPython.
+# Benchmark PyRs-compiled binaries against CPython.
 #
 #   ./run.sh            # all benchmarks, best of 3 runs each
 #   RUNS=5 ./run.sh     # more runs per benchmark
 #   ./run.sh fib sort   # a subset
 #
 # Each benchmark's output must be byte-identical between python3 and the
-# pyrs binary before it is timed — a mismatch aborts the suite.
+# PyRs binary before it is timed — a mismatch aborts the suite.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -14,7 +14,7 @@ PYRS=${PYRS:-../target/release/pyrs}
 RUNS=${RUNS:-3}
 
 command -v python3 > /dev/null || { echo "python3 not found" >&2; exit 1; }
-[ -x "$PYRS" ] || { echo "pyrs not built; run: cargo build --release" >&2; exit 1; }
+[ -x "$PYRS" ] || { echo "PyRs not built; run: cargo build --release" >&2; exit 1; }
 
 # best (minimum) wall time in nanoseconds over $RUNS runs
 best_ns() {
@@ -40,7 +40,7 @@ fi
 tmp=$(mktemp -d -t pyrs-bench-XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 
-printf '%-12s %12s %12s %10s\n' benchmark python3 pyrs speedup
+printf '%-12s %12s %12s %10s\n' benchmark python3 PyRs speedup
 printf '%-12s %12s %12s %10s\n' --------- ------- ---- -------
 
 total_py=0
@@ -52,7 +52,7 @@ for name in "${targets[@]}"; do
 
     # correctness first: outputs must match byte-for-byte
     if ! diff <(python3 "$src") <("$bin") > /dev/null; then
-        echo "$name: OUTPUT MISMATCH between python3 and pyrs" >&2
+        echo "$name: OUTPUT MISMATCH between python3 and PyRs" >&2
         exit 1
     fi
 

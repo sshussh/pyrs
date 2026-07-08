@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# pyrs — Python compiler in Rust
+# PyRs — Python compiler in Rust
 #
 #   make help                     list every target
 #   make run                      compile and run main.py (the scratch file)
@@ -12,7 +12,7 @@
 FILE    ?= main.py
 # Output binary, derived from FILE unless overridden
 OUT     ?= $(basename $(notdir $(FILE)))
-# pyrs optimization level (0-3)
+# PyRs optimization level (0-3)
 O       ?= 2
 # Benchmark repetitions (best-of-N)
 RUNS    ?= 3
@@ -38,11 +38,11 @@ release: ## Build the compiler (release)
 	$(CARGO) build --release
 
 .PHONY: install
-install: ## Install the pyrs binary into ~/.cargo/bin
+install: ## Install the PyRs binary into ~/.cargo/bin
 	$(CARGO) install --path cli
 
 # ---------------------------------------------------------------------------
-##@ Using pyrs
+##@ Using PyRs
 # ---------------------------------------------------------------------------
 
 .PHONY: compile
