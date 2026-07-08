@@ -852,3 +852,142 @@ print(reverse([1, 2, 3, 4]))
     );
     assert_eq!(out, "[4, 3, 2, 1]\n");
 }
+
+// ---- v0.4: slice steps, str methods, global variables ----
+
+#[test]
+fn slice_steps_match_python() {
+    let out = run_program(
+        "slicestep",
+        "\
+s = \"hello world\"
+print(s[::-1], s[::2], s[8:2:-2])
+xs = [1, 2, 3, 4, 5, 6, 7, 8]
+print(xs[::-1], xs[1:7:2], xs[7:1:-3], xs[::-2])
+print(s[5:5:-1] + \"|\", xs[0:0:2])
+",
+    );
+    assert_eq!(
+        out,
+        "dlrow olleh hlowrd rwo\n\
+         [8, 7, 6, 5, 4, 3, 2, 1] [2, 4, 6] [8, 5] [8, 6, 4, 2]\n\
+         | []\n"
+    );
+}
+
+#[test]
+fn str_methods_match_python() {
+    let out = run_program(
+        "strmethods",
+        "\
+t = \"  Hello, World!  \"
+print(t.strip() + \"|\", t.upper().strip(), t.lower().strip())
+print(\"hello\".startswith(\"he\"), \"hello\".endswith(\"lo\"), \"hello\".startswith(\"lo\"))
+print(\"banana\".find(\"an\"), \"banana\".find(\"x\"), \"banana\".count(\"an\"))
+print(\"banana\".replace(\"an\", \"-\"), \"abc\".replace(\"\", \".\"))
+print(\"a,b,,c\".split(\",\"))
+print(\"  the   quick  fox \".split())
+print(\"-\".join([\"a\", \"b\", \"c\"]))
+csv = \"name,age,city\"
+print(\", \".join(csv.split(\",\")))
+",
+    );
+    assert_eq!(
+        out,
+        "Hello, World!| HELLO, WORLD! hello, world!\n\
+         True True False\n\
+         1 -1 2\n\
+         b--a .a.b.c.\n\
+         ['a', 'b', '', 'c']\n\
+         ['the', 'quick', 'fox']\n\
+         a-b-c\n\
+         name, age, city\n"
+    );
+}
+
+#[test]
+fn global_variables_match_python() {
+    let out = run_program(
+        "globals",
+        "\
+counter = 0
+label = \"total\"
+
+def bump(n: int):
+    global counter
+    counter += n
+
+def describe() -> str:
+    return label + \": \" + str(counter)
+
+def shadow() -> int:
+    counter = 100
+    return counter
+
+bump(3)
+bump(4)
+print(counter, describe())
+print(shadow(), counter)
+",
+    );
+    assert_eq!(out, "7 total: 7\n100 7\n");
+}
+
+#[test]
+fn global_write_without_declaration_is_error() {
+    let dir = TempDir::new("globalerr");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "x = 1\ndef f():\n    x += 1\nf()\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("global x"), "stderr: {stderr}");
+}
+
+#[test]
+fn loop_variable_final_value_matches_python() {
+    let out = run_program(
+        "loopvar",
+        "\
+i = 99
+for i in range(0):
+    print(i)
+print(i)
+for i in range(5):
+    pass
+print(i)
+for j in range(3):
+    j = 100
+print(j)
+",
+    );
+    // empty range leaves the var untouched; exhaustion keeps the last
+    // yielded value; body mutation cannot derail iteration
+    assert_eq!(out, "99\n4\n100\n");
+}
+
+#[test]
+fn word_frequency_end_to_end() {
+    let out = run_program(
+        "wordfreq",
+        "\
+text = \"the quick fox the lazy dog the end\"
+words = text.split()
+target = \"the\"
+count = 0
+for w in words:
+    if w == target:
+        count += 1
+print(f\"{target} appears {count} times in {len(words)} words\")
+print(\" \".join(words[::-1]))
+",
+    );
+    assert_eq!(
+        out,
+        "the appears 3 times in 8 words\nend the dog lazy the fox quick the\n"
+    );
+}

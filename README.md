@@ -36,7 +36,7 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.3)
+## The language (v0.4)
 
 A statically-typed Python subset:
 
@@ -51,16 +51,19 @@ A statically-typed Python subset:
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
   `and`/`or`/`not` (short-circuit), casts
   `int()`/`float()`/`bool()`/`str()`, `len()`, indexing with negative
-  indices, slicing `s[a:b]` (no step yet), `print(...)` with any mix of
-  values
+  indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
+  `print(...)` with any mix of values
 - **f-strings:** `f"x={x}, next={x + 1}"` with `{{`/`}}` escapes and
   nesting (no format specs yet — write `{str(x)}` style conversions)
 - **Strings:** immutable; `+` concat, `*` repeat, lexicographic
   comparisons, indexing, slicing, `in`, iteration, `len()`, `str(x)`
-  conversions
+  conversions, and methods: `upper` `lower` `strip` `lstrip` `rstrip`
+  `startswith` `endswith` `find` `count` `replace` `split` `join`
 - **Lists:** homogeneous, growable; literals, indexing (read/write),
   slicing (copies, like Python), `append`/`pop`, `in`, `len`, iteration;
   assignment aliases like Python
+- **Globals:** top-level variables are readable from any function;
+  writing needs a `global x` declaration, exactly like Python
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 
@@ -81,15 +84,15 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.3): no bigints (int is 64-bit and wraps), `and`/`or`
+Known limits (v0.4): no bigints (int is 64-bit and wraps), `and`/`or`
 return `bool` rather than the operand, `x ** e` with a *dynamic*
 negative int exponent traps (a constant like `2 ** -1` works and gives
 float), int↔float comparisons convert the int to float (exactness loss
 past 2^53), list literals coerce mixed numerics to one element type,
-`nan in [nan]` is False (no identity semantics), heap memory is never
-freed, and slice steps / f-string format specs / str methods / dicts /
-classes / exceptions are not in yet — the parser reports "not supported
-yet" for each.
+`nan in [nan]` is False (no identity semantics), str methods use ASCII
+case/whitespace rules, heap memory is never freed, and f-string format
+specs / dicts / tuples / classes / exceptions are not in yet — the
+parser reports "not supported yet" for each.
 
 Errors come with source snippets:
 

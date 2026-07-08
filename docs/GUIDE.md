@@ -168,9 +168,23 @@ def main():
 # prints "entry point" — no explicit call needed
 ```
 
-**Scoping is per-function.** A function body sees only its parameters and
-its own locals — top-level variables are not visible inside functions
-(pass values as arguments instead). There is no `global`/`nonlocal` yet.
+**Scoping follows Python.** A function reads its own locals first, then
+the module globals (top-level variables). Assigning inside a function
+creates a *local* that shadows any global of the same name — to write a
+global, declare it first:
+
+```python
+counter = 0
+
+def bump():
+    global counter      # without this, counter = ... would be a new local
+    counter += 1
+
+bump()
+print(counter)          # 1
+```
+
+`nonlocal` is not supported (there are no nested functions yet).
 
 ### Types
 
@@ -274,17 +288,32 @@ s = "hello" + " " + "world"    # concatenation
 line = "-" * 20                # repetition (either operand order)
 print("apple" < "banana")      # lexicographic comparison (all six ops)
 print(s[0], s[-1])             # indexing, negative from the end
-print(s[6:], s[:5], s[2:7])    # slicing (see below)
+print(s[6:], s[:5], s[::-1])   # slicing with steps (see below)
 print(len(s))                  # length
 for c in s:                    # iterate characters (each is a 1-char str)
     print(c)
 label = str(42)                # str() converts int/float/bool
 ```
 
-Slicing takes `[lo:hi]` with either bound omitted. Bounds follow Python:
-negative values count from the end, out-of-range values clamp, and an
-empty range gives `""`. Slice *steps* are not supported yet
-(`s[::2]` is a compile error; a trailing empty step like `s[::]` is fine).
+Slicing takes `[lo:hi:step]` with any part omitted, exactly like Python:
+negative bounds count from the end, out-of-range bounds clamp, an empty
+range gives `""`, and negative steps walk backwards — `s[::-1]` reverses,
+`s[8:2:-2]` == `"rwo"` for `"hello world"`. A zero step raises
+`ValueError`.
+
+String methods (ASCII case/whitespace rules):
+
+```python
+"  hi  ".strip()          # also lstrip / rstrip
+"abc".upper()             # "ABC"; .lower() too
+"hello".startswith("he")  # True; .endswith too
+"banana".find("an")       # 1, or -1 when absent
+"banana".count("an")      # 2 (non-overlapping)
+"banana".replace("an", "-")   # "b--a"
+"a,b,,c".split(",")       # ['a', 'b', '', 'c'] — keeps empty parts
+"a b  c".split()          # ['a', 'b', 'c']    — whitespace runs
+"-".join(["a", "b"])      # "a-b"
+```
 
 ### f-strings
 
@@ -342,8 +371,9 @@ for x in xs:     # iteration re-reads the live length,
     xs.append(x) # so appending inside the loop extends it (careful!)
 ```
 
-Not supported yet: list `+`/`*`/`==`, `insert`/`remove`/`index`/`sort`,
-nested lists, and slice assignment.
+Lists slice with steps too: `xs[::-1]` reverses, `xs[::2]` takes every
+other element. Not supported yet: list `+`/`*`/`==`,
+`insert`/`remove`/`index`/`sort`, nested lists, and slice assignment.
 
 ### Control flow
 
@@ -407,6 +437,7 @@ functions, closures, `lambda`, and redefining a function.
 | `print(a, b, ...)` | any values, any count | space-separated, newline at end |
 | `len(x)` | str, list | int |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
+| `global x` | (statement) | write access to a module global |
 | `int(x)` | int, float (truncates toward zero), bool | int |
 | `float(x)` | int, float, bool | float |
 | `bool(x)` | int, float, bool, str, list (truthiness) | bool |
@@ -446,7 +477,9 @@ print the same message CPython would, then exit with code 1:
 | `IndexError: list index out of range` | out-of-bounds `xs[i]` read |
 | `IndexError: list assignment index out of range` | out-of-bounds `xs[i] = v` |
 | `IndexError: pop from empty list` / `pop index out of range` | `xs.pop(...)` |
-| `ValueError: range() arg 3 must not be zero` | zero step at runtime |
+| `ValueError: range() arg 3 must not be zero` | zero range step at runtime |
+| `ValueError: slice step cannot be zero` | zero slice step at runtime |
+| `ValueError: empty separator` | `s.split("")` |
 | `ValueError: cannot convert float NaN to integer` | `int(nan)` |
 | `OverflowError: cannot convert float infinity to integer` | `int(inf)` |
 | `ValueError: integer to a negative power...` | `x ** e` with a dynamic negative int `e` |
@@ -504,7 +537,8 @@ deliberate exceptions:
 7. **Possibly-unbound variables** read as `0`/`0.0`/`False` for scalars;
    str/list reads trap with `UnboundLocalError`. (Straight-line
    use-before-assignment is caught at compile time.)
-8. **Functions can't see top-level variables** — pass arguments.
+8. **str methods use ASCII rules** for case (`upper`/`lower`) and
+   whitespace (`strip`/`split`) — Python is Unicode-aware.
 9. **Memory is never freed** (no GC yet); fine for short-lived programs,
    a known limitation for long-running ones.
 10. **Str elements print unescaped in list reprs**
@@ -514,9 +548,8 @@ deliberate exceptions:
 
 Not implemented yet (clear compile errors): classes, dicts, sets, tuples,
 imports, exceptions, `with`, `match`, generators/`yield`, `lambda`,
-nested functions, closures, `global`/`nonlocal`, str methods, slice
-steps, f-string format specs, keyword/default arguments, multiple
-assignment, and unpacking.
+nested functions, closures, `nonlocal`, f-string format specs,
+keyword/default arguments, multiple assignment, and unpacking.
 
 ## 9. Performance
 
