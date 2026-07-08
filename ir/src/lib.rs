@@ -61,6 +61,9 @@ impl std::fmt::Display for Ty {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
     pub funcs: Vec<Function>,
+    /// Module-level variables (assigned by top-level statements, readable
+    /// from any function, writable with `global`). Zero/null-initialized.
+    pub globals: Vec<(String, Ty)>,
     /// Name of the function that is the program entry point.
     pub entry: String,
 }
@@ -81,6 +84,11 @@ pub struct Function {
 pub enum Stmt {
     /// Store into a local (params included).
     Assign {
+        name: String,
+        value: Expr,
+    },
+    /// Store into a module-level global.
+    GlobalAssign {
         name: String,
         value: Expr,
     },
@@ -131,6 +139,8 @@ pub enum ExprKind {
     ConstStr(String),
     /// Load a local variable.
     Local(String),
+    /// Load a module-level global.
+    GlobalLoad(String),
     /// Evaluate `value`, store it in local `name`, then evaluate `body`.
     /// Used for compiler temps (e.g. comparison chaining).
     Let {
@@ -156,12 +166,20 @@ pub enum ExprKind {
         base: Box<Expr>,
         index: Box<Expr>,
     },
-    /// `base[lo:hi]` (no step). Semantic fills defaults: missing lo → 0,
-    /// missing hi → i64::MAX; the runtime clamps Python-style.
+    /// `base[lo:hi:step]`. Missing bounds are encoded as i64::MIN (their
+    /// meaning depends on the step's sign); the runtime resolves and
+    /// clamps exactly like CPython's PySlice_AdjustIndices. A missing
+    /// step is ConstInt(1); step 0 traps.
     Slice {
         base: Box<Expr>,
         lo: Box<Expr>,
         hi: Box<Expr>,
+        step: Box<Expr>,
+    },
+    /// A `str` method call (`base` is the first argument).
+    StrCall {
+        func: StrFn,
+        args: Vec<Expr>,
     },
     /// `needle in haystack`: str-in-str substring or element-in-list.
     /// The needle is already coerced to the element type. Result is Bool.
@@ -225,4 +243,33 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+}
+
+/// String methods implemented by the C runtime. ASCII-only case and
+/// whitespace handling (documented deviation from Python's Unicode rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrFn {
+    /// `s.upper()` → str
+    Upper,
+    /// `s.lower()` → str
+    Lower,
+    /// `s.strip()` / `s.lstrip()` / `s.rstrip()` → str
+    Strip,
+    Lstrip,
+    Rstrip,
+    /// `s.startswith(t)` / `s.endswith(t)` → bool
+    StartsWith,
+    EndsWith,
+    /// `s.find(t)` → int (-1 when absent)
+    Find,
+    /// `s.count(t)` → int (non-overlapping)
+    Count,
+    /// `s.replace(old, new)` → str
+    Replace,
+    /// `s.split()` → list[str] (whitespace runs, no empty parts)
+    SplitWs,
+    /// `s.split(sep)` → list[str] (empty parts kept; sep must be nonempty)
+    Split,
+    /// `sep.join(parts)` → str
+    Join,
 }
