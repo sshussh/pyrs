@@ -321,6 +321,9 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             }
             Ok(())
         }
+        ast::StmtKind::With { item, target, body } => {
+            lower_with(item, target.as_ref(), body, ctx, out)
+        }
         ast::StmtKind::Global(names) => {
             // a no-op at module level, like Python
             if ctx.is_entry {
@@ -484,6 +487,136 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             iter,
             body,
         } => lower_for(var, *var_span, iter, body, ctx, out),
+    }
+}
+
+/// `with open(...) as f:` — files only. Desugars to bind + body + close,
+/// with the close also inserted before every early exit (return, or a
+/// break/continue that leaves the with-block), matching Python's
+/// try/finally semantics. Runtime traps exit the process, so they need
+/// no handling.
+fn lower_with(
+    item: &ast::Expr,
+    target: Option<&(String, Span)>,
+    body: &[ast::Stmt],
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    let item_ir = lower_expr(item, ctx)?;
+    if item_ir.ty != ir::Ty::File {
+        return Err(err(
+            format!(
+                "'{}' object does not support the context manager protocol",
+                item_ir.ty
+            ),
+            item.span,
+        ));
+    }
+
+    // bind the handle: `as name` uses the user's variable, otherwise a temp
+    let (load_handle, bind_stmt) = match target {
+        Some((name, name_span)) => {
+            let bind = bind_name(name, *name_span, None, item_ir, item.span, ctx)?;
+            let load = if ctx.binds_global(name) {
+                ir::ExprKind::GlobalLoad(name.clone())
+            } else {
+                ir::ExprKind::Local(name.clone())
+            };
+            (
+                ir::Expr {
+                    ty: ir::Ty::File,
+                    kind: load,
+                },
+                bind,
+            )
+        }
+        Option::None => {
+            let t = ctx.fresh_temp("with", ir::Ty::File);
+            let load = ir::Expr {
+                ty: ir::Ty::File,
+                kind: ir::ExprKind::Local(t.clone()),
+            };
+            (
+                load,
+                ir::Stmt::Assign {
+                    name: t,
+                    value: item_ir,
+                },
+            )
+        }
+    };
+    out.push(bind_stmt);
+
+    let close_stmt = || {
+        ir::Stmt::ExprStmt(ir::Expr {
+            ty: ir::Ty::None,
+            kind: ir::ExprKind::FileCall {
+                func: ir::FileFn::Close,
+                args: vec![load_handle.clone()],
+            },
+        })
+    };
+
+    let mut lowered = lower_block(body, ctx)?;
+    insert_closes(&mut lowered, &close_stmt(), false, ctx);
+    out.extend(lowered);
+    out.push(close_stmt());
+    Ok(())
+}
+
+/// Insert `close` before every statement that exits the with-block.
+/// `return` always exits (even from nested loops); `break`/`continue`
+/// exit only when they belong to a loop *enclosing* the with, i.e. when
+/// we are not inside a loop nested within the with-body.
+fn insert_closes(
+    stmts: &mut Vec<ir::Stmt>,
+    close: &ir::Stmt,
+    in_nested_loop: bool,
+    ctx: &mut FnCtx,
+) {
+    let mut i = 0;
+    while i < stmts.len() {
+        match &mut stmts[i] {
+            ir::Stmt::Return(value) => {
+                // evaluate the return value BEFORE closing: Python runs
+                // the finally after the return expression
+                if let Some(v) = value.take() {
+                    let ty = v.ty;
+                    let t = ctx.fresh_temp("with.ret", ty);
+                    let assign = ir::Stmt::Assign {
+                        name: t.clone(),
+                        value: v,
+                    };
+                    *value = Some(ir::Expr {
+                        ty,
+                        kind: ir::ExprKind::Local(t),
+                    });
+                    stmts.insert(i, close.clone());
+                    stmts.insert(i, assign);
+                    i += 2;
+                } else {
+                    stmts.insert(i, close.clone());
+                    i += 1;
+                }
+            }
+            ir::Stmt::Break | ir::Stmt::Continue if !in_nested_loop => {
+                stmts.insert(i, close.clone());
+                i += 1;
+            }
+            ir::Stmt::If { branches, orelse } => {
+                for (_, b) in branches.iter_mut() {
+                    insert_closes(b, close, in_nested_loop, ctx);
+                }
+                insert_closes(orelse, close, in_nested_loop, ctx);
+            }
+            ir::Stmt::While { body, step, .. } => {
+                // break/continue inside this loop stay inside the with
+                insert_closes(body, close, true, ctx);
+                insert_closes(step, close, true, ctx);
+            }
+            _ => {}
+        }
+        i += 1;
     }
 }
 
