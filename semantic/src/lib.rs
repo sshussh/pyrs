@@ -65,148 +65,399 @@ struct FuncSig {
     span: Span,
 }
 
-/// Analyze a parsed module and lower it to IR.
-pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
-    let mut funcs: HashMap<String, FuncSig> = HashMap::new();
-    let mut func_order: Vec<&ast::FuncDef> = Vec::new();
-    let mut script: Vec<&ast::Stmt> = Vec::new();
+/// One parsed module handed to [`analyze_program`]. The driver supplies
+/// these in topological order (dependencies first) with the root last;
+/// the index doubles as the diagnostic file id.
+pub struct ModuleInput<'a> {
+    /// Import name: `"utils"` for `utils.py`, [`ENTRY_NAME`] for the root.
+    pub name: String,
+    pub ast: &'a ast::Module,
+}
 
-    // pass 1: collect signatures so functions can call forward references
+/// How a locally-visible imported name resolves.
+#[derive(Debug, Clone)]
+enum ImportBinding {
+    /// `import sys [as s]`
+    Sys,
+    /// `import M [as m]` — the local name refers to module `M`.
+    Module(String),
+    /// `from M import x [as y]` — the local name refers to `M.x`.
+    Symbol { module: String, name: String },
+}
+
+/// A fully analyzed module's exported surface, for cross-module lookup.
+struct ModuleData {
+    funcs: HashMap<String, FuncSig>,
+    globals: HashMap<String, ir::Ty>,
+}
+
+/// Read-only per-module context threaded into every function lowering.
+struct ModuleCtx<'a> {
+    /// The module's own name (`""`-prefixed for the root, `"M."` otherwise
+    /// via [`ModuleCtx::prefix`]).
+    module: &'a str,
+    is_root: bool,
+    funcs: &'a HashMap<String, FuncSig>,
+    imports: &'a HashMap<String, ImportBinding>,
+    /// Fully analyzed dependency modules, keyed by name.
+    mods: &'a HashMap<String, ModuleData>,
+}
+
+impl ModuleCtx<'_> {
+    /// The IR name prefix for this module's own symbols. The root keeps
+    /// bare names (`x`, `foo`); other modules are namespaced (`utils.x`).
+    fn prefix(&self) -> String {
+        if self.is_root {
+            String::new()
+        } else {
+            format!("{}.", self.module)
+        }
+    }
+}
+
+/// The IR/emit name of `name` defined in module `module` (always
+/// namespaced — only the root is bare, handled by the caller).
+fn qual(module: &str, name: &str) -> String {
+    format!("{module}.{name}")
+}
+
+/// The builtins that cannot be shadowed by a user `def`.
+const BUILTINS: [&str; 5] = ["print", "len", "range", "input", "open"];
+
+/// A call to a module's run-once init function, `<mod>.__init__()`.
+fn init_call(module: &str) -> ir::Stmt {
+    ir::Stmt::ExprStmt(ir::Expr {
+        ty: ir::Ty::None,
+        kind: ir::ExprKind::Call {
+            func: qual(module, "__init__"),
+            args: vec![],
+        },
+    })
+}
+
+/// Analyze a single module (no file imports beyond `sys`). Used by tests
+/// and by the driver for single-file programs.
+pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
+    analyze_program(&[ModuleInput {
+        name: ENTRY_NAME.to_string(),
+        ast: module,
+    }])
+}
+
+/// Collect a module's function signatures (with builtin-shadowing and
+/// duplicate checks).
+fn collect_sigs(
+    module: &ast::Module,
+) -> SResult<(HashMap<String, FuncSig>, Vec<&ast::FuncDef>)> {
+    let mut funcs: HashMap<String, FuncSig> = HashMap::new();
+    let mut order: Vec<&ast::FuncDef> = Vec::new();
     for stmt in &module.body {
-        match &stmt.kind {
-            ast::StmtKind::FuncDef(f) => {
-                if funcs.contains_key(&f.name) {
+        if let ast::StmtKind::FuncDef(f) = &stmt.kind {
+            if BUILTINS.contains(&f.name.as_str()) {
+                return Err(err(
+                    format!("cannot redefine the builtin '{}'", f.name),
+                    f.span,
+                ));
+            }
+            if funcs.contains_key(&f.name) {
+                return Err(err(
+                    format!("function '{}' is defined more than once", f.name),
+                    f.span,
+                ));
+            }
+            let mut params = Vec::new();
+            for p in &f.params {
+                let ty = resolve_type(p.ty);
+                if ty == ir::Ty::None {
                     return Err(err(
-                        format!("function '{}' is defined more than once", f.name),
-                        f.span,
+                        format!("parameter '{}' cannot have type None", p.name),
+                        p.span,
                     ));
                 }
-                let mut params = Vec::new();
-                for p in &f.params {
-                    let ty = resolve_type(p.ty);
-                    if ty == ir::Ty::None {
+                params.push(ty);
+            }
+            let ret = f.ret.map(resolve_type).unwrap_or(ir::Ty::None);
+            funcs.insert(
+                f.name.clone(),
+                FuncSig {
+                    params,
+                    ret,
+                    span: f.span,
+                },
+            );
+            order.push(f);
+        }
+    }
+    Ok((funcs, order))
+}
+
+/// The names a module binds at the top level (assignment targets), so
+/// `from M import x` can be validated before M is lowered.
+fn collect_global_names(module: &ast::Module) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for stmt in &module.body {
+        match &stmt.kind {
+            ast::StmtKind::Assign {
+                target: ast::AssignTarget::Name { name, .. },
+                ..
+            }
+            | ast::StmtKind::AugAssign {
+                target: ast::AssignTarget::Name { name, .. },
+                ..
+            } => {
+                names.insert(name.clone());
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Build a module's import bindings (local name → target), validating that
+/// imported modules and symbols exist.
+fn collect_imports(
+    module: &ast::Module,
+    self_name: &str,
+    all_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+    all_globals: &HashMap<String, std::collections::HashSet<String>>,
+) -> SResult<HashMap<String, ImportBinding>> {
+    let mut imports: HashMap<String, ImportBinding> = HashMap::new();
+    for stmt in &module.body {
+        match &stmt.kind {
+            ast::StmtKind::Import {
+                module: m,
+                alias,
+                span,
+            } => {
+                let local = alias.clone().unwrap_or_else(|| m.clone());
+                let binding = if m == "sys" {
+                    ImportBinding::Sys
+                } else {
+                    if m == self_name {
+                        return Err(err(format!("module '{m}' cannot import itself"), *span));
+                    }
+                    ImportBinding::Module(m.clone())
+                };
+                imports.insert(local, binding);
+            }
+            ast::StmtKind::FromImport {
+                module: m,
+                names,
+                span,
+            } => {
+                if m == "sys" {
+                    return Err(err(
+                        "'from sys import ...' is not supported; use 'import sys' \
+                         and 'sys.argv'",
+                        *span,
+                    ));
+                }
+                if m == self_name {
+                    return Err(err(
+                        format!("module '{m}' cannot import from itself"),
+                        *span,
+                    ));
+                }
+                let mfuncs = all_funcs.get(m);
+                let mglobals = all_globals.get(m);
+                for (name, alias, nspan) in names {
+                    let is_func = mfuncs.is_some_and(|f| f.contains_key(name));
+                    let is_global = mglobals.is_some_and(|g| g.contains(name));
+                    if !is_func && !is_global {
                         return Err(err(
-                            format!("parameter '{}' cannot have type None", p.name),
-                            p.span,
+                            format!("cannot import name '{name}' from '{m}'"),
+                            *nspan,
                         ));
                     }
-                    params.push(ty);
+                    let local = alias.clone().unwrap_or_else(|| name.clone());
+                    imports.insert(
+                        local,
+                        ImportBinding::Symbol {
+                            module: m.clone(),
+                            name: name.clone(),
+                        },
+                    );
                 }
-                let ret = f.ret.map(resolve_type).unwrap_or(ir::Ty::None);
-                funcs.insert(
-                    f.name.clone(),
-                    FuncSig {
-                        params,
-                        ret,
-                        span: f.span,
-                    },
-                );
-                func_order.push(f);
             }
-            _ => script.push(stmt),
+            _ => {}
         }
     }
+    Ok(imports)
+}
 
-    let sys_imported = module
-        .body
-        .iter()
-        .any(|s| matches!(&s.kind, ast::StmtKind::Import { module, .. } if module == "sys"));
+/// Analyze a whole program: several modules with cross-file imports.
+/// `modules` is in topological order (dependencies first, root last);
+/// diagnostics are tagged with the module index as their file id.
+pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
+    assert!(!modules.is_empty(), "a program needs at least one module");
+    let root_idx = modules.len() - 1;
 
-    for builtin in ["print", "len", "range", "input", "open"] {
-        if funcs.contains_key(builtin) {
-            let f = func_order.iter().find(|f| f.name == builtin).unwrap();
-            return Err(err(
-                format!("cannot redefine the builtin '{builtin}'"),
-                f.span,
-            ));
-        }
+    // pass 1: every module's signatures and global-name surface
+    let mut all_funcs: HashMap<String, HashMap<String, FuncSig>> = HashMap::new();
+    let mut all_orders: Vec<Vec<&ast::FuncDef>> = Vec::new();
+    let mut all_global_names: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for (i, m) in modules.iter().enumerate() {
+        let (funcs, order) = collect_sigs(m.ast).map_err(|d| d.with_file(i))?;
+        all_funcs.insert(m.name.clone(), funcs);
+        all_orders.push(order);
+        all_global_names.insert(m.name.clone(), collect_global_names(m.ast));
     }
 
-    // pass 2: lower the entry FIRST — its top-level assignments define the
-    // module globals (and their types) that function bodies may reference
-    let mut globals: HashMap<String, ir::Ty> = HashMap::new();
-    let mut globals_order: Vec<(String, ir::Ty)> = Vec::new();
+    // pass 2: import bindings (validated against the collected surface)
+    let mut all_imports: Vec<HashMap<String, ImportBinding>> = Vec::new();
+    for (i, m) in modules.iter().enumerate() {
+        let imports = collect_imports(m.ast, &m.name, &all_funcs, &all_global_names)
+            .map_err(|d| d.with_file(i))?;
+        all_imports.push(imports);
+    }
 
-    let entry_body: Vec<ast::Stmt> = script.iter().map(|s| (*s).clone()).collect();
-    let entry = if !entry_body.is_empty() {
-        let entry_def = ast::FuncDef {
-            name: ENTRY_NAME.to_string(),
-            params: vec![],
-            ret: None,
-            body: entry_body,
-            span: Span::default(),
+    // pass 3: lower each module in dependency order, accumulating results
+    let mut mods: HashMap<String, ModuleData> = HashMap::new();
+    let mut out_funcs: Vec<ir::Function> = Vec::new();
+    let mut out_globals: Vec<(String, ir::Ty)> = Vec::new();
+
+    for (i, m) in modules.iter().enumerate() {
+        let is_root = i == root_idx;
+        let funcs = &all_funcs[&m.name];
+        let mctx = ModuleCtx {
+            module: &m.name,
+            is_root,
+            funcs,
+            imports: &all_imports[i],
+            mods: &mods,
         };
-        Some(lower_function(
-            &entry_def,
-            &funcs,
-            &mut globals,
-            &mut globals_order,
-            true,
-            sys_imported,
-        )?)
-    } else if let Some(sig) = funcs.get("main") {
-        // no top-level code: call main() if it takes no arguments
-        if !sig.params.is_empty() {
-            return Err(err(
-                "main() is used as the entry point and cannot take parameters",
-                sig.span,
-            ));
+
+        let mut globals: HashMap<String, ir::Ty> = HashMap::new();
+        let mut globals_order: Vec<(String, ir::Ty)> = Vec::new();
+        let script: Vec<ast::Stmt> = m
+            .ast
+            .body
+            .iter()
+            .filter(|s| !matches!(s.kind, ast::StmtKind::FuncDef(_)))
+            .cloned()
+            .collect();
+
+        // the module's top-level statements become its init function; for
+        // the root that IS the entry, otherwise `<mod>.__init__` guarded to
+        // run once
+        let init_name = if is_root {
+            ENTRY_NAME.to_string()
+        } else {
+            qual(&m.name, "__init__")
+        };
+
+        let init = if is_root && script.is_empty() {
+            // pyrs convenience: a root that is only definitions calls main()
+            if let Some(sig) = funcs.get("main") {
+                if !sig.params.is_empty() {
+                    return Err(err(
+                        "main() is used as the entry point and cannot take parameters",
+                        sig.span,
+                    )
+                    .with_file(i));
+                }
+                Some(ir::Function {
+                    name: ENTRY_NAME.to_string(),
+                    params: vec![],
+                    ret: ir::Ty::None,
+                    locals: vec![],
+                    body: vec![ir::Stmt::ExprStmt(ir::Expr {
+                        ty: sig.ret,
+                        kind: ir::ExprKind::Call {
+                            func: "main".to_string(),
+                            args: vec![],
+                        },
+                    })],
+                })
+            } else {
+                None
+            }
+        } else {
+            let init_def = ast::FuncDef {
+                name: init_name.clone(),
+                params: vec![],
+                ret: None,
+                body: script,
+                span: Span::default(),
+            };
+            let mut f = lower_function(&init_def, &mctx, &mut globals, &mut globals_order, true)
+                .map_err(|d| d.with_file(i))?;
+            if !is_root {
+                add_init_guard(&mut f, &m.name, &mut globals_order);
+            }
+            Some(f)
+        };
+
+        // functions, with the module's globals now typed
+        for fd in &all_orders[i] {
+            let f = lower_function(fd, &mctx, &mut globals, &mut globals_order, false)
+                .map_err(|d| d.with_file(i))?;
+            out_funcs.push(f);
         }
-        Some(ir::Function {
-            name: ENTRY_NAME.to_string(),
-            params: vec![],
-            ret: ir::Ty::None,
-            locals: vec![],
-            body: vec![ir::Stmt::ExprStmt(ir::Expr {
-                ty: sig.ret,
-                kind: ir::ExprKind::Call {
-                    func: "main".to_string(),
-                    args: vec![],
-                },
-            })],
-        })
-    } else {
-        // still lower the functions below so their errors surface before
-        // the missing-entry-point complaint
-        None
-    };
 
-    // pass 3: lower every user function with the globals in scope
-    let mut lowered = Vec::new();
-    for f in &func_order {
-        lowered.push(lower_function(
-            f,
-            &funcs,
-            &mut globals,
-            &mut globals_order,
-            false,
-            sys_imported,
-        )?);
+        match init {
+            Some(f) => out_funcs.push(f),
+            None if is_root => {
+                return Err(err(
+                    "program has no entry point: add top-level statements or define main()",
+                    Span::default(),
+                )
+                .with_file(i));
+            }
+            // a non-root module with only definitions has no init to call
+            None => {}
+        }
+
+        out_globals.extend(globals_order.iter().cloned());
+        mods.insert(
+            m.name.clone(),
+            ModuleData {
+                funcs: funcs.clone(),
+                globals,
+            },
+        );
     }
-
-    let Some(entry) = entry else {
-        return Err(err(
-            "program has no entry point: add top-level statements or define main()",
-            Span::default(),
-        ));
-    };
-    lowered.push(entry);
 
     Ok(ir::Module {
-        funcs: lowered,
-        globals: globals_order,
+        funcs: out_funcs,
+        globals: out_globals,
         entry: ENTRY_NAME.to_string(),
     })
 }
 
+/// Prepend a run-once guard to a module init: `if <mod>.__done__: return;
+/// <mod>.__done__ = True; ...`.
+fn add_init_guard(f: &mut ir::Function, module: &str, globals_order: &mut Vec<(String, ir::Ty)>) {
+    let done = qual(module, "__done__");
+    globals_order.push((done.clone(), ir::Ty::Bool));
+    let guard = ir::Stmt::If {
+        branches: vec![(
+            ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::GlobalLoad(done.clone()),
+            },
+            vec![ir::Stmt::Return(None)],
+        )],
+        orelse: vec![],
+    };
+    let set = ir::Stmt::GlobalAssign {
+        name: done,
+        value: ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(true),
+        },
+    };
+    let mut body = vec![guard, set];
+    body.append(&mut f.body);
+    f.body = body;
+}
+
 struct FnCtx<'a> {
-    funcs: &'a HashMap<String, FuncSig>,
+    mctx: &'a ModuleCtx<'a>,
     globals: &'a mut HashMap<String, ir::Ty>,
     globals_order: &'a mut Vec<(String, ir::Ty)>,
-    /// The synthesized entry function: its bindings ARE the globals.
+    /// This function is a module init: its top-level bindings are globals.
     is_entry: bool,
-    /// Whether the module has `import sys` (enables sys.argv).
-    sys_imported: bool,
     /// Names this function declared with `global`.
     declared_globals: std::collections::HashSet<String>,
     fn_name: String,
@@ -235,23 +486,49 @@ impl FnCtx<'_> {
     fn binds_global(&self, name: &str) -> bool {
         self.is_entry || self.declared_globals.contains(name)
     }
+
+    /// This module's functions.
+    fn funcs(&self) -> &HashMap<String, FuncSig> {
+        self.mctx.funcs
+    }
+
+    /// The IR/emit name for one of *this* module's own globals.
+    fn own_global(&self, name: &str) -> String {
+        format!("{}{}", self.mctx.prefix(), name)
+    }
+
+    /// The IR/emit name for one of *this* module's own functions.
+    fn own_func(&self, name: &str) -> String {
+        format!("{}{}", self.mctx.prefix(), name)
+    }
+
+    /// Is `sys` imported (under any alias)?
+    fn sys_alias(&self, name: &str) -> bool {
+        matches!(self.mctx.imports.get(name), Some(ImportBinding::Sys))
+    }
+
+    /// If `name` is an imported module alias, its real module name.
+    fn module_alias(&self, name: &str) -> Option<String> {
+        match self.mctx.imports.get(name) {
+            Some(ImportBinding::Module(real)) => Some(real.clone()),
+            _ => None,
+        }
+    }
 }
 
 fn lower_function(
     f: &ast::FuncDef,
-    funcs: &HashMap<String, FuncSig>,
+    mctx: &ModuleCtx,
     globals: &mut HashMap<String, ir::Ty>,
     globals_order: &mut Vec<(String, ir::Ty)>,
     is_entry: bool,
-    sys_imported: bool,
 ) -> SResult<ir::Function> {
     let mut params = Vec::new();
     let mut ctx = FnCtx {
-        funcs,
+        mctx,
         globals,
         globals_order,
         is_entry,
-        sys_imported,
         declared_globals: std::collections::HashSet::new(),
         fn_name: f.name.clone(),
         ret: f.ret.map(resolve_type).unwrap_or(ir::Ty::None),
@@ -284,8 +561,16 @@ fn lower_function(
         ));
     }
 
+    // functions keep their given name for the init (already qualified); a
+    // regular function is namespaced by its module
+    let ir_name = if f.name == ENTRY_NAME || f.name.contains('.') {
+        f.name.clone()
+    } else {
+        ctx.own_func(&f.name)
+    };
+
     Ok(ir::Function {
-        name: f.name.clone(),
+        name: ir_name,
         params,
         ret: ctx.ret,
         locals: ctx.locals_order,
@@ -311,19 +596,28 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             f.span,
         )),
         ast::StmtKind::Pass => Ok(()),
-        ast::StmtKind::Import { module, span } => {
+        ast::StmtKind::Import { module, span, .. } => {
             if !ctx.is_entry {
                 return Err(err(
                     "imports are only supported at the top level of the program",
                     *span,
                 ));
             }
+            // `import sys` needs no init; any other module runs its body
+            // (once, guarded) at this point
             if module != "sys" {
+                out.push(init_call(module));
+            }
+            Ok(())
+        }
+        ast::StmtKind::FromImport { module, span, .. } => {
+            if !ctx.is_entry {
                 return Err(err(
-                    format!("module '{module}' is not available; only 'import sys' is supported"),
+                    "imports are only supported at the top level of the program",
                     *span,
                 ));
             }
+            out.push(init_call(module));
             Ok(())
         }
         ast::StmtKind::With { item, target, body } => {
@@ -425,7 +719,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             // print is a statement-level builtin
             if let ast::ExprKind::Call { func, args, .. } = &e.kind
                 && func == "print"
-                && !ctx.funcs.contains_key("print")
+                && !ctx.funcs().contains_key("print")
             {
                 let mut lowered_args = Vec::new();
                 for (i, arg) in args.iter().enumerate() {
@@ -452,6 +746,14 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 args,
             } = &e.kind
             {
+                // `module.func(args)` as a statement discards the result
+                if let ast::ExprKind::Name(alias) = &base.kind
+                    && let Some(real) = ctx.module_alias(alias)
+                {
+                    let call = lower_module_call(&real, method, *method_span, args, ctx)?;
+                    out.push(ir::Stmt::ExprStmt(call));
+                    return Ok(());
+                }
                 let stmt = lower_method_stmt(base, method, *method_span, args, ctx)?;
                 out.push(stmt);
                 return Ok(());
@@ -523,7 +825,7 @@ fn lower_with(
         Some((name, name_span)) => {
             let bind = bind_name(name, *name_span, None, item_ir, item.span, ctx)?;
             let load = if ctx.binds_global(name) {
-                ir::ExprKind::GlobalLoad(name.clone())
+                ir::ExprKind::GlobalLoad(ctx.own_global(name))
             } else {
                 ir::ExprKind::Local(name.clone())
             };
@@ -968,7 +1270,7 @@ fn bind_name(
     value_span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Stmt> {
-    if ctx.funcs.contains_key(name) {
+    if ctx.funcs().contains_key(name) {
         return Err(err(
             format!("'{name}' is a function and cannot be assigned to"),
             name_span,
@@ -1020,10 +1322,10 @@ fn bind_name(
     if is_global {
         if !ctx.globals.contains_key(name) {
             ctx.globals.insert(name.to_string(), target_ty);
-            ctx.globals_order.push((name.to_string(), target_ty));
+            ctx.globals_order.push((ctx.own_global(name), target_ty));
         }
         Ok(ir::Stmt::GlobalAssign {
-            name: name.to_string(),
+            name: ctx.own_global(name),
             value: value_expr,
         })
     } else {
@@ -1076,7 +1378,7 @@ fn lower_aug_assign(
             let left = ir::Expr {
                 ty: current_ty,
                 kind: if is_global {
-                    ir::ExprKind::GlobalLoad(name.clone())
+                    ir::ExprKind::GlobalLoad(ctx.own_global(name))
                 } else {
                     ir::ExprKind::Local(name.clone())
                 },
@@ -1086,7 +1388,7 @@ fn lower_aug_assign(
             let combined = coerce_assign(combined, current_ty, name, span)?;
             out.push(if is_global {
                 ir::Stmt::GlobalAssign {
-                    name: name.clone(),
+                    name: ctx.own_global(name),
                     value: combined,
                 }
             } else {
@@ -1159,7 +1461,7 @@ fn lower_for(
     // `for i in range(...)` — lazy, no list is materialized
     if let ast::ExprKind::Call { func, args, .. } = &iter.kind
         && func == "range"
-        && !ctx.funcs.contains_key("range")
+        && !ctx.funcs().contains_key("range")
     {
         return lower_for_range(var, var_span, args, iter.span, body, ctx, out);
     }
@@ -1541,9 +1843,33 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 // module globals are readable from any function
                 Ok(ir::Expr {
                     ty: *ty,
-                    kind: ir::ExprKind::GlobalLoad(name.clone()),
+                    kind: ir::ExprKind::GlobalLoad(ctx.own_global(name)),
                 })
-            } else if ctx.funcs.contains_key(name) {
+            } else if let Some(binding) = ctx.mctx.imports.get(name) {
+                // a name brought in by `from other import ...`
+                match binding {
+                    ImportBinding::Symbol { module, name: real } => {
+                        if let Some(ty) = ctx.mctx.mods[module].globals.get(real) {
+                            Ok(ir::Expr {
+                                ty: *ty,
+                                kind: ir::ExprKind::GlobalLoad(qual(module, real)),
+                            })
+                        } else {
+                            Err(err(
+                                format!(
+                                    "'{name}' is a function imported from '{module}'; \
+                                     call it with parentheses: '{name}(...)'"
+                                ),
+                                expr.span,
+                            ))
+                        }
+                    }
+                    ImportBinding::Module(_) | ImportBinding::Sys => Err(err(
+                        format!("module '{name}' is not a value; use '{name}.<name>'"),
+                        expr.span,
+                    )),
+                }
+            } else if ctx.funcs().contains_key(name) {
                 Err(err(
                     format!("functions can only be called; add parentheses: '{name}(...)'"),
                     expr.span,
@@ -1587,30 +1913,52 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             attr,
             attr_span,
         } => {
-            if let ast::ExprKind::Name(module) = &base.kind
-                && module == "sys"
-            {
-                if !ctx.sys_imported {
+            if let ast::ExprKind::Name(alias) = &base.kind {
+                if ctx.sys_alias(alias) {
+                    if attr == "argv" {
+                        return Ok(ir::Expr {
+                            ty: ir::list_of(ir::Ty::Str),
+                            kind: ir::ExprKind::Argv,
+                        });
+                    }
+                    return Err(err(
+                        format!("'sys.{attr}' is not supported yet (only sys.argv)"),
+                        *attr_span,
+                    ));
+                }
+                // `module.global` from an imported module
+                if let Some(real) = ctx.module_alias(alias) {
+                    let data = &ctx.mctx.mods[&real];
+                    if let Some(ty) = data.globals.get(attr) {
+                        return Ok(ir::Expr {
+                            ty: *ty,
+                            kind: ir::ExprKind::GlobalLoad(qual(&real, attr)),
+                        });
+                    }
+                    if data.funcs.contains_key(attr) {
+                        return Err(err(
+                            format!(
+                                "'{real}.{attr}' is a function; call it: '{alias}.{attr}(...)'"
+                            ),
+                            *attr_span,
+                        ));
+                    }
+                    return Err(err(
+                        format!("module '{real}' has no attribute '{attr}'"),
+                        *attr_span,
+                    ));
+                }
+                if alias == "sys" {
                     return Err(err(
                         "name 'sys' is not defined; add 'import sys' at the top \
                          of the program",
                         base.span,
                     ));
                 }
-                if attr == "argv" {
-                    return Ok(ir::Expr {
-                        ty: ir::list_of(ir::Ty::Str),
-                        kind: ir::ExprKind::Argv,
-                    });
-                }
-                return Err(err(
-                    format!("'sys.{attr}' is not supported yet (only sys.argv)"),
-                    *attr_span,
-                ));
             }
             Err(err(
-                "attribute access is only supported for 'sys.argv' and \
-                 method calls",
+                "attribute access is only supported for 'sys.argv', imported \
+                 module globals, and method calls",
                 *attr_span,
             ))
         }
@@ -1620,6 +1968,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             method_span,
             args,
         } => {
+            // `module.func(args)` — a cross-module call, resolved before we
+            // try to treat `base` as a value
+            if let ast::ExprKind::Name(alias) = &base.kind
+                && let Some(real) = ctx.module_alias(alias)
+            {
+                return lower_module_call(&real, method, *method_span, args, ctx);
+            }
             let base_ir = lower_expr(base, ctx)?;
             match base_ir.ty {
                 ir::Ty::List(elem) => match method.as_str() {
@@ -1869,7 +2224,7 @@ fn lower_list_comp(
 
     let looping: Loop = if let ast::ExprKind::Call { func, args, .. } = &iter.kind
         && func == "range"
-        && !ctx.funcs.contains_key("range")
+        && !ctx.funcs().contains_key("range")
     {
         if args.is_empty() || args.len() > 3 {
             return Err(err(
@@ -2231,6 +2586,74 @@ fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
     }
 }
 
+/// Type-check and lower a call to a function with a known signature.
+fn lower_call_with_sig(
+    display: &str,
+    ir_name: String,
+    sig: &FuncSig,
+    args: &[ast::Expr],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() != sig.params.len() {
+        return Err(err(
+            format!(
+                "function '{display}' takes {} argument(s) but {} were given",
+                sig.params.len(),
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let mut lowered_args = Vec::new();
+    for (i, (arg, &expected)) in args.iter().zip(&sig.params).enumerate() {
+        // `f([])` / `f([1, 2])` use the parameter's element type
+        let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected) {
+            lower_list_lit(items, Some(*elem), arg.span, ctx)?
+        } else {
+            lower_expr(arg, ctx)?
+        };
+        let a = coerce(
+            a,
+            expected,
+            arg.span,
+            &format!("argument {} of '{display}'", i + 1),
+        )?;
+        lowered_args.push(a);
+    }
+    Ok(ir::Expr {
+        ty: sig.ret,
+        kind: ir::ExprKind::Call {
+            func: ir_name,
+            args: lowered_args,
+        },
+    })
+}
+
+/// `module.func(args)` — a call into another module.
+fn lower_module_call(
+    real: &str,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let data = &ctx.mctx.mods[real];
+    if let Some(sig) = data.funcs.get(method).cloned() {
+        return lower_call_with_sig(method, qual(real, method), &sig, args, method_span, ctx);
+    }
+    if data.globals.contains_key(method) {
+        return Err(err(
+            format!("'{real}.{method}' is a value, not a function"),
+            method_span,
+        ));
+    }
+    Err(err(
+        format!("module '{real}' has no attribute '{method}'"),
+        method_span,
+    ))
+}
+
 fn lower_call(
     func: &str,
     func_span: Span,
@@ -2238,14 +2661,36 @@ fn lower_call(
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    if !ctx.funcs.contains_key(func) {
+    // a function defined in this module
+    if ctx.funcs().contains_key(func) {
+        let sig = ctx.funcs().get(func).cloned().unwrap();
+        return lower_call_with_sig(func, ctx.own_func(func), &sig, args, span, ctx);
+    }
+    // a function pulled in by `from other import func`
+    if let Some(ImportBinding::Symbol { module, name }) = ctx.mctx.imports.get(func).cloned() {
+        if let Some(sig) = ctx.mctx.mods[&module].funcs.get(&name).cloned() {
+            return lower_call_with_sig(func, qual(&module, &name), &sig, args, span, ctx);
+        }
+        return Err(err(
+            format!("'{func}' is a value imported from '{module}', not a function"),
+            func_span,
+        ));
+    }
+    // a module alias used as if it were a function
+    if ctx.module_alias(func).is_some() || ctx.sys_alias(func) {
+        return Err(err(
+            format!("'{func}' is a module, not a function"),
+            func_span,
+        ));
+    }
+    {
         match func {
             "print" => {
-                return Err(err(
+                Err(err(
                     "print(...) does not return a value and cannot be used \
                      in an expression",
                     span,
-                ));
+                ))
             }
             "len" => {
                 if args.len() != 1 {
@@ -2261,16 +2706,16 @@ fn lower_call(
                         args[0].span,
                     ));
                 }
-                return Ok(ir::Expr {
+                Ok(ir::Expr {
                     ty: ir::Ty::Int,
                     kind: ir::ExprKind::Len(Box::new(arg)),
-                });
+                })
             }
             "range" => {
-                return Err(err(
+                Err(err(
                     "range(...) is only supported as the iterable of a 'for' loop",
                     span,
-                ));
+                ))
             }
             "input" => {
                 let prompt = match args {
@@ -2296,10 +2741,10 @@ fn lower_call(
                         ));
                     }
                 };
-                return Ok(ir::Expr {
+                Ok(ir::Expr {
                     ty: ir::Ty::Str,
                     kind: ir::ExprKind::Input { prompt },
-                });
+                })
             }
             "open" => {
                 if args.is_empty() || args.len() > 2 {
@@ -2344,54 +2789,17 @@ fn lower_call(
                         kind: ir::ExprKind::ConstStr("r".to_string()),
                     },
                 };
-                return Ok(ir::Expr {
+                Ok(ir::Expr {
                     ty: ir::Ty::File,
                     kind: ir::ExprKind::Open {
                         path: Box::new(path),
                         mode: Box::new(mode),
                     },
-                });
+                })
             }
-            _ => {
-                return Err(err(format!("function '{func}' is not defined"), func_span));
-            }
+            _ => Err(err(format!("function '{func}' is not defined"), func_span)),
         }
     }
-
-    let sig = ctx.funcs.get(func).cloned().unwrap();
-    if args.len() != sig.params.len() {
-        return Err(err(
-            format!(
-                "function '{func}' takes {} argument(s) but {} were given",
-                sig.params.len(),
-                args.len()
-            ),
-            span,
-        ));
-    }
-    let mut lowered_args = Vec::new();
-    for (i, (arg, &expected)) in args.iter().zip(&sig.params).enumerate() {
-        // `f([])` / `f([1, 2])` use the parameter's element type
-        let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected) {
-            lower_list_lit(items, Some(*elem), arg.span, ctx)?
-        } else {
-            lower_expr(arg, ctx)?
-        };
-        let a = coerce(
-            a,
-            expected,
-            arg.span,
-            &format!("argument {} of '{func}'", i + 1),
-        )?;
-        lowered_args.push(a);
-    }
-    Ok(ir::Expr {
-        ty: sig.ret,
-        kind: ir::ExprKind::Call {
-            func: func.to_string(),
-            args: lowered_args,
-        },
-    })
 }
 
 fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Expr> {
