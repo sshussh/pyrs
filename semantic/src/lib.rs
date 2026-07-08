@@ -146,9 +146,7 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
 
 /// Collect a module's function signatures (with builtin-shadowing and
 /// duplicate checks).
-fn collect_sigs(
-    module: &ast::Module,
-) -> SResult<(HashMap<String, FuncSig>, Vec<&ast::FuncDef>)> {
+fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<&ast::FuncDef>)> {
     let mut funcs: HashMap<String, FuncSig> = HashMap::new();
     let mut order: Vec<&ast::FuncDef> = Vec::new();
     for stmt in &module.body {
@@ -347,7 +345,7 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
         };
 
         let init = if is_root && script.is_empty() {
-            // pyrs convenience: a root that is only definitions calls main()
+            // PyRs convenience: a root that is only definitions calls main()
             if let Some(sig) = funcs.get("main") {
                 if !sig.params.is_empty() {
                     return Err(err(
@@ -1086,12 +1084,13 @@ fn lower_str_method(
                 },
             });
         }
+        "isdigit" => (IsDigit, ir::Ty::Bool, 0),
         _ => {
             return Err(err(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
                      upper, lower, strip, lstrip, rstrip, startswith, \
-                     endswith, find, count, replace, split, join)"
+                     endswith, find, count, replace, split, join, isdigit)"
                 ),
                 method_span,
             ));
@@ -2685,13 +2684,11 @@ fn lower_call(
     }
     {
         match func {
-            "print" => {
-                Err(err(
-                    "print(...) does not return a value and cannot be used \
+            "print" => Err(err(
+                "print(...) does not return a value and cannot be used \
                      in an expression",
-                    span,
-                ))
-            }
+                span,
+            )),
             "len" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -2711,12 +2708,10 @@ fn lower_call(
                     kind: ir::ExprKind::Len(Box::new(arg)),
                 })
             }
-            "range" => {
-                Err(err(
-                    "range(...) is only supported as the iterable of a 'for' loop",
-                    span,
-                ))
-            }
+            "range" => Err(err(
+                "range(...) is only supported as the iterable of a 'for' loop",
+                span,
+            )),
             "input" => {
                 let prompt = match args {
                     [] => Option::None,
@@ -3290,6 +3285,23 @@ print(fib(10))
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Bool);
+    }
+
+    #[test]
+    fn str_isdigit_is_bool() {
+        let m = analyze_ok("b = \"42\".isdigit()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::IsDigit,
+                ..
+            }
+        ));
     }
 
     #[test]

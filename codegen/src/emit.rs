@@ -132,6 +132,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_split_ws(ptr)\n");
         out.push_str("declare ptr @pyrs_str_split(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_join(ptr, ptr)\n");
+        out.push_str("declare i32 @pyrs_str_isdigit(ptr)\n");
         out.push_str("declare ptr @pyrs_list_new(i64)\n");
         out.push_str("declare void @pyrs_list_push(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
@@ -718,6 +719,7 @@ impl Emitter {
                     StrFn::SplitWs => ("pyrs_str_split_ws", false, false),
                     StrFn::Split => ("pyrs_str_split", false, false),
                     StrFn::Join => ("pyrs_str_join", false, false),
+                    StrFn::IsDigit => ("pyrs_str_isdigit", true, false),
                 };
                 let args_str = vals
                     .iter()

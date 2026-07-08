@@ -33,10 +33,10 @@ fn run_program(tag: &str, source: &str) -> String {
         .args(["run", "-i"])
         .arg(&src)
         .output()
-        .expect("failed to spawn pyrs");
+        .expect("failed to spawn PyRs");
     assert!(
         out.status.success(),
-        "pyrs run failed\nstdout: {}\nstderr: {}",
+        "PyRs run failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -52,7 +52,7 @@ fn run_program_expect_fail(tag: &str, source: &str) -> (i32, String) {
         .args(["run", "-i"])
         .arg(&src)
         .output()
-        .expect("failed to spawn pyrs");
+        .expect("failed to spawn PyRs");
     assert!(
         !out.status.success(),
         "expected failure but program succeeded"
@@ -906,6 +906,20 @@ print(\", \".join(csv.split(\",\")))
 }
 
 #[test]
+fn str_isdigit_matches_python() {
+    let out = run_program(
+        "isdigit",
+        "\
+print(\"123\".isdigit(), \"\".isdigit(), \"12a\".isdigit())
+print(\"-3\".isdigit(), \"3.5\".isdigit(), \" 7\".isdigit())
+nums = [\"10\", \"3x\", \"\", \"42\"]
+print(len([n for n in nums if n.isdigit()]))
+",
+    );
+    assert_eq!(out, "True False False\nFalse False False\n2\n");
+}
+
+#[test]
 fn global_variables_match_python() {
     let out = run_program(
         "globals",
@@ -1418,10 +1432,10 @@ fn run_project(tag: &str, files: &[(&str, &str)], root: &str) -> String {
         .args(["run", "-i"])
         .arg(dir.0.join(root))
         .output()
-        .expect("failed to spawn pyrs");
+        .expect("failed to spawn PyRs");
     assert!(
         out.status.success(),
-        "pyrs run failed\nstdout: {}\nstderr: {}",
+        "PyRs run failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -1438,7 +1452,7 @@ fn compile_project_expect_fail(tag: &str, files: &[(&str, &str)], root: &str) ->
         .args(["compile", "-i"])
         .arg(dir.0.join(root))
         .output()
-        .expect("failed to spawn pyrs");
+        .expect("failed to spawn PyRs");
     assert!(!out.status.success(), "expected a compile error");
     String::from_utf8_lossy(&out.stderr).into_owned()
 }

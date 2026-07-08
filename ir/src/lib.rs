@@ -315,4 +315,6 @@ pub enum StrFn {
     Split,
     /// `sep.join(parts)` → str
     Join,
+    /// 's.isdigit()' -> bool
+    IsDigit,
 }

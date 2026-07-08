@@ -1,4 +1,4 @@
-/* pyrs runtime: tiny C support library linked into every compiled program.
+/* PyRs runtime: tiny C support library linked into every compiled program.
  *
  * Printing matches CPython:
  * - floats use the shortest representation that round-trips, and whole
@@ -598,6 +598,20 @@ PyrsStr *pyrs_str_from_bool(int v) {
     return r;
 }
 
+int pyrs_str_isdigit(const PyrsStr *s) {
+    check_ref(s);
+    if (s->len == 0) {
+        return 0;
+    }
+    for (long long i = 0; i < s->len; i++) {
+        if (s->data[i] < '0' || s->data[i] > '9') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 /* ---- lists ---- */
 
 PyrsList *pyrs_list_new(long long cap) {
@@ -976,7 +990,7 @@ PyrsStr *pyrs_input(const PyrsStr *prompt) {
 /* ---- integer power ---- */
 
 /* repeated squaring; unsigned internally so overflow wraps (like the rest
- * of pyrs int arithmetic) instead of being UB */
+ * of PyRs int arithmetic) instead of being UB */
 long long pyrs_ipow(long long base, long long exp) {
     if (exp < 0) {
         pyrs_die(
