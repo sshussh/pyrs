@@ -26,6 +26,8 @@ pub enum Ty {
     Str,
     /// Growable list; elements may themselves be lists
     List(&'static Ty),
+    /// An open file handle from `open(...)`
+    File,
     /// Absence of a value: `None` returns / bare functions
     None,
 }
@@ -43,6 +45,7 @@ impl std::fmt::Display for Ty {
             Ty::Bool => write!(f, "bool"),
             Ty::Str => write!(f, "str"),
             Ty::List(e) => write!(f, "list[{e}]"),
+            Ty::File => write!(f, "file"),
             Ty::None => write!(f, "None"),
         }
     }
@@ -137,6 +140,17 @@ pub enum ExprKind {
     },
     /// `sys.argv` → list[str] (requires `import sys`).
     Argv,
+    /// `open(path, mode)` → file. Mode is a str ("r"/"w"/"a"), validated
+    /// at compile time when constant, at runtime otherwise.
+    Open {
+        path: Box<Expr>,
+        mode: Box<Expr>,
+    },
+    /// A file method call (`base` is the first argument).
+    FileCall {
+        func: FileFn,
+        args: Vec<Expr>,
+    },
     /// Evaluate `value`, store it in local `name`, then evaluate `body`.
     /// Used for compiler temps (e.g. comparison chaining).
     Let {
@@ -239,6 +253,22 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+}
+
+/// File methods implemented by the C runtime. Errors (closed file,
+/// wrong mode) trap with CPython's exact messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFn {
+    /// `f.read()` → str (everything remaining)
+    Read,
+    /// `f.readline()` → str (keeps the trailing newline; "" at EOF)
+    ReadLine,
+    /// `f.readlines()` → list[str]
+    ReadLines,
+    /// `f.write(s)` → int (characters written)
+    Write,
+    /// `f.close()` → None (idempotent)
+    Close,
 }
 
 /// String methods implemented by the C runtime. ASCII-only case and
