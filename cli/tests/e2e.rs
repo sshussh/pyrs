@@ -1247,3 +1247,84 @@ fn file_misuse_is_compile_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---- with statement ----
+
+#[test]
+fn with_statement_matches_python() {
+    let dir = TempDir::new("withstmt");
+    let path = dir.0.join("w.txt").display().to_string();
+    let out = run_program(
+        "withstmt",
+        &format!(
+            "\
+with open(\"{path}\", \"w\") as f:
+    f.write(\"one\\n\")
+    f.write(\"two\\n\")
+
+with open(\"{path}\") as r:
+    print(r.readlines())
+
+def head(p: str) -> str:
+    with open(p) as fh:
+        return fh.readline().strip()
+
+print(head(\"{path}\"))
+
+found = \"\"
+for attempt in range(3):
+    with open(\"{path}\") as fh:
+        if attempt == 1:
+            found = fh.readline().strip()
+            break
+print(found, attempt)
+
+with open(\"{path}\"):
+    print(\"no-as form\")
+"
+        ),
+    );
+    assert_eq!(out, "['one\\n', 'two\\n']\none\none 1\nno-as form\n");
+}
+
+#[test]
+fn with_closes_the_file() {
+    let dir = TempDir::new("withclose");
+    let path = dir.0.join("w.txt").display().to_string();
+    let (code, stderr) = run_program_expect_fail(
+        "withclose",
+        &format!(
+            "\
+w = open(\"{path}\", \"w\")
+w.close()
+with open(\"{path}\") as f:
+    pass
+f.read()
+"
+        ),
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: I/O operation on closed file."),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn with_on_non_file_is_compile_error() {
+    let dir = TempDir::new("withbad");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "with 5 as x:\n    pass\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("does not support the context manager protocol"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

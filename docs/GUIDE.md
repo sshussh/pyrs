@@ -497,6 +497,19 @@ for line in open("report.txt").readlines():   # lines keep their '\n'
     print(line.strip())
 ```
 
+`with` works for files and guarantees the close on every exit path,
+including early `return`/`break` (the return value is evaluated before
+the close, so `return f.read()` behaves exactly like Python):
+
+```python
+with open("report.txt") as f:
+    text = f.read()
+
+def first_line(p: str) -> str:
+    with open(p) as fh:
+        return fh.readline().strip()
+```
+
 `readline()` returns `""` at end of file. Errors match CPython exactly:
 missing files raise `FileNotFoundError: [Errno 2] ...`, operations on a
 closed file raise `ValueError: I/O operation on closed file.`, and
@@ -504,8 +517,9 @@ reading a write-mode file raises `io.UnsupportedOperation: not
 readable`. Writes are flushed immediately, so data survives even if you
 forget `close()`.
 
-Not supported yet: binary modes, `with open(...) as f:`, iterating the
-file object directly (use `.readlines()`), printing file objects, and
+Not supported yet: binary modes, iterating the
+file object directly (use `.readlines()`), printing file objects,
+multiple context managers in one `with`, `with` on non-files, and
 file-typed function parameters (there is no `file` annotation — handles
 are inferred locally).
 
