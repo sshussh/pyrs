@@ -118,6 +118,10 @@ pub enum Stmt {
     ListClear {
         list: Expr,
     },
+    /// `list.sort()` — in-place; element type carried on `list.ty`.
+    ListSort {
+        list: Expr,
+    },
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
         orelse: Vec<Stmt>,

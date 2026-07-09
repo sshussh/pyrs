@@ -908,6 +908,50 @@ void pyrs_list_clear(PyrsList *l) {
     l->len = 0;
 }
 
+/* qsort needs a tag; single-threaded compiler runtime is fine */
+static int sort_elem_tag;
+
+static int cmp_slots_qsort(const void *pa, const void *pb) {
+    long long a = *(const long long *)pa;
+    long long b = *(const long long *)pb;
+    int tag = sort_elem_tag;
+    switch (tag) {
+    case 0: /* int */
+    case 2: /* bool as 0/1 */
+        return (a > b) - (a < b);
+    case 1: { /* float: total order, NaN last */
+        double x, y;
+        memcpy(&x, &a, sizeof x);
+        memcpy(&y, &b, sizeof y);
+        int nx = isnan(x);
+        int ny = isnan(y);
+        if (nx && ny) {
+            return 0;
+        }
+        if (nx) {
+            return 1;
+        }
+        if (ny) {
+            return -1;
+        }
+        return (x > y) - (x < y);
+    }
+    case 3:
+        return pyrs_str_cmp((const PyrsStr *)a, (const PyrsStr *)b);
+    default:
+        return 0;
+    }
+}
+
+void pyrs_list_sort(PyrsList *l, int tag) {
+    check_ref(l);
+    if (l->len < 2) {
+        return;
+    }
+    sort_elem_tag = tag;
+    qsort(l->data, (size_t)l->len, sizeof(long long), cmp_slots_qsort);
+}
+
 long long pyrs_list_pop(PyrsList *l, long long i) {
     check_ref(l);
     if (l->len == 0) {

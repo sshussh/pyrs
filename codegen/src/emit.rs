@@ -147,6 +147,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_list_remove(ptr, i64, i32)\n");
         out.push_str("declare i64 @pyrs_list_index(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_list_clear(ptr)\n");
+        out.push_str("declare void @pyrs_list_sort(ptr, i32)\n");
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
         out.push_str("declare i32 @pyrs_list_eq(ptr, ptr, i32)\n");
@@ -567,6 +568,16 @@ impl Emitter {
             Stmt::ListClear { list } => {
                 let l = self.emit_expr(list);
                 self.line(format!("call void @pyrs_list_clear(ptr {l})"));
+            }
+            Stmt::ListSort { list } => {
+                let l = self.emit_expr(list);
+                let Ty::List(elem) = list.ty else {
+                    unreachable!("ListSort on non-list");
+                };
+                self.line(format!(
+                    "call void @pyrs_list_sort(ptr {l}, i32 {})",
+                    elem_tag(elem)
+                ));
             }
             Stmt::ListAppendUnchecked { list, value } => {
                 // capacity was guaranteed at allocation: store the slot at

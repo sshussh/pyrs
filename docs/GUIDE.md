@@ -408,16 +408,19 @@ m.append(["a", "b"])
 ```
 
 List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
-`index(v)`, `clear()`. `insert` clamps the index like CPython;
+`index(v)`, `clear()`, `sort()`. `insert` clamps the index like CPython;
 `remove` / `index` trap with `ValueError` when the value is missing.
+`sort()` is in-place (statement only); `sorted(xs)` returns a new sorted
+copy. Supported element types: `int`, `float`, `bool`, `str` (no
+`key=`/`reverse=` yet). Float NaN sorts last (stable total order).
 
 List `+` concatenates (same element type); `*` repeats with an int count
 (`n <= 0` yields `[]`). Both produce a new list (shallow copy of slots).
 `==` / `!=` compare length and elements (same rules as `in`; nested lists
 compare recursively).
 
-Not supported yet: list `sort`, ordering comparisons (`<` etc.), `in` on
-lists of lists (membership still limited), and slice assignment.
+Not supported yet: list ordering comparisons (`<` etc.), `in` on lists of
+lists (membership still limited), and slice assignment.
 
 ### Control flow
 
@@ -483,6 +486,7 @@ functions, closures, `lambda`, and redefining a function.
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
 | `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg; 2-arg only) |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
+| `sorted(xs)` | `list[int\|float\|bool\|str]` | new sorted list (no `key=`/`reverse=`) |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `global x` | (statement) | write access to a module global |
 | `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |

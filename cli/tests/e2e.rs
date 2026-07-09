@@ -920,6 +920,37 @@ print(len([n for n in nums if n.isdigit()]))
 }
 
 #[test]
+fn list_sort_and_sorted_match_python() {
+    let out = run_program(
+        "listsort",
+        "\
+xs = [3, 1, 2]
+xs.sort()
+print(xs)
+print(sorted([3, 1, 2]))
+print(sorted([3.0, 1.5, 2.0]))
+print(sorted([\"b\", \"a\", \"c\"]))
+print(sorted([True, False, True]))
+a = [1]
+b = sorted(a)
+b.append(2)
+print(a, b)
+",
+    );
+    assert_eq!(
+        out,
+        "\
+[1, 2, 3]
+[1, 2, 3]
+[1.5, 2.0, 3.0]
+['a', 'b', 'c']
+[False, True, True]
+[1] [1, 2]
+"
+    );
+}
+
+#[test]
 fn list_eq_ne_match_python() {
     let out = run_program(
         "listeq",

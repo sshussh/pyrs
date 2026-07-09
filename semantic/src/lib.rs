@@ -122,8 +122,8 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 9] = [
-    "print", "len", "range", "input", "open", "abs", "min", "max", "sum",
+const BUILTINS: [&str; 10] = [
+    "print", "len", "range", "input", "open", "abs", "min", "max", "sum", "sorted",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -993,6 +993,20 @@ fn lower_method_stmt(
                 }
                 Ok(ir::Stmt::ListClear { list: base_ir })
             }
+            "sort" => {
+                if !args.is_empty() {
+                    return Err(err(
+                        format!(
+                            "sort() takes no arguments ({} given); key=/reverse= \
+                             are not supported yet",
+                            args.len()
+                        ),
+                        method_span,
+                    ));
+                }
+                ensure_sortable_list_elem(*elem, method_span)?;
+                Ok(ir::Stmt::ListSort { list: base_ir })
+            }
             // pop / index as statements discard the result
             "pop" => {
                 let pop = lower_list_pop(base_ir, *elem, args, method_span, ctx)?;
@@ -1005,7 +1019,7 @@ fn lower_method_stmt(
             _ => Err(err(
                 format!(
                     "list method '{method}' is not supported yet (supported: \
-                     append, pop, insert, remove, index, clear)"
+                     append, pop, insert, remove, index, clear, sort)"
                 ),
                 method_span,
             )),
@@ -1243,6 +1257,19 @@ fn lower_list_pop(
             index: Box::new(index),
         },
     })
+}
+
+fn ensure_sortable_list_elem(elem: ir::Ty, span: Span) -> SResult<()> {
+    match elem {
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => Ok(()),
+        other => Err(err(
+            format!(
+                "sort is only supported for list[int], list[float], list[bool], \
+                 and list[str], found list[{other}]"
+            ),
+            span,
+        )),
+    }
 }
 
 fn lower_list_index_of(
@@ -2057,7 +2084,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     // pop returns the removed element
                     "pop" => lower_list_pop(base_ir, *elem, args, *method_span, ctx),
                     "index" => lower_list_index_of(base_ir, *elem, args, *method_span, ctx),
-                    "append" | "insert" | "remove" | "clear" => Err(err(
+                    "append" | "insert" | "remove" | "clear" | "sort" => Err(err(
                         format!(
                             "list.{method}(...) returns None and cannot be used \
                              in an expression"
@@ -2875,6 +2902,59 @@ fn lower_call(
                         args[0].span,
                     )),
                 }
+            }
+            "sorted" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!(
+                            "sorted() takes exactly 1 argument ({} given); \
+                             key=/reverse= are not supported yet",
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(&args[0], ctx)?;
+                let elem = match arg.ty {
+                    ir::Ty::List(e) => *e,
+                    other => {
+                        return Err(err(
+                            format!("sorted() expects a list, found {other}"),
+                            args[0].span,
+                        ));
+                    }
+                };
+                ensure_sortable_list_elem(elem, args[0].span)?;
+                // copy via `xs * 1`, sort the copy, yield it
+                let ty = arg.ty;
+                let tmp = ctx.fresh_temp("sorted", ty);
+                let copy = ir::Expr {
+                    ty,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Mul,
+                        left: Box::new(arg),
+                        right: Box::new(int_const(1)),
+                    },
+                };
+                let local = |name: String| ir::Expr {
+                    ty,
+                    kind: ir::ExprKind::Local(name),
+                };
+                Ok(ir::Expr {
+                    ty,
+                    kind: ir::ExprKind::Block {
+                        stmts: vec![
+                            ir::Stmt::Assign {
+                                name: tmp.clone(),
+                                value: copy,
+                            },
+                            ir::Stmt::ListSort {
+                                list: local(tmp.clone()),
+                            },
+                        ],
+                        result: Box::new(local(tmp)),
+                    },
+                })
             }
             "range" => Err(err(
                 "range(...) is only supported as the iterable of a 'for' loop",
@@ -3806,6 +3886,18 @@ print(fib(10))
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn list_sort_stmt_and_sorted_builtin() {
+        let m = analyze_ok("xs = [3, 1]\nxs.sort()\nys = sorted([2, 1])\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(matches!(entry.body[1], ir::Stmt::ListSort { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
     }
 
     #[test]
