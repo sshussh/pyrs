@@ -1,46 +1,452 @@
 # PyRs Compiler Specification & Architecture
 
-This document outlines the architectural decisions, technology stack, and build strategies for the PyRs hybrid compiler project.
+Public architecture document for PyRs: goals, technology stack, pipeline,
+crate boundaries, IR contract, runtime ABI, and build/link strategy.
 
-## 1. Core Technology Stack
+**Companion docs:**
 
-- **Frontend / Driver:** Rust (Edition 2024)
-- **Backend / LLVM Shim:** C++23 / C++26
-- **Build System:** Cargo Workspaces + CMake
-- **Native Toolchain:** LLVM (linked statically via `llvm-config`), Clang/GCC
-- **Key Rust Libraries:** * `logos` (Lexer)
-  - `clap` (CLI)
-  - `cmake` (FFI build)
-  - `chumsky` (Parser - Planned)
-  - `serde` + `rmp-serde` (IR Serialization - Planned)
+| Document                       | Role                                           |
+| ------------------------------ | ---------------------------------------------- |
+| [`README.md`](../README.md)    | Product overview, language surface, benchmarks |
+| [`GUIDE.md`](GUIDE.md)         | Full language reference and toolchain usage    |
+| [`PRIMITIVES.md`](PRIMITIVES.md) | Builtin/method/stdlib split; primitives kit  |
+| [`EXTENDING.md`](EXTENDING.md) | Contributor guide: how to add features         |
+| [`AGENTS.md`](../AGENTS.md)    | Conventions for automated agents               |
 
-## 2. Workspace Architecture & Data Flow
+**Versioning:** the language surface is labeled **v0.7** (README / GUIDE).
+Workspace crate versions and the clap `version =` string should match that
+milestone; if they lag (historically `0.1.0`), treat the **language** label
+as authoritative for docs and release tags (`v0.7.0`), and bump Cargo/clap
+when shipping.
 
-The project is divided into specialized crates to enforce a strict, unidirectional data flow and isolate the C++ FFI.
+---
 
-| Phase / Crate  | Role & Responsibility                                                                                                         | Input           | Output            | Dependencies             |
-| :------------- | :---------------------------------------------------------------------------------------------------------------------------- | :-------------- | :---------------- | :----------------------- |
-| **`cli`**      | **Orchestrator.** Parses CLI arguments (`clap`), handles File I/O, pipes data through phases, and manages final LLVM linking. | Source File     | Native Executable | All crates               |
-| **`common`**   | **Foundation.** Houses shared types (Spans, Diagnostics, File IDs) to prevent circular dependencies.                          | -               | Shared Types      | None                     |
-| **`lexer`**    | **Scanner.** Wraps `logos` with a custom state machine to handle Python's semantic whitespace (`INDENT`/`DEDENT`).            | Source Text     | `Vec<Token>`      | `common`                 |
-| **`parser`**   | **Syntax Analysis.** Consumes tokens to build the Abstract Syntax Tree (AST).                                                 | `Vec<Token>`    | AST               | `lexer`, `common`        |
-| **`semantic`** | **Analysis & Lowering.** Handles name resolution, type checking, and lowers the AST into the Intermediate Representation.     | AST             | IR                | `parser`, `ir`, `common` |
-| **`ir`**       | **The Contract.** Pure data structures representing lowered instructions. Defines the boundary between Rust and C++.          | -               | -                 | `common`                 |
-| **`codegen`**  | **LLVM Bridge.** Exposes `extern "C"` bindings. Responsible for building the C++ LLVM shim via CMake.                         | IR (Serialized) | Object Code       | `ir`, `cmake`            |
+## 1. Goals
 
-## 3. Build and Linking Strategy
+**PyRs** is an ahead-of-time compiler for Python. It turns source into a
+standalone native executable through LLVM. There is no interpreter or VM
+in the compiled program.
 
-To successfully bind Rust to statically-linked LLVM on Linux (specifically Arch Linux), the build pipeline enforces a strict dependency resolution order via `build.rs`:
+| Goal                                | Meaning                                                                                                                                                        |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Drop-in replacement (long-term)** | Grow the supported surface until PyRs can replace CPython for real workloads.                                                                                  |
+| **Byte-parity (hard rule today)**   | For every construct that _is_ supported, stdout, stderr, and exit codes must match CPython on the same program (modulo documented deviations in README/GUIDE). |
+| **Native performance**              | Compute-bound code should compile to machine code comparable to C for the same algorithm.                                                                      |
+| **Honest errors**                   | Unsupported features fail at compile time with a named `"… is not supported yet"` diagnostic; runtime traps reuse CPython's messages where applicable.         |
 
-1. **CMake Invocation (`codegen/build.rs`):** Compiles the C++ shim (`lib.cc`) into a static archive (`libcodegen_shim.a`).
-2. **Metadata Propagation:** The `links = "codegen_shim"` directive in `codegen/Cargo.toml` guarantees linker flags propagate up to the final binary crate.
-3. **Shim Linking (`cli/build.rs`):** Cargo links the native shim archive first.
-4. **LLVM Component Resolution (`cli/build.rs`):** `llvm-config --link-static --libs` dynamically fetches the exact static LLVM component libraries (e.g., `core`, `executionengine`, `analysis`) and links them.
-5. **System Dependency Resolution (`cli/build.rs`):** `llvm-config --system-libs` fetches required system libraries (e.g., `z`, `zstd`, `m`, `rt`, `dl`, `ncurses`, `xml2`) to satisfy LLVM's internal requirements.
-6. **C++ Runtime (`cli/build.rs`):** Statically links the C++ standard library (`stdc++`).
+**Naming:**
 
-## 4. Language Implementation Rules
+| Form         | Use                                                     |
+| ------------ | ------------------------------------------------------- |
+| **PyRs**     | Project name in prose and docs                          |
+| **`pyrs`**   | Binary, Cargo package, CLI                              |
+| **`pyrs_*`** | C runtime symbols and mangled user functions in LLVM IR |
 
-- **Semantic Whitespace:** Managed entirely in the `lexer` via a visual-width calculation (`calc_indent`) and an `indent_stack`. It buffers `Indent` and `Dedent` tokens into a `VecDeque` and correctly unrolls open blocks upon hitting `EOF`.
-- **C++ FFI Boundary:** C++ logic is strictly isolated in `codegen/shim`. Rust communicates with it by passing pointers to serialized IR byte arrays (e.g., MessagePack) to ensure memory safety across the boundary.
-- **Symbol Visibility:** Visibility of internal C++ symbols is explicitly hidden (`CXX_VISIBILITY_PRESET hidden`) to prevent namespace collisions with Rust's native toolchain.
+---
+
+## 2. Technology stack
+
+| Layer                       | Choice                                                                         |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| Frontend / driver           | Rust (edition **2024**)                                                        |
+| LLVM bridge (shim)          | C++ (CMake target standard **C++26**)                                          |
+| Object emission / opt       | LLVM via `llvm-config` (parse → verify → optimize → object)                    |
+| Final link of user programs | System `cc` + small C runtime                                                  |
+| Build                       | Cargo workspace + CMake (shim only)                                            |
+| Lexer                       | [`logos`](https://crates.io/crates/logos) + custom INDENT/DEDENT state machine |
+| Parser                      | Hand-written recursive descent (not a parser combinator library)               |
+| CLI                         | [`clap`](https://crates.io/crates/clap) derive API                             |
+| FFI build glue              | [`cmake`](https://crates.io/crates/cmake) crate from `codegen/build.rs`        |
+
+There is **no** MessagePack (or other binary) serialization of the
+compiler IR across the Rust/C++ boundary. The hand-off is **LLVM IR text**.
+There is no planned dependency on `chumsky` in the current design.
+
+**Host requirements to build the compiler:** Rust toolchain, `llvm-config`
+on `PATH`, CMake, a C/C++ compiler, and `python3` for parity tests and
+benchmarks. `make doctor` checks these.
+
+---
+
+## 3. Pipeline and data flow
+
+Strict **unidirectional** flow. Each stage consumes only the previous
+stage's output.
+
+```
+source text
+   │  lexer          logos tokens + INDENT/DEDENT / line joining
+   ▼
+Vec<(Token, Span)>
+   │  parser         recursive descent → syntax-only AST
+   ▼
+ast::Module
+   │  semantic       names, types, coercions, desugaring
+   ▼
+ir::Module           fully typed tree (the contract)
+   │  codegen/emit   LLVM IR as text
+   ▼
+LLVM IR string
+   │  C++ shim       parseIR → verify → opt (O0–O3) → native .o
+   ▼
+object file  +  runtime.c  ──cc -lm──►  native executable
+```
+
+**Driver (`cli`):** for `compile` / `run`, resolve the import graph
+(`cli/src/modules.rs`), parse every module, run `semantic::analyze_program`,
+emit LLVM IR, optionally write `<output>.ll`, invoke the shim to produce
+an object file, then compile/link `runtime.c` with `cc`.
+
+**Invariant:** if codegen must “figure out” a type or desugar a construct,
+the design is wrong — that work belongs in **semantic**.
+
+---
+
+## 4. Workspace crates
+
+```
+pyrs/                 Cargo workspace (resolver = "3")
+├── common/           spans, diagnostics
+├── lexer/
+├── parser/           AST + recursive descent
+├── semantic/         typecheck + lower to IR
+├── ir/               pure data structures (no analysis)
+├── codegen/          emit.rs + runtime.c + CMake shim
+└── cli/              binary `pyrs`
+```
+
+| Crate          | Role                                                                    | Input                               | Output                  | Depends on               |
+| -------------- | ----------------------------------------------------------------------- | ----------------------------------- | ----------------------- | ------------------------ |
+| **`common`**   | Shared `Span`, `Phase`, `Diagnostic` (with file index for multi-module) | —                                   | types                   | —                        |
+| **`lexer`**    | Tokenize; synthesize `INDENT`/`DEDENT`; handle implicit line joining    | source `&str`                       | `Vec<(Token, Span)>`    | `common`                 |
+| **`parser`**   | Build untyped AST                                                       | source (lexes internally) or tokens | `ast::Module`           | `lexer`, `common`        |
+| **`semantic`** | Resolve names/imports, type-check, lower                                | one or more ASTs                    | `ir::Module`            | `parser`, `ir`, `common` |
+| **`ir`**       | Typed IR contract                                                       | —                                   | data types only         | `common`                 |
+| **`codegen`**  | Emit LLVM IR text; FFI to shim; embed `RUNTIME_C`                       | `ir::Module`                        | IR string / object file | `ir`, CMake, LLVM        |
+| **`cli`**      | Orchestrate pipeline; module load; link user programs                   | `.py` paths                         | executable / dumps      | all crates               |
+
+Dependencies form a DAG. **`ir` does not depend on parser or semantic.**
+The C++ shim is built as a static archive and linked into the **`pyrs`**
+binary; it is not linked into user programs.
+
+---
+
+## 5. Phase responsibilities
+
+### 5.1 Lexer
+
+- Wraps **logos** with a visual-width indent stack (`calc_indent`,
+  `indent_stack`), pending `Indent`/`Dedent` queue, and parenthesis depth
+  for implicit line joining.
+- Blank/comment-only lines do not affect indentation.
+- Open blocks are closed with `Dedent` tokens at EOF.
+- Errors are `Diagnostic`s with phase `Lex`, never panics on bad input.
+
+### 5.2 Parser
+
+- Hand-written recursive descent; expression ladder by precedence
+  (`or` → `and` → `not` → comparison → … → primary).
+- AST is **syntax only** — no types, no name resolution.
+- Unsupported Python constructs should produce clear
+  `"… is not supported yet"` errors (not a vague syntax error) when
+  recognized.
+
+### 5.3 Semantic analysis and lowering
+
+- Single-file entry: `analyze`; multi-file: `analyze_program` (driver always
+  goes through the multi-file path after module load).
+- Resolves names (locals, `global`, module globals, imports).
+- Type-checks with a fixed type after first assignment; parameter
+  annotations are required in the current language.
+- Applies implicit numeric promotion (`bool → int → float`) and inserts
+  **explicit** IR casts.
+- Desugars sugar (e.g. `for` → `while` + step, list comprehensions,
+  `with` for files, comparison chaining with temps).
+- Checks return paths on functions declared to return a value.
+- Emits a single flat `ir::Module` (all functions and globals, entry name
+  `__main__`).
+- **Reserved builtins** (cannot be redefined by `def`): `print`, `len`,
+  `range`, `input`, `open`, `abs`. Casts `int`/`float`/`bool`/`str` are
+  separate syntax/`Cast` paths, not this reserved list.
+- Builtin *calls* are lowered in `lower_call` (and method tables for
+  `str` / `list` / `file`); see [PRIMITIVES.md](PRIMITIVES.md).
+
+### 5.4 IR
+
+Pure data. Every expression carries `ty`. Codegen matches on IR only.
+
+Notable shapes:
+
+- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `list[T]`
+  (interned via `list_of` so `Ty` stays `Copy`), `file`, `None`.
+  `file` is a runtime handle type used for `open` / methods / `with`;
+  there is **no** user-facing `file` annotation or file-typed parameters
+  yet (handles are not first-class in the type language for signatures).
+- **Statements:** assign / global assign / index assign, list append
+  (checked and unchecked), `if`, `while` (+ step for desugared `for`),
+  return, print, die, break/continue, expression statements.
+- **Expressions:** constants, locals/globals, calls, binary/unary, index
+  and slice, `str`/`file` method calls (`StrFn` / `FileFn`), list ops
+  (lit, new-with-cap, pop, contains), `Let` temps, `Block` (for
+  comprehensions), casts, `len`, `abs`, `input`, `argv`, `open`, etc.
+
+Compiler temps use names starting with `.` (illegal as Python identifiers).
+
+### 5.5 Codegen (Rust)
+
+- `emit_llvm_ir` lowers IR to **textual** LLVM IR.
+- User functions are mangled as `pyrs_<name>` (module symbols may be
+  namespaced in the IR as `module.name` before mangling).
+- Module globals are LLVM globals `@g.<name>`.
+- **Two native styles** (see PRIMITIVES.md performance policy):
+  - **Inline IR / LLVM intrinsics** for hot or simple ops (list index +
+    bounds checks, `len` field load, `abs` → `llvm.abs.i64` /
+    `llvm.fabs.f64`, scalar arithmetic).
+  - **Calls into `runtime.c`** for bulk string/list work, I/O, print,
+    and complex helpers (`pyrs_str_*`, `pyrs_list_*`, `pyrs_open`, …).
+- List values live in **8-byte slots** (int/bool as integers; float
+  bitcast; pointers as `ptrtoint`/`inttoptr`). Helpers
+  `slot_from_value` / `value_from_slot` own the encoding.
+- Runtime traps go through helpers that pass C strings to `pyrs_die`
+  (PyRs string constants are length-prefixed; the die path skips the
+  8-byte header).
+
+### 5.6 C++ shim
+
+- File: `codegen/shim/src/lib.cc` (+ small headers for LLVM version
+  differences, e.g. target-triple APIs across LLVM 18 vs 21+).
+- Export: `pyrs_compile_ir(ir_bytes, len, out_path, opt_level, err_buf, …)`.
+- Parses textual IR with LLVM’s IRReader (**NUL-terminated** buffer via
+  `getMemBufferCopy` — required by the LL lexer).
+- Verifies, runs the standard new pass manager pipeline at O0–O3, emits a
+  PIC object for the host triple.
+- **Language-agnostic:** new PyRs features do not require C++ changes
+  (except when adapting to new LLVM C++ API breaks).
+- Internal C++ symbols use hidden visibility
+  (`CXX_VISIBILITY_PRESET hidden`) to avoid clashing with Rust’s link.
+
+### 5.7 C runtime
+
+- Source: `codegen/runtime/runtime.c`, embedded as `codegen::RUNTIME_C`
+  and written to a temp file at link time by the driver.
+- Provides Python-faithful printing (float shortest round-trip repr,
+  `True`/`False`, list repr), string and list heap objects, file I/O,
+  `input` / `sys.argv` wiring, arithmetic helpers (e.g. floored float
+  ops, int pow), and trap messages that match CPython where required.
+- Not every language op hits C: some are pure LLVM (e.g. `abs` on
+  int/float). The runtime is the home for layout- and OS-facing work.
+- **Memory:** strings and lists are allocated and **not freed** today
+  (documented limitation). Freeing / GC is required before a 1.0 release.
+
+### 5.8 Final link of user programs
+
+The driver runs approximately:
+
+```text
+cc program.o runtime.c -O2 -lm -o <output>
+```
+
+The **compiler** (`pyrs` binary) links the C++ shim and LLVM; **user
+programs** link only the object file from the shim plus `runtime.c`.
+
+---
+
+## 6. Multi-module compilation
+
+**Resolution model (current, stopgap):**
+
+- Imports are resolved relative to the **entry script’s directory**
+  (like `sys.path[0]` when running `python root.py`).
+- `import utils` / `import utils as u` / `from utils import x, y as z`
+  load `<rootdir>/utils.py` only. No packages, `import a.b`,
+  `from . import x`, `from m import *`, multi-name `import a, b`, or
+  `sys.path` search.
+- The root module’s synthetic name is **`__main__`** (`ENTRY_NAME` /
+  `ROOT_NAME`); dependency modules keep their file stem as the import name.
+- `import sys` is special-cased (exposes `sys.argv`); it is not loaded
+  as a file. Other stdlib modules are not provided unless added later
+  under an explicit design ([PRIMITIVES.md](PRIMITIVES.md)).
+- Cycles and missing modules/names are compile errors with spans pointing
+  at the importing file.
+
+**Pipeline:**
+
+1. `cli::modules::load_program` parses the root and dependencies, detects
+   cycles, returns modules in **topological order** (dependencies first,
+   root last). The vector index is the diagnostic **file id**.
+2. `semantic::analyze_program` collects signatures and global surfaces,
+   validates import bindings, lowers each module with a per-module
+   namespace (root keeps bare IR names; others use `module.` prefixes),
+   and merges into one `ir::Module`.
+3. Module bodies run at the import site (like Python); one linked
+   executable contains the whole program.
+
+Full packages and relative imports are planned to replace this model.
+
+---
+
+## 7. Type system (current vs direction)
+
+**Today (v0.7 subset):**
+
+- Static types after first assignment; cannot rebind a name to a
+  different type.
+- Parameter annotations required; return annotation optional (defaults to
+  “returns nothing”).
+- Homogeneous lists; empty lists need an annotation
+  (`xs: list[int] = []`).
+- Implicit promotions: `bool → int → float` in arithmetic, args, returns.
+- Function-wide local scoping with `global` for writes to module globals
+  (Python-like).
+
+**Direction:**
+
+- Move toward **full optional typing** and more of CPython’s dynamic
+  semantics over time, without abandoning parity for the supported core.
+- Document every intentional deviation in README/GUIDE until removed.
+
+Documented deviations (non-exhaustive; see GUIDE § Differences): 64-bit
+wrapping ints, `and`/`or` return `bool`, ASCII-only string case/whitespace
+rules, no GC, dynamic negative int `**` traps, etc.
+
+---
+
+## 8. Diagnostics
+
+- Every user-facing failure from lex/parse/semantic is a
+  `common::Diagnostic { phase, message, span, file }`.
+- Rendering produces a labeled error with file:line:col and a caret
+  underline under the span (narrowest useful span preferred).
+- Synthesized or locationless messages may use a default span and print
+  without a snippet.
+- **Phase honesty:** if a bad program can reach codegen, semantic is
+  missing a check. Users should not routinely see `error[codegen]`.
+- Runtime errors print to stderr and `exit(1)` with CPython-compatible
+  text where the runtime claims parity.
+
+---
+
+## 9. Build and linking strategy (compiler binary)
+
+LLVM is linked into the **`codegen`** crate (and thus the `pyrs` binary)
+from **`codegen/build.rs`**, not a separate `cli/build.rs`.
+
+Order of operations:
+
+1. **CMake** builds `codegen/shim` → static archive `libcodegen_shim.a`
+   (C++ objects only; **does not** link LLVM into the archive).
+2. Cargo is told `links = "codegen_shim"` so native link flags propagate.
+3. **`llvm-config --libdir`** and **`llvm-config --libs`** for the
+   components the shim needs (`core`, `support`, `native`, `analysis`,
+   `irreader`, `passes`, `target`, `mc`, `bitreader`, `bitwriter`, …).
+   Linking is **dynamic by default** on many distros (`--link-static` is
+   not forced); `build.rs` emits whatever `-l` / `-L` flags
+   `llvm-config` returns.
+4. **`llvm-config --system-libs`** for LLVM’s system dependencies.
+5. Link **`libstdc++`** for the C++ runtime used by the shim.
+
+Symbol visibility for the shim archive is **hidden** so internal C++
+symbols do not collide with the Rust toolchain.
+
+Rebuild triggers: changes under `codegen/shim/` (listed in
+`cargo:rerun-if-changed`).
+
+---
+
+## 10. Symbol and ABI conventions
+
+| Kind                     | Convention                                                                     |
+| ------------------------ | ------------------------------------------------------------------------------ |
+| User function in LLVM    | `@pyrs_<name>` (after IR naming / module prefix)                               |
+| Module global            | `@g.<name>`                                                                    |
+| Compiler temporary local | name starts with `.`                                                           |
+| Runtime API              | C functions `pyrs_*` declared in emitted IR and defined in `runtime.c`         |
+| LLVM intrinsics          | e.g. `llvm.abs.i64`, `llvm.fabs.f64`, `llvm.pow.f64` — no C body               |
+| String layout            | `{ i64 len, bytes… }` length-prefixed (+ trailing NUL for C interop)           |
+| List layout              | `{ i64 len, i64 cap, i64* data }` with 8-byte value slots                      |
+| Print / contains tags    | Scalars 0–3; nested list element tag = `4 + 8 × inner` (Rust and C must agree) |
+| CLI argv                 | `@pyrs_set_args` from generated `main`; `@pyrs_argv` returns `list[str]`       |
+| Program entry in IR      | synthetic function / module name `__main__` for the root script                  |
+
+Changing a layout or tag encoding requires a coordinated edit of
+**emit.rs** and **runtime.c**.
+
+---
+
+## 11. Compatibility and testing bar
+
+1. **Differential testing:** for each supported feature, the same program
+   under `python3` and `pyrs` must match (stdout and, for traps, message +
+   exit code). Capture expected output from CPython; do not invent it.
+2. **Unit tests** live in each crate; **e2e tests** in `cli/tests/e2e.rs`
+   compile real binaries (including multi-file module projects).
+3. **Local CI gate:** `make ci` → rustfmt check, clippy (`-D warnings`),
+   full workspace tests, example parity vs `python3`.
+4. **`make examples`:** currently globs `examples/*.py` only (top-level
+   scripts). Multi-file demos under `examples/modules/` are covered by
+   e2e tests; extending the Makefile glob is a known chore.
+5. **GitHub Actions:** `.github/workflows/ci.yml` mirrors `make ci`;
+   separate workflows exist for benches, docs, and releases.
+6. **Benchmarks:** `benchmarks/run.sh` verifies byte-identical output
+   before timing; results may be summarized in the README.
+
+Parity is a **hard rule** for supported features until the project owner
+documents a deliberate exception.
+
+---
+
+## 12. Architectural limits and roadmap anchors
+
+These are product constraints that affect design choices:
+
+| Area             | Current                                              | Direction                                                                 |
+| ---------------- | ---------------------------------------------------- | ------------------------------------------------------------------------- |
+| Modules          | Sibling `.py` next to entry; `import` / `from` / `as` | Full packages + relative imports                                          |
+| Memory           | Never free heap strings/lists                        | GC / freeing **before 1.0**                                               |
+| Typing           | Required params; fixed types                         | Optional typing + more dynamism                                           |
+| Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
+| stdlib           | `sys` special-case only                              | Mostly PyRs modules on the kit later; no large stdlib without design      |
+| Language surface | Subset (see README v0.7)                             | Grow toward CPython drop-in                                               |
+
+Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
+dicts, sets, tuples, exceptions / `try`, generators, nested functions /
+closures, `lambda`, packages, f-string format specs, default/keyword
+arguments, `for line in f`, file-typed parameters. Prefer compile-time
+rejection with a clear message over silent wrong behavior.
+
+**Strategy:** finish optimized **primitives** (IR + C) for current and new
+core types before a real stdlib tree. Do not grow `runtime.c` with
+high-level libraries.
+
+---
+
+## 13. CLI surface (driver contract)
+
+| Command                                               | Behavior                                               |
+| ----------------------------------------------------- | ------------------------------------------------------ |
+| `pyrs compile -i FILE -o OUT [-O 0..3] [--emit-llvm]` | Full pipeline → native executable; optional `.ll` dump |
+| `pyrs run -i FILE [-O N] [-- ARGS…]`                  | Compile to a temp dir, execute, propagate exit code    |
+| `pyrs lex -i FILE`                                    | Token dump (compiler debugging)                        |
+| `pyrs parse -i FILE`                                  | AST dump (compiler debugging)                          |
+
+Default optimization level is **2**. Entry semantics: top-level statements
+run as a script; if there are none, a zero-argument `main` is called when
+present.
+
+---
+
+## 14. Design principles (summary)
+
+1. **Unidirectional crates** — no reverse dependencies; IR is the
+   semantic↔codegen contract.
+2. **Python semantics win** on every supported construct.
+3. **Textual LLVM IR** is the only Rust↔C++ payload for codegen.
+4. **Thin shim** — all language knowledge stays in Rust + `runtime.c`
+   (plus LLVM intrinsics emitted from Rust).
+5. **Diagnostics over panics** for user programs.
+6. **Measure parity first**, performance second; never trade silent
+   wrongness for speed. Prefer IR for hot primitives; C for complex/OS.
+7. **Primitives before stdlib** — finite native kit, then PyRs modules
+   ([PRIMITIVES.md](PRIMITIVES.md)).
+8. **Document deviations** until they are removed on the path to drop-in
+   CPython replacement.
