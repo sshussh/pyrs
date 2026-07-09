@@ -225,14 +225,16 @@ All assignment forms:
 
 ```python
 name = expr                # plain
+a = b = expr               # multi-target; RHS once, assign right-to-left
 name: type = expr          # annotated (required for empty lists)
 name += expr               # augmented: += -= *= /= //= %= **=
 xs[i] = expr               # list element
 xs[i] += expr              # augmented element (base and index evaluate once)
+a = xs[i] = expr           # multi-target with index (shares the value)
 ```
 
-Not supported: multiple targets (`a = b = 1`), tuple unpacking
-(`a, b = 1, 2`), and annotations on anything but a plain name.
+Not supported: tuple unpacking (`a, b = 1, 2`), and annotations on
+anything but a plain single name (no `a: int = b = 0`).
 
 ### Operators
 
@@ -724,7 +726,7 @@ deliberate exceptions:
 Not implemented yet (clear compile errors): classes, dicts, sets, tuples,
 imports, exceptions, `with`, `match`, generators/`yield`, `lambda`,
 nested functions, closures, `nonlocal`, f-string format specs,
-keyword/default arguments, multiple assignment, and unpacking.
+`*args`/`**kwargs`, and unpacking.
 
 ## 9. Performance
 

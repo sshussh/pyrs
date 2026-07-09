@@ -230,12 +230,21 @@ impl Parser {
 
         if self.peek() == &Token::Eq {
             self.advance();
-            let target = self.expr_to_target(expr)?;
-            let value = self.parse_expr()?;
-            let span = target_span(&target).to(value.span);
+            let mut targets = vec![self.expr_to_target(expr)?];
+            // `a = b = c = value` — more targets while RHS is itself assigned
+            let value = loop {
+                let next = self.parse_expr()?;
+                if self.peek() == &Token::Eq {
+                    self.advance();
+                    targets.push(self.expr_to_target(next)?);
+                } else {
+                    break next;
+                }
+            };
+            let span = target_span(&targets[0]).to(value.span);
             return Ok(Stmt {
                 kind: StmtKind::Assign {
-                    target,
+                    targets,
                     annotation: None,
                     value,
                 },
@@ -244,7 +253,7 @@ impl Parser {
         }
 
         if self.peek() == &Token::Colon {
-            // annotated assignment: `x: ty = value` (names only)
+            // annotated assignment: `x: ty = value` (names only; not multi-assign)
             let ExprKind::Name(_) = expr.kind else {
                 return Err(self.error("type annotations are only allowed on plain variable names"));
             };
@@ -255,11 +264,16 @@ impl Parser {
                 "after type annotation (declarations require a value)",
             )?;
             let value = self.parse_expr()?;
+            if self.peek() == &Token::Eq {
+                return Err(
+                    self.error("type annotations are not allowed in multi-target assignment")
+                );
+            }
             let span = expr.span.to(value.span);
             let target = self.expr_to_target(expr)?;
             return Ok(Stmt {
                 kind: StmtKind::Assign {
-                    target,
+                    targets: vec![target],
                     annotation: Some(annotation),
                     value,
                 },
@@ -1553,10 +1567,22 @@ mod tests {
     #[test]
     fn parses_index_assignment() {
         let m = parse_ok("xs[0] = 5\n");
-        let StmtKind::Assign { target, .. } = &m.body[0].kind else {
+        let StmtKind::Assign { targets, .. } = &m.body[0].kind else {
             panic!("expected Assign");
         };
-        assert!(matches!(target, AssignTarget::Index { .. }));
+        assert!(matches!(targets.as_slice(), [AssignTarget::Index { .. }]));
+    }
+
+    #[test]
+    fn parses_multi_assign() {
+        let m = parse_ok("a = b = 0\n");
+        let StmtKind::Assign { targets, value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        assert_eq!(targets.len(), 2);
+        assert!(matches!(&targets[0], AssignTarget::Name { name, .. } if name == "a"));
+        assert!(matches!(&targets[1], AssignTarget::Name { name, .. } if name == "b"));
+        assert!(matches!(value.kind, ExprKind::Int(0)));
     }
 
     #[test]

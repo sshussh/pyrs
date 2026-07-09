@@ -1531,6 +1531,26 @@ print(len(open(path).readlines()))
 }
 
 #[test]
+fn multi_assign_matches_python() {
+    let out = run_program(
+        "multi",
+        "\
+a = b = 0
+print(a, b)
+a = b = c = 1
+print(a, b, c)
+xs = [0, 0]
+a = xs[0] = 5
+print(a, xs)
+x = y = [1]
+y.append(2)
+print(x)
+",
+    );
+    assert_eq!(out, "0 0\n1 1 1\n5 [5, 0]\n[1, 2]\n");
+}
+
+#[test]
 fn defaults_and_kwargs_match_python() {
     let out = run_program(
         "defkw",

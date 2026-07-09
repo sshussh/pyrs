@@ -217,11 +217,14 @@ fn collect_global_names(module: &ast::Module) -> std::collections::HashSet<Strin
     let mut names = std::collections::HashSet::new();
     for stmt in &module.body {
         match &stmt.kind {
-            ast::StmtKind::Assign {
-                target: ast::AssignTarget::Name { name, .. },
-                ..
+            ast::StmtKind::Assign { targets, .. } => {
+                for t in targets {
+                    if let ast::AssignTarget::Name { name, .. } = t {
+                        names.insert(name.clone());
+                    }
+                }
             }
-            | ast::StmtKind::AugAssign {
+            ast::StmtKind::AugAssign {
                 target: ast::AssignTarget::Name { name, .. },
                 ..
             } => {
@@ -728,10 +731,44 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             Ok(())
         }
         ast::StmtKind::Assign {
-            target,
+            targets,
             annotation,
             value,
-        } => lower_assign(target, *annotation, value, ctx, out),
+        } => {
+            if targets.is_empty() {
+                return Err(err("assignment has no targets", stmt.span));
+            }
+            if targets.len() == 1 {
+                return lower_assign(&targets[0], *annotation, value, ctx, out);
+            }
+            if annotation.is_some() {
+                return Err(err(
+                    "type annotations are not allowed in multi-target assignment",
+                    stmt.span,
+                ));
+            }
+            // evaluate RHS once, then assign right-to-left (Python order)
+            let value_ir = lower_expr(value, ctx)?;
+            if value_ir.ty == ir::Ty::None {
+                return Err(err(
+                    "cannot assign: the expression has no value (returns None)",
+                    value.span,
+                ));
+            }
+            let tmp = ctx.fresh_temp("multi", value_ir.ty);
+            out.push(ir::Stmt::Assign {
+                name: tmp.clone(),
+                value: value_ir.clone(),
+            });
+            let load = ir::Expr {
+                ty: value_ir.ty,
+                kind: ir::ExprKind::Local(tmp),
+            };
+            for target in targets.iter().rev() {
+                lower_assign_ir(target, None, load.clone(), value.span, ctx, out)?;
+            }
+            Ok(())
+        }
         ast::StmtKind::AugAssign { target, op, value } => {
             lower_aug_assign(target, *op, value, stmt.span, ctx, out)
         }
@@ -1330,27 +1367,41 @@ fn lower_assign(
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
+    let ann_ty = annotation.map(resolve_type);
+    // `xs: list[int] = [...]` / `= []`: propagate the element type
+    let lowered =
+        if let (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem))) = (&value.kind, ann_ty) {
+            lower_list_lit(items, Some(*elem), value.span, ctx)?
+        } else {
+            lower_expr(value, ctx)?
+        };
+    lower_assign_ir(target, ann_ty, lowered, value.span, ctx, out)
+}
+
+/// Assign an already-lowered IR value to a target (used by multi-assign).
+fn lower_assign_ir(
+    target: &ast::AssignTarget,
+    ann_ty: Option<ir::Ty>,
+    value_ir: ir::Expr,
+    value_span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
     match target {
         ast::AssignTarget::Name { name, span } => {
-            let ann_ty = annotation.map(resolve_type);
-
-            // `xs: list[int] = [...]` / `= []`: propagate the element type
-            let lowered = if let (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem))) =
-                (&value.kind, ann_ty)
-            {
-                lower_list_lit(items, Some(*elem), value.span, ctx)?
-            } else {
-                lower_expr(value, ctx)?
-            };
-
-            let stmt = bind_name(name, *span, ann_ty, lowered, value.span, ctx)?;
+            let stmt = bind_name(name, *span, ann_ty, value_ir, value_span, ctx)?;
             out.push(stmt);
             Ok(())
         }
         ast::AssignTarget::Index { base, index } => {
+            if ann_ty.is_some() {
+                return Err(err(
+                    "type annotations are only allowed on plain variable names",
+                    value_span,
+                ));
+            }
             let (list_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
-            let value_ir = lower_expr(value, ctx)?;
-            let value_ir = coerce(value_ir, elem, value.span, "list element assignment")?;
+            let value_ir = coerce(value_ir, elem, value_span, "list element assignment")?;
             out.push(ir::Stmt::IndexAssign {
                 base: list_ir,
                 index: index_ir,
@@ -4194,6 +4245,24 @@ print(first(f))
         assert_eq!(first.ret, ir::Ty::Str);
         let wrap = find_func(&m, "wrap");
         assert_eq!(wrap.ret, ir::Ty::File);
+    }
+
+    #[test]
+    fn multi_assign_binds_both() {
+        let m = analyze_ok("a = b = 1\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        // temp + two global assigns (right-to-left)
+        assert!(entry.body.len() >= 3);
+        assert!(
+            m.globals.iter().any(|(n, t)| n == "a" && *t == ir::Ty::Int),
+            "{:?}",
+            m.globals
+        );
+        assert!(
+            m.globals.iter().any(|(n, t)| n == "b" && *t == ir::Ty::Int),
+            "{:?}",
+            m.globals
+        );
     }
 
     #[test]

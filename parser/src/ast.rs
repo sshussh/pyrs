@@ -105,9 +105,10 @@ pub enum StmtKind {
         body: Vec<Stmt>,
     },
     Return(Option<Expr>),
-    /// `target = value` or `name: ty = value`
+    /// `a = b = value` or `name: ty = value` (annotation only with a single name target).
     Assign {
-        target: AssignTarget,
+        /// Left-to-right targets; assignment runs right-to-left after evaluating `value` once.
+        targets: Vec<AssignTarget>,
         annotation: Option<TypeName>,
         value: Expr,
     },
