@@ -42,7 +42,7 @@ jobs:
     name: Run benchmarks
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup PyRs toolchain
         uses: ./.github/actions/setup-pyrs

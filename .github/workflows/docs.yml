@@ -33,7 +33,7 @@ jobs:
     name: Hygiene
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Required docs and workflows exist
         run: |
