@@ -82,10 +82,8 @@ fn parse_file(path: &Path) -> Result<Parsed, LoadError> {
             }
             | ast::StmtKind::FromImport {
                 module: m, span, ..
-            } => {
-                if m != "sys" {
-                    imports.push((m.clone(), *span));
-                }
+            } if m != "sys" => {
+                imports.push((m.clone(), *span));
             }
             _ => {}
         }
