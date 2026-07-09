@@ -13,11 +13,9 @@ crate boundaries, IR contract, runtime ABI, and build/link strategy.
 | [`EXTENDING.md`](EXTENDING.md) | Contributor guide: how to add features         |
 | [`AGENTS.md`](../AGENTS.md)    | Conventions for automated agents               |
 
-**Versioning:** the language surface is labeled **v0.7** (README / GUIDE).
-Workspace crate versions and the clap `version =` string should match that
-milestone; if they lag (historically `0.1.0`), treat the **language** label
-as authoritative for docs and release tags (`v0.7.0`), and bump Cargo/clap
-when shipping.
+**Versioning:** the language surface is labeled **v0.8** (README / GUIDE).
+Workspace crate versions and the CLI version (`env!("CARGO_PKG_VERSION")`)
+must match that milestone. Release tags use the same number (`v0.8.0`).
 
 ---
 
@@ -287,7 +285,7 @@ Full packages and relative imports are planned to replace this model.
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.7 subset):**
+**Today (v0.8 subset):**
 
 - Static types after first assignment; cannot rebind a name to a
   different type.
@@ -406,7 +404,7 @@ These are product constraints that affect design choices:
 | Typing           | Required params; fixed types                         | Optional typing + more dynamism                                           |
 | Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | `sys` special-case only                              | Mostly PyRs modules on the kit later; no large stdlib without design      |
-| Language surface | Subset (see README v0.7)                             | Grow toward CPython drop-in                                               |
+| Language surface | Subset (see README v0.8)                             | Grow toward CPython drop-in                                               |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
 dicts, sets, tuples, exceptions / `try`, generators, nested functions /

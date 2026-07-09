@@ -38,7 +38,7 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.7)
+## The language (v0.8)
 
 A statically-typed Python subset:
 
@@ -107,7 +107,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.7): no bigints (int is 64-bit and wraps), `and`/`or`
+Known limits (v0.8): no bigints (int is 64-bit and wraps), `and`/`or`
 return `bool` rather than the operand, `min`/`max` take exactly two
 numeric args (no iterable form yet) and unify to a common type
 (`min(1, 1.5)` is `1.0`, not the int `1`), `x ** e` with a *dynamic*
@@ -206,4 +206,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.7.0 && git push origin v0.7.0`.
+Release tags: `git tag v0.8.0 && git push origin v0.8.0`.

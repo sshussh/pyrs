@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path;
 
 #[derive(Debug, Parser)]
-#[command(name = "PyRs", version = "0.1.0", about = "PyRs compiler")]
+#[command(name = "PyRs", version = env!("CARGO_PKG_VERSION"), about = "PyRs compiler")]
 pub struct Cli {
     /// Command to execute
     #[clap(subcommand)]
