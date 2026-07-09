@@ -465,6 +465,7 @@ functions, closures, `lambda`, and redefining a function.
 |---------|---------|---------|
 | `print(a, b, ...)` | any values, any count | space-separated, newline at end |
 | `len(x)` | str, list | int |
+| `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `global x` | (statement) | write access to a module global |
 | `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |

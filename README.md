@@ -53,8 +53,8 @@ A statically-typed Python subset:
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
   `and`/`or`/`not` (short-circuit), casts
-  `int()`/`float()`/`bool()`/`str()`, `len()`, indexing with negative
-  indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
+  `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, indexing with
+  negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
   `print(...)` with any mix of values
 - **f-strings:** `f"x={x}, next={x + 1}"` with `{{`/`}}` escapes and
   nesting (no format specs yet — write `{str(x)}` style conversions)

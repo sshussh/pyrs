@@ -153,6 +153,7 @@ impl Emitter {
         out.push_str("declare double @llvm.fabs.f64(double)\n");
         out.push_str("declare double @llvm.floor.f64(double)\n");
         out.push_str("declare double @llvm.pow.f64(double, double)\n");
+        out.push_str("declare i64 @llvm.abs.i64(i64, i1)\n");
         out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n\n");
         out.push_str(&self.global_defs);
         out.push_str(&self.string_defs);
@@ -800,6 +801,19 @@ impl Emitter {
             ExprKind::Len(inner) => {
                 let v = self.emit_expr(inner);
                 self.emit_len(&v)
+            }
+            ExprKind::Abs(inner) => {
+                let v = self.emit_expr(inner);
+                let t = self.tmp();
+                match inner.ty {
+                    // is_int_min_poison=false: abs(i64::MIN) wraps (no bigints)
+                    Ty::Int => {
+                        self.line(format!("{t} = call i64 @llvm.abs.i64(i64 {v}, i1 false)"))
+                    }
+                    Ty::Float => self.line(format!("{t} = call double @llvm.fabs.f64(double {v})")),
+                    other => unreachable!("Abs on {other:?}"),
+                }
+                t
             }
             ExprKind::IntToFloat(inner) => {
                 let v = self.emit_expr(inner);

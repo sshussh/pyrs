@@ -122,7 +122,7 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 5] = ["print", "len", "range", "input", "open"];
+const BUILTINS: [&str; 6] = ["print", "len", "range", "input", "open", "abs"];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
 fn init_call(module: &str) -> ir::Stmt {
@@ -2708,6 +2708,33 @@ fn lower_call(
                     kind: ir::ExprKind::Len(Box::new(arg)),
                 })
             }
+            "abs" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("abs() takes exactly one argument ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(&args[0], ctx)?;
+                // bool → int (abs(True) is 1); int/float keep their type
+                let arg = match arg.ty {
+                    ir::Ty::Bool => ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::BoolToInt(Box::new(arg)),
+                    },
+                    ir::Ty::Int | ir::Ty::Float => arg,
+                    other => {
+                        return Err(err(
+                            format!("bad operand type for abs(): '{other}'"),
+                            args[0].span,
+                        ));
+                    }
+                };
+                Ok(ir::Expr {
+                    ty: arg.ty,
+                    kind: ir::ExprKind::Abs(Box::new(arg)),
+                })
+            }
             "range" => Err(err(
                 "range(...) is only supported as the iterable of a 'for' loop",
                 span,
@@ -3302,6 +3329,38 @@ print(fib(10))
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn abs_int_float_and_bool() {
+        let m = analyze_ok("a = abs(-5)\nb = abs(-2.5)\nc = abs(True)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Abs(_)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+        assert!(matches!(value.kind, ir::ExprKind::Abs(_)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        // bool promotes to int, then abs
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Abs(_)));
+    }
+
+    #[test]
+    fn abs_rejects_str() {
+        let e = analyze_err("x = abs(\"nope\")\n");
+        assert!(
+            e.message.contains("bad operand type for abs()"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

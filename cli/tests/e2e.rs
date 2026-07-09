@@ -920,6 +920,45 @@ print(len([n for n in nums if n.isdigit()]))
 }
 
 #[test]
+fn abs_matches_python() {
+    let out = run_program(
+        "abs",
+        "\
+print(abs(-5), abs(5), abs(0), abs(True), abs(False))
+print(abs(-3.5), abs(3.5), abs(-0.0), abs(0.0))
+print(abs(-2), abs(2.0 - 5.0))
+x = -42
+print(abs(x))
+",
+    );
+    assert_eq!(
+        out,
+        "5 5 0 1 0\n\
+         3.5 3.5 0.0 0.0\n\
+         2 3.0\n\
+         42\n"
+    );
+}
+
+#[test]
+fn abs_wrong_type_is_compile_error() {
+    let dir = TempDir::new("abs_bad");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "print(abs(\"x\"))\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("bad operand type for abs()"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn global_variables_match_python() {
     let out = run_program(
         "globals",

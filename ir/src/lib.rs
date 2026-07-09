@@ -223,6 +223,9 @@ pub enum ExprKind {
     },
     /// `len(x)` for str or list.
     Len(Box<Expr>),
+    /// `abs(x)` for int or float (bool is promoted to int first).
+    /// Result type matches the operand. `abs(i64::MIN)` wraps (no bigints).
+    Abs(Box<Expr>),
     /// int → float (sitofp)
     IntToFloat(Box<Expr>),
     /// float → int, truncating toward zero (Python's `int()`)
