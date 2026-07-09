@@ -1531,6 +1531,35 @@ print(len(open(path).readlines()))
 }
 
 #[test]
+fn for_line_in_file_matches_python() {
+    let dir = TempDir::new("forfile");
+    let data = dir.0.join("lines.txt").display().to_string();
+    // no trailing newline on last line — CPython still yields "c"
+    let out = run_program(
+        "forfile",
+        &format!(
+            "\
+path = \"{data}\"
+w = open(path, \"w\")
+w.write(\"a\\nb\\nc\")
+w.close()
+f = open(path)
+for line in f:
+    print(line.strip())
+f.close()
+# with-open + for
+with open(path) as g:
+    n = 0
+    for line in g:
+        n = n + 1
+    print(n)
+"
+        ),
+    );
+    assert_eq!(out, "a\nb\nc\n3\n");
+}
+
+#[test]
 fn list_repr_escapes_like_python() {
     let out = run_program(
         "represcape",

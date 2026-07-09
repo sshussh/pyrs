@@ -535,6 +535,12 @@ f.close()
 
 for line in open("report.txt").readlines():   # lines keep their '\n'
     print(line.strip())
+
+# direct file iteration (readline until "")
+f = open("report.txt")
+for line in f:
+    print(line.strip())
+f.close()
 ```
 
 `with` works for files and guarantees the close on every exit path,
@@ -550,18 +556,17 @@ def first_line(p: str) -> str:
         return fh.readline().strip()
 ```
 
-`readline()` returns `""` at end of file. Errors match CPython exactly:
-missing files raise `FileNotFoundError: [Errno 2] ...`, operations on a
-closed file raise `ValueError: I/O operation on closed file.`, and
-reading a write-mode file raises `io.UnsupportedOperation: not
-readable`. Writes are flushed immediately, so data survives even if you
-forget `close()`.
+`readline()` returns `""` at end of file. `for line in f` stops on that
+empty string (lines keep their trailing `\n` when present). Errors match
+CPython exactly: missing files raise `FileNotFoundError: [Errno 2] ...`,
+operations on a closed file raise `ValueError: I/O operation on closed
+file.`, and reading a write-mode file raises
+`io.UnsupportedOperation: not readable`. Writes are flushed immediately,
+so data survives even if you forget `close()`.
 
-Not supported yet: binary modes, iterating the
-file object directly (use `.readlines()`), printing file objects,
-multiple context managers in one `with`, `with` on non-files, and
-file-typed function parameters (there is no `file` annotation — handles
-are inferred locally).
+Not supported yet: binary modes, printing file objects, multiple context
+managers in one `with`, `with` on non-files, and file-typed function
+parameters (there is no `file` annotation — handles are inferred locally).
 
 ### Standard input and arguments
 

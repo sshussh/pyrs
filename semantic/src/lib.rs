@@ -1569,13 +1569,107 @@ fn lower_for(
         return lower_for_range(var, var_span, args, iter.span, body, ctx, out);
     }
 
-    // general case: iterate a list or a string by index
+    // general case: list/string by index, or file via readline until ""
     let seq = lower_expr(iter, ctx)?;
+    match seq.ty {
+        ir::Ty::File => lower_for_file(var, var_span, seq, body, ctx, out),
+        ir::Ty::List(_) | ir::Ty::Str => lower_for_indexed(var, var_span, seq, body, ctx, out),
+        other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
+    }
+}
+
+/// `for line in f:` — desugar to while-True: line = f.readline(); if not line: break; body
+fn lower_for_file(
+    var: &str,
+    var_span: Span,
+    file: ir::Expr,
+    body: &[ast::Stmt],
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    let file_t = ctx.fresh_temp("for.file", ir::Ty::File);
+    out.push(ir::Stmt::Assign {
+        name: file_t.clone(),
+        value: file,
+    });
+    let file_local = ir::Expr {
+        ty: ir::Ty::File,
+        kind: ir::ExprKind::Local(file_t),
+    };
+
+    let line = ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::FileCall {
+            func: ir::FileFn::ReadLine,
+            args: vec![file_local],
+        },
+    };
+    let bind = bind_name(var, var_span, None, line, var_span, ctx)?;
+
+    // if not line: break  ("" at EOF is falsy)
+    let line_local = if let ir::Stmt::Assign { name, .. } = &bind {
+        ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::Local(name.clone()),
+        }
+    } else if let ir::Stmt::GlobalAssign { name, .. } = &bind {
+        ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::GlobalLoad(name.clone()),
+        }
+    } else {
+        return Err(err(
+            "internal error: for-file loop variable binding",
+            var_span,
+        ));
+    };
+    let truthy = to_bool(line_local, var_span)?;
+    let not_line = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Unary {
+            op: ir::UnOp::Not,
+            operand: Box::new(truthy),
+        },
+    };
+    let eof_break = ir::Stmt::If {
+        branches: vec![(not_line, vec![ir::Stmt::Break])],
+        orelse: vec![],
+    };
+
+    ctx.loop_depth += 1;
+    let user_body = lower_block(body, ctx);
+    ctx.loop_depth -= 1;
+    let mut loop_body = vec![bind, eof_break];
+    loop_body.extend(user_body?);
+
+    out.push(ir::Stmt::While {
+        cond: ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(true),
+        },
+        body: loop_body,
+        step: vec![],
+    });
+    Ok(())
+}
+
+/// `for x in xs` / `for c in s` — index from 0 to len (re-read each iteration).
+fn lower_for_indexed(
+    var: &str,
+    var_span: Span,
+    seq: ir::Expr,
+    body: &[ast::Stmt],
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
     let elem_ty = match seq.ty {
         ir::Ty::List(e) => *e,
         ir::Ty::Str => ir::Ty::Str,
         other => {
-            return Err(err(format!("'{other}' object is not iterable"), iter.span));
+            return Err(err(
+                format!("internal error: lower_for_indexed on {other}"),
+                var_span,
+            ));
         }
     };
 
@@ -3924,6 +4018,21 @@ print(fib(10))
     fn for_range_zero_step_is_compile_error() {
         let e = analyze_err("for i in range(0, 10, 0):\n    print(i)\n");
         assert!(e.message.contains("zero"), "{}", e.message);
+    }
+
+    #[test]
+    fn for_over_file_desugars_to_while_true() {
+        let m = analyze_ok("f = open(\"x\")\nfor line in f:\n    print(line)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        // open assign, file temp assign, While True
+        assert!(
+            entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::While { cond, .. } if matches!(cond.kind, ir::ExprKind::ConstBool(true)))),
+            "expected while-True for file iteration, body={:?}",
+            entry.body
+        );
     }
 
     #[test]

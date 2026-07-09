@@ -113,8 +113,8 @@ float), int↔float comparisons convert the int to float (exactness loss
 past 2^53), list literals coerce mixed numerics to one element type,
 `nan in [nan]` is False (no identity semantics), str methods use ASCII
 case/whitespace rules, heap memory is never freed, files support text
-modes "r"/"w"/"a" only (no `for line in f`, no file-typed parameters
-yet; `with` works for files only), imports are single sibling modules
+modes "r"/"w"/"a" only (no file-typed parameters yet; `with` and
+`for line in f` work for files), imports are single sibling modules
 only (no packages, `import a.b`, `from m import *`, or relative
 imports), and f-string format
 specs / dicts / tuples / classes / exceptions are not in yet — the
