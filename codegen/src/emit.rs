@@ -252,6 +252,30 @@ impl Emitter {
         t
     }
 
+    /// `min`/`max`: pick `right` only when it strictly compares less/greater
+    /// than `left` (matches CPython's "prefer the first on ties / NaN").
+    fn emit_min_max(&mut self, is_max: bool, left: &Expr, right: &Expr) -> String {
+        let l = self.emit_expr(left);
+        let r = self.emit_expr(right);
+        let pick_r = self.tmp();
+        match left.ty {
+            Ty::Int => {
+                let pred = if is_max { "sgt" } else { "slt" };
+                self.line(format!("{pick_r} = icmp {pred} i64 {r}, {l}"));
+            }
+            Ty::Float => {
+                // olt/ogt are false for NaN, so the left operand is kept
+                let pred = if is_max { "ogt" } else { "olt" };
+                self.line(format!("{pick_r} = fcmp {pred} double {r}, {l}"));
+            }
+            other => unreachable!("min/max on {other:?}"),
+        }
+        let t = self.tmp();
+        let lty = lty(left.ty);
+        self.line(format!("{t} = select i1 {pick_r}, {lty} {r}, {lty} {l}"));
+        t
+    }
+
     /// Inline list element addressing: negative-index adjustment, bounds
     /// check (trapping with `message`), then the slot address. Much faster
     /// than an out-of-line runtime call in hot loops.
@@ -815,6 +839,10 @@ impl Emitter {
                 }
                 t
             }
+            // Python min/max: if right is strictly less/greater, take right;
+            // otherwise left (ties and NaN comparisons keep the left operand).
+            ExprKind::Min { left, right } => self.emit_min_max(false, left, right),
+            ExprKind::Max { left, right } => self.emit_min_max(true, left, right),
             ExprKind::IntToFloat(inner) => {
                 let v = self.emit_expr(inner);
                 let t = self.tmp();

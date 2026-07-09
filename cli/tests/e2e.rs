@@ -959,6 +959,51 @@ fn abs_wrong_type_is_compile_error() {
 }
 
 #[test]
+fn min_max_match_python() {
+    // Cases chosen so print matches CPython. Bools promote to int in PyRs
+    // (like abs); avoid max(True, 0) which would print True under CPython.
+    // Mixed int/float unifies to float (min(1, 1.5) -> 1.0, not 1).
+    let out = run_program(
+        "minmax",
+        "\
+print(min(-3, 2), max(-3, 2))
+print(min(3, 3), max(3, 3))
+print(min(-3.5, 2.0), max(-3.5, 2.0))
+print(min(True, 0), max(2, True), min(0, True))
+print(min(-0.0, 0.0), max(0.0, -0.0))
+print(min(1, 1.5), max(1, 1.5))
+",
+    );
+    assert_eq!(
+        out,
+        "\
+-3 2
+3 3
+-3.5 2.0
+0 2 0
+-0.0 0.0
+1.0 1.5
+"
+    );
+}
+
+#[test]
+fn min_wrong_type_is_compile_error() {
+    let dir = TempDir::new("min_bad");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "print(min(1, \"x\"))\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("min()"), "stderr: {stderr}");
+    assert!(stderr.contains("str"), "stderr: {stderr}");
+}
+
+#[test]
 fn global_variables_match_python() {
     let out = run_program(
         "globals",

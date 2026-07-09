@@ -122,7 +122,9 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 6] = ["print", "len", "range", "input", "open", "abs"];
+const BUILTINS: [&str; 8] = [
+    "print", "len", "range", "input", "open", "abs", "min", "max",
+];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
 fn init_call(module: &str) -> ir::Stmt {
@@ -2735,6 +2737,32 @@ fn lower_call(
                     kind: ir::ExprKind::Abs(Box::new(arg)),
                 })
             }
+            "min" | "max" => {
+                if args.len() != 2 {
+                    return Err(err(
+                        format!(
+                            "{func}() takes exactly 2 arguments ({} given);                              iterable form is not supported yet",
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+                let left = lower_expr(&args[0], ctx)?;
+                let right = lower_expr(&args[1], ctx)?;
+                let (left, right, ty) = unify_numeric(left, right, span, &format!("{func}()"))?;
+                let kind = if func == "min" {
+                    ir::ExprKind::Min {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }
+                } else {
+                    ir::ExprKind::Max {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }
+                };
+                Ok(ir::Expr { ty, kind })
+            }
             "range" => Err(err(
                 "range(...) is only supported as the iterable of a 'for' loop",
                 span,
@@ -3361,6 +3389,43 @@ print(fib(10))
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn min_max_unify_numeric() {
+        let m = analyze_ok("a = min(-3, 2)\nb = max(1, 1.5)\nc = min(True, 0)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Min { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+        assert!(matches!(value.kind, ir::ExprKind::Max { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Min { .. }));
+    }
+
+    #[test]
+    fn min_rejects_str() {
+        let e = analyze_err("x = min(1, \"nope\")\n");
+        assert!(
+            e.message.contains("min()") && e.message.contains("str"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn min_arity() {
+        let e = analyze_err("x = min(1)\n");
+        assert!(e.message.contains("exactly 2 arguments"), "{}", e.message);
     }
 
     #[test]

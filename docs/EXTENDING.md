@@ -516,6 +516,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `ListPop` / `ListLit` / `ListNew` / `Len` | list construction and length |
 | `Block { stmts, result }` | statements inside expressions (comprehensions) |
 | `Abs` | `abs(x)` via LLVM abs/fabs |
+| `Min` / `Max` | 2-arg `min`/`max` (numeric; select on compare) |
 | Numeric / string casts / `ToBool` | `int`/`float`/`bool`/`str` and truthiness |
 
 ### `StrFn` (current)

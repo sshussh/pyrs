@@ -226,6 +226,16 @@ pub enum ExprKind {
     /// `abs(x)` for int or float (bool is promoted to int first).
     /// Result type matches the operand. `abs(i64::MIN)` wraps (no bigints).
     Abs(Box<Expr>),
+    /// `min(a, b)` - operands share a numeric type; on ties return the left.
+    Min {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// `max(a, b)` - operands share a numeric type; on ties return the left.
+    Max {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// int → float (sitofp)
     IntToFloat(Box<Expr>),
     /// float → int, truncating toward zero (Python's `int()`)

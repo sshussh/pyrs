@@ -53,8 +53,9 @@ A statically-typed Python subset:
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
   `and`/`or`/`not` (short-circuit), casts
-  `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, indexing with
-  negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
+  `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, `min()`/`max()`
+  (two arguments), indexing with negative indices, full slicing
+  `s[a:b:c]` including `[::-1]` reversal,
   `print(...)` with any mix of values
 - **f-strings:** `f"x={x}, next={x + 1}"` with `{{`/`}}` escapes and
   nesting (no format specs yet — write `{str(x)}` style conversions)
@@ -102,7 +103,9 @@ Python semantics are preserved where it counts:
   first assignment
 
 Known limits (v0.7): no bigints (int is 64-bit and wraps), `and`/`or`
-return `bool` rather than the operand, `x ** e` with a *dynamic*
+return `bool` rather than the operand, `min`/`max` take exactly two
+numeric args (no iterable form yet) and unify to a common type
+(`min(1, 1.5)` is `1.0`, not the int `1`), `x ** e` with a *dynamic*
 negative int exponent traps (a constant like `2 ** -1` works and gives
 float), int↔float comparisons convert the int to float (exactness loss
 past 2^53), list literals coerce mixed numerics to one element type,
