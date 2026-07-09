@@ -127,6 +127,8 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_str_startswith(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_str_endswith(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_str_find(ptr, ptr)\n");
+        out.push_str("declare i64 @pyrs_str_rfind(ptr, ptr)\n");
+        out.push_str("declare i64 @pyrs_str_rindex(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_str_count(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_replace(ptr, ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_split_ws(ptr)\n");
@@ -816,6 +818,8 @@ impl Emitter {
                     StrFn::StartsWith => ("pyrs_str_startswith", true, false),
                     StrFn::EndsWith => ("pyrs_str_endswith", true, false),
                     StrFn::Find => ("pyrs_str_find", false, true),
+                    StrFn::RFind => ("pyrs_str_rfind", false, true),
+                    StrFn::RIndex => ("pyrs_str_rindex", false, true),
                     StrFn::Count => ("pyrs_str_count", false, true),
                     StrFn::Replace => ("pyrs_str_replace", false, false),
                     StrFn::SplitWs => ("pyrs_str_split_ws", false, false),

@@ -62,8 +62,8 @@ A statically-typed Python subset:
 - **Strings:** immutable; `+` concat, `*` repeat, lexicographic
   comparisons, indexing, slicing, `in`, iteration, `len()`, `str(x)`
   conversions, and methods: `upper` `lower` `strip` `lstrip` `rstrip`
-  `startswith` `endswith` `find` `count` `replace` `split` `join`
-  `isdigit` `isalpha` `isspace` `isupper` `islower`
+  `startswith` `endswith` `find` `rfind` `rindex` `count` `replace`
+  `split` `join` `isdigit` `isalpha` `isspace` `isupper` `islower`
 - **Lists:** homogeneous, growable; literals, comprehensions
   (`[x * x for x in xs if x > 0]`, with Python 3 scoping — and faster
   than the equivalent loop: results are pre-sized and appends inlined),

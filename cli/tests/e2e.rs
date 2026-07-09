@@ -920,6 +920,36 @@ print(len([n for n in nums if n.isdigit()]))
 }
 
 #[test]
+fn str_rfind_rindex_match_python() {
+    let out = run_program(
+        "rfind",
+        "\
+print(\"banana\".rfind(\"an\"), \"banana\".find(\"an\"))
+print(\"banana\".rfind(\"x\"), \"\".rfind(\"a\"), \"abc\".rfind(\"\"))
+print(\"aaa\".rfind(\"aa\"))
+print(\"banana\".rindex(\"an\"))
+",
+    );
+    assert_eq!(
+        out,
+        "\
+3 1
+-1 -1 3
+1
+3
+"
+    );
+
+    let (code, stderr) =
+        run_program_expect_fail("rindex_miss", "print(\"banana\".rindex(\"x\"))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: substring not found"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn str_isalpha_isspace_case_match_python_ascii() {
     // ASCII-only rules (documented); cases chosen to match CPython on ASCII.
     let out = run_program(

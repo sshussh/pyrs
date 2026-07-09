@@ -320,6 +320,10 @@ pub enum StrFn {
     EndsWith,
     /// `s.find(t)` → int (-1 when absent)
     Find,
+    /// `s.rfind(t)` → int (-1 when absent; empty needle → `len(s)`)
+    RFind,
+    /// `s.rindex(t)` → int (traps with ValueError when absent)
+    RIndex,
     /// `s.count(t)` → int (non-overlapping)
     Count,
     /// `s.replace(old, new)` → str

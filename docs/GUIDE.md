@@ -310,6 +310,8 @@ String methods (ASCII case/whitespace rules):
 "abc".upper()             # "ABC"; .lower() too
 "hello".startswith("he")  # True; .endswith too
 "banana".find("an")       # 1, or -1 when absent
+"banana".rfind("an")      # 3 (last occurrence); "".rfind is -1; empty needle -> len
+"banana".rindex("an")     # like rfind, but ValueError if missing
 "banana".count("an")      # 2 (non-overlapping)
 "banana".replace("an", "-")   # "b--a"
 "a,b,,c".split(",")       # ['a', 'b', '', 'c'] — keeps empty parts

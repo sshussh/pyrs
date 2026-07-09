@@ -1059,6 +1059,8 @@ fn lower_str_method(
         "startswith" => (StartsWith, ir::Ty::Bool, 1),
         "endswith" => (EndsWith, ir::Ty::Bool, 1),
         "find" => (Find, ir::Ty::Int, 1),
+        "rfind" => (RFind, ir::Ty::Int, 1),
+        "rindex" => (RIndex, ir::Ty::Int, 1),
         "count" => (Count, ir::Ty::Int, 1),
         "replace" => (Replace, ir::Ty::Str, 2),
         "split" => {
@@ -1096,8 +1098,8 @@ fn lower_str_method(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
                      upper, lower, strip, lstrip, rstrip, startswith, \
-                     endswith, find, count, replace, split, join, isdigit, \
-                     isalpha, isspace, isupper, islower)"
+                     endswith, find, rfind, rindex, count, replace, split, \
+                     join, isdigit, isalpha, isspace, isupper, islower)"
                 ),
                 method_span,
             ));
@@ -3394,6 +3396,23 @@ print(fib(10))
             &value.kind,
             ir::ExprKind::StrCall {
                 func: ir::StrFn::IsDigit,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn str_rfind_is_int() {
+        let m = analyze_ok("i = \"banana\".rfind(\"an\")\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::RFind,
                 ..
             }
         ));

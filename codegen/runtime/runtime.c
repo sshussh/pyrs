@@ -427,6 +427,33 @@ long long pyrs_str_find(const PyrsStr *s, const PyrsStr *t) {
     return -1;
 }
 
+/* last index of t in s, or -1; the empty needle is found at len(s) */
+long long pyrs_str_rfind(const PyrsStr *s, const PyrsStr *t) {
+    check_ref(s);
+    check_ref(t);
+    if (t->len > s->len) {
+        return -1;
+    }
+    if (t->len == 0) {
+        return s->len;
+    }
+    for (long long i = s->len - t->len; i >= 0; i--) {
+        if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* like rfind, but trap when absent (CPython: ValueError: substring not found) */
+long long pyrs_str_rindex(const PyrsStr *s, const PyrsStr *t) {
+    long long i = pyrs_str_rfind(s, t);
+    if (i < 0) {
+        pyrs_die("ValueError: substring not found");
+    }
+    return i;
+}
+
 /* non-overlapping occurrences; Python counts len+1 for an empty needle */
 long long pyrs_str_count(const PyrsStr *s, const PyrsStr *t) {
     check_ref(s);
