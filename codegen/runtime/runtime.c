@@ -612,6 +612,64 @@ int pyrs_str_isdigit(const PyrsStr *s) {
     return 1;
 }
 
+int pyrs_str_isalpha(const PyrsStr *s) {
+    check_ref(s);
+    if (s->len == 0) {
+        return 0;
+    }
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int pyrs_str_isspace(const PyrsStr *s) {
+    check_ref(s);
+    if (s->len == 0) {
+        return 0;
+    }
+    for (long long i = 0; i < s->len; i++) {
+        if (!is_py_space(s->data[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* ASCII: at least one cased letter; all cased letters upper (or lower). */
+int pyrs_str_isupper(const PyrsStr *s) {
+    check_ref(s);
+    int saw_cased = 0;
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c >= 'a' && c <= 'z') {
+            return 0;
+        }
+        if (c >= 'A' && c <= 'Z') {
+            saw_cased = 1;
+        }
+    }
+    return saw_cased;
+}
+
+int pyrs_str_islower(const PyrsStr *s) {
+    check_ref(s);
+    int saw_cased = 0;
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c >= 'A' && c <= 'Z') {
+            return 0;
+        }
+        if (c >= 'a' && c <= 'z') {
+            saw_cased = 1;
+        }
+    }
+    return saw_cased;
+}
+
 /* ---- lists ---- */
 
 PyrsList *pyrs_list_new(long long cap) {

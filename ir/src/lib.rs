@@ -330,6 +330,14 @@ pub enum StrFn {
     Split,
     /// `sep.join(parts)` → str
     Join,
-    /// 's.isdigit()' -> bool
+    /// `s.isdigit()` -> bool (ASCII digits)
     IsDigit,
+    /// `s.isalpha()` -> bool (ASCII letters)
+    IsAlpha,
+    /// `s.isspace()` -> bool (ASCII whitespace; same set as strip/split)
+    IsSpace,
+    /// `s.isupper()` -> bool (ASCII: >=1 letter, all letters upper)
+    IsUpper,
+    /// `s.islower()` -> bool (ASCII: >=1 letter, all letters lower)
+    IsLower,
 }

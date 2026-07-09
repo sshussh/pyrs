@@ -1087,12 +1087,17 @@ fn lower_str_method(
             });
         }
         "isdigit" => (IsDigit, ir::Ty::Bool, 0),
+        "isalpha" => (IsAlpha, ir::Ty::Bool, 0),
+        "isspace" => (IsSpace, ir::Ty::Bool, 0),
+        "isupper" => (IsUpper, ir::Ty::Bool, 0),
+        "islower" => (IsLower, ir::Ty::Bool, 0),
         _ => {
             return Err(err(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
                      upper, lower, strip, lstrip, rstrip, startswith, \
-                     endswith, find, count, replace, split, join, isdigit)"
+                     endswith, find, count, replace, split, join, isdigit, \
+                     isalpha, isspace, isupper, islower)"
                 ),
                 method_span,
             ));
@@ -3392,6 +3397,33 @@ print(fib(10))
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn str_isalpha_isspace_case_are_bool() {
+        let m = analyze_ok(
+            "a = \"ab\".isalpha()\nb = \" \\t\".isspace()\n\
+             c = \"AB\".isupper()\nd = \"ab\".islower()\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        for (i, want) in [
+            ir::StrFn::IsAlpha,
+            ir::StrFn::IsSpace,
+            ir::StrFn::IsUpper,
+            ir::StrFn::IsLower,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!("body[{i}]");
+            };
+            assert_eq!(value.ty, ir::Ty::Bool);
+            assert!(matches!(
+                &value.kind,
+                ir::ExprKind::StrCall { func, .. } if *func == want
+            ));
+        }
     }
 
     #[test]

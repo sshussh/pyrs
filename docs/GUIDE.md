@@ -316,6 +316,10 @@ String methods (ASCII case/whitespace rules):
 "a b  c".split()          # ['a', 'b', 'c']    — whitespace runs
 "-".join(["a", "b"])      # "a-b"
 "123".isdigit()           # True; "" and non-digits are False
+"abc".isalpha()           # True; ASCII letters only
+" \\t".isspace()          # True; same whitespace set as strip/split
+"ABC".isupper()           # True; "AbC" / digits-only are False
+"a1".islower()            # True if all letters are lower and >=1 letter
 ```
 
 ### f-strings

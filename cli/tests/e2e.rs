@@ -920,6 +920,31 @@ print(len([n for n in nums if n.isdigit()]))
 }
 
 #[test]
+fn str_isalpha_isspace_case_match_python_ascii() {
+    // ASCII-only rules (documented); cases chosen to match CPython on ASCII.
+    let out = run_program(
+        "strpreds",
+        "\
+print(\"abc\".isalpha(), \"ABC\".isalpha(), \"AbC\".isalpha())
+print(\"\".isalpha(), \"a1\".isalpha(), \" \".isalpha())
+print(\" \".isspace(), \" \\t\\n\".isspace(), \"\".isspace(), \"a \".isspace())
+print(\"ABC\".isupper(), \"AbC\".isupper(), \"123\".isupper(), \"\".isupper())
+print(\"abc\".islower(), \"a1\".islower(), \"ABC\".islower(), \" \".islower())
+",
+    );
+    assert_eq!(
+        out,
+        "\
+True True True
+False False False
+True True False False
+True False False False
+True True False False
+"
+    );
+}
+
+#[test]
 fn abs_matches_python() {
     let out = run_program(
         "abs",
