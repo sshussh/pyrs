@@ -1,0 +1,30 @@
+# Keep GitHub Actions and Cargo dependencies current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+    # Group minor/patch bumps to reduce PR noise; majors stay separate.
+    groups:
+      clap:
+        patterns:
+          - "clap*"
+      build-tools:
+        patterns:
+          - "cmake"
+          - "logos*"

@@ -1,0 +1,79 @@
+# Light check that markdown docs and workflow YAML stay present / well-formed.
+# Does not require LLVM — runs quickly on every PR.
+name: Docs & repo hygiene
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "docs/**"
+      - "README.md"
+      - "AGENTS.md"
+      - "Makefile"
+      - ".github/**"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "docs/**"
+      - "README.md"
+      - "AGENTS.md"
+      - "Makefile"
+      - ".github/**"
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    name: Hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Required docs and workflows exist
+        run: |
+          set -euo pipefail
+          for f in \
+            README.md \
+            Makefile \
+            docs/GUIDE.md \
+            docs/SPECIFICATIONS.md \
+            .github/workflows/ci.yml \
+            .github/workflows/bench.yml \
+            .github/workflows/release.yml \
+            .github/actions/setup-pyrs/action.yml \
+            .github/dependabot.yml \
+            rust-toolchain.toml
+          do
+            test -f "$f" || { echo "missing: $f"; exit 1; }
+            echo "ok $f"
+          done
+
+      - name: Makefile ci target present
+        run: grep -q '^ci:' Makefile
+
+      - name: Workflow YAML parse (Python)
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          try:
+              import yaml
+          except ImportError:
+              # PyYAML may be absent; fall back to a trivial structural check.
+              yaml = None
+          root = pathlib.Path(".github/workflows")
+          files = sorted(root.glob("*.yml")) + sorted(root.glob("*.yaml"))
+          assert files, "no workflows found"
+          for p in files:
+              text = p.read_text()
+              assert "name:" in text and "on:" in text and "jobs:" in text, p
+              if yaml is not None:
+                  data = yaml.safe_load(text)
+                  assert isinstance(data, dict) and "jobs" in data, p
+              print("ok", p)
+          PY

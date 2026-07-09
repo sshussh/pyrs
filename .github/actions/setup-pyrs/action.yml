@@ -1,0 +1,105 @@
+# Composite action: install the PyRs build toolchain (Rust, LLVM, CMake, Python).
+# Used by ci / bench / release workflows so dependency setup stays in one place.
+name: Setup PyRs toolchain
+description: Install Rust, LLVM, CMake, a C/C++ compiler, and Python 3 for building PyRs
+
+inputs:
+  llvm-version:
+    description: LLVM major version to install from Ubuntu packages
+    required: false
+    default: "18"
+  rust-components:
+    description: Extra rustup components (space-separated)
+    required: false
+    default: "rustfmt clippy"
+  sccache:
+    description: Enable sccache for faster Rust rebuilds (true/false)
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install system packages
+      shell: bash
+      env:
+        LLVM_VERSION: ${{ inputs.llvm-version }}
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          cmake \
+          ninja-build \
+          pkg-config \
+          python3 \
+          "llvm-${LLVM_VERSION}-dev" \
+          "clang-${LLVM_VERSION}" \
+          "libclang-${LLVM_VERSION}-dev" \
+          zlib1g-dev \
+          libzstd-dev \
+          libncurses-dev \
+          libxml2-dev
+        # Prefer versioned llvm-config / tools on PATH for build.rs and CMake.
+        LLVM_BIN="/usr/lib/llvm-${LLVM_VERSION}/bin"
+        echo "${LLVM_BIN}" >> "${GITHUB_PATH}"
+        if [ -x "${LLVM_BIN}/llvm-config" ]; then
+          sudo ln -sfn "${LLVM_BIN}/llvm-config" /usr/local/bin/llvm-config
+        elif [ -x "/usr/bin/llvm-config-${LLVM_VERSION}" ]; then
+          sudo ln -sfn "/usr/bin/llvm-config-${LLVM_VERSION}" /usr/local/bin/llvm-config
+        else
+          echo "llvm-config for LLVM ${LLVM_VERSION} not found" >&2
+          exit 1
+        fi
+        {
+          echo "LLVM_DIR=/usr/lib/llvm-${LLVM_VERSION}/lib/cmake/llvm"
+          echo "Clang_DIR=/usr/lib/llvm-${LLVM_VERSION}/lib/cmake/clang"
+          echo "CC=clang-${LLVM_VERSION}"
+          echo "CXX=clang++-${LLVM_VERSION}"
+        } >> "${GITHUB_ENV}"
+
+    - name: Verify system toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "== doctor (pre-Rust) =="
+        for tool in cmake cc c++ llvm-config python3; do
+          command -v "$tool"
+          "$tool" --version 2>&1 | head -1 || true
+        done
+        llvm-config --version
+        llvm-config --prefix
+        test -d "${LLVM_DIR}"
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.rust-components }}
+
+    - name: Cache Cargo build
+      uses: Swatinem/rust-cache@v2
+      with:
+        # Include LLVM version in the cache key so upgrades rebuild cleanly.
+        key: llvm-${{ inputs.llvm-version }}
+
+    - name: Optional sccache
+      if: inputs.sccache == 'true'
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Configure sccache env
+      if: inputs.sccache == 'true'
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
+        echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
+
+    - name: Show toolchain summary
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "rustc:  $(rustc --version)"
+        echo "cargo:  $(cargo --version)"
+        echo "cmake:  $(cmake --version | head -1)"
+        echo "llvm:   $(llvm-config --version)"
+        echo "python: $(python3 --version)"
+        echo "cc:     $(${CC:-cc} --version | head -1)"

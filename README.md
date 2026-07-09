@@ -1,5 +1,7 @@
 # PyRs
 
+[![CI](https://github.com/sshussh/pyrs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshussh/pyrs/actions/workflows/ci.yml)
+
 A Python compiler built in Rust, targeting native code through LLVM.
 
 PyRs compiles a statically-typed subset of Python straight to machine code —
@@ -182,3 +184,17 @@ compiler.
 cargo build --release
 cargo test
 ```
+
+### Continuous integration
+
+GitHub Actions (see `.github/workflows/`):
+
+| Workflow | When | What |
+|----------|------|------|
+| **CI** | push/PR to `main` | `fmt`, clippy, tests, example parity, opt-level smoke |
+| **Benchmarks** | weekly / manual / bench-related pushes | `benchmarks/run.sh` (artifact log) |
+| **Release** | tags `v*.*.*` | Linux `x86_64` tarball + checksum + GitHub Release |
+| **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
+
+Local gate (same spirit as CI): `make doctor && make ci`.
+Release tags: `git tag v0.7.0 && git push origin v0.7.0`.

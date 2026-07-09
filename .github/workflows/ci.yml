@@ -1,0 +1,172 @@
+# Main quality gate — mirrors `make ci` (fmt, clippy, tests, example parity).
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Quiet CMake chatter from codegen/build.rs
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fast static checks (no full link of every target if we split later)
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (rustfmt only)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  # Full build + clippy + unit/e2e tests
+  # ---------------------------------------------------------------------------
+  test:
+    name: Build, Clippy & Test
+    runs-on: ubuntu-24.04
+    needs: [] # parallel with fmt
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PyRs toolchain
+        uses: ./.github/actions/setup-pyrs
+        with:
+          llvm-version: "18"
+          rust-components: rustfmt clippy
+
+      - name: Doctor
+        run: make doctor
+
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+      - name: Upload test failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-target-${{ github.run_id }}
+          path: |
+            target/tmp
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Example parity vs CPython (needs a release binary)
+  # ---------------------------------------------------------------------------
+  examples:
+    name: Example parity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PyRs toolchain
+        uses: ./.github/actions/setup-pyrs
+        with:
+          llvm-version: "18"
+
+      - name: Build release pyrs
+        run: cargo build --release -p pyrs
+
+      - name: Examples vs python3
+        run: make examples
+
+      - name: Modules example vs python3
+        working-directory: examples/modules
+        run: |
+          set -euo pipefail
+          PYRS="${GITHUB_WORKSPACE}/target/release/pyrs"
+          got="$("$PYRS" run -i shapes.py 2>&1)"
+          want="$(python3 shapes.py 2>&1)"
+          if [ "$got" = "$want" ]; then
+            echo "MATCH  examples/modules/shapes.py"
+          else
+            echo "DIFFER examples/modules/shapes.py"
+            echo "---- pyrs ----"
+            printf '%s\n' "$got"
+            echo "---- python3 ----"
+            printf '%s\n' "$want"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Compile-smoke: a few opt levels produce working binaries
+  # ---------------------------------------------------------------------------
+  smoke:
+    name: Compile smoke (O0/O2/O3)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PyRs toolchain
+        uses: ./.github/actions/setup-pyrs
+        with:
+          llvm-version: "18"
+
+      - name: Build release pyrs
+        run: cargo build --release -p pyrs
+
+      - name: Compile and run fib at multiple opt levels
+        run: |
+          set -euo pipefail
+          PYRS=./target/release/pyrs
+          for o in 0 2 3; do
+            out="fib-O${o}"
+            "$PYRS" compile -O "$o" -i examples/fib.py -o "$out"
+            got="$("./$out")"
+            want="$(python3 examples/fib.py)"
+            test "$got" = "$want"
+            echo "ok fib -O${o}"
+          done
+          "$PYRS" compile -O 2 --emit-llvm -i examples/fib.py -o fib-ll
+          test -f fib-ll.ll
+          echo "ok --emit-llvm"
+
+  # ---------------------------------------------------------------------------
+  # Single green gate for branch protection (all required jobs)
+  # ---------------------------------------------------------------------------
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [fmt, test, examples, smoke]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check all jobs
+        run: |
+          set -euo pipefail
+          results=(
+            "${{ needs.fmt.result }}"
+            "${{ needs.test.result }}"
+            "${{ needs.examples.result }}"
+            "${{ needs.smoke.result }}"
+          )
+          for r in "${results[@]}"; do
+            if [ "$r" != "success" ]; then
+              echo "Required job failed or was skipped: $r"
+              exit 1
+            fi
+          done
+          echo "All CI jobs passed."

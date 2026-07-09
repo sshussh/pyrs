@@ -1,0 +1,5 @@
+# Pin the channel used by CI and local `rustup` overrides.
+# Edition 2024 requires a recent stable compiler.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

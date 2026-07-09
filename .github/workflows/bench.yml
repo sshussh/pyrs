@@ -1,0 +1,77 @@
+# Benchmark suite vs CPython. Manual or weekly — not a PR gate (noisy / slow).
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Best-of-N timing repetitions per benchmark
+        required: false
+        default: "3"
+      subset:
+        description: Optional space-separated benchmark names (empty = all)
+        required: false
+        default: ""
+  schedule:
+    # Mondays 06:15 UTC
+    - cron: "15 6 * * 1"
+  # Optional: comment out if you only want manual/scheduled runs
+  push:
+    branches: [main]
+    paths:
+      - "benchmarks/**"
+      - "codegen/**"
+      - "semantic/**"
+      - "cli/**"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+
+jobs:
+  bench:
+    name: Run benchmarks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PyRs toolchain
+        uses: ./.github/actions/setup-pyrs
+        with:
+          llvm-version: "18"
+
+      - name: Build release pyrs
+        run: cargo build --release -p pyrs
+
+      - name: Run benchmark suite
+        id: bench
+        env:
+          RUNS: ${{ github.event.inputs.runs || '3' }}
+          PYRS: ${{ github.workspace }}/target/release/pyrs
+        run: |
+          set -euo pipefail
+          subset="${{ github.event.inputs.subset || '' }}"
+          mkdir -p bench-out
+          if [ -n "$subset" ]; then
+            # shellcheck disable=SC2086
+            ./benchmarks/run.sh $subset | tee bench-out/results.txt
+          else
+            ./benchmarks/run.sh | tee bench-out/results.txt
+          fi
+
+      - name: Upload benchmark log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.run_id }}
+          path: bench-out/
+          retention-days: 30
