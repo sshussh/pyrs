@@ -920,6 +920,43 @@ print(len([n for n in nums if n.isdigit()]))
 }
 
 #[test]
+fn list_concat_and_repeat_match_python() {
+    let out = run_program(
+        "listcat",
+        "\
+print([1, 2] + [3, 4])
+print([1] * 3)
+print(3 * [1, 2])
+print([1] * 0)
+print([1] * (-2))
+empty: list[int] = []
+print(empty + [1])
+a = [1]
+b = a * 1
+b.append(2)
+print(a, b)
+xs: list[str] = [\"a\"]
+print(xs + [\"b\", \"c\"])
+print(xs * 2)
+",
+    );
+    assert_eq!(
+        out,
+        "\
+[1, 2, 3, 4]
+[1, 1, 1]
+[1, 2, 1, 2, 1, 2]
+[]
+[]
+[1]
+[1] [1, 2]
+['a', 'b', 'c']
+['a', 'a']
+"
+    );
+}
+
+#[test]
 fn list_insert_remove_index_clear_match_python() {
     let out = run_program(
         "listmut",

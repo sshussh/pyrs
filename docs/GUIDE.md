@@ -411,8 +411,11 @@ List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
 `index(v)`, `clear()`. `insert` clamps the index like CPython;
 `remove` / `index` trap with `ValueError` when the value is missing.
 
-Not supported yet: list `+`/`*`/`==`, `sort`, `in` on lists of lists,
-and slice assignment.
+List `+` concatenates (same element type); `*` repeats with an int count
+(`n <= 0` yields `[]`). Both produce a new list (shallow copy of slots).
+
+Not supported yet: list `==`/`!=`, `sort`, `in` on lists of lists, and
+slice assignment.
 
 ### Control flow
 

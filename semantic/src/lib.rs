@@ -3084,11 +3084,9 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
     if l.ty == ir::Ty::Str || r.ty == ir::Ty::Str {
         return lower_str_binary(op, l, r, span);
     }
+    // ---- list + / * ----
     if matches!(l.ty, ir::Ty::List(_)) || matches!(r.ty, ir::Ty::List(_)) {
-        return Err(err(
-            format!("{describe} is not supported for lists yet"),
-            span,
-        ));
+        return lower_list_binary(op, l, r, span);
     }
 
     match op {
@@ -3235,6 +3233,61 @@ fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResu
         });
     }
     Ok(contains)
+}
+
+fn lower_list_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match op {
+        // xs + ys — same element type required
+        ast::BinOp::Add => match (l.ty, r.ty) {
+            (ir::Ty::List(a), ir::Ty::List(b)) if a == b => Ok(ir::Expr {
+                ty: ir::Ty::List(a),
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+            }),
+            (ir::Ty::List(a), ir::Ty::List(b)) => Err(err(
+                format!("cannot concatenate list[{a}] and list[{b}]"),
+                span,
+            )),
+            _ => {
+                let other = if matches!(l.ty, ir::Ty::List(_)) {
+                    &r.ty
+                } else {
+                    &l.ty
+                };
+                Err(err(
+                    format!("can only concatenate list (not \"{other}\") to list"),
+                    span,
+                ))
+            }
+        },
+        // xs * n / n * xs — count normalized to the right
+        ast::BinOp::Mul => {
+            let (xs, n) = match (l.ty, r.ty) {
+                (ir::Ty::List(_), _) => (l, r),
+                (_, ir::Ty::List(_)) => (r, l),
+                _ => unreachable!("lower_list_binary only when a side is list"),
+            };
+            let n = promote_numeric(n, span, "list repetition")?;
+            if n.ty != ir::Ty::Int {
+                return Err(err("a list can only be multiplied by an int", span));
+            }
+            Ok(ir::Expr {
+                ty: xs.ty,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Mul,
+                    left: Box::new(xs),
+                    right: Box::new(n),
+                },
+            })
+        }
+        other => Err(err(
+            format!("operator '{other}' is not supported for lists yet"),
+            span,
+        )),
+    }
 }
 
 fn lower_str_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
@@ -3679,6 +3732,31 @@ print(fib(10))
         assert_eq!(value.ty, ir::Ty::Int);
         assert!(matches!(value.kind, ir::ExprKind::ListIndexOf { .. }));
         assert!(matches!(entry.body[4], ir::Stmt::ListClear { .. }));
+    }
+
+    #[test]
+    fn list_concat_and_repeat() {
+        let m = analyze_ok("a = [1] + [2, 3]\nb = [1, 2] * 3\nc = 2 * [9]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        for i in 0..3 {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!();
+            };
+            assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
+            assert!(matches!(
+                value.kind,
+                ir::ExprKind::Binary {
+                    op: ir::BinOp::Add | ir::BinOp::Mul,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn list_concat_rejects_mixed_elem() {
+        let e = analyze_err("x = [1] + [1.5]\n");
+        assert!(e.message.contains("concatenate"), "{}", e.message);
     }
 
     #[test]

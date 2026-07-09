@@ -275,8 +275,9 @@ pub enum ExprKind {
 /// Binary operations. Operand types are encoded in the operand `Expr`s and
 /// are always equal on both sides; comparison results are `Bool`.
 ///
-/// On `Str` operands: `Add` is concatenation, `Mul` is repetition (the int
-/// count is always the right operand), comparisons are lexicographic.
+/// On `Str`/`List` operands: `Add` is concatenation, `Mul` is repetition
+/// (the int count is always the right operand). Str comparisons are
+/// lexicographic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,

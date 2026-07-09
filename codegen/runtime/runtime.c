@@ -723,6 +723,40 @@ void pyrs_list_push(PyrsList *l, long long slot) {
     l->data[l->len++] = slot;
 }
 
+/* new list: a then b (shallow copy of slots) */
+PyrsList *pyrs_list_concat(const PyrsList *a, const PyrsList *b) {
+    check_ref(a);
+    check_ref(b);
+    long long n = a->len + b->len;
+    PyrsList *r = pyrs_list_new(n);
+    if (a->len > 0) {
+        memcpy(r->data, a->data, (size_t)a->len * sizeof(long long));
+    }
+    if (b->len > 0) {
+        memcpy(r->data + a->len, b->data, (size_t)b->len * sizeof(long long));
+    }
+    r->len = n;
+    return r;
+}
+
+/* new list: a repeated n times; n <= 0 yields empty (like CPython) */
+PyrsList *pyrs_list_repeat(const PyrsList *a, long long n) {
+    check_ref(a);
+    if (n <= 0 || a->len == 0) {
+        return pyrs_list_new(0);
+    }
+    if (n > 0 && a->len > 0 && n > (LLONG_MAX / a->len)) {
+        pyrs_die("MemoryError: list repeat too large");
+    }
+    long long total = a->len * n;
+    PyrsList *r = pyrs_list_new(total);
+    for (long long i = 0; i < n; i++) {
+        memcpy(r->data + i * a->len, a->data, (size_t)a->len * sizeof(long long));
+    }
+    r->len = total;
+    return r;
+}
+
 long long pyrs_list_get(const PyrsList *l, long long i) {
     check_ref(l);
     if (i < 0) {

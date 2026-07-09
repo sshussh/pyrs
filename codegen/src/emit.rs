@@ -141,6 +141,8 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_str_islower(ptr)\n");
         out.push_str("declare ptr @pyrs_list_new(i64)\n");
         out.push_str("declare void @pyrs_list_push(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_list_concat(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_list_repeat(ptr, i64)\n");
         out.push_str("declare void @pyrs_list_insert(ptr, i64, i64)\n");
         out.push_str("declare void @pyrs_list_remove(ptr, i64, i32)\n");
         out.push_str("declare i64 @pyrs_list_index(ptr, i64, i32)\n");
@@ -1074,9 +1076,12 @@ impl Emitter {
             return self.emit_short_circuit(op, left, right);
         }
 
-        // string operations dispatch to the runtime
+        // string / list operations dispatch to the runtime
         if left.ty == Ty::Str {
             return self.emit_str_binary(op, left, right);
+        }
+        if matches!(left.ty, Ty::List(_)) {
+            return self.emit_list_binary(op, left, right);
         }
 
         let l = self.emit_expr(left);
@@ -1214,6 +1219,30 @@ impl Emitter {
                 t
             }
             BinOp::And | BinOp::Or => unreachable!("handled above"),
+        }
+    }
+
+    /// Binary ops whose left operand is a list (`+` concat, `*` repeat).
+    fn emit_list_binary(&mut self, op: BinOp, left: &Expr, right: &Expr) -> String {
+        let l = self.emit_expr(left);
+        let r = self.emit_expr(right);
+        match op {
+            BinOp::Add => {
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_list_concat(ptr {l}, ptr {r})"
+                ));
+                t
+            }
+            // semantic normalizes the int count to the right operand
+            BinOp::Mul => {
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_list_repeat(ptr {l}, i64 {r})"
+                ));
+                t
+            }
+            other => unreachable!("bad list op {other:?}"),
         }
     }
 
