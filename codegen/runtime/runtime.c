@@ -801,8 +801,17 @@ PyrsList *pyrs_list_slice(const PyrsList *l, long long lo, long long hi, long lo
     return r;
 }
 
-/* element tags match codegen: 0=int 1=float 2=bool 3=str */
+/* element tags match codegen: 0=int 1=float 2=bool 3=str;
+ * list-of-X is 4 + 8 * tag(X) (recursive). */
+static int slot_eq(long long a, long long b, int tag);
+int pyrs_list_eq(const PyrsList *a, const PyrsList *b, int tag);
+
 static int slot_eq(long long a, long long b, int tag) {
+    if (tag >= 4) {
+        /* nested list: slots are list pointers; inner tag = (tag-4)/8 */
+        int inner = (tag - 4) / 8;
+        return pyrs_list_eq((const PyrsList *)a, (const PyrsList *)b, inner);
+    }
     switch (tag) {
     case 0:
     case 2:
@@ -817,9 +826,23 @@ static int slot_eq(long long a, long long b, int tag) {
     case 3:
         return pyrs_str_cmp((const PyrsStr *)a, (const PyrsStr *)b) == 0;
     default:
-        /* nested lists / unsupported tags: no match (same as `in`) */
         return 0;
     }
+}
+
+/* element-wise equality; used by == and by nested slot_eq */
+int pyrs_list_eq(const PyrsList *a, const PyrsList *b, int tag) {
+    check_ref(a);
+    check_ref(b);
+    if (a->len != b->len) {
+        return 0;
+    }
+    for (long long i = 0; i < a->len; i++) {
+        if (!slot_eq(a->data[i], b->data[i], tag)) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 int pyrs_list_contains(const PyrsList *l, long long slot, int tag) {

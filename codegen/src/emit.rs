@@ -149,6 +149,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_list_clear(ptr)\n");
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
+        out.push_str("declare i32 @pyrs_list_eq(ptr, ptr, i32)\n");
         out.push_str("declare i64 @pyrs_list_pop(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_input(ptr)\n");
         out.push_str("declare ptr @pyrs_argv()\n");
@@ -1222,7 +1223,7 @@ impl Emitter {
         }
     }
 
-    /// Binary ops whose left operand is a list (`+` concat, `*` repeat).
+    /// Binary ops whose left operand is a list (`+`/`*`/`==`/`!=`).
     fn emit_list_binary(&mut self, op: BinOp, left: &Expr, right: &Expr) -> String {
         let l = self.emit_expr(left);
         let r = self.emit_expr(right);
@@ -1241,6 +1242,25 @@ impl Emitter {
                     "{t} = call ptr @pyrs_list_repeat(ptr {l}, i64 {r})"
                 ));
                 t
+            }
+            BinOp::Eq | BinOp::Ne => {
+                let Ty::List(elem) = left.ty else {
+                    unreachable!("list eq without list type");
+                };
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_list_eq(ptr {l}, ptr {r}, i32 {})",
+                    elem_tag(elem)
+                ));
+                let eq = self.tmp();
+                self.line(format!("{eq} = icmp ne i32 {c}, 0"));
+                if matches!(op, BinOp::Eq) {
+                    eq
+                } else {
+                    let t = self.tmp();
+                    self.line(format!("{t} = xor i1 {eq}, true"));
+                    t
+                }
             }
             other => unreachable!("bad list op {other:?}"),
         }

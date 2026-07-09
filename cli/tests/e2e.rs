@@ -920,6 +920,44 @@ print(len([n for n in nums if n.isdigit()]))
 }
 
 #[test]
+fn list_eq_ne_match_python() {
+    let out = run_program(
+        "listeq",
+        "\
+print([1, 2] == [1, 2])
+print([1, 2] == [1, 3])
+print([1, 2] != [1, 2])
+print([1, 2] != [1, 3])
+xs: list[int] = []
+ys: list[int] = []
+print(xs == ys)
+print([1.0, 2.0] == [1.0, 2.0])
+print([0.0] == [-0.0])
+print([\"a\", \"b\"] == [\"a\", \"b\"])
+print([1] == [1, 2])
+print([[1, 2], [3]] == [[1, 2], [3]])
+print([[1], [2]] != [[1], [9]])
+",
+    );
+    assert_eq!(
+        out,
+        "\
+True
+False
+False
+True
+True
+True
+True
+True
+False
+True
+True
+"
+    );
+}
+
+#[test]
 fn list_concat_and_repeat_match_python() {
     let out = run_program(
         "listcat",

@@ -3283,6 +3283,28 @@ fn lower_list_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SR
                 },
             })
         }
+        // element-wise equality (same list element type)
+        ast::BinOp::Eq | ast::BinOp::NotEq => match (l.ty, r.ty) {
+            (ir::Ty::List(a), ir::Ty::List(b)) if a == b => Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: if matches!(op, ast::BinOp::Eq) {
+                        ir::BinOp::Eq
+                    } else {
+                        ir::BinOp::Ne
+                    },
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+            }),
+            (ir::Ty::List(a), ir::Ty::List(b)) => {
+                Err(err(format!("cannot compare list[{a}] and list[{b}]"), span))
+            }
+            _ => Err(err(
+                format!("'{}' is not comparable with '{}'", l.ty, r.ty),
+                span,
+            )),
+        },
         other => Err(err(
             format!("operator '{other}' is not supported for lists yet"),
             span,
@@ -3757,6 +3779,33 @@ print(fib(10))
     fn list_concat_rejects_mixed_elem() {
         let e = analyze_err("x = [1] + [1.5]\n");
         assert!(e.message.contains("concatenate"), "{}", e.message);
+    }
+
+    #[test]
+    fn list_eq_is_bool() {
+        let m = analyze_ok("b = [1, 2] == [1, 2]\nc = [1] != [2]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Binary {
+                op: ir::BinOp::Eq,
+                ..
+            }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Binary {
+                op: ir::BinOp::Ne,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -69,7 +69,8 @@ A statically-typed Python subset:
   than the equivalent loop: results are pre-sized and appends inlined),
   indexing (read/write), slicing (copies, like Python),
   `append`/`pop`/`insert`/`remove`/`index`/`clear`, `+`/`*` (concat /
-  repeat), `in`, `len`, iteration; assignment aliases like Python
+  repeat), `==`/`!=`, `in`, `len`, iteration; assignment aliases like
+  Python
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
 - **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for

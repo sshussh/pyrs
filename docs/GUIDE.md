@@ -413,9 +413,11 @@ List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
 
 List `+` concatenates (same element type); `*` repeats with an int count
 (`n <= 0` yields `[]`). Both produce a new list (shallow copy of slots).
+`==` / `!=` compare length and elements (same rules as `in`; nested lists
+compare recursively).
 
-Not supported yet: list `==`/`!=`, `sort`, `in` on lists of lists, and
-slice assignment.
+Not supported yet: list `sort`, ordering comparisons (`<` etc.), `in` on
+lists of lists (membership still limited), and slice assignment.
 
 ### Control flow
 
