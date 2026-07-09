@@ -920,6 +920,70 @@ print(len([n for n in nums if n.isdigit()]))
 }
 
 #[test]
+fn list_insert_remove_index_clear_match_python() {
+    let out = run_program(
+        "listmut",
+        "\
+xs = [1, 2, 3]
+xs.insert(0, 9)
+print(xs)
+xs = [1, 2, 3]
+xs.insert(1, 9)
+print(xs)
+xs = [1, 2, 3]
+xs.insert(100, 9)
+print(xs)
+xs = [1, 2, 3]
+xs.insert(-1, 9)
+print(xs)
+xs = [1, 2, 3]
+xs.insert(-100, 9)
+print(xs)
+xs = [1, 2, 3, 2]
+xs.remove(2)
+print(xs)
+print([1, 2, 3, 2].index(2))
+xs = [1, 2, 3]
+xs.clear()
+print(xs)
+ys = [\"a\", \"b\", \"a\"]
+print(ys.index(\"a\"))
+ys.remove(\"a\")
+print(ys)
+",
+    );
+    assert_eq!(
+        out,
+        "\
+[9, 1, 2, 3]
+[1, 9, 2, 3]
+[1, 2, 3, 9]
+[1, 2, 9, 3]
+[9, 1, 2, 3]
+[1, 3, 2]
+1
+[]
+0
+['b', 'a']
+"
+    );
+
+    let (code, stderr) = run_program_expect_fail("list_remove_miss", "xs = [1]\nxs.remove(9)\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: list.remove(x): x not in list"),
+        "stderr: {stderr}"
+    );
+
+    let (code, stderr) = run_program_expect_fail("list_index_miss", "print([1].index(9))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: list.index(x): x not in list"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn str_rfind_rindex_match_python() {
     let out = run_program(
         "rfind",

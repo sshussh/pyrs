@@ -953,15 +953,59 @@ fn lower_method_stmt(
                     value,
                 })
             }
-            // pop as a statement discards the popped value
+            "insert" => {
+                if args.len() != 2 {
+                    return Err(err(
+                        format!("insert() takes exactly 2 arguments ({} given)", args.len()),
+                        method_span,
+                    ));
+                }
+                let index = lower_expr(&args[0], ctx)?;
+                let index = coerce(index, ir::Ty::Int, args[0].span, "insert() index")?;
+                let value = lower_expr(&args[1], ctx)?;
+                let value = coerce(value, *elem, args[1].span, "insert() argument")?;
+                Ok(ir::Stmt::ListInsert {
+                    list: base_ir,
+                    index,
+                    value,
+                })
+            }
+            "remove" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("remove() takes exactly one argument ({} given)", args.len()),
+                        method_span,
+                    ));
+                }
+                let value = lower_expr(&args[0], ctx)?;
+                let value = coerce(value, *elem, args[0].span, "remove() argument")?;
+                Ok(ir::Stmt::ListRemove {
+                    list: base_ir,
+                    value,
+                })
+            }
+            "clear" => {
+                if !args.is_empty() {
+                    return Err(err(
+                        format!("clear() takes no arguments ({} given)", args.len()),
+                        method_span,
+                    ));
+                }
+                Ok(ir::Stmt::ListClear { list: base_ir })
+            }
+            // pop / index as statements discard the result
             "pop" => {
                 let pop = lower_list_pop(base_ir, *elem, args, method_span, ctx)?;
                 Ok(ir::Stmt::ExprStmt(pop))
             }
+            "index" => {
+                let idx = lower_list_index_of(base_ir, *elem, args, method_span, ctx)?;
+                Ok(ir::Stmt::ExprStmt(idx))
+            }
             _ => Err(err(
                 format!(
-                    "list method '{method}' is not supported yet (only 'append' \
-                     and 'pop')"
+                    "list method '{method}' is not supported yet (supported: \
+                     append, pop, insert, remove, index, clear)"
                 ),
                 method_span,
             )),
@@ -1197,6 +1241,30 @@ fn lower_list_pop(
         kind: ir::ExprKind::ListPop {
             list: Box::new(list),
             index: Box::new(index),
+        },
+    })
+}
+
+fn lower_list_index_of(
+    list: ir::Expr,
+    elem: ir::Ty,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!("index() takes exactly one argument ({} given)", args.len()),
+            method_span,
+        ));
+    }
+    let value = lower_expr(&args[0], ctx)?;
+    let value = coerce(value, elem, args[0].span, "index() argument")?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::ListIndexOf {
+            list: Box::new(list),
+            value: Box::new(value),
         },
     })
 }
@@ -1988,9 +2056,12 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 ir::Ty::List(elem) => match method.as_str() {
                     // pop returns the removed element
                     "pop" => lower_list_pop(base_ir, *elem, args, *method_span, ctx),
-                    "append" => Err(err(
-                        "list.append(...) returns None and cannot be used \
-                         in an expression",
+                    "index" => lower_list_index_of(base_ir, *elem, args, *method_span, ctx),
+                    "append" | "insert" | "remove" | "clear" => Err(err(
+                        format!(
+                            "list.{method}(...) returns None and cannot be used \
+                             in an expression"
+                        ),
                         *method_span,
                     )),
                     _ => Err(err(
@@ -3591,6 +3662,23 @@ print(fib(10))
         let m = analyze_ok("xs = [1]\nxs.append(2)\n");
         let entry = find_func(&m, ENTRY_NAME);
         assert!(matches!(entry.body[1], ir::Stmt::ListAppend { .. }));
+    }
+
+    #[test]
+    fn list_insert_remove_clear_and_index() {
+        let m = analyze_ok(
+            "xs = [1, 2, 3]\nxs.insert(1, 9)\nxs.remove(2)\n\
+             i = xs.index(9)\nxs.clear()\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(matches!(entry.body[1], ir::Stmt::ListInsert { .. }));
+        assert!(matches!(entry.body[2], ir::Stmt::ListRemove { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[3] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::ListIndexOf { .. }));
+        assert!(matches!(entry.body[4], ir::Stmt::ListClear { .. }));
     }
 
     #[test]

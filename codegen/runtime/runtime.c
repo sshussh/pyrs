@@ -768,34 +768,87 @@ PyrsList *pyrs_list_slice(const PyrsList *l, long long lo, long long hi, long lo
 }
 
 /* element tags match codegen: 0=int 1=float 2=bool 3=str */
+static int slot_eq(long long a, long long b, int tag) {
+    switch (tag) {
+    case 0:
+    case 2:
+        return a == b;
+    case 1: {
+        /* numeric equality: 0.0 == -0.0, nan != nan */
+        double x, y;
+        memcpy(&x, &a, sizeof x);
+        memcpy(&y, &b, sizeof y);
+        return x == y;
+    }
+    case 3:
+        return pyrs_str_cmp((const PyrsStr *)a, (const PyrsStr *)b) == 0;
+    default:
+        /* nested lists / unsupported tags: no match (same as `in`) */
+        return 0;
+    }
+}
+
 int pyrs_list_contains(const PyrsList *l, long long slot, int tag) {
     check_ref(l);
     for (long long i = 0; i < l->len; i++) {
-        switch (tag) {
-        case 0:
-        case 2:
-            if (l->data[i] == slot) {
-                return 1;
-            }
-            break;
-        case 1: {
-            /* numeric equality: 0.0 == -0.0, nan != nan */
-            double a, b;
-            memcpy(&a, &l->data[i], sizeof a);
-            memcpy(&b, &slot, sizeof b);
-            if (a == b) {
-                return 1;
-            }
-            break;
-        }
-        case 3:
-            if (pyrs_str_cmp((const PyrsStr *)l->data[i], (const PyrsStr *)slot) == 0) {
-                return 1;
-            }
-            break;
+        if (slot_eq(l->data[i], slot, tag)) {
+            return 1;
         }
     }
     return 0;
+}
+
+void pyrs_list_insert(PyrsList *l, long long i, long long slot) {
+    check_ref(l);
+    /* CPython: clamp index into [0, len] after negative adjustment */
+    if (i < 0) {
+        i += l->len;
+        if (i < 0) {
+            i = 0;
+        }
+    }
+    if (i > l->len) {
+        i = l->len;
+    }
+    if (l->len == l->cap) {
+        long long cap = l->cap < 4 ? 4 : l->cap * 2;
+        long long *data = xmalloc((size_t)cap * sizeof(long long));
+        memcpy(data, l->data, (size_t)l->len * sizeof(long long));
+        l->data = data;
+        l->cap = cap;
+    }
+    memmove(&l->data[i + 1], &l->data[i],
+            (size_t)(l->len - i) * sizeof(long long));
+    l->data[i] = slot;
+    l->len++;
+}
+
+void pyrs_list_remove(PyrsList *l, long long slot, int tag) {
+    check_ref(l);
+    for (long long i = 0; i < l->len; i++) {
+        if (slot_eq(l->data[i], slot, tag)) {
+            memmove(&l->data[i], &l->data[i + 1],
+                    (size_t)(l->len - i - 1) * sizeof(long long));
+            l->len--;
+            return;
+        }
+    }
+    pyrs_die("ValueError: list.remove(x): x not in list");
+}
+
+long long pyrs_list_index(const PyrsList *l, long long slot, int tag) {
+    check_ref(l);
+    for (long long i = 0; i < l->len; i++) {
+        if (slot_eq(l->data[i], slot, tag)) {
+            return i;
+        }
+    }
+    pyrs_die("ValueError: list.index(x): x not in list");
+}
+
+void pyrs_list_clear(PyrsList *l) {
+    check_ref(l);
+    l->len = 0;
 }
 
 long long pyrs_list_pop(PyrsList *l, long long i) {

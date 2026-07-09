@@ -103,6 +103,21 @@ pub enum Stmt {
         list: Expr,
         value: Expr,
     },
+    /// `list.insert(index, value)` — index clamped like CPython.
+    ListInsert {
+        list: Expr,
+        index: Expr,
+        value: Expr,
+    },
+    /// `list.remove(value)` — first match; traps if missing.
+    ListRemove {
+        list: Expr,
+        value: Expr,
+    },
+    /// `list.clear()`
+    ListClear {
+        list: Expr,
+    },
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
         orelse: Vec<Stmt>,
@@ -208,6 +223,11 @@ pub enum ExprKind {
     ListPop {
         list: Box<Expr>,
         index: Box<Expr>,
+    },
+    /// `list.index(value)` — first match; traps if missing. Result is `int`.
+    ListIndexOf {
+        list: Box<Expr>,
+        value: Box<Expr>,
     },
     /// A list literal; `ty` is `List(elem)` and items are already coerced.
     ListLit(Vec<Expr>),

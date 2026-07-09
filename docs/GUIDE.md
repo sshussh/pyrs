@@ -407,8 +407,12 @@ m: list[list[str]] = []
 m.append(["a", "b"])
 ```
 
-Not supported yet: list `+`/`*`/`==`, `insert`/`remove`/`index`/`sort`,
-`in` on lists of lists, and slice assignment.
+List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
+`index(v)`, `clear()`. `insert` clamps the index like CPython;
+`remove` / `index` trap with `ValueError` when the value is missing.
+
+Not supported yet: list `+`/`*`/`==`, `sort`, `in` on lists of lists,
+and slice assignment.
 
 ### Control flow
 

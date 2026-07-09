@@ -494,6 +494,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `IndexAssign` | `xs[i] = v` | bounds check + store |
 | `ListAppend` | `xs.append(v)` | `pyrs_list_push` |
 | `ListAppendUnchecked` | append with known capacity | inline store + len bump |
+| `ListInsert` / `ListRemove` / `ListClear` | list mutators | `pyrs_list_insert` / `remove` / `clear` |
 | `If` | if/elif/else | branch tree |
 | `While { cond, body, step }` | all loops; `continue` → `step` | multi-block loop |
 | `Return` | return | `ret` |
@@ -513,7 +514,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `FileCall { func: FileFn, args }` | file methods → `pyrs_file_*` |
 | `Open` / `Input` / `Argv` | I/O and CLI |
 | `Contains` | `in` / `not in` |
-| `ListPop` / `ListLit` / `ListNew` / `Len` | list construction and length |
+| `ListPop` / `ListIndexOf` / `ListLit` / `ListNew` / `Len` | list ops |
 | `Block { stmts, result }` | statements inside expressions (comprehensions) |
 | `Abs` | `abs(x)` via LLVM abs/fabs |
 | `Min` / `Max` | 2-arg `min`/`max` (numeric; select on compare) |

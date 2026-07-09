@@ -141,6 +141,10 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_str_islower(ptr)\n");
         out.push_str("declare ptr @pyrs_list_new(i64)\n");
         out.push_str("declare void @pyrs_list_push(ptr, i64)\n");
+        out.push_str("declare void @pyrs_list_insert(ptr, i64, i64)\n");
+        out.push_str("declare void @pyrs_list_remove(ptr, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_list_index(ptr, i64, i32)\n");
+        out.push_str("declare void @pyrs_list_clear(ptr)\n");
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
         out.push_str("declare i64 @pyrs_list_pop(ptr, i64)\n");
@@ -539,6 +543,28 @@ impl Emitter {
                 let slot = self.slot_from_value(&v, value.ty);
                 self.line(format!("call void @pyrs_list_push(ptr {l}, i64 {slot})"));
             }
+            Stmt::ListInsert { list, index, value } => {
+                let l = self.emit_expr(list);
+                let i = self.emit_expr(index);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                self.line(format!(
+                    "call void @pyrs_list_insert(ptr {l}, i64 {i}, i64 {slot})"
+                ));
+            }
+            Stmt::ListRemove { list, value } => {
+                let l = self.emit_expr(list);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                self.line(format!(
+                    "call void @pyrs_list_remove(ptr {l}, i64 {slot}, i32 {})",
+                    elem_tag(&value.ty)
+                ));
+            }
+            Stmt::ListClear { list } => {
+                let l = self.emit_expr(list);
+                self.line(format!("call void @pyrs_list_clear(ptr {l})"));
+            }
             Stmt::ListAppendUnchecked { list, value } => {
                 // capacity was guaranteed at allocation: store the slot at
                 // data[len] and bump len, no call, no check
@@ -881,6 +907,17 @@ impl Emitter {
                     "{slot} = call i64 @pyrs_list_pop(ptr {l}, i64 {i})"
                 ));
                 self.value_from_slot(&slot, expr.ty)
+            }
+            ExprKind::ListIndexOf { list, value } => {
+                let l = self.emit_expr(list);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i64 @pyrs_list_index(ptr {l}, i64 {slot}, i32 {})",
+                    elem_tag(&value.ty)
+                ));
+                t
             }
             ExprKind::ListLit(items) => {
                 let l = self.tmp();
