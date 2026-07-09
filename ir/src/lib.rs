@@ -236,6 +236,8 @@ pub enum ExprKind {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// `sum(xs)` for `list[int]` or `list[float]`; empty lists yield 0 / 0.0.
+    Sum(Box<Expr>),
     /// int → float (sitofp)
     IntToFloat(Box<Expr>),
     /// float → int, truncating toward zero (Python's `int()`)

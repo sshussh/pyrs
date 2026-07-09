@@ -467,6 +467,7 @@ functions, closures, `lambda`, and redefining a function.
 | `len(x)` | str, list | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
 | `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg; 2-arg only) |
+| `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `global x` | (statement) | write access to a module global |
 | `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |

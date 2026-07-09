@@ -1004,6 +1004,47 @@ fn min_wrong_type_is_compile_error() {
 }
 
 #[test]
+fn sum_matches_python() {
+    let out = run_program(
+        "sum",
+        "\
+print(sum([1, 2, 3]))
+xs: list[int] = []
+print(sum(xs))
+print(sum([1.5, 2.5]))
+ys: list[float] = []
+print(sum(ys))
+print(sum([-1, 4, 10]))
+",
+    );
+    assert_eq!(
+        out,
+        "\
+6
+0
+4.0
+0.0
+13
+"
+    );
+}
+
+#[test]
+fn sum_wrong_type_is_compile_error() {
+    let dir = TempDir::new("sum_bad");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "print(sum([\"a\", \"b\"]))\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("sum()"), "stderr: {stderr}");
+}
+
+#[test]
 fn global_variables_match_python() {
     let out = run_program(
         "globals",

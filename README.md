@@ -54,8 +54,8 @@ A statically-typed Python subset:
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
   `and`/`or`/`not` (short-circuit), casts
   `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, `min()`/`max()`
-  (two arguments), indexing with negative indices, full slicing
-  `s[a:b:c]` including `[::-1]` reversal,
+  (two arguments), `sum()` on `list[int]`/`list[float]`, indexing with
+  negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
   `print(...)` with any mix of values
 - **f-strings:** `f"x={x}, next={x + 1}"` with `{{`/`}}` escapes and
   nesting (no format specs yet — write `{str(x)}` style conversions)

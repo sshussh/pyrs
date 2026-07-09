@@ -276,6 +276,79 @@ impl Emitter {
         t
     }
 
+    /// `sum(xs)` for homogeneous numeric lists: open-coded loop over slots.
+    fn emit_sum(&mut self, list: &Expr) -> String {
+        let Ty::List(elem) = list.ty else {
+            unreachable!("sum of non-list");
+        };
+        let hdr = self.emit_expr(list);
+        let len = self.emit_len(&hdr);
+        let data_pp = self.tmp();
+        self.line(format!(
+            "{data_pp} = getelementptr inbounds i8, ptr {hdr}, i64 16"
+        ));
+        let data_p = self.tmp();
+        self.line(format!("{data_p} = load ptr, ptr {data_pp}"));
+
+        // Pre-allocate temp names used in phis (body writes i_next / acc_next).
+        self.tmp += 1;
+        let i = format!("%t{}", self.tmp);
+        self.tmp += 1;
+        let acc = format!("%t{}", self.tmp);
+        self.tmp += 1;
+        let i_next = format!("%t{}", self.tmp);
+        self.tmp += 1;
+        let acc_next = format!("%t{}", self.tmp);
+
+        let zero = match *elem {
+            Ty::Int => "0".to_string(),
+            Ty::Float => fconst(0.0),
+            other => unreachable!("sum element {other:?}"),
+        };
+        let elty = lty(*elem);
+
+        let pred = self.cur_block.clone();
+        let loop_l = self.fresh_block("sum.loop");
+        let body_l = self.fresh_block("sum.body");
+        let end_l = self.fresh_block("sum.end");
+        self.line(format!("br label %{loop_l}"));
+
+        self.start_block(&loop_l);
+        self.line(format!(
+            "{i} = phi i64 [ 0, %{pred} ], [ {i_next}, %{body_l} ]"
+        ));
+        self.line(format!(
+            "{acc} = phi {elty} [ {zero}, %{pred} ], [ {acc_next}, %{body_l} ]"
+        ));
+        let done = self.tmp();
+        self.line(format!("{done} = icmp sge i64 {i}, {len}"));
+        self.line(format!("br i1 {done}, label %{end_l}, label %{body_l}"));
+
+        self.start_block(&body_l);
+        let addr = self.tmp();
+        self.line(format!(
+            "{addr} = getelementptr inbounds i64, ptr {data_p}, i64 {i}"
+        ));
+        let slot = self.tmp();
+        self.line(format!("{slot} = load i64, ptr {addr}"));
+        match *elem {
+            Ty::Int => {
+                self.line(format!("{acc_next} = add i64 {acc}, {slot}"));
+            }
+            Ty::Float => {
+                let v = self.tmp();
+                self.line(format!("{v} = bitcast i64 {slot} to double"));
+                self.line(format!("{acc_next} = fadd double {acc}, {v}"));
+            }
+            other => unreachable!("sum element {other:?}"),
+        }
+        self.line(format!("{i_next} = add i64 {i}, 1"));
+        self.line(format!("br label %{loop_l}"));
+
+        self.start_block(&end_l);
+        acc
+    }
+
     /// Inline list element addressing: negative-index adjustment, bounds
     /// check (trapping with `message`), then the slot address. Much faster
     /// than an out-of-line runtime call in hot loops.
@@ -843,6 +916,7 @@ impl Emitter {
             // otherwise left (ties and NaN comparisons keep the left operand).
             ExprKind::Min { left, right } => self.emit_min_max(false, left, right),
             ExprKind::Max { left, right } => self.emit_min_max(true, left, right),
+            ExprKind::Sum(list) => self.emit_sum(list),
             ExprKind::IntToFloat(inner) => {
                 let v = self.emit_expr(inner);
                 let t = self.tmp();

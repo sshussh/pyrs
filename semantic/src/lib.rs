@@ -122,8 +122,8 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 8] = [
-    "print", "len", "range", "input", "open", "abs", "min", "max",
+const BUILTINS: [&str; 9] = [
+    "print", "len", "range", "input", "open", "abs", "min", "max", "sum",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -2763,6 +2763,41 @@ fn lower_call(
                 };
                 Ok(ir::Expr { ty, kind })
             }
+            "sum" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!(
+                            "sum() takes exactly 1 argument ({} given); \
+                             start= is not supported yet",
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(&args[0], ctx)?;
+                let elem = match arg.ty {
+                    ir::Ty::List(e) => *e,
+                    other => {
+                        return Err(err(
+                            format!("sum() expects a list of numbers, found {other}"),
+                            args[0].span,
+                        ));
+                    }
+                };
+                match elem {
+                    ir::Ty::Int | ir::Ty::Float => Ok(ir::Expr {
+                        ty: elem,
+                        kind: ir::ExprKind::Sum(Box::new(arg)),
+                    }),
+                    other => Err(err(
+                        format!(
+                            "sum() is only supported for list[int] and list[float], \
+                             found list[{other}]"
+                        ),
+                        args[0].span,
+                    )),
+                }
+            }
             "range" => Err(err(
                 "range(...) is only supported as the iterable of a 'for' loop",
                 span,
@@ -3426,6 +3461,32 @@ print(fib(10))
     fn min_arity() {
         let e = analyze_err("x = min(1)\n");
         assert!(e.message.contains("exactly 2 arguments"), "{}", e.message);
+    }
+
+    #[test]
+    fn sum_list_int_and_float() {
+        let m = analyze_ok("a = sum([1, 2, 3])\nb = sum([1.5, 2.5])\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Sum(_)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+        assert!(matches!(value.kind, ir::ExprKind::Sum(_)));
+    }
+
+    #[test]
+    fn sum_rejects_str_list() {
+        let e = analyze_err("x = sum([\"a\", \"b\"])\n");
+        assert!(
+            e.message.contains("sum()") && e.message.contains("list[str]"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
