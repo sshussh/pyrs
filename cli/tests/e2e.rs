@@ -872,10 +872,34 @@ print(f\"nested {f'inner {n}'} outer\")
 }
 
 #[test]
-fn fstring_format_spec_is_compile_error() {
-    let dir = TempDir::new("fspec");
+fn fstring_dot_nf_matches_python() {
+    let out = run_program(
+        "fspec",
+        "\
+pi = 3.14159
+n = 2
+flag = True
+print(f\"{pi:.2f}\")
+print(f\"{pi:.0f}\")
+print(f\"{pi:.5f}\")
+print(f\"{n:.2f}\")
+print(f\"{flag:.1f}\")
+print(f\"{-pi:.2f}\")
+print(f\"{0.001:.4f}\")
+print(f\"x={pi:.3f} y={n:.0f}\")
+",
+    );
+    assert_eq!(
+        out,
+        "3.14\n3\n3.14159\n2.00\n1.0\n-3.14\n0.0010\nx=3.142 y=2\n"
+    );
+}
+
+#[test]
+fn fstring_unsupported_format_spec_is_compile_error() {
+    let dir = TempDir::new("fspecbad");
     let src = dir.0.join("prog.py");
-    fs::write(&src, "x = 1\nprint(f\"{x:.2f}\")\n").unwrap();
+    fs::write(&src, "x = 1.0\nprint(f\"{x:.2e}\")\n").unwrap();
     let out = Command::new(PYRS)
         .args(["compile", "-i"])
         .arg(&src)
@@ -883,7 +907,7 @@ fn fstring_format_spec_is_compile_error() {
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("format specifiers"), "stderr: {stderr}");
+    assert!(stderr.contains("not supported"), "stderr: {stderr}");
 }
 
 #[test]

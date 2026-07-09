@@ -116,6 +116,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_index(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_from_int(i64)\n");
         out.push_str("declare ptr @pyrs_str_from_float(double)\n");
+        out.push_str("declare ptr @pyrs_str_format_float(double, i64)\n");
         out.push_str("declare ptr @pyrs_str_from_bool(i32)\n");
         out.push_str("declare ptr @pyrs_str_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_str_contains(ptr, ptr)\n");
@@ -1033,6 +1034,14 @@ impl Emitter {
                 let v = self.emit_expr(inner);
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_str_from_float(double {v})"));
+                t
+            }
+            ExprKind::FloatFormat { value, precision } => {
+                let v = self.emit_expr(value);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_str_format_float(double {v}, i64 {precision})"
+                ));
                 t
             }
             ExprKind::BoolToStr(inner) => {

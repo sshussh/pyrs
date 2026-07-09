@@ -59,8 +59,9 @@ A statically-typed Python subset:
   (two arguments), `sum()` on `list[int]`/`list[float]`, indexing with
   negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
   `print(...)` with any mix of values
-- **f-strings:** `f"x={x}, next={x + 1}"` with `{{`/`}}` escapes and
-  nesting (no format specs yet — write `{str(x)}` style conversions)
+- **f-strings:** `f"x={x}, next={x + 1}"` with `{{`/`}}` escapes,
+  nesting, and fixed-point `{x:.Nf}` (other format codes / `!r` still
+  unsupported)
 - **Strings:** immutable; `+` concat, `*` repeat, lexicographic
   comparisons, indexing, slicing, `in`, iteration, `len()`, `str(x)`
   conversions, and methods: `upper` `lower` `strip` `lstrip` `rstrip`
@@ -119,9 +120,9 @@ modes "r"/"w"/"a" only (`with`, `for line in f`, and `file` params/
 returns work; no `list[file]` or printing files), imports are single
 sibling modules
 only (no packages, `import a.b`, `from m import *`, or relative
-imports), and f-string format
-specs / dicts / tuples / classes / exceptions are not in yet — the
-parser reports "not supported yet" for each.
+imports), and full f-string format specs (beyond `{x:.Nf}`) / dicts /
+tuples / classes / exceptions are not in yet — the parser reports "not
+supported yet" for each.
 
 Errors come with source snippets:
 

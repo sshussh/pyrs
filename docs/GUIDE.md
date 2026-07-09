@@ -332,16 +332,21 @@ String methods (ASCII case/whitespace rules):
 ```python
 name = "world"
 n = 42
+pi = 3.14159
 print(f"hello {name}, n={n}, next={n + 1}")
 print(f"{{literal braces}} and {f'nested {n}'}")
+print(f"pi={pi:.2f}")          # fixed-point: "pi=3.14"
+print(f"{n:.2f}")              # int/bool promoted: "2.00"
 ```
 
 Any expression can appear inside `{...}`, including slices, calls, and
 nested f-strings. Interpolated values are converted with the `str()`
 rules (int/float/bool/str). `{{` and `}}` produce literal braces.
 
-Not supported yet: format specifiers (`{x:.2f}`) and conversions
-(`{x!r}`) — both produce a targeted compile error suggesting `str(x)`.
+**Format specs:** `{x:.Nf}` (fixed-point with `N` digits after the
+decimal) is supported for `int`/`float`/`bool`. Other format codes
+(`e`, `g`, width/alignment, …) and conversions (`{x!r}`, `{x!s}`) are
+not supported yet and produce a targeted compile error.
 
 ### Lists
 
@@ -736,9 +741,9 @@ deliberate exceptions:
     gives `nan` (Python returns a complex number).
 
 Not implemented yet (clear compile errors): classes, dicts, sets, tuples,
-imports, exceptions, `with`, `match`, generators/`yield`, `lambda`,
-nested functions, closures, `nonlocal`, f-string format specs,
-`*args`/`**kwargs`, and unpacking.
+packages/relative imports, exceptions, `match`, generators/`yield`,
+`lambda`, nested functions, closures, `nonlocal`, full f-string format
+specs beyond `{x:.Nf}`, `*args`/`**kwargs`, and unpacking.
 
 ## 9. Performance
 

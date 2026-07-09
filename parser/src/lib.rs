@@ -1190,14 +1190,17 @@ fn parse_fstring(raw: &str, span: Span) -> PResult<Expr> {
                         None => return Err(err("unterminated '{' in f-string")),
                     }
                 }
-                check_fragment_modifiers(&frag, span)?;
-                if frag.trim().is_empty() {
+                let (expr_src, format) = split_fstring_fragment(&frag, span)?;
+                if expr_src.trim().is_empty() {
                     return Err(err("empty expression in f-string"));
                 }
                 if !lit.is_empty() {
                     parts.push(FStringPart::Literal(std::mem::take(&mut lit)));
                 }
-                parts.push(FStringPart::Expr(parse_fragment(&frag, span)?));
+                parts.push(FStringPart::Expr {
+                    expr: parse_fragment(expr_src, span)?,
+                    format,
+                });
             }
             '}' => {
                 if chars.peek() == Some(&'}') {
@@ -1219,34 +1222,80 @@ fn parse_fstring(raw: &str, span: Span) -> PResult<Expr> {
     })
 }
 
-/// Reject `{x:...}` format specs and `{x!r}` conversions (unsupported); a
-/// ':' inside brackets (e.g. a slice) is fine.
-fn check_fragment_modifiers(frag: &str, span: Span) -> PResult<()> {
+/// Split `{expr}` / `{expr:.Nf}` / reject unsupported `!` conversions and
+/// other format specs. A `:` inside brackets (e.g. a slice) is part of the
+/// expression, not a format delimiter.
+fn split_fstring_fragment<'a>(
+    frag: &'a str,
+    span: Span,
+) -> PResult<(&'a str, Option<FStringFormat>)> {
     let mut depth = 0i32;
-    let mut chars = frag.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
+    let bytes = frag.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] as char {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
-            ':' if depth == 0 => {
-                return Err(Diagnostic::new(
-                    Phase::Parse,
-                    "format specifiers in f-strings are not supported yet; \
-                     convert explicitly, e.g. {str(x)}",
-                    span,
-                ));
+            '!' if depth == 0 => {
+                // allow `!=` comparison inside the expression
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    i += 1;
+                } else {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        "conversions like '!r' in f-strings are not supported yet",
+                        span,
+                    ));
+                }
             }
-            '!' if depth == 0 && chars.peek() != Some(&'=') => {
-                return Err(Diagnostic::new(
-                    Phase::Parse,
-                    "conversions like '!r' in f-strings are not supported yet",
-                    span,
-                ));
+            ':' if depth == 0 => {
+                let expr_src = &frag[..i];
+                let spec = &frag[i + 1..];
+                let format = parse_fstring_format(spec, span)?;
+                return Ok((expr_src, Some(format)));
             }
             _ => {}
         }
+        i += 1;
     }
-    Ok(())
+    Ok((frag, None))
+}
+
+/// Currently only `{x:.Nf}` (fixed-point, N digits).
+fn parse_fstring_format(spec: &str, span: Span) -> PResult<FStringFormat> {
+    let unsupported = || {
+        Diagnostic::new(
+            Phase::Parse,
+            format!(
+                "format specifier '{spec}' in f-strings is not supported yet \
+                 (only '.Nf' fixed-point is supported)"
+            ),
+            span,
+        )
+    };
+    let s = spec.trim();
+    if !s.starts_with('.') || !s.ends_with('f') || s.len() < 3 {
+        return Err(unsupported());
+    }
+    let digits = &s[1..s.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(unsupported());
+    }
+    let precision: u32 = digits.parse().map_err(|_| {
+        Diagnostic::new(
+            Phase::Parse,
+            format!("format precision '{digits}' is out of range"),
+            span,
+        )
+    })?;
+    if precision > 1000 {
+        return Err(Diagnostic::new(
+            Phase::Parse,
+            "format precision must be at most 1000",
+            span,
+        ));
+    }
+    Ok(FStringFormat::DotNf { precision })
 }
 
 fn parse_fragment(frag: &str, span: Span) -> PResult<Expr> {
@@ -1360,8 +1409,8 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
         ExprKind::Unary { operand, .. } => rebase_spans(operand, span),
         ExprKind::JoinedStr(parts) => {
             for part in parts {
-                if let FStringPart::Expr(e) = part {
-                    rebase_spans(e, span);
+                if let FStringPart::Expr { expr, .. } = part {
+                    rebase_spans(expr, span);
                 }
             }
         }
@@ -1834,9 +1883,20 @@ def f(n: int) -> int:
         };
         assert_eq!(parts.len(), 5);
         assert!(matches!(&parts[0], FStringPart::Literal(s) if s == "a"));
-        assert!(matches!(&parts[1], FStringPart::Expr(_)));
-        assert!(matches!(&parts[3], FStringPart::Expr(e)
-            if matches!(e.kind, ExprKind::Binary { .. })));
+        assert!(matches!(
+            &parts[1],
+            FStringPart::Expr {
+                format: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parts[3],
+            FStringPart::Expr {
+                expr: e,
+                format: None
+            } if matches!(e.kind, ExprKind::Binary { .. })
+        ));
     }
 
     #[test]
@@ -1852,9 +1912,41 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn error_fstring_format_spec() {
-        let e = parse_err("s = f\"{x:.2f}\"\n");
-        assert!(e.message.contains("format specifiers"), "{}", e.message);
+    fn parses_fstring_dot_nf_format() {
+        let m = parse_ok("s = f\"{x:.2f} {y[1:3]} {z:.0f}\"\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        let ExprKind::JoinedStr(parts) = &value.kind else {
+            panic!("expected JoinedStr");
+        };
+        assert!(matches!(
+            &parts[0],
+            FStringPart::Expr {
+                format: Some(FStringFormat::DotNf { precision: 2 }),
+                ..
+            }
+        ));
+        // slice colon is not a format delimiter
+        assert!(matches!(
+            &parts[2],
+            FStringPart::Expr { format: None, .. }
+        ));
+        assert!(matches!(
+            &parts[4],
+            FStringPart::Expr {
+                format: Some(FStringFormat::DotNf { precision: 0 }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn error_fstring_unsupported_format_spec() {
+        let e = parse_err("s = f\"{x:.2e}\"\n");
+        assert!(e.message.contains("not supported"), "{}", e.message);
+        let e = parse_err("s = f\"{x:10.2f}\"\n");
+        assert!(e.message.contains("not supported"), "{}", e.message);
     }
 
     #[test]

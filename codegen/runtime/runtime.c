@@ -617,6 +617,24 @@ PyrsStr *pyrs_str_from_float(double v) {
     return r;
 }
 
+/* f-string `{x:.Nf}` / format(x, ".Nf") fixed-point (CPython %.*f) */
+PyrsStr *pyrs_str_format_float(double v, long long precision) {
+    if (precision < 0) {
+        precision = 0;
+    }
+    if (precision > 1000) {
+        precision = 1000;
+    }
+    int p = (int)precision;
+    int n = snprintf(NULL, 0, "%.*f", p, v);
+    if (n < 0) {
+        pyrs_die("ValueError: float format failed");
+    }
+    PyrsStr *r = str_alloc((long long)n);
+    snprintf(r->data, (size_t)n + 1, "%.*f", p, v);
+    return r;
+}
+
 PyrsStr *pyrs_str_from_bool(int v) {
     const char *text = v ? "True" : "False";
     size_t n = strlen(text);

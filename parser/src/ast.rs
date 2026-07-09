@@ -211,10 +211,20 @@ pub enum UnaryOp {
     Not,
 }
 
+/// Supported f-string format specs (minimal subset of PEP 3101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FStringFormat {
+    /// `{x:.Nf}` — fixed-point with `N` digits after the decimal.
+    DotNf { precision: u32 },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FStringPart {
     Literal(String),
-    Expr(Expr),
+    Expr {
+        expr: Expr,
+        format: Option<FStringFormat>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

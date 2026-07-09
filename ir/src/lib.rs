@@ -272,6 +272,11 @@ pub enum ExprKind {
     IntToStr(Box<Expr>),
     FloatToStr(Box<Expr>),
     BoolToStr(Box<Expr>),
+    /// f-string `{x:.Nf}` fixed-point format; operand is always `Float`.
+    FloatFormat {
+        value: Box<Expr>,
+        precision: u32,
+    },
     /// truthiness test → bool: numerics `!= 0`, str/list `len != 0`
     ToBool(Box<Expr>),
 }

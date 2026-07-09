@@ -2422,10 +2422,14 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         ty: ir::Ty::Str,
                         kind: ir::ExprKind::ConstStr(s.clone()),
                     },
-                    ast::FStringPart::Expr(e) => {
+                    ast::FStringPart::Expr { expr: e, format } => {
                         let v = lower_expr(e, ctx)?;
-                        // reuse str() conversion rules
-                        lower_cast(ast::TypeName::Str, v, e.span)?
+                        match format {
+                            None => lower_cast(ast::TypeName::Str, v, e.span)?,
+                            Some(ast::FStringFormat::DotNf { precision }) => {
+                                lower_float_format(v, *precision, e.span)?
+                            }
+                        }
                     }
                 };
                 result = Some(match result {
@@ -3465,6 +3469,40 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
         )),
         ast::TypeName::None => Err(err("None is not a conversion", span)),
     }
+}
+
+/// f-string `{x:.Nf}`: format int/float/bool as fixed-point (CPython-compatible).
+fn lower_float_format(value: ir::Expr, precision: u32, span: Span) -> SResult<ir::Expr> {
+    let as_float = match value.ty {
+        ir::Ty::Float => value,
+        ir::Ty::Int => ir::Expr {
+            ty: ir::Ty::Float,
+            kind: ir::ExprKind::IntToFloat(Box::new(value)),
+        },
+        ir::Ty::Bool => {
+            let as_int = ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::BoolToInt(Box::new(value)),
+            };
+            ir::Expr {
+                ty: ir::Ty::Float,
+                kind: ir::ExprKind::IntToFloat(Box::new(as_int)),
+            }
+        }
+        other => {
+            return Err(err(
+                format!("Unknown format code 'f' for object of type '{other}'"),
+                span,
+            ));
+        }
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::FloatFormat {
+            value: Box::new(as_float),
+            precision,
+        },
+    })
 }
 
 /// bool → int; int/float pass through; anything else is an error.
@@ -4702,8 +4740,52 @@ print(count([]))
     }
 
     #[test]
+    fn fstring_dot_nf_lowers_to_float_format() {
+        let m = analyze_ok("x = 3.14159\ns = f\"{x:.2f}\"\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        fn has_fmt(e: &ir::Expr) -> bool {
+            match &e.kind {
+                ir::ExprKind::FloatFormat { precision: 2, .. } => true,
+                ir::ExprKind::Binary { left, right, .. } => has_fmt(left) || has_fmt(right),
+                _ => false,
+            }
+        }
+        assert!(has_fmt(value), "{value:?}");
+    }
+
+    #[test]
+    fn fstring_dot_nf_promotes_int() {
+        let m = analyze_ok("n = 2\ns = f\"{n:.2f}\"\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        fn has_int_to_float_fmt(e: &ir::Expr) -> bool {
+            match &e.kind {
+                ir::ExprKind::FloatFormat { value, precision: 2 } => {
+                    matches!(value.kind, ir::ExprKind::IntToFloat(_))
+                }
+                ir::ExprKind::Binary { left, right, .. } => {
+                    has_int_to_float_fmt(left) || has_int_to_float_fmt(right)
+                }
+                _ => false,
+            }
+        }
+        assert!(has_int_to_float_fmt(value), "{value:?}");
+    }
+
+    #[test]
     fn error_fstring_of_list() {
         let e = analyze_err("xs = [1]\ns = f\"{xs}\"\nprint(s)\n");
         assert!(e.message.contains("convert"), "{}", e.message);
+    }
+
+    #[test]
+    fn error_fstring_dot_nf_on_str() {
+        let e = analyze_err("s = \"hi\"\nt = f\"{s:.2f}\"\n");
+        assert!(e.message.contains("format code"), "{}", e.message);
     }
 }

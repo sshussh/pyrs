@@ -410,9 +410,9 @@ These are product constraints that affect design choices:
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
 dicts, sets, tuples, exceptions / `try`, generators, nested functions /
-closures, `lambda`, packages, f-string format specs, default/keyword
-arguments, `for line in f`, file-typed parameters. Prefer compile-time
-rejection with a clear message over silent wrong behavior.
+closures, `lambda`, packages, f-string format codes beyond `{x:.Nf}`,
+`*args`/`**kwargs`. Prefer compile-time rejection with a clear message
+over silent wrong behavior.
 
 **Strategy:** finish optimized **primitives** (IR + C) for current and new
 core types before a real stdlib tree. Do not grow `runtime.c` with
