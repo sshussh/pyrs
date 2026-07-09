@@ -45,7 +45,8 @@ A statically-typed Python subset:
 - **Types:** `int` (i64), `float` (f64), `bool`, `str`, `list[T]` —
   including nested lists (`list[list[float]]` matrices)
 - **Functions:** `def` with mandatory parameter annotations
-  (`def f(x: int) -> int:`), recursion, forward references
+  (`def f(x: int, y: int = 0) -> int:`), defaults and keyword args,
+  recursion, forward references
 - **Statements:** `if`/`elif`/`else`, `while`,
   `for x in range(...)` / lists / strings, `break`/`continue`,
   assignments (plain, annotated, augmented — including `xs[i] += v`),

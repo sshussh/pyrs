@@ -370,7 +370,7 @@ impl Parser {
         let (name, _) = self.expect_ident("after 'def'")?;
         self.expect(Token::LParen, "after function name")?;
 
-        let mut params = Vec::new();
+        let mut params: Vec<Param> = Vec::new();
         if self.peek() != &Token::RParen {
             loop {
                 let (pname, pspan) = self.expect_ident("in parameter list")?;
@@ -385,10 +385,24 @@ impl Parser {
                     ));
                 }
                 let ty = self.parse_type_name("in parameter annotation")?;
+                let default = if self.eat(&Token::Eq) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                // no non-default after default
+                if default.is_none() && params.iter().any(|p| p.default.is_some()) {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        format!("non-default argument '{pname}' follows default argument"),
+                        pspan,
+                    ));
+                }
                 params.push(Param {
                     name: pname,
                     ty,
                     span: pspan,
+                    default,
                 });
                 if !self.eat(&Token::Comma) {
                     break;
@@ -881,7 +895,7 @@ impl Parser {
                         continue;
                     }
                     self.advance();
-                    let args = self.parse_call_args()?;
+                    let (args, keywords) = self.parse_call_args()?;
                     let close = self.expect(Token::RParen, "after method arguments")?;
                     let span = expr.span.to(close);
                     expr = Expr {
@@ -890,6 +904,7 @@ impl Parser {
                             method,
                             method_span,
                             args,
+                            keywords,
                         },
                         span,
                     };
@@ -900,11 +915,33 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_call_args(&mut self) -> PResult<Vec<Expr>> {
+    /// Positional args then `name=value` keywords (no positionals after keywords).
+    fn parse_call_args(&mut self) -> PResult<(Vec<Expr>, Vec<Keyword>)> {
         let mut args = Vec::new();
+        let mut keywords = Vec::new();
+        let mut seen_kw = false;
         if self.peek() != &Token::RParen {
             loop {
-                args.push(self.parse_expr()?);
+                // keyword: IDENT '=' expr (not `==`)
+                if let Token::Ident(name) = self.peek().clone()
+                    && *self.peek2() == Token::Eq
+                {
+                    let name_span = self.peek_span();
+                    self.advance(); // name
+                    self.advance(); // =
+                    let value = self.parse_expr()?;
+                    keywords.push(Keyword {
+                        name,
+                        name_span,
+                        value,
+                    });
+                    seen_kw = true;
+                } else {
+                    if seen_kw {
+                        return Err(self.error("positional argument follows keyword argument"));
+                    }
+                    args.push(self.parse_expr()?);
+                }
                 if !self.eat(&Token::Comma) {
                     break;
                 }
@@ -913,7 +950,7 @@ impl Parser {
                 }
             }
         }
-        Ok(args)
+        Ok((args, keywords))
     }
 
     fn parse_primary(&mut self) -> PResult<Expr> {
@@ -987,13 +1024,14 @@ impl Parser {
                 self.advance();
                 if self.peek() == &Token::LParen {
                     self.advance();
-                    let args = self.parse_call_args()?;
+                    let (args, keywords) = self.parse_call_args()?;
                     let close = self.expect(Token::RParen, "after call arguments")?;
                     return Ok(Expr {
                         kind: ExprKind::Call {
                             func: name,
                             func_span: span,
                             args,
+                            keywords,
                         },
                         span: span.to(close),
                     });

@@ -42,6 +42,16 @@ pub struct Param {
     pub name: String,
     pub ty: TypeName,
     pub span: Span,
+    /// Default value after `=`; if present, later params must also have defaults.
+    pub default: Option<Expr>,
+}
+
+/// `name=value` in a call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Keyword {
+    pub name: String,
+    pub name_span: Span,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,6 +230,7 @@ pub enum ExprKind {
         func: String,
         func_span: Span,
         args: Vec<Expr>,
+        keywords: Vec<Keyword>,
     },
     /// `obj.attr` without a call — currently only `sys.argv`.
     Attribute {
@@ -233,6 +244,7 @@ pub enum ExprKind {
         method: String,
         method_span: Span,
         args: Vec<Expr>,
+        keywords: Vec<Keyword>,
     },
     /// `base[index]`
     Index {

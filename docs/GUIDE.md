@@ -467,6 +467,10 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 - Parameter annotations are **required**; the return annotation defaults
   to "returns nothing" when omitted.
+- Default values and keyword arguments work (`def f(a: int, b: int = 1)`
+  and `f(1, b=2)`). Defaults are re-evaluated at each call that needs
+  them (so `def f(xs: list[int] = [])` does not share one list across
+  calls — a deliberate deviation from CPython). No `*args` / `**kwargs`.
 - A function declared `-> T` must return on every path — the compiler
   checks this (an infinite `while True:` without `break` counts as
   not falling through).
@@ -475,8 +479,8 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - Function names are internally prefixed, so naming a function `printf`
   or `malloc` cannot collide with the C library.
 
-Not supported yet: default values, keyword arguments, `*args`, nested
-functions, closures, `lambda`, and redefining a function.
+Not supported yet: `*args` / `**kwargs`, nested functions, closures,
+`lambda`, and redefining a function.
 
 ### Built-in functions
 

@@ -1531,6 +1531,48 @@ print(len(open(path).readlines()))
 }
 
 #[test]
+fn defaults_and_kwargs_match_python() {
+    let out = run_program(
+        "defkw",
+        "\
+def f(a: int, b: int = 2, c: int = 3) -> int:
+    return a * 100 + b * 10 + c
+
+print(f(1))
+print(f(1, 9))
+print(f(1, c=10))
+print(f(1, 8, 9))
+print(f(a=4, b=5, c=6))
+print(f(7, c=0, b=1))
+",
+    );
+    // f(1,c=10) => a=1,b=2,c=10 => 130
+    assert_eq!(out, "123\n193\n130\n189\n456\n710\n");
+}
+
+#[test]
+fn defaults_and_kwargs_errors() {
+    let dir = TempDir::new("defkwerr");
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "def f(a: int, b: int = 1) -> int:\n    return a + b\nprint(f(b=2))\n",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("missing required argument 'a'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn file_typed_params_match_python_io() {
     let dir = TempDir::new("fileparam");
     let data = dir.0.join("fp.txt").display().to_string();

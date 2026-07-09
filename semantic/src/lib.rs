@@ -60,8 +60,16 @@ fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Ty> {
 }
 
 #[derive(Debug, Clone)]
+struct ParamSig {
+    name: String,
+    ty: ir::Ty,
+    /// Cloned AST default; lowered at each call site when the arg is omitted.
+    default: Option<ast::Expr>,
+}
+
+#[derive(Debug, Clone)]
 struct FuncSig {
-    params: Vec<ir::Ty>,
+    params: Vec<ParamSig>,
     ret: ir::Ty,
     span: Span,
 }
@@ -167,6 +175,7 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                 ));
             }
             let mut params = Vec::new();
+            let mut seen_names = std::collections::HashSet::new();
             for p in &f.params {
                 let ty = resolve_type(p.ty);
                 if ty == ir::Ty::None {
@@ -175,7 +184,17 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                         p.span,
                     ));
                 }
-                params.push(ty);
+                if !seen_names.insert(p.name.clone()) {
+                    return Err(err(
+                        format!("duplicate parameter name '{}'", p.name),
+                        p.span,
+                    ));
+                }
+                params.push(ParamSig {
+                    name: p.name.clone(),
+                    ty,
+                    default: p.default.clone(),
+                });
             }
             let ret = f.ret.map(resolve_type).unwrap_or(ir::Ty::None);
             funcs.insert(
@@ -745,15 +764,22 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 method,
                 method_span,
                 args,
+                keywords,
             } = &e.kind
             {
                 // `module.func(args)` as a statement discards the result
                 if let ast::ExprKind::Name(alias) = &base.kind
                     && let Some(real) = ctx.module_alias(alias)
                 {
-                    let call = lower_module_call(&real, method, *method_span, args, ctx)?;
+                    let call = lower_module_call(&real, method, *method_span, args, keywords, ctx)?;
                     out.push(ir::Stmt::ExprStmt(call));
                     return Ok(());
+                }
+                if !keywords.is_empty() {
+                    return Err(err(
+                        "keyword arguments are not supported for this method call",
+                        keywords[0].name_span,
+                    ));
                 }
                 let stmt = lower_method_stmt(base, method, *method_span, args, ctx)?;
                 out.push(stmt);
@@ -2165,13 +2191,20 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             method,
             method_span,
             args,
+            keywords,
         } => {
             // `module.func(args)` — a cross-module call, resolved before we
             // try to treat `base` as a value
             if let ast::ExprKind::Name(alias) = &base.kind
                 && let Some(real) = ctx.module_alias(alias)
             {
-                return lower_module_call(&real, method, *method_span, args, ctx);
+                return lower_module_call(&real, method, *method_span, args, keywords, ctx);
+            }
+            if !keywords.is_empty() {
+                return Err(err(
+                    "keyword arguments are not supported for this method call",
+                    keywords[0].name_span,
+                ));
             }
             let base_ir = lower_expr(base, ctx)?;
             match base_ir.ty {
@@ -2289,7 +2322,8 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             func,
             func_span,
             args,
-        } => lower_call(func, *func_span, args, expr.span, ctx),
+            keywords,
+        } => lower_call(func, *func_span, args, keywords, expr.span, ctx),
         ast::ExprKind::Cast { ty, arg } => {
             let value = lower_expr(arg, ctx)?;
             lower_cast(*ty, value, arg.span)
@@ -2793,22 +2827,27 @@ fn lower_call_with_sig(
     ir_name: String,
     sig: &FuncSig,
     args: &[ast::Expr],
+    keywords: &[ast::Keyword],
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    if args.len() != sig.params.len() {
+    let n = sig.params.len();
+    if args.len() > n {
         return Err(err(
             format!(
                 "function '{display}' takes {} argument(s) but {} were given",
-                sig.params.len(),
+                n,
                 args.len()
             ),
             span,
         ));
     }
-    let mut lowered_args = Vec::new();
-    for (i, (arg, &expected)) in args.iter().zip(&sig.params).enumerate() {
-        // `f([])` / `f([1, 2])` use the parameter's element type
+
+    let mut slots: Vec<Option<ir::Expr>> = (0..n).map(|_| None).collect();
+    let mut filled = vec![false; n];
+
+    for (i, arg) in args.iter().enumerate() {
+        let expected = sig.params[i].ty;
         let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected) {
             lower_list_lit(items, Some(*elem), arg.span, ctx)?
         } else {
@@ -2820,8 +2859,80 @@ fn lower_call_with_sig(
             arg.span,
             &format!("argument {} of '{display}'", i + 1),
         )?;
-        lowered_args.push(a);
+        slots[i] = Some(a);
+        filled[i] = true;
     }
+
+    for kw in keywords {
+        let Some(idx) = sig.params.iter().position(|p| p.name == kw.name) else {
+            return Err(err(
+                format!(
+                    "function '{display}' got an unexpected keyword argument '{name}'",
+                    name = kw.name
+                ),
+                kw.name_span,
+            ));
+        };
+        if filled[idx] {
+            return Err(err(
+                format!(
+                    "function '{display}' got multiple values for argument '{name}'",
+                    name = kw.name
+                ),
+                kw.name_span,
+            ));
+        }
+        let expected = sig.params[idx].ty;
+        let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) =
+            (&kw.value.kind, expected)
+        {
+            lower_list_lit(items, Some(*elem), kw.value.span, ctx)?
+        } else {
+            lower_expr(&kw.value, ctx)?
+        };
+        let a = coerce(
+            a,
+            expected,
+            kw.value.span,
+            &format!("argument '{name}' of '{display}'", name = kw.name),
+        )?;
+        slots[idx] = Some(a);
+        filled[idx] = true;
+    }
+
+    let mut lowered_args = Vec::with_capacity(n);
+    for (i, p) in sig.params.iter().enumerate() {
+        if let Some(a) = slots[i].take() {
+            lowered_args.push(a);
+            continue;
+        }
+        if let Some(def) = &p.default {
+            let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&def.kind, p.ty) {
+                lower_list_lit(items, Some(*elem), def.span, ctx)?
+            } else {
+                lower_expr(def, ctx)?
+            };
+            let a = coerce(
+                a,
+                p.ty,
+                def.span,
+                &format!(
+                    "default for parameter '{name}' of '{display}'",
+                    name = p.name
+                ),
+            )?;
+            lowered_args.push(a);
+        } else {
+            return Err(err(
+                format!(
+                    "function '{display}' missing required argument '{name}'",
+                    name = p.name
+                ),
+                span,
+            ));
+        }
+    }
+
     Ok(ir::Expr {
         ty: sig.ret,
         kind: ir::ExprKind::Call {
@@ -2837,11 +2948,20 @@ fn lower_module_call(
     method: &str,
     method_span: Span,
     args: &[ast::Expr],
+    keywords: &[ast::Keyword],
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     let data = &ctx.mctx.mods[real];
     if let Some(sig) = data.funcs.get(method).cloned() {
-        return lower_call_with_sig(method, qual(real, method), &sig, args, method_span, ctx);
+        return lower_call_with_sig(
+            method,
+            qual(real, method),
+            &sig,
+            args,
+            keywords,
+            method_span,
+            ctx,
+        );
     }
     if data.globals.contains_key(method) {
         return Err(err(
@@ -2859,18 +2979,27 @@ fn lower_call(
     func: &str,
     func_span: Span,
     args: &[ast::Expr],
+    keywords: &[ast::Keyword],
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     // a function defined in this module
     if ctx.funcs().contains_key(func) {
         let sig = ctx.funcs().get(func).cloned().unwrap();
-        return lower_call_with_sig(func, ctx.own_func(func), &sig, args, span, ctx);
+        return lower_call_with_sig(func, ctx.own_func(func), &sig, args, keywords, span, ctx);
     }
     // a function pulled in by `from other import func`
     if let Some(ImportBinding::Symbol { module, name }) = ctx.mctx.imports.get(func).cloned() {
         if let Some(sig) = ctx.mctx.mods[&module].funcs.get(&name).cloned() {
-            return lower_call_with_sig(func, qual(&module, &name), &sig, args, span, ctx);
+            return lower_call_with_sig(
+                func,
+                qual(&module, &name),
+                &sig,
+                args,
+                keywords,
+                span,
+                ctx,
+            );
         }
         return Err(err(
             format!("'{func}' is a value imported from '{module}', not a function"),
@@ -2882,6 +3011,12 @@ fn lower_call(
         return Err(err(
             format!("'{func}' is a module, not a function"),
             func_span,
+        ));
+    }
+    if let Some(kw) = keywords.first() {
+        return Err(err(
+            format!("'{func}()' does not take keyword arguments"),
+            kw.name_span,
         ));
     }
     {
@@ -4059,6 +4194,34 @@ print(first(f))
         assert_eq!(first.ret, ir::Ty::Str);
         let wrap = find_func(&m, "wrap");
         assert_eq!(wrap.ret, ir::Ty::File);
+    }
+
+    #[test]
+    fn defaults_and_keyword_args() {
+        let m = analyze_ok(
+            "\
+def f(a: int, b: int = 2) -> int:
+    return a + b
+print(f(1))
+print(f(1, b=3))
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(matches!(
+            &entry.body[0],
+            ir::Stmt::Print(args) if args.len() == 1
+                && matches!(args[0].kind, ir::ExprKind::Call { ref args, .. } if args.len() == 2)
+        ));
+    }
+
+    #[test]
+    fn missing_required_after_kw_is_error() {
+        let e = analyze_err("def f(a: int, b: int = 1) -> int:\n    return a\nprint(f(b=2))\n");
+        assert!(
+            e.message.contains("missing required argument 'a'"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
