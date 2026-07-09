@@ -96,13 +96,17 @@ pub enum StmtKind {
     While {
         cond: Expr,
         body: Vec<Stmt>,
+        /// Runs when the loop ends without `break`.
+        orelse: Vec<Stmt>,
     },
-    /// `for var in iter:` — iter is `range(...)`, a list, or a str.
+    /// `for var in iter:` — iter is `range(...)`, a list, a str, or a file.
     For {
         var: String,
         var_span: Span,
         iter: Expr,
         body: Vec<Stmt>,
+        /// Runs when the loop ends without `break`.
+        orelse: Vec<Stmt>,
     },
     Return(Option<Expr>),
     /// `a = b = value` or `name: ty = value` (annotation only with a single name target).

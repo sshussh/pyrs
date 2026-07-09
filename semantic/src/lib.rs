@@ -840,24 +840,20 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             });
             Ok(())
         }
-        ast::StmtKind::While { cond, body } => {
+        ast::StmtKind::While { cond, body, orelse } => {
             let c = lower_condition(cond, ctx)?;
             ctx.loop_depth += 1;
-            let b = lower_block(body, ctx);
+            let b = lower_block(body, ctx)?;
             ctx.loop_depth -= 1;
-            out.push(ir::Stmt::While {
-                cond: c,
-                body: b?,
-                step: vec![],
-            });
-            Ok(())
+            push_loop_with_else(c, b, vec![], orelse, ctx, out)
         }
         ast::StmtKind::For {
             var,
             var_span,
             iter,
             body,
-        } => lower_for(var, *var_span, iter, body, ctx, out),
+            orelse,
+        } => lower_for(var, *var_span, iter, body, orelse, ctx, out),
     }
 }
 
@@ -1636,6 +1632,7 @@ fn lower_for(
     var_span: Span,
     iter: &ast::Expr,
     body: &[ast::Stmt],
+    orelse: &[ast::Stmt],
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
@@ -1644,24 +1641,97 @@ fn lower_for(
         && func == "range"
         && !ctx.funcs().contains_key("range")
     {
-        return lower_for_range(var, var_span, args, iter.span, body, ctx, out);
+        return lower_for_range(var, var_span, args, iter.span, body, orelse, ctx, out);
     }
 
     // general case: list/string by index, or file via readline until ""
     let seq = lower_expr(iter, ctx)?;
     match seq.ty {
-        ir::Ty::File => lower_for_file(var, var_span, seq, body, ctx, out),
-        ir::Ty::List(_) | ir::Ty::Str => lower_for_indexed(var, var_span, seq, body, ctx, out),
+        ir::Ty::File => lower_for_file(var, var_span, seq, body, orelse, ctx, out),
+        ir::Ty::List(_) | ir::Ty::Str => {
+            lower_for_indexed(var, var_span, seq, body, orelse, ctx, out)
+        }
         other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
     }
 }
 
-/// `for line in f:` — desugar to while-True: line = f.readline(); if not line: break; body
+/// Emit while + optional else (else runs only if no break).
+fn push_loop_with_else(
+    cond: ir::Expr,
+    body: Vec<ir::Stmt>,
+    step: Vec<ir::Stmt>,
+    orelse: &[ast::Stmt],
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    if orelse.is_empty() {
+        out.push(ir::Stmt::While { cond, body, step });
+        return Ok(());
+    }
+    let broke = ctx.fresh_temp("broke", ir::Ty::Bool);
+    out.push(ir::Stmt::Assign {
+        name: broke.clone(),
+        value: ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(false),
+        },
+    });
+    let body = rewrite_breaks_set_flag(body, &broke);
+    out.push(ir::Stmt::While { cond, body, step });
+    let not_broke = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Unary {
+            op: ir::UnOp::Not,
+            operand: Box::new(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Local(broke),
+            }),
+        },
+    };
+    let else_body = lower_block(orelse, ctx)?;
+    out.push(ir::Stmt::If {
+        branches: vec![(not_broke, else_body)],
+        orelse: vec![],
+    });
+    Ok(())
+}
+
+fn rewrite_breaks_set_flag(stmts: Vec<ir::Stmt>, broke: &str) -> Vec<ir::Stmt> {
+    let mut out = Vec::with_capacity(stmts.len());
+    for s in stmts {
+        match s {
+            ir::Stmt::Break => {
+                out.push(ir::Stmt::Assign {
+                    name: broke.to_string(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::ConstBool(true),
+                    },
+                });
+                out.push(ir::Stmt::Break);
+            }
+            ir::Stmt::If { branches, orelse } => {
+                out.push(ir::Stmt::If {
+                    branches: branches
+                        .into_iter()
+                        .map(|(c, b)| (c, rewrite_breaks_set_flag(b, broke)))
+                        .collect(),
+                    orelse: rewrite_breaks_set_flag(orelse, broke),
+                });
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `for line in f:` — while more: line = readline; if not line: more=False else: body
 fn lower_for_file(
     var: &str,
     var_span: Span,
     file: ir::Expr,
     body: &[ast::Stmt],
+    orelse: &[ast::Stmt],
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
@@ -1675,6 +1745,20 @@ fn lower_for_file(
         kind: ir::ExprKind::Local(file_t),
     };
 
+    // avoid Break for EOF so for-else still runs on clean exhaustion
+    let more_t = ctx.fresh_temp("for.more", ir::Ty::Bool);
+    out.push(ir::Stmt::Assign {
+        name: more_t.clone(),
+        value: ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(true),
+        },
+    });
+    let more_local = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Local(more_t.clone()),
+    };
+
     let line = ir::Expr {
         ty: ir::Ty::Str,
         kind: ir::ExprKind::FileCall {
@@ -1684,7 +1768,6 @@ fn lower_for_file(
     };
     let bind = bind_name(var, var_span, None, line, var_span, ctx)?;
 
-    // if not line: break  ("" at EOF is falsy)
     let line_local = if let ir::Stmt::Assign { name, .. } = &bind {
         ir::Expr {
             ty: ir::Ty::Str,
@@ -1706,29 +1789,30 @@ fn lower_for_file(
         ty: ir::Ty::Bool,
         kind: ir::ExprKind::Unary {
             op: ir::UnOp::Not,
-            operand: Box::new(truthy),
+            operand: Box::new(truthy.clone()),
         },
-    };
-    let eof_break = ir::Stmt::If {
-        branches: vec![(not_line, vec![ir::Stmt::Break])],
-        orelse: vec![],
     };
 
     ctx.loop_depth += 1;
-    let user_body = lower_block(body, ctx);
+    let user_body = lower_block(body, ctx)?;
     ctx.loop_depth -= 1;
-    let mut loop_body = vec![bind, eof_break];
-    loop_body.extend(user_body?);
 
-    out.push(ir::Stmt::While {
-        cond: ir::Expr {
+    let stop = ir::Stmt::Assign {
+        name: more_t,
+        value: ir::Expr {
             ty: ir::Ty::Bool,
-            kind: ir::ExprKind::ConstBool(true),
+            kind: ir::ExprKind::ConstBool(false),
         },
-        body: loop_body,
-        step: vec![],
-    });
-    Ok(())
+    };
+    let loop_body = vec![
+        bind,
+        ir::Stmt::If {
+            branches: vec![(not_line, vec![stop]), (truthy, user_body)],
+            orelse: vec![],
+        },
+    ];
+
+    push_loop_with_else(more_local, loop_body, vec![], orelse, ctx, out)
 }
 
 /// `for x in xs` / `for c in s` — index from 0 to len (re-read each iteration).
@@ -1737,6 +1821,7 @@ fn lower_for_indexed(
     var_span: Span,
     seq: ir::Expr,
     body: &[ast::Stmt],
+    orelse: &[ast::Stmt],
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
@@ -1814,12 +1899,7 @@ fn lower_for_indexed(
         },
     }];
 
-    out.push(ir::Stmt::While {
-        cond,
-        body: loop_body,
-        step,
-    });
-    Ok(())
+    push_loop_with_else(cond, loop_body, step, orelse, ctx, out)
 }
 
 fn lower_for_range(
@@ -1828,6 +1908,7 @@ fn lower_for_range(
     args: &[ast::Expr],
     range_span: Span,
     body: &[ast::Stmt],
+    orelse: &[ast::Stmt],
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
@@ -1976,12 +2057,7 @@ fn lower_for_range(
         },
     };
 
-    out.push(ir::Stmt::While {
-        cond,
-        body: loop_body,
-        step: vec![step_stmt],
-    });
-    Ok(())
+    push_loop_with_else(cond, loop_body, vec![step_stmt], orelse, ctx, out)
 }
 
 fn int_const(v: i64) -> ir::Expr {
@@ -4212,18 +4288,120 @@ print(fib(10))
     }
 
     #[test]
-    fn for_over_file_desugars_to_while_true() {
+    fn for_over_file_desugars_to_while_more() {
         let m = analyze_ok("f = open(\"x\")\nfor line in f:\n    print(line)\n");
         let entry = find_func(&m, ENTRY_NAME);
-        // open assign, file temp assign, While True
+        // open, file temp, more=True, While more (EOF uses flag, not break)
+        assert!(
+            entry.body.iter().any(|s| matches!(
+                s,
+                ir::Stmt::While {
+                    cond: ir::Expr {
+                        kind: ir::ExprKind::Local(name),
+                        ..
+                    },
+                    ..
+                } if name.contains("more")
+            )),
+            "expected while-more for file iteration, body={:?}",
+            entry.body
+        );
+    }
+
+    #[test]
+    fn for_else_without_break_emits_not_broke_if() {
+        let m = analyze_ok(
+            "\
+for i in range(2):
+    pass
+else:
+    print(1)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        // broke=False, While, If(not broke)
         assert!(
             entry
                 .body
                 .iter()
-                .any(|s| matches!(s, ir::Stmt::While { cond, .. } if matches!(cond.kind, ir::ExprKind::ConstBool(true)))),
-            "expected while-True for file iteration, body={:?}",
+                .any(|s| matches!(s, ir::Stmt::While { .. })),
+            "{:?}",
             entry.body
         );
+        assert!(
+            entry.body.iter().any(|s| matches!(
+                s,
+                ir::Stmt::If {
+                    branches,
+                    ..
+                } if matches!(
+                    branches[0].0.kind,
+                    ir::ExprKind::Unary { op: ir::UnOp::Not, .. }
+                )
+            )),
+            "expected if-not-broke for for-else, body={:?}",
+            entry.body
+        );
+    }
+
+    #[test]
+    fn while_else_desugars_to_broke_flag() {
+        let m = analyze_ok(
+            "\
+n = 0
+while n < 1:
+    n = n + 1
+else:
+    print(1)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(
+            entry.body.iter().any(|s| matches!(
+                s,
+                ir::Stmt::Assign {
+                    value: ir::Expr {
+                        kind: ir::ExprKind::ConstBool(false),
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "expected broke=False init, body={:?}",
+            entry.body
+        );
+        assert!(
+            entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::While { .. })),
+            "{:?}",
+            entry.body
+        );
+    }
+
+    #[test]
+    fn for_without_else_has_no_broke_flag() {
+        let m = analyze_ok("for i in range(2):\n    print(i)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        // no ConstBool false assign for broke
+        let bool_false_assigns = entry
+            .body
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s,
+                    ir::Stmt::Assign {
+                        value: ir::Expr {
+                            kind: ir::ExprKind::ConstBool(false),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(bool_false_assigns, 0, "{:?}", entry.body);
     }
 
     #[test]

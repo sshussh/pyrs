@@ -378,6 +378,56 @@ print(total, i)
 }
 
 #[test]
+fn for_and_while_else_match_python() {
+    let out = run_program(
+        "loopelse",
+        "\
+for i in range(3):
+    if i == 1:
+        continue
+    print(i)
+else:
+    print(\"done\")
+for i in range(5):
+    if i == 3:
+        break
+    print(i)
+else:
+    print(\"skipped\")
+n = 0
+while n < 3:
+    n += 1
+    if n == 2:
+        continue
+    print(n)
+else:
+    print(\"w-done\")
+n = 0
+while n < 5:
+    n += 1
+    if n == 3:
+        break
+else:
+    print(\"w-skip\")
+print(\"after\")
+for i in range(0):
+    print(\"x\")
+else:
+    print(\"empty\")
+xs = [10, 20]
+for x in xs:
+    print(x)
+else:
+    print(\"list-ok\")
+",
+    );
+    assert_eq!(
+        out,
+        "0\n2\ndone\n0\n1\n2\n1\n3\nw-done\nafter\nempty\n10\n20\nlist-ok\n"
+    );
+}
+
+#[test]
 fn for_range_dynamic_zero_step_traps() {
     let (code, stderr) = run_program_expect_fail(
         "forzero",

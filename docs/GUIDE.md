@@ -446,15 +446,27 @@ for i in range(10, 0, -3):   # 10, 7, 4, 1
     print(i)
 for x in [1, 2, 3]: ...      # over a list
 for c in "hello": ...        # over a string's characters
+
+# else runs only when the loop ends without break
+for x in xs:
+    if x < 0:
+        break
+else:
+    print("all non-negative")
+
+while n > 0:
+    n -= 1
+else:
+    print("counted down")
 ```
 
 `range()` is lazy (no list is materialized) and accepts any int
 expressions; a step of zero raises `ValueError` at runtime (or at compile
 time when it's a constant). The loop variable keeps its final value after
 the loop, like Python. `break`/`continue` work in both loop kinds;
-`continue` in a `for` still advances the iteration.
-
-Not supported yet: `for`/`while` `else` clauses.
+`continue` in a `for` still advances the iteration. A `for`/`while` `else`
+clause runs when the loop finishes normally (including zero iterations)
+and is skipped if the loop exits via `break`.
 
 ### Functions
 

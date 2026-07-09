@@ -47,10 +47,11 @@ A statically-typed Python subset:
 - **Functions:** `def` with mandatory parameter annotations
   (`def f(x: int, y: int = 0) -> int:`), defaults and keyword args,
   recursion, forward references
-- **Statements:** `if`/`elif`/`else`, `while`,
-  `for x in range(...)` / lists / strings, `break`/`continue`,
-  assignments (plain, annotated, augmented — including `xs[i] += v`),
-  `return`, `pass`
+- **Statements:** `if`/`elif`/`else`, `while` / `for` (including
+  `else` on loops — runs only if no `break`),
+  `for x in range(...)` / lists / strings / files, `break`/`continue`,
+  assignments (plain, annotated, multi-target, augmented — including
+  `xs[i] += v`), `return`, `pass`
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
   `and`/`or`/`not` (short-circuit), casts

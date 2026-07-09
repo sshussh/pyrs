@@ -485,9 +485,10 @@ impl Parser {
         let start = self.expect(Token::While, "")?;
         let cond = self.parse_expr()?;
         let body = self.parse_block("'while' body")?;
+        let orelse = self.parse_loop_else()?;
         let end = self.peek_span();
         Ok(Stmt {
-            kind: StmtKind::While { cond, body },
+            kind: StmtKind::While { cond, body, orelse },
             span: start.to(end),
         })
     }
@@ -501,6 +502,7 @@ impl Parser {
         self.expect(Token::In, "after the loop variable")?;
         let iter = self.parse_expr()?;
         let body = self.parse_block("'for' body")?;
+        let orelse = self.parse_loop_else()?;
         let end = self.peek_span();
         Ok(Stmt {
             kind: StmtKind::For {
@@ -508,9 +510,20 @@ impl Parser {
                 var_span,
                 iter,
                 body,
+                orelse,
             },
             span: start.to(end),
         })
+    }
+
+    /// Optional `else:` suite after a for/while (same indentation as the loop).
+    fn parse_loop_else(&mut self) -> PResult<Vec<Stmt>> {
+        if self.peek() == &Token::Else {
+            self.advance();
+            self.parse_block("'else' body")
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn parse_import(&mut self) -> PResult<Stmt> {
@@ -1403,6 +1416,30 @@ mod tests {
         };
         assert_eq!(body.len(), 2);
         assert!(matches!(body[1].kind, StmtKind::Continue));
+    }
+
+    #[test]
+    fn parses_for_and_while_else() {
+        let m = parse_ok(
+            "\
+for i in range(3):
+    pass
+else:
+    print(1)
+while True:
+    break
+else:
+    print(2)
+",
+        );
+        let StmtKind::For { orelse, .. } = &m.body[0].kind else {
+            panic!("expected For");
+        };
+        assert_eq!(orelse.len(), 1);
+        let StmtKind::While { orelse, .. } = &m.body[1].kind else {
+            panic!("expected While");
+        };
+        assert_eq!(orelse.len(), 1);
     }
 
     #[test]
