@@ -336,12 +336,19 @@ impl Parser {
                 self.advance();
                 Ok(TypeName::Str)
             }
+            Token::File => {
+                self.advance();
+                Ok(TypeName::File)
+            }
             Token::List => {
                 self.advance();
                 self.expect(Token::LBracket, "after 'list' (e.g. 'list[int]')")?;
                 let elem = self.parse_type_name("inside 'list[...]'")?;
                 if elem == TypeName::None {
                     return Err(self.error("list elements cannot be None"));
+                }
+                if elem == TypeName::File {
+                    return Err(self.error("list elements cannot be file"));
                 }
                 self.expect(Token::RBracket, "to close 'list[...]'")?;
                 Ok(TypeName::List(Box::leak(Box::new(elem))))
@@ -351,7 +358,7 @@ impl Parser {
                 Ok(TypeName::None)
             }
             other => Err(self.error(format!(
-                "expected a type ('int', 'float', 'bool', 'str', 'list[...]' or 'None') {}, found {}",
+                "expected a type ('int', 'float', 'bool', 'str', 'file', 'list[...]' or 'None') {}, found {}",
                 context,
                 other.describe()
             ))),
@@ -958,8 +965,8 @@ impl Parser {
                     span,
                 })
             }
-            // int(x) / float(x) / bool(x) / str(x) casts
-            Token::Int | Token::Float | Token::Bool | Token::Str => {
+            // int(x) / float(x) / bool(x) / str(x) casts (file(...) is rejected in semantic)
+            Token::Int | Token::Float | Token::Bool | Token::Str | Token::File => {
                 let ty = self.parse_type_name("")?;
                 self.expect(Token::LParen, &format!("after '{ty}' (cast)"))?;
                 let arg = self.parse_expr()?;

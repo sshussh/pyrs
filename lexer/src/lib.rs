@@ -132,6 +132,8 @@ pub enum Token {
     Bool,
     #[token("str")]
     Str,
+    #[token("file")]
+    File,
     #[token("list")]
     List,
 
@@ -288,6 +290,7 @@ fn token_text(token: &Token) -> &'static str {
         Token::Float => "float",
         Token::Bool => "bool",
         Token::Str => "str",
+        Token::File => "file",
         Token::List => "list",
         Token::Plus => "+",
         Token::Minus => "-",
@@ -580,12 +583,13 @@ mod test {
     #[test]
     fn test_types() {
         assert_eq!(
-            kinds("int float bool str list"),
+            kinds("int float bool str file list"),
             vec![
                 Token::Int,
                 Token::Float,
                 Token::Bool,
                 Token::Str,
+                Token::File,
                 Token::List,
                 Token::EOF
             ]

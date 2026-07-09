@@ -45,6 +45,7 @@ fn resolve_type(ty: ast::TypeName) -> ir::Ty {
         ast::TypeName::Float => ir::Ty::Float,
         ast::TypeName::Bool => ir::Ty::Bool,
         ast::TypeName::Str => ir::Ty::Str,
+        ast::TypeName::File => ir::Ty::File,
         ast::TypeName::List(e) => ir::list_of(resolve_type(*e)),
         ast::TypeName::None => ir::Ty::None,
     }
@@ -3196,6 +3197,10 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             other => Err(err(format!("str() cannot convert {other} yet"), span)),
         },
         ast::TypeName::List(_) => Err(err("list(...) conversions are not supported", span)),
+        ast::TypeName::File => Err(err(
+            "file() is not a conversion; use open(path) to open a file",
+            span,
+        )),
         ast::TypeName::None => Err(err("None is not a conversion", span)),
     }
 }
@@ -4033,6 +4038,27 @@ print(fib(10))
             "expected while-True for file iteration, body={:?}",
             entry.body
         );
+    }
+
+    #[test]
+    fn file_typed_param_and_return() {
+        let m = analyze_ok(
+            "\
+def first(f: file) -> str:
+    return f.readline()
+
+def wrap(path: str) -> file:
+    return open(path)
+
+f = open(\"x\")
+print(first(f))
+",
+        );
+        let first = find_func(&m, "first");
+        assert_eq!(first.params[0].1, ir::Ty::File);
+        assert_eq!(first.ret, ir::Ty::Str);
+        let wrap = find_func(&m, "wrap");
+        assert_eq!(wrap.ret, ir::Ty::File);
     }
 
     #[test]

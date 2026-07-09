@@ -196,7 +196,8 @@ print(counter)          # 1
 | `float` | IEEE-754 double | |
 | `bool`  | `True` / `False` | assignable where int/float is expected |
 | `str`   | immutable string | heap-allocated, length-prefixed |
-| `list[T]` | growable homogeneous list | `T` is any type incl. another list (`list[list[float]]`) |
+| `file`  | open file handle | from `open(...)`; usable in params/returns; not in lists |
+| `list[T]` | growable homogeneous list | `T` is any type incl. another list (`list[list[float]]`); not `file` |
 
 Implicit promotions (mypy-flavored): `bool → int → float`. They apply in
 arithmetic, assignments, arguments, and returns:
@@ -564,9 +565,18 @@ file.`, and reading a write-mode file raises
 `io.UnsupportedOperation: not readable`. Writes are flushed immediately,
 so data survives even if you forget `close()`.
 
+File parameters and returns use the `file` annotation:
+
+```python
+def first_line(f: file) -> str:
+    return f.readline().strip()
+
+def open_it(path: str) -> file:
+    return open(path)
+```
+
 Not supported yet: binary modes, printing file objects, multiple context
-managers in one `with`, `with` on non-files, and file-typed function
-parameters (there is no `file` annotation — handles are inferred locally).
+managers in one `with`, `with` on non-files, and `list[file]`.
 
 ### Standard input and arguments
 

@@ -1531,6 +1531,41 @@ print(len(open(path).readlines()))
 }
 
 #[test]
+fn file_typed_params_match_python_io() {
+    let dir = TempDir::new("fileparam");
+    let data = dir.0.join("fp.txt").display().to_string();
+    let out = run_program(
+        "fileparam",
+        &format!(
+            "\
+def first_line(f: file) -> str:
+    return f.readline().strip()
+
+def count_lines(f: file) -> int:
+    n = 0
+    for line in f:
+        n = n + 1
+    return n
+
+def open_it(path: str) -> file:
+    return open(path)
+
+path = \"{data}\"
+w = open(path, \"w\")
+w.write(\"hello\\nworld\\n\")
+w.close()
+
+f = open_it(path)
+print(first_line(f))
+print(count_lines(f))
+f.close()
+"
+        ),
+    );
+    assert_eq!(out, "hello\n1\n");
+}
+
+#[test]
 fn for_line_in_file_matches_python() {
     let dir = TempDir::new("forfile");
     let data = dir.0.join("lines.txt").display().to_string();

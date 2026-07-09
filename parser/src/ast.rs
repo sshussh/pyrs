@@ -11,6 +11,8 @@ pub enum TypeName {
     Float,
     Bool,
     Str,
+    /// Open file handle from `open(...)` (not CPython's typing.IO name).
+    File,
     List(&'static TypeName),
     /// `-> None`: the function returns nothing.
     None,
@@ -23,6 +25,7 @@ impl std::fmt::Display for TypeName {
             TypeName::Float => write!(f, "float"),
             TypeName::Bool => write!(f, "bool"),
             TypeName::Str => write!(f, "str"),
+            TypeName::File => write!(f, "file"),
             TypeName::List(e) => write!(f, "list[{e}]"),
             TypeName::None => write!(f, "None"),
         }
