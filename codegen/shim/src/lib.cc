@@ -5,6 +5,7 @@
 
 #include "lib.hh"
 
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -25,6 +26,19 @@
 #include <cstring>
 #include <memory>
 #include <string>
+
+// LLVM 21+ takes llvm::Triple for createTargetMachine / setTargetTriple.
+// LLVM 18–20 take StringRef (std::string converts). Bridge both for CI and
+// local toolchains.
+#if LLVM_VERSION_MAJOR >= 21
+#define PYRS_TM_TRIPLE_ARG(triple, triple_str) (triple)
+#define PYRS_SET_TRIPLE(module, triple, triple_str) \
+    (module)->setTargetTriple(triple)
+#else
+#define PYRS_TM_TRIPLE_ARG(triple, triple_str) (triple_str)
+#define PYRS_SET_TRIPLE(module, triple, triple_str) \
+    (module)->setTargetTriple(triple_str)
+#endif
 
 namespace {
 
@@ -90,13 +104,14 @@ int pyrs_compile_ir(const uint8_t *ir_data, size_t ir_len,
 
     llvm::TargetOptions options;
     std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
-        triple, "generic", "", options, llvm::Reloc::PIC_));
+        PYRS_TM_TRIPLE_ARG(triple, triple_str), "generic", "", options,
+        llvm::Reloc::PIC_));
     if (!tm) {
         set_error(err_buf, err_buf_len, "could not create target machine");
         return 2;
     }
 
-    module->setTargetTriple(triple);
+    PYRS_SET_TRIPLE(module, triple, triple_str);
     module->setDataLayout(tm->createDataLayout());
 
     // verify before optimizing so emitter bugs surface with a message
