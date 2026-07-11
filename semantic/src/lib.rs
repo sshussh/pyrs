@@ -1902,6 +1902,7 @@ fn lower_for_indexed(
     push_loop_with_else(cond, loop_body, step, orelse, ctx, out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_for_range(
     var: &str,
     var_span: Span,

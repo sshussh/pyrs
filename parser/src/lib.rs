@@ -1225,10 +1225,10 @@ fn parse_fstring(raw: &str, span: Span) -> PResult<Expr> {
 /// Split `{expr}` / `{expr:.Nf}` / reject unsupported `!` conversions and
 /// other format specs. A `:` inside brackets (e.g. a slice) is part of the
 /// expression, not a format delimiter.
-fn split_fstring_fragment<'a>(
-    frag: &'a str,
+fn split_fstring_fragment(
+    frag: &str,
     span: Span,
-) -> PResult<(&'a str, Option<FStringFormat>)> {
+) -> PResult<(&str, Option<FStringFormat>)> {
     let mut depth = 0i32;
     let bytes = frag.as_bytes();
     let mut i = 0usize;
