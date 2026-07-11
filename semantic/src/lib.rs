@@ -4766,7 +4766,10 @@ print(count([]))
         };
         fn has_int_to_float_fmt(e: &ir::Expr) -> bool {
             match &e.kind {
-                ir::ExprKind::FloatFormat { value, precision: 2 } => {
+                ir::ExprKind::FloatFormat {
+                    value,
+                    precision: 2,
+                } => {
                     matches!(value.kind, ir::ExprKind::IntToFloat(_))
                 }
                 ir::ExprKind::Binary { left, right, .. } => {

@@ -1225,10 +1225,7 @@ fn parse_fstring(raw: &str, span: Span) -> PResult<Expr> {
 /// Split `{expr}` / `{expr:.Nf}` / reject unsupported `!` conversions and
 /// other format specs. A `:` inside brackets (e.g. a slice) is part of the
 /// expression, not a format delimiter.
-fn split_fstring_fragment(
-    frag: &str,
-    span: Span,
-) -> PResult<(&str, Option<FStringFormat>)> {
+fn split_fstring_fragment(frag: &str, span: Span) -> PResult<(&str, Option<FStringFormat>)> {
     let mut depth = 0i32;
     let bytes = frag.as_bytes();
     let mut i = 0usize;
@@ -1883,13 +1880,7 @@ def f(n: int) -> int:
         };
         assert_eq!(parts.len(), 5);
         assert!(matches!(&parts[0], FStringPart::Literal(s) if s == "a"));
-        assert!(matches!(
-            &parts[1],
-            FStringPart::Expr {
-                format: None,
-                ..
-            }
-        ));
+        assert!(matches!(&parts[1], FStringPart::Expr { format: None, .. }));
         assert!(matches!(
             &parts[3],
             FStringPart::Expr {
@@ -1928,10 +1919,7 @@ def f(n: int) -> int:
             }
         ));
         // slice colon is not a format delimiter
-        assert!(matches!(
-            &parts[2],
-            FStringPart::Expr { format: None, .. }
-        ));
+        assert!(matches!(&parts[2], FStringPart::Expr { format: None, .. }));
         assert!(matches!(
             &parts[4],
             FStringPart::Expr {
