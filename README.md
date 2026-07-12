@@ -38,27 +38,30 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.8)
+## The language (v0.9)
 
 A statically-typed Python subset:
 
-- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `list[T]` —
-  including nested lists (`list[list[float]]` matrices)
+- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `list[T]`,
+  `tuple[T1, T2, …]`, `dict[K, V]`, `set[T]` — including nested lists
+  (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only
 - **Functions:** `def` with mandatory parameter annotations
   (`def f(x: int, y: int = 0) -> int:`), defaults and keyword args,
-  recursion, forward references
+  recursion, forward references; pass/return tuples and other containers
 - **Statements:** `if`/`elif`/`else`, `while` / `for` (including
   `else` on loops — runs only if no `break`),
-  `for x in range(...)` / lists / strings / files, `break`/`continue`,
-  assignments (plain, annotated, multi-target, augmented — including
-  `xs[i] += v`), `return`, `pass`
+  `for x in range(...)` / lists / strings / files / tuples / dict keys /
+  sets, `break`/`continue`, assignments (plain, annotated, multi-target,
+  unpacking `a, b = t`, augmented — including `xs[i] += v`),
+  `del d[k]`, `return`, `pass`, `raise ExcType("msg")`,
+  `try`/`except`/`finally`
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
   `and`/`or`/`not` (short-circuit), casts
   `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, `min()`/`max()`
   (two arguments), `sum()` on `list[int]`/`list[float]`, indexing with
   negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
-  `print(...)` with any mix of values
+  `print(...)` with any mix of values (including tuples/dicts/sets)
 - **f-strings:** `f"x={x}, next={x + 1}"` with `{{`/`}}` escapes,
   nesting, and fixed-point `{x:.Nf}` (other format codes / `!r` still
   unsupported)
@@ -74,6 +77,19 @@ A statically-typed Python subset:
   `append`/`pop`/`insert`/`remove`/`index`/`clear`/`sort`, `sorted()`,
   `+`/`*` (concat / repeat), `==`/`!=`, `in`, `len`, iteration;
   assignment aliases like Python
+- **Tuples:** fixed-arity, heterogeneous; literals `(a, b)`, `(a,)`,
+  `()`; index (incl. negative); `len`; unpacking; print like CPython
+- **Dicts:** `dict[K, V]` with `K` in `{int, str}`; literal `{k: v}`,
+  `{}` (needs annotation); get/set, `del d[k]`, `in` on keys, `len`,
+  insertion-order key iteration; methods `get` (with default), `pop`,
+  `keys`/`values`/`items` (return lists), `clear`
+- **Sets:** `set[T]` with `T` in `{int, str}`; nonempty `{a, b}`, empty
+  `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`, `in`, `len`,
+  iteration
+- **Exceptions:** `raise ValueError("msg")` (and KeyError, IndexError,
+  ZeroDivisionError, TypeError, RuntimeError); `try`/`except`/`except
+  Type as e`/`finally`; uncaught traps print CPython-like messages and
+  exit 1; runtime traps are catchable inside `try`
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
 - **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for
@@ -97,17 +113,17 @@ Python semantics are preserved where it counts:
 - `-2 ** 2 == -4`, `2 ** -1 == 0.5`, right-associative `2 ** 3 ** 2`
 - `1 < middle() < 10` evaluates `middle()` exactly once and
   short-circuits, exactly like Python
-- `ZeroDivisionError`, `IndexError`, `ValueError` trap with exit 1
-  instead of being undefined behavior
+- `ZeroDivisionError`, `IndexError`, `ValueError`, `KeyError`, … trap
+  with exit 1 when uncaught (or transfer to an active `except`)
 - floats print with shortest round-trip representation
   (`0.1 + 0.2` → `0.30000000000000004`, `1.0` → `1.0`); lists print as
-  `[1, 2, 3]` / `['a', 'b']`
+  `[1, 2, 3]` / `['a', 'b']`; tuples/dicts/sets print like CPython
 - iterating a list re-reads the live length, so appending inside the
   loop behaves like CPython
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.8): no bigints (int is 64-bit and wraps), `and`/`or`
+Known limits (v0.9): no bigints (int is 64-bit and wraps), `and`/`or`
 return `bool` rather than the operand, `min`/`max` take exactly two
 numeric args (no iterable form yet) and unify to a common type
 (`min(1, 1.5)` is `1.0`, not the int `1`), `x ** e` with a *dynamic*
@@ -118,11 +134,14 @@ past 2^53), list literals coerce mixed numerics to one element type,
 case/whitespace rules, heap memory is never freed, files support text
 modes "r"/"w"/"a" only (`with`, `for line in f`, and `file` params/
 returns work; no `list[file]` or printing files), imports are single
-sibling modules
-only (no packages, `import a.b`, `from m import *`, or relative
-imports), and full f-string format specs (beyond `{x:.Nf}`) / dicts /
-tuples / classes / exceptions are not in yet — the parser reports "not
-supported yet" for each.
+sibling modules only (no packages, `import a.b`, `from m import *`, or
+relative imports), full f-string format specs (beyond `{x:.Nf}`) are
+unsupported, dict/set keys are only `int`/`str`, `dict.get` requires a
+default (no bare `None` return), `keys`/`values`/`items` return lists
+(not view objects), no starred unpack `*a`, no tuple methods, dynamic
+indexing of heterogeneous tuples is rejected at compile time, `try`
+has no `else` clause, and classes / generators / closures / `lambda` /
+`*args` are not in yet.
 
 Errors come with source snippets:
 
@@ -206,4 +225,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.8.0 && git push origin v0.8.0`.
+Release tags: `git tag v0.9.0 && git push origin v0.9.0`.

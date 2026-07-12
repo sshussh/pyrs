@@ -13,9 +13,9 @@ crate boundaries, IR contract, runtime ABI, and build/link strategy.
 | [`EXTENDING.md`](EXTENDING.md) | Contributor guide: how to add features         |
 | [`AGENTS.md`](../AGENTS.md)    | Conventions for automated agents               |
 
-**Versioning:** the language surface is labeled **v0.8** (README / GUIDE).
+**Versioning:** the language surface is labeled **v0.9** (README / GUIDE).
 Workspace crate versions and the CLI version (`env!("CARGO_PKG_VERSION")`)
-must match that milestone. Release tags use the same number (`v0.8.0`).
+must match that milestone. Release tags use the same number (`v0.9.0`).
 
 ---
 
@@ -285,17 +285,22 @@ Full packages and relative imports are planned to replace this model.
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.8 subset):**
+**Today (v0.9 subset):**
 
 - Static types after first assignment; cannot rebind a name to a
   different type.
 - Parameter annotations required; return annotation optional (defaults to
   “returns nothing”).
 - Homogeneous lists; empty lists need an annotation
-  (`xs: list[int] = []`).
+  (`xs: list[int] = []`). Heterogeneous fixed-arity tuples;
+  `dict[K,V]` / `set[T]` with `K`/`T` in `{int, str}`.
 - Implicit promotions: `bool → int → float` in arithmetic, args, returns.
 - Function-wide local scoping with `global` for writes to module globals
   (Python-like).
+- Minimal exceptions: `raise` + `try`/`except`/`finally` via setjmp frames
+  (process-global, single-threaded); runtime traps (`pyrs_die`) are
+  catchable. `return`/`break`/`continue` pop the frame and run `finally`.
+  Named traps only: other prefixes match bare `except:` only.
 
 **Direction:**
 
@@ -404,7 +409,7 @@ These are product constraints that affect design choices:
 | Typing           | Required params; fixed types                         | Optional typing + more dynamism                                           |
 | Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | `sys` special-case only                              | Mostly PyRs modules on the kit later; no large stdlib without design      |
-| Language surface | Subset (see README v0.8)                             | Grow toward CPython drop-in                                               |
+| Language surface | Subset (see README v0.9)                             | Grow toward CPython drop-in                                               |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
 dicts, sets, tuples, exceptions / `try`, generators, nested functions /

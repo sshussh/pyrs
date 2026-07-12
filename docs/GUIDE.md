@@ -190,6 +190,11 @@ print(counter)          # 1
 
 ### Types
 
+`int`, `float`, `bool`, `str`, `file`, `list[T]`, `tuple[T1, T2, …]`
+(empty: `tuple[()]`), `dict[K, V]`, `set[T]`, and `None` (return only).
+Dict keys and set elements are restricted to `int` and `str`.
+
+
 | type | representation | notes |
 |------|----------------|-------|
 | `int`   | 64-bit signed integer | wraps on overflow (no bigints) |
@@ -198,6 +203,9 @@ print(counter)          # 1
 | `str`   | immutable string | heap-allocated, length-prefixed |
 | `file`  | open file handle | from `open(...)`; usable in params/returns; not in lists |
 | `list[T]` | growable homogeneous list | `T` is any type incl. another list (`list[list[float]]`); not `file` |
+| `tuple[T1, …]` | fixed-arity heterogeneous tuple | empty `tuple[()]`; index / len / unpack / iterate (homogeneous) |
+| `dict[K, V]` | hash map, insertion order | `K` is `int` or `str`; empty `{}` needs annotation |
+| `set[T]` | hash set, insertion order | `T` is `int` or `str`; empty via `s: set[int] = set()` |
 
 Implicit promotions (mypy-flavored): `bool → int → float`. They apply in
 arithmetic, assignments, arguments, and returns:
@@ -233,8 +241,9 @@ xs[i] += expr              # augmented element (base and index evaluate once)
 a = xs[i] = expr           # multi-target with index (shares the value)
 ```
 
-Not supported: tuple unpacking (`a, b = 1, 2`), and annotations on
-anything but a plain single name (no `a: int = b = 0`).
+Unpacking works: `a, b = 1, 2`, `a, b = t` (tuple or list RHS; length
+mismatch traps like CPython). Annotations only on a plain single name
+(no `a: int = b = 0`).
 
 ### Operators
 
@@ -506,25 +515,27 @@ Not supported yet: `*args` / `**kwargs`, nested functions, closures,
 | builtin | accepts | returns |
 |---------|---------|---------|
 | `print(a, b, ...)` | any values, any count | space-separated, newline at end |
-| `len(x)` | str, list | int |
+| `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
 | `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg; 2-arg only) |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
 | `sorted(xs)` | `list[int\|float\|bool\|str]` | new sorted list (no `key=`/`reverse=`) |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
+| `set()` | empty only; needs annotation | `s: set[int] = set()` |
 | `global x` | (statement) | write access to a module global |
 | `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |
 | `open(path[, mode])` | str path, mode "r"/"w"/"a" | file value with read/readline/readlines/write/close |
 | `sys.argv` | needs `import sys` | list[str]; `[0]` is the binary path |
 | `int(x)` | int, float (truncates toward zero), bool | int |
 | `float(x)` | int, float, bool | float |
-| `bool(x)` | int, float, bool, str, list (truthiness) | bool |
+| `bool(x)` | int, float, bool, str, list, tuple, dict, set | bool |
 | `str(x)` | int, float, bool, str | str |
 
 `print` formatting matches CPython: floats use the shortest
 representation that round-trips (`0.1 + 0.2` → `0.30000000000000004`,
 `10.0` → `10.0`, `1e16` → `1e+16`), bools print `True`/`False`, lists
-print `[1, 2, 3]` / `['a', 'b']`. The builtins cannot be redefined.
+print `[1, 2, 3]` / `['a', 'b']`, and tuples/dicts/sets print like
+CPython. The builtins cannot be redefined.
 
 ### Comments and line continuation
 
@@ -659,8 +670,26 @@ a function, and re-assigning another module's attributes.
 
 ## 6. Runtime errors
 
-There are no exceptions to catch (yet) — Python-style runtime errors
-print the same message CPython would, then exit with code 1:
+Uncaught runtime errors print the same message CPython would, then exit
+with code 1. Inside `try`/`except`, the same traps transfer to a matching
+handler instead of exiting:
+
+```python
+try:
+    raise ValueError("bad")
+except ValueError as e:
+    print(e)          # message body only (str)
+finally:
+    print("done")
+```
+
+Supported exception types for `raise` / typed `except`: `ValueError`,
+`KeyError`, `IndexError`, `ZeroDivisionError`, `TypeError`, `RuntimeError`.
+Bare `except:` catches all (including traps like `FileNotFoundError` /
+`UnboundLocalError` that are not among the named types). The bound name
+is the message string (not a full exception object). `try` has no `else`
+clause. `return` / `break` / `continue` inside `try` run `finally` and
+pop the catch frame before leaving (CPython-compatible).
 
 | error | raised by |
 |-------|-----------|
@@ -668,7 +697,10 @@ print the same message CPython would, then exit with code 1:
 | `IndexError: string index out of range` | out-of-bounds `s[i]` |
 | `IndexError: list index out of range` | out-of-bounds `xs[i]` read |
 | `IndexError: list assignment index out of range` | out-of-bounds `xs[i] = v` |
+| `IndexError: tuple index out of range` | out-of-bounds `t[i]` |
 | `IndexError: pop from empty list` / `pop index out of range` | `xs.pop(...)` |
+| `KeyError: ...` | missing dict key / `set.remove` of absent element |
+| `ValueError: not enough/too many values to unpack` | unpack length mismatch |
 | `ValueError: range() arg 3 must not be zero` | zero range step at runtime |
 | `ValueError: slice step cannot be zero` | zero slice step at runtime |
 | `ValueError: empty separator` | `s.split("")` |
@@ -740,10 +772,26 @@ deliberate exceptions:
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
 
-Not implemented yet (clear compile errors): classes, dicts, sets, tuples,
-packages/relative imports, exceptions, `match`, generators/`yield`,
-`lambda`, nested functions, closures, `nonlocal`, full f-string format
-specs beyond `{x:.Nf}`, `*args`/`**kwargs`, and unpacking.
+Container notes (v0.9):
+
+- **tuple:** literals, index (const OOB is a compile error; dynamic OOB
+  traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`
+  and methods are not supported yet.
+- **dict:** keys are `int` or `str` only; `get` requires a default
+  (no bare `None`); `keys`/`values`/`items` return lists (not views);
+  insertion-order iteration over keys.
+- **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
+  `{}` is always an empty dict.
+
+Exception notes: `except E as e` binds the message `str`, not an exception
+object. Other traps (`EOFError`, `FileNotFoundError`, …) match bare
+`except:` only, not `except RuntimeError`.
+
+Not implemented yet (clear compile errors): classes, packages/relative
+imports, `match`, generators/`yield`, `lambda`, nested functions,
+closures, `nonlocal`, full f-string format specs beyond `{x:.Nf}`,
+`*args`/`**kwargs`, starred unpack, and most remaining methods on
+tuple/dict/set.
 
 ## 9. Performance
 

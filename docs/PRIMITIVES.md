@@ -135,9 +135,9 @@ Organize work by **family**, not a flat list of C functions.
 | **list** | Growable slots, mutators | `push`, `pop`, `insert`, `+`, `==` | C + IR for index/len |
 | **file / io** | Text files, stdin, argv | `open`, `read`, `input`, `argv` | C |
 | **print / traps** | CPython-like output and errors | `print_*`, `die` | C |
-| **tuple** (planned) | Fixed sequences, unpack | pack/unpack, index | IR/C |
-| **dict / set** (planned) | Hash tables, insertion order | get/set/del, iter | C (+ IR hot get?) |
-| **exceptions** (planned) | Raise/catch plumbing | replace pure `die` over time | C + IR landing |
+| **tuple** | Fixed sequences, unpack | pack/unpack, index, print | C + IR |
+| **dict / set** | Hash tables, insertion order | get/set/del, iter, keys/values/items | C |
+| **exceptions** | Raise/catch plumbing | `pyrs_raise`, try frames (`setjmp`), `die` → catch | C + IR landing |
 | **OS extensions** (later) | Beyond files | env, cwd, stat | C (`_posix` / `_pyrs`) |
 
 **Explanation:** Stdlib modules (`math`, `os.path`, `json`) are **not**
