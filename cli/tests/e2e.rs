@@ -2225,3 +2225,72 @@ print(u[1][0])
     assert_eq!(out, "1\n2\n3\nTrue\nTrue\na\n");
 }
 
+#[test]
+fn dict_basic_ops() {
+    let out = run_program(
+        "dict_basic",
+        "\
+d: dict[str, int] = {\"x\": 1, \"y\": 2}
+print(d)
+print(len(d))
+print(d[\"x\"])
+d[\"z\"] = 3
+print(\"x\" in d, \"q\" not in d)
+print(d.get(\"x\", 0), d.get(\"q\", 0))
+print(d.keys())
+print(d.values())
+print(d.items())
+del d[\"x\"]
+print(d)
+print(d.pop(\"y\"))
+print(d)
+",
+    );
+    assert_eq!(
+        out,
+        "{'x': 1, 'y': 2}\n2\n1\nTrue True\n1 0\n['x', 'y', 'z']\n[1, 2, 3]\n[('x', 1), ('y', 2), ('z', 3)]\n{'y': 2, 'z': 3}\n2\n{'z': 3}\n"
+    );
+}
+
+#[test]
+fn dict_key_error() {
+    let (code, err) = run_program_expect_fail(
+        "dict_key",
+        "d: dict[str, int] = {\"a\": 1}\nprint(d[\"b\"])\n",
+    );
+    assert_eq!(code, 1);
+    assert!(err.contains("KeyError: 'b'"), "{err}");
+}
+
+#[test]
+fn dict_extra_ops() {
+    let out = run_program(
+        "dict_extra",
+        "\
+d: dict[str, int] = {}
+d[\"a\"] = 1
+print(d)
+d.clear()
+print(len(d))
+d2: dict[int, str] = {1: \"x\", 2: \"y\"}
+for k in d2:
+    print(k)
+print(d2.get(3, \"z\"))
+",
+    );
+    assert_eq!(out, "{'a': 1}\n0\n1\n2\nz\n");
+}
+
+#[test]
+fn nested_list_dict_set_eq() {
+    let out = run_program(
+        "nested_eq",
+        "\
+print([{\"a\": 1}] == [{\"a\": 1}])
+print([{1, 2}] == [{1, 2}])
+print([{\"a\": 1}] == [{\"a\": 2}])
+",
+    );
+    assert_eq!(out, "True\nTrue\nFalse\n");
+}
+
