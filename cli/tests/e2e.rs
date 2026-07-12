@@ -2148,3 +2148,80 @@ fn circular_imports_are_rejected() {
     );
     assert!(stderr.contains("circular import"), "stderr: {stderr}");
 }
+
+#[test]
+fn tuples_print_index_unpack() {
+    let out = run_program(
+        "tuples",
+        "\
+t: tuple[int, str, float] = (1, \"a\", 2.0)
+print(t)
+print((1,))
+print(())
+print(len(t))
+print(t[0], t[-1])
+a, b = 1, 2
+print(a, b)
+a, b = (3, 4)
+print(a, b)
+
+def pair(x: int, y: int) -> tuple[int, int]:
+    return (x, y)
+
+p = pair(10, 20)
+print(p[0] + p[1])
+",
+    );
+    assert_eq!(out, "(1, 'a', 2.0)\n(1,)\n()\n3\n1 2.0\n1 2\n3 4\n30\n");
+}
+
+#[test]
+fn tuple_index_error() {
+    // dynamic index so the trap is at runtime (constant OOB is a compile error)
+    let (code, err) = run_program_expect_fail("tuple_idx", "t = (1, 2)\ni = 5\nprint(t[i])\n");
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("IndexError: tuple index out of range"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unpack_too_few() {
+    // list RHS exercises runtime pyrs_unpack_check
+    let (code, err) = run_program_expect_fail("unpack_few", "xs: list[int] = [1]\na, b = xs\n");
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("not enough values to unpack (expected 2, got 1)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unpack_too_many() {
+    let (code, err) =
+        run_program_expect_fail("unpack_many", "xs: list[int] = [1, 2, 3]\na, b = xs\n");
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("too many values to unpack (expected 2, got 3)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn tuple_for_and_eq() {
+    let out = run_program(
+        "tuple_for",
+        "\
+t: tuple[int, int, int] = (1, 2, 3)
+for x in t:
+    print(x)
+print((1, 2) == (1, 2))
+print((1, 2) != (1, 3))
+u: tuple[int, tuple[str, int]] = (1, (\"a\", 2))
+print(u[1][0])
+",
+    );
+    assert_eq!(out, "1\n2\n3\nTrue\nTrue\na\n");
+}
+
