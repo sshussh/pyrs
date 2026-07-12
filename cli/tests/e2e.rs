@@ -2209,23 +2209,6 @@ fn unpack_too_many() {
 }
 
 #[test]
-fn tuple_for_and_eq() {
-    let out = run_program(
-        "tuple_for",
-        "\
-t: tuple[int, int, int] = (1, 2, 3)
-for x in t:
-    print(x)
-print((1, 2) == (1, 2))
-print((1, 2) != (1, 3))
-u: tuple[int, tuple[str, int]] = (1, (\"a\", 2))
-print(u[1][0])
-",
-    );
-    assert_eq!(out, "1\n2\n3\nTrue\nTrue\na\n");
-}
-
-#[test]
 fn dict_basic_ops() {
     let out = run_program(
         "dict_basic",
@@ -2263,38 +2246,6 @@ fn dict_key_error() {
 }
 
 #[test]
-fn dict_extra_ops() {
-    let out = run_program(
-        "dict_extra",
-        "\
-d: dict[str, int] = {}
-d[\"a\"] = 1
-print(d)
-d.clear()
-print(len(d))
-d2: dict[int, str] = {1: \"x\", 2: \"y\"}
-for k in d2:
-    print(k)
-print(d2.get(3, \"z\"))
-",
-    );
-    assert_eq!(out, "{'a': 1}\n0\n1\n2\nz\n");
-}
-
-#[test]
-fn nested_list_dict_set_eq() {
-    let out = run_program(
-        "nested_eq",
-        "\
-print([{\"a\": 1}] == [{\"a\": 1}])
-print([{1, 2}] == [{1, 2}])
-print([{\"a\": 1}] == [{\"a\": 2}])
-",
-    );
-    assert_eq!(out, "True\nTrue\nFalse\n");
-}
-
-#[test]
 fn set_basic_ops() {
     let out = run_program(
         "set_basic",
@@ -2311,6 +2262,100 @@ print(s2)
 ",
     );
     assert_eq!(out, "True\n4\nFalse\n{10}\n");
+}
+
+#[test]
+fn try_except_raise() {
+    let out = run_program(
+        "try_exc",
+        "\
+try:
+    raise ValueError(\"bad\")
+except ValueError as e:
+    print(\"caught\", e)
+print(\"after\")
+try:
+    xs: list[int] = [1]
+    print(xs[5])
+except IndexError:
+    print(\"idx\")
+try:
+    raise RuntimeError(\"x\")
+except:
+    print(\"bare\")
+",
+    );
+    assert_eq!(out, "caught bad\nafter\nidx\nbare\n");
+}
+
+#[test]
+fn uncaught_raise() {
+    let (code, err) = run_program_expect_fail("uncaught", "raise ValueError(\"oops\")\n");
+    assert_eq!(code, 1);
+    assert!(err.contains("ValueError: oops"), "{err}");
+}
+
+#[test]
+fn try_finally_paths() {
+    let out = run_program(
+        "try_finally",
+        "\
+try:
+    print(\"body\")
+finally:
+    print(\"fin\")
+print(\"after\")
+try:
+    raise ValueError(\"x\")
+except ValueError:
+    print(\"caught\")
+finally:
+    print(\"fin2\")
+try:
+    try:
+        raise ValueError(\"y\")
+    finally:
+        print(\"fin3\")
+except ValueError:
+    print(\"outer\")
+
+def f() -> int:
+    try:
+        return 1
+    finally:
+        print(\"fin4\")
+print(f())
+while True:
+    try:
+        break
+    finally:
+        print(\"fin5\")
+print(\"done\")
+",
+    );
+    assert_eq!(
+        out,
+        "body\nfin\nafter\ncaught\nfin2\nfin3\nouter\nfin4\n1\nfin5\ndone\n"
+    );
+}
+
+#[test]
+fn dict_extra_ops() {
+    let out = run_program(
+        "dict_extra",
+        "\
+d: dict[str, int] = {}
+d[\"a\"] = 1
+print(d)
+d.clear()
+print(len(d))
+d2: dict[int, str] = {1: \"x\", 2: \"y\"}
+for k in d2:
+    print(k)
+print(d2.get(3, \"z\"))
+",
+    );
+    assert_eq!(out, "{'a': 1}\n0\n1\n2\nz\n");
 }
 
 #[test]
@@ -2341,3 +2386,223 @@ fn set_remove_keyerror() {
     assert!(err.contains("KeyError: 2"), "{err}");
 }
 
+#[test]
+fn tuple_for_and_eq() {
+    let out = run_program(
+        "tuple_for",
+        "\
+t: tuple[int, int, int] = (1, 2, 3)
+for x in t:
+    print(x)
+print((1, 2) == (1, 2))
+print((1, 2) != (1, 3))
+u: tuple[int, tuple[str, int]] = (1, (\"a\", 2))
+print(u[1][0])
+",
+    );
+    assert_eq!(out, "1\n2\n3\nTrue\nTrue\na\n");
+}
+
+#[test]
+fn exception_matrix() {
+    let out = run_program(
+        "exc_matrix",
+        "\
+try:
+    raise ValueError(\"v\")
+except KeyError:
+    print(\"no\")
+except ValueError:
+    print(\"val\")
+try:
+    d: dict[str, int] = {\"a\": 1}
+    print(d[\"b\"])
+except KeyError:
+    print(\"key\")
+try:
+    print(1 // 0)
+except ZeroDivisionError:
+    print(\"zdiv\")
+try:
+    raise TypeError(\"t\")
+except RuntimeError:
+    print(\"rt\")
+except:
+    print(\"bare\")
+",
+    );
+    assert_eq!(out, "val\nkey\nzdiv\nbare\n");
+}
+
+#[test]
+fn with_try_still_closes() {
+    // Exception propagates *out* of `with` so finally/close must run before
+    // the outer except (proves with → try/finally, not only in-body catch).
+    let dir = TempDir::new("with_try");
+    let path = dir.0.join("t.txt");
+    let path_s = path.to_str().unwrap();
+    let out = run_program(
+        "with_try",
+        &format!(
+            "\
+try:
+    with open(\"{path_s}\", \"w\") as f:
+        f.write(\"hi\")
+        raise ValueError(\"x\")
+except ValueError:
+    print(\"caught\")
+f2 = open(\"{path_s}\", \"r\")
+print(f2.read())
+f2.close()
+"
+        ),
+    );
+    assert_eq!(out, "caught\nhi\n");
+}
+
+#[test]
+fn other_trap_not_runtime_error() {
+    let out = run_program(
+        "other_trap",
+        "\
+try:
+    open(\"/no/such/file/pyrs_xyz_missing\", \"r\")
+except RuntimeError:
+    print(\"rt\")
+except:
+    print(\"other\")
+",
+    );
+    assert_eq!(out, "other\n");
+}
+
+#[test]
+fn nested_list_dict_set_eq() {
+    let out = run_program(
+        "nested_eq",
+        "\
+print([{\"a\": 1}] == [{\"a\": 1}])
+print([{1, 2}] == [{1, 2}])
+print([{\"a\": 1}] == [{\"a\": 2}])
+",
+    );
+    assert_eq!(out, "True\nTrue\nFalse\n");
+}
+
+#[test]
+fn try_continue_and_multi_return() {
+    let out = run_program(
+        "try_cont",
+        "\
+i = 0
+while i < 3:
+    i += 1
+    try:
+        if i == 2:
+            continue
+        print(\"c\", i)
+    finally:
+        print(\"f\", i)
+print(\"done\")
+
+def g(x: int) -> int:
+    try:
+        if x > 0:
+            return 1
+        return 2
+    finally:
+        print(\"fr\")
+print(g(1))
+print(g(-1))
+
+try:
+    try:
+        raise ValueError(\"a\")
+    except ValueError:
+        print(\"h\")
+        raise RuntimeError(\"b\")
+    finally:
+        print(\"fh\")
+except RuntimeError as e:
+    print(\"outer\", e)
+",
+    );
+    assert_eq!(
+        out,
+        "c 1\nf 1\nf 2\nc 3\nf 3\ndone\nfr\n1\nfr\n2\nh\nfh\nouter b\n"
+    );
+}
+
+#[test]
+fn loop_inside_try_break_defers_finally() {
+    // finally must run once after the loop, not on break
+    let out = run_program(
+        "loop_in_try",
+        "\
+try:
+    i = 0
+    while i < 3:
+        i += 1
+        if i == 2:
+            break
+        print(\"x\", i)
+    print(\"after\")
+finally:
+    print(\"fin\")
+print(\"done\")
+",
+    );
+    assert_eq!(out, "x 1\nafter\nfin\ndone\n");
+}
+
+#[test]
+fn trap_in_except_finally_stdout() {
+    let dir = TempDir::new("trap_exc");
+    let src = dir.0.join("prog.py");
+    let src_s = "\
+try:
+    raise ValueError(\"x\")
+except ValueError:
+    xs: list[int] = [1]
+    print(xs[99])
+finally:
+    print(\"f\")
+";
+    std::fs::write(&src, src_s).unwrap();
+    let out = std::process::Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(&src)
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "f\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("IndexError: list index out of range"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn nested_try_in_except_outer_finally() {
+    let out = run_program(
+        "nested_h",
+        "\
+try:
+    try:
+        raise ValueError(\"a\")
+    except ValueError:
+        try:
+            raise RuntimeError(\"b\")
+        finally:
+            print(\"fin_nested\")
+    finally:
+        print(\"fin_inner\")
+except RuntimeError as e:
+    print(\"outer\", e)
+finally:
+    print(\"fin_outer\")
+",
+    );
+    assert_eq!(out, "fin_nested\nfin_inner\nouter b\nfin_outer\n");
+}
