@@ -35,8 +35,7 @@ fn lty(ty: Ty) -> &'static str {
         Ty::Float => "double",
         Ty::Bool => "i1",
         Ty::Str => "ptr",
-        Ty::List(_) => "ptr",
-        Ty::File => "ptr",
+        Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) | Ty::File => "ptr",
         Ty::None => "void",
     }
 }
@@ -50,10 +49,8 @@ fn fconst(v: f64) -> String {
     format!("0x{:016X}", v.to_bits())
 }
 
-/// Tag values understood by the runtime's `pyrs_print_list` and
-/// `pyrs_list_contains`. Scalars are 0-3; a list element encodes its own
-/// element tag recursively as `4 + 8 * inner`, so `list[list[int]]`
-/// elements carry tag 4 and the runtime recurses.
+/// Tag values understood by the runtime's print/contains helpers.
+/// Scalars 0-3; nested list `4 + 8 * inner`; tuple=5, dict=6, set=7.
 fn elem_tag(ty: &Ty) -> u32 {
     match ty {
         Ty::Int => 0,
@@ -61,6 +58,9 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Bool => 2,
         Ty::Str => 3,
         Ty::List(inner) => 4 + 8 * elem_tag(inner),
+        Ty::Tuple(_) => 5,
+        Ty::Dict { .. } => 6,
+        Ty::Set(_) => 7,
         Ty::File | Ty::None => unreachable!("no print tag for {ty:?}"),
     }
 }
@@ -79,7 +79,31 @@ fn escape_bytes(s: &str) -> (String, usize) {
     (out, bytes.len() + 1)
 }
 
-#[derive(Default)]
+/// Exit kind stored in a try scope's `exit_ptr` alloca (i32).
+const TRY_EXIT_NORMAL: i32 = 0;
+const TRY_EXIT_RETURN: i32 = 1;
+const TRY_EXIT_BREAK: i32 = 2;
+const TRY_EXIT_CONTINUE: i32 = 3;
+const TRY_EXIT_RERAISE: i32 = 4;
+
+/// One enclosing `try` while emitting; used to route return/break/continue
+/// through `finally` and to always pop the setjmp frame.
+///
+/// The setjmp frame stays on the stack for the whole try construct (body +
+/// handlers). A runtime `phase_ptr` (0=body, 1=handler) distinguishes the
+/// first longjmp (dispatch to handlers) from a raise/trap during a handler
+/// (go to finally with RERAISE — do not re-enter handlers).
+struct TryScope {
+    fin_l: String,
+    end_l: String,
+    /// `alloca i32` holding TRY_EXIT_*
+    exit_ptr: String,
+    /// Runtime flag (`alloca i32`, 1=live): pop at most once on structured exit.
+    live_ptr: String,
+    /// `loops.len()` when this try was entered.
+    loops_at_entry: usize,
+}
+
 struct Emitter {
     /// finished function definitions
     funcs: String,
@@ -96,6 +120,32 @@ struct Emitter {
     terminated: bool,
     /// (continue target, break target) for enclosing loops
     loops: Vec<(String, String)>,
+    /// Enclosing try scopes (innermost last).
+    tries: Vec<TryScope>,
+    /// Current function return type (for try-return plumbing).
+    fn_ret: Ty,
+    /// Shared alloca for a pending return value while unwinding through finally.
+    try_ret_ptr: Option<String>,
+}
+
+impl Default for Emitter {
+    fn default() -> Self {
+        Self {
+            funcs: String::new(),
+            body: String::new(),
+            strings: HashMap::new(),
+            string_defs: String::new(),
+            global_defs: String::new(),
+            tmp: 0,
+            blk: 0,
+            cur_block: String::new(),
+            terminated: false,
+            loops: Vec::new(),
+            tries: Vec::new(),
+            fn_ret: Ty::None,
+            try_ret_ptr: None,
+        }
+    }
 }
 
 impl Emitter {
@@ -107,9 +157,48 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_bool(i32)\n");
         out.push_str("declare void @pyrs_print_str(ptr)\n");
         out.push_str("declare void @pyrs_print_list(ptr, i32)\n");
+        out.push_str("declare void @pyrs_print_tuple(ptr)\n");
+        out.push_str("declare void @pyrs_print_dict(ptr)\n");
+        out.push_str("declare void @pyrs_print_set(ptr)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
+        out.push_str("declare void @pyrs_raise(i32, ptr) noreturn\n");
+        out.push_str("declare void @pyrs_reraise() noreturn\n");
+        out.push_str("declare void @pyrs_set_exc(i32, ptr)\n");
+        out.push_str("declare void @pyrs_set_exc_msg(ptr)\n");
+        out.push_str("declare ptr @pyrs_try_push()\n");
+        // setjmp must be called directly (not via a C wrapper): longjmp restores
+        // to the setjmp call site. jmp_buf is the first field of PyrsExcFrame.
+        // returns_twice is required so LLVM does not clobber the stack across longjmp.
+        out.push_str("declare i32 @setjmp(ptr) returns_twice\n");
+        out.push_str("declare void @pyrs_try_pop()\n");
+        out.push_str("declare i32 @pyrs_exc_type()\n");
+        out.push_str("declare ptr @pyrs_exc_message()\n");
+        out.push_str("declare void @pyrs_exc_clear()\n");
+        out.push_str("declare ptr @pyrs_tuple_new(i64)\n");
+        out.push_str("declare void @pyrs_tuple_set(ptr, i64, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_tuple_get(ptr, i64)\n");
+        out.push_str("declare i32 @pyrs_tuple_eq(ptr, ptr)\n");
+        out.push_str("declare void @pyrs_unpack_check(i64, i64)\n");
+        out.push_str("declare ptr @pyrs_dict_new()\n");
+        out.push_str("declare void @pyrs_dict_set(ptr, i64, i32, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_dict_get(ptr, i64, i32)\n");
+        out.push_str("declare i32 @pyrs_dict_get_default(ptr, i64, i32, ptr)\n");
+        out.push_str("declare void @pyrs_dict_del(ptr, i64, i32)\n");
+        out.push_str("declare i32 @pyrs_dict_contains(ptr, i64, i32)\n");
+        out.push_str("declare void @pyrs_dict_clear(ptr)\n");
+        out.push_str("declare i64 @pyrs_dict_pop(ptr, i64, i32, i32, i64, ptr)\n");
+        out.push_str("declare ptr @pyrs_dict_keys(ptr)\n");
+        out.push_str("declare ptr @pyrs_dict_values(ptr)\n");
+        out.push_str("declare ptr @pyrs_dict_items(ptr)\n");
+        out.push_str("declare ptr @pyrs_set_new()\n");
+        out.push_str("declare void @pyrs_set_add(ptr, i64, i32)\n");
+        out.push_str("declare void @pyrs_set_remove(ptr, i64, i32)\n");
+        out.push_str("declare void @pyrs_set_discard(ptr, i64, i32)\n");
+        out.push_str("declare i32 @pyrs_set_contains(ptr, i64, i32)\n");
+        out.push_str("declare void @pyrs_set_clear(ptr)\n");
+        out.push_str("declare ptr @pyrs_set_elements(ptr)\n");
         out.push_str("declare ptr @pyrs_str_concat(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_repeat(ptr, i64)\n");
         out.push_str("declare i32 @pyrs_str_cmp(ptr, ptr)\n");
@@ -184,7 +273,9 @@ impl Emitter {
             let init = match ty {
                 Ty::Float => fconst(0.0),
                 Ty::Bool => "false".to_string(),
-                Ty::Str | Ty::List(_) | Ty::File => "null".to_string(),
+                Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) | Ty::File => {
+                    "null".to_string()
+                }
                 _ => "0".to_string(),
             };
             self.global_defs.push_str(&format!(
@@ -427,7 +518,7 @@ impl Emitter {
                 self.line(format!("{t} = zext i1 {value} to i64"));
                 t
             }
-            Ty::Str | Ty::List(_) => {
+            Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) => {
                 let t = self.tmp();
                 self.line(format!("{t} = ptrtoint ptr {value} to i64"));
                 t
@@ -449,7 +540,7 @@ impl Emitter {
                 self.line(format!("{t} = trunc i64 {slot} to i1"));
                 t
             }
-            Ty::Str | Ty::List(_) => {
+            Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) => {
                 let t = self.tmp();
                 self.line(format!("{t} = inttoptr i64 {slot} to ptr"));
                 t
@@ -465,6 +556,9 @@ impl Emitter {
         self.tmp = 0;
         self.blk = 0;
         self.loops.clear();
+        self.tries.clear();
+        self.fn_ret = func.ret;
+        self.try_ret_ptr = None;
 
         self.start_block("entry");
         // spill params into allocas so assignment to params just works
@@ -479,10 +573,18 @@ impl Emitter {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
             let zero = match ty {
                 Ty::Float => fconst(0.0),
-                Ty::Str | Ty::List(_) | Ty::File => "null".to_string(),
+                Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) | Ty::File => {
+                    "null".to_string()
+                }
                 _ => "0".to_string(),
             };
             self.line(format!("store {} {zero}, ptr %v.{name}", lty(*ty)));
+        }
+        // pending return value for try/finally (only if the function returns)
+        if func.ret != Ty::None {
+            let p = "%try.retval".to_string();
+            self.line(format!("{p} = alloca {}", lty(func.ret)));
+            self.try_ret_ptr = Some(p);
         }
 
         self.emit_block(&func.body);
@@ -535,12 +637,103 @@ impl Emitter {
                 let i = self.emit_expr(index);
                 let v = self.emit_expr(value);
                 let slot = self.slot_from_value(&v, value.ty);
-                let addr = self.emit_list_elem_addr(
-                    &b,
-                    &i,
-                    "IndexError: list assignment index out of range",
-                );
-                self.line(format!("store i64 {slot}, ptr {addr}"));
+                match base.ty {
+                    Ty::List(_) => {
+                        let addr = self.emit_list_elem_addr(
+                            &b,
+                            &i,
+                            "IndexError: list assignment index out of range",
+                        );
+                        self.line(format!("store i64 {slot}, ptr {addr}"));
+                    }
+                    Ty::Dict { key, value: val } => {
+                        let kslot = self.slot_from_value(&i, *key);
+                        let vslot = slot;
+                        self.line(format!(
+                            "call void @pyrs_dict_set(ptr {b}, i64 {kslot}, i32 {}, i64 {vslot}, i32 {})",
+                            elem_tag(key),
+                            elem_tag(val)
+                        ));
+                    }
+                    other => unreachable!("IndexAssign on {other:?}"),
+                }
+            }
+            Stmt::IndexDelete { base, index } => {
+                let b = self.emit_expr(base);
+                let i = self.emit_expr(index);
+                let Ty::Dict { key, .. } = base.ty else {
+                    unreachable!("IndexDelete on non-dict");
+                };
+                let kslot = self.slot_from_value(&i, *key);
+                self.line(format!(
+                    "call void @pyrs_dict_del(ptr {b}, i64 {kslot}, i32 {})",
+                    elem_tag(key)
+                ));
+            }
+            Stmt::DictClear { dict } => {
+                let d = self.emit_expr(dict);
+                self.line(format!("call void @pyrs_dict_clear(ptr {d})"));
+            }
+            Stmt::SetAdd { set, value } => {
+                let s = self.emit_expr(set);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                self.line(format!(
+                    "call void @pyrs_set_add(ptr {s}, i64 {slot}, i32 {})",
+                    elem_tag(&value.ty)
+                ));
+            }
+            Stmt::SetRemove { set, value } => {
+                let s = self.emit_expr(set);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                self.line(format!(
+                    "call void @pyrs_set_remove(ptr {s}, i64 {slot}, i32 {})",
+                    elem_tag(&value.ty)
+                ));
+            }
+            Stmt::SetDiscard { set, value } => {
+                let s = self.emit_expr(set);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                self.line(format!(
+                    "call void @pyrs_set_discard(ptr {s}, i64 {slot}, i32 {})",
+                    elem_tag(&value.ty)
+                ));
+            }
+            Stmt::SetClear { set } => {
+                let s = self.emit_expr(set);
+                self.line(format!("call void @pyrs_set_clear(ptr {s})"));
+            }
+            Stmt::UnpackCheck { len, expected } => {
+                let n = self.emit_expr(len);
+                self.line(format!(
+                    "call void @pyrs_unpack_check(i64 {n}, i64 {expected})"
+                ));
+            }
+            Stmt::Raise { exc, message } => {
+                let m = self.emit_expr(message);
+                // pyrs_raise wants a C string: data pointer after length header
+                let data = self.tmp();
+                self.line(format!(
+                    "{data} = getelementptr inbounds i8, ptr {m}, i64 8"
+                ));
+                // Always longjmp: try frames stay live through handlers, so a
+                // raise in except re-enters this try's setjmp with phase=handler
+                // and then runs finally (see emit_try).
+                self.line(format!(
+                    "call void @pyrs_raise(i32 {}, ptr {data})",
+                    exc.tag()
+                ));
+                self.line("unreachable");
+                self.terminated = true;
+            }
+            Stmt::Try {
+                body,
+                handlers,
+                finally,
+            } => {
+                self.emit_try(body, handlers, finally);
             }
             Stmt::ListAppend { list, value } => {
                 let l = self.emit_expr(list);
@@ -604,18 +797,28 @@ impl Emitter {
                 self.line(format!("store i64 {newlen}, ptr {l}"));
             }
             Stmt::Return(None) => {
-                self.line("ret void");
-                self.terminated = true;
+                if !self.tries.is_empty() {
+                    self.emit_try_exit(TRY_EXIT_RETURN, None);
+                } else {
+                    self.line("ret void");
+                    self.terminated = true;
+                }
             }
             Stmt::Return(Some(value)) => {
                 let v = self.emit_expr(value);
-                self.line(format!("ret {} {v}", lty(value.ty)));
-                self.terminated = true;
+                if !self.tries.is_empty() {
+                    self.emit_try_exit(TRY_EXIT_RETURN, Some((v, value.ty)));
+                } else {
+                    self.line(format!("ret {} {v}", lty(value.ty)));
+                    self.terminated = true;
+                }
             }
             Stmt::ExprStmt(expr) => {
                 self.emit_expr(expr);
             }
             Stmt::Die(message) => {
+                // Frame stays live through handlers; longjmp re-enters setjmp
+                // with phase=handler and runs finally.
                 self.emit_die(message);
             }
             Stmt::Print(args) => {
@@ -637,6 +840,11 @@ impl Emitter {
                             "call void @pyrs_print_list(ptr {v}, i32 {})",
                             elem_tag(elem)
                         )),
+                        Ty::Tuple(_) => self.line(format!("call void @pyrs_print_tuple(ptr {v})")),
+                        Ty::Dict { .. } => {
+                            self.line(format!("call void @pyrs_print_dict(ptr {v})"))
+                        }
+                        Ty::Set(_) => self.line(format!("call void @pyrs_print_set(ptr {v})")),
                         Ty::File | Ty::None => {
                             unreachable!("semantic rejects {:?} print args", arg.ty)
                         }
@@ -645,14 +853,25 @@ impl Emitter {
                 self.line("call void @pyrs_print_end()");
             }
             Stmt::Break => {
-                let (_, end) = self.loops.last().expect("break outside loop").clone();
-                self.line(format!("br label %{end}"));
-                self.terminated = true;
+                // Only run try finally when the try is nested *inside* the loop
+                // being broken (break leaves the try). If the loop is nested
+                // inside the try, break stays in the try (CPython).
+                if self.break_exits_innermost_try() {
+                    self.emit_try_exit(TRY_EXIT_BREAK, None);
+                } else {
+                    let (_, end) = self.loops.last().expect("break outside loop").clone();
+                    self.line(format!("br label %{end}"));
+                    self.terminated = true;
+                }
             }
             Stmt::Continue => {
-                let (cont, _) = self.loops.last().expect("continue outside loop").clone();
-                self.line(format!("br label %{cont}"));
-                self.terminated = true;
+                if self.break_exits_innermost_try() {
+                    self.emit_try_exit(TRY_EXIT_CONTINUE, None);
+                } else {
+                    let (cont, _) = self.loops.last().expect("continue outside loop").clone();
+                    self.line(format!("br label %{cont}"));
+                    self.terminated = true;
+                }
             }
             Stmt::While { cond, body, step } => {
                 let cond_l = self.fresh_block("while.cond");
@@ -828,6 +1047,22 @@ impl Emitter {
                         self.line(format!("{slot} = load i64, ptr {addr}"));
                         self.value_from_slot(&slot, *elem)
                     }
+                    Ty::Tuple(_) => {
+                        let slot = self.tmp();
+                        self.line(format!(
+                            "{slot} = call i64 @pyrs_tuple_get(ptr {b}, i64 {i})"
+                        ));
+                        self.value_from_slot(&slot, expr.ty)
+                    }
+                    Ty::Dict { key, value } => {
+                        let kslot = self.slot_from_value(&i, *key);
+                        let slot = self.tmp();
+                        self.line(format!(
+                            "{slot} = call i64 @pyrs_dict_get(ptr {b}, i64 {kslot}, i32 {})",
+                            elem_tag(key)
+                        ));
+                        self.value_from_slot(&slot, *value)
+                    }
                     other => unreachable!("index on {other:?}"),
                 }
             }
@@ -896,6 +1131,26 @@ impl Emitter {
                 let h = self.emit_expr(haystack);
                 let c = self.tmp();
                 match haystack.ty {
+                    Ty::Dict { key, .. } => {
+                        let kslot = self.slot_from_value(&n, *key);
+                        self.line(format!(
+                            "{c} = call i32 @pyrs_dict_contains(ptr {h}, i64 {kslot}, i32 {})",
+                            elem_tag(key)
+                        ));
+                        let b = self.tmp();
+                        self.line(format!("{b} = icmp ne i32 {c}, 0"));
+                        return b;
+                    }
+                    Ty::Set(elem) => {
+                        let slot = self.slot_from_value(&n, *elem);
+                        self.line(format!(
+                            "{c} = call i32 @pyrs_set_contains(ptr {h}, i64 {slot}, i32 {})",
+                            elem_tag(elem)
+                        ));
+                        let b = self.tmp();
+                        self.line(format!("{b} = icmp ne i32 {c}, 0"));
+                        return b;
+                    }
                     Ty::Str => {
                         self.line(format!(
                             "{c} = call i32 @pyrs_str_contains(ptr {h}, ptr {n})"
@@ -1066,8 +1321,8 @@ impl Emitter {
                         self.line(format!("{t} = fcmp une double {v}, {}", fconst(0.0)));
                         t
                     }
-                    // str and list share the leading i64 length field
-                    Ty::Str | Ty::List(_) => {
+                    // containers share the leading i64 length field
+                    Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) => {
                         let len = self.emit_len(&v);
                         let t = self.tmp();
                         self.line(format!("{t} = icmp ne i64 {len}, 0"));
@@ -1088,7 +1343,435 @@ impl Emitter {
                 t
             }
             ExprKind::Binary { op, left, right } => self.emit_binary(*op, left, right),
+            ExprKind::TupleLit(items) => {
+                let n = items.len() as i64;
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_tuple_new(i64 {n})"));
+                for (i, item) in items.iter().enumerate() {
+                    let v = self.emit_expr(item);
+                    let slot = self.slot_from_value(&v, item.ty);
+                    self.line(format!(
+                        "call void @pyrs_tuple_set(ptr {t}, i64 {i}, i64 {slot}, i32 {})",
+                        elem_tag(&item.ty)
+                    ));
+                }
+                t
+            }
+            ExprKind::DictLit(pairs) => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_dict_new()"));
+                let Ty::Dict { key, value } = expr.ty else {
+                    unreachable!("DictLit type");
+                };
+                for (k, v) in pairs {
+                    let kv = self.emit_expr(k);
+                    let vv = self.emit_expr(v);
+                    let kslot = self.slot_from_value(&kv, k.ty);
+                    let vslot = self.slot_from_value(&vv, v.ty);
+                    self.line(format!(
+                        "call void @pyrs_dict_set(ptr {t}, i64 {kslot}, i32 {}, i64 {vslot}, i32 {})",
+                        elem_tag(key),
+                        elem_tag(value)
+                    ));
+                }
+                t
+            }
+            ExprKind::DictNew => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_dict_new()"));
+                t
+            }
+            ExprKind::SetLit(items) => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_set_new()"));
+                for item in items {
+                    let v = self.emit_expr(item);
+                    let slot = self.slot_from_value(&v, item.ty);
+                    self.line(format!(
+                        "call void @pyrs_set_add(ptr {t}, i64 {slot}, i32 {})",
+                        elem_tag(&item.ty)
+                    ));
+                }
+                t
+            }
+            ExprKind::SetNew => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_set_new()"));
+                t
+            }
+            ExprKind::DictGet { dict, key, default } => {
+                let d = self.emit_expr(dict);
+                let k = self.emit_expr(key);
+                let Ty::Dict { key: kt, value: vt } = dict.ty else {
+                    unreachable!();
+                };
+                let kslot = self.slot_from_value(&k, *kt);
+                let out_p = self.tmp();
+                self.line(format!("{out_p} = alloca i64, align 8"));
+                let found = self.tmp();
+                self.line(format!(
+                    "{found} = call i32 @pyrs_dict_get_default(ptr {d}, i64 {kslot}, i32 {}, ptr {out_p})",
+                    elem_tag(kt)
+                ));
+                let hit = self.tmp();
+                self.line(format!("{hit} = icmp ne i32 {found}, 0"));
+                let then_l = self.fresh_block("dget.then");
+                let else_l = self.fresh_block("dget.else");
+                let end_l = self.fresh_block("dget.end");
+                self.line(format!("br i1 {hit}, label %{then_l}, label %{else_l}"));
+                self.start_block(&then_l);
+                let slot_hit = self.tmp();
+                self.line(format!("{slot_hit} = load i64, ptr {out_p}"));
+                let val_hit = self.value_from_slot(&slot_hit, *vt);
+                let then_pred = self.cur_block.clone();
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&else_l);
+                let val_miss = self.emit_expr(default);
+                let else_pred = self.cur_block.clone();
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&end_l);
+                let phi = self.tmp();
+                self.line(format!(
+                    "{phi} = phi {} [ {val_hit}, %{then_pred} ], [ {val_miss}, %{else_pred} ]",
+                    lty(*vt)
+                ));
+                phi
+            }
+            ExprKind::DictPop { dict, key, default } => {
+                let d = self.emit_expr(dict);
+                let k = self.emit_expr(key);
+                let Ty::Dict { key: kt, value: vt } = dict.ty else {
+                    unreachable!();
+                };
+                let kslot = self.slot_from_value(&k, *kt);
+                let out_p = self.tmp();
+                self.line(format!("{out_p} = alloca i64, align 8"));
+                let has_def = if default.is_some() { 1 } else { 0 };
+                let def_slot = if let Some(def) = default {
+                    let dv = self.emit_expr(def);
+                    self.slot_from_value(&dv, def.ty)
+                } else {
+                    "0".to_string()
+                };
+                let slot = self.tmp();
+                self.line(format!(
+                    "{slot} = call i64 @pyrs_dict_pop(ptr {d}, i64 {kslot}, i32 {}, i32 {has_def}, i64 {def_slot}, ptr {out_p})",
+                    elem_tag(kt)
+                ));
+                // pop writes result to *out
+                let loaded = self.tmp();
+                self.line(format!("{loaded} = load i64, ptr {out_p}"));
+                let _ = slot;
+                self.value_from_slot(&loaded, *vt)
+            }
+            ExprKind::DictKeys(d) => {
+                let v = self.emit_expr(d);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_dict_keys(ptr {v})"));
+                t
+            }
+            ExprKind::DictValues(d) => {
+                let v = self.emit_expr(d);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_dict_values(ptr {v})"));
+                t
+            }
+            ExprKind::DictItems(d) => {
+                let v = self.emit_expr(d);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_dict_items(ptr {v})"));
+                t
+            }
+            ExprKind::SetToList(s) => {
+                let v = self.emit_expr(s);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_set_elements(ptr {v})"));
+                t
+            }
         }
+    }
+
+    /// Whether the current outermost remaining try is left by break/continue
+    /// of the innermost loop (same rule as `break_exits_innermost_try`).
+    fn outer_exited_by_break(&self) -> bool {
+        let Some(outer) = self.tries.last() else {
+            return false;
+        };
+        if self.loops.is_empty() {
+            return false;
+        }
+        outer.loops_at_entry > self.loops.len() - 1
+    }
+
+    /// Propagate exit kind to the enclosing try: mark its frame dead, pop,
+    /// and jump to its finally (used after an inner finally completes).
+    fn emit_chain_to_outer(&mut self, kind: i32) {
+        let outer = self.tries.last().expect("chain without outer try");
+        let o_exit = outer.exit_ptr.clone();
+        let o_live = outer.live_ptr.clone();
+        let o_fin = outer.fin_l.clone();
+        self.line(format!("store i32 {kind}, ptr {o_exit}"));
+        // outer frame is still live until we leave it
+        let was = self.tmp();
+        self.line(format!("{was} = load i32, ptr {o_live}"));
+        self.line(format!("store i32 0, ptr {o_live}"));
+        let need = self.tmp();
+        self.line(format!("{need} = icmp ne i32 {was}, 0"));
+        let pop_l = self.fresh_block("try.chain.pop");
+        let go_l = self.fresh_block("try.chain.go");
+        self.line(format!("br i1 {need}, label %{pop_l}, label %{go_l}"));
+        self.start_block(&pop_l);
+        self.line("call void @pyrs_try_pop()");
+        self.line(format!("br label %{go_l}"));
+        self.start_block(&go_l);
+        self.line(format!("br label %{o_fin}"));
+    }
+
+    /// True when break/continue of the innermost loop should leave the
+    /// innermost try (try is nested inside that loop). False when the loop
+    /// is nested inside the try (break stays in the try body).
+    fn break_exits_innermost_try(&self) -> bool {
+        let Some(try_scope) = self.tries.last() else {
+            return false;
+        };
+        if self.loops.is_empty() {
+            return false;
+        }
+        // loops_at_entry == loops.len() when try started inside the current
+        // loop depth; then loops_at_entry > loop_index (loops.len()-1).
+        try_scope.loops_at_entry > self.loops.len() - 1
+    }
+
+    /// Leave the protected try region: pop the setjmp frame at most once
+    /// (runtime live flag), record exit kind, jump to finally.
+    fn emit_try_exit(&mut self, kind: i32, ret: Option<(String, Ty)>) {
+        let scope = self.tries.last().expect("emit_try_exit without active try");
+        let exit_ptr = scope.exit_ptr.clone();
+        let live_ptr = scope.live_ptr.clone();
+        let fin_l = scope.fin_l.clone();
+        if let Some((v, ty)) = ret {
+            let ptr = self
+                .try_ret_ptr
+                .clone()
+                .expect("return value in try without ret slot");
+            self.line(format!("store {} {v}, ptr {ptr}", lty(ty)));
+        }
+        self.line(format!("store i32 {kind}, ptr {exit_ptr}"));
+        // Runtime live flag: every exit edge may reach here; pop at most once.
+        let was = self.tmp();
+        self.line(format!("{was} = load i32, ptr {live_ptr}"));
+        self.line(format!("store i32 0, ptr {live_ptr}"));
+        let need = self.tmp();
+        self.line(format!("{need} = icmp ne i32 {was}, 0"));
+        let pop_l = self.fresh_block("try.pop");
+        let go_l = self.fresh_block("try.tofin");
+        self.line(format!("br i1 {need}, label %{pop_l}, label %{go_l}"));
+        self.start_block(&pop_l);
+        self.line("call void @pyrs_try_pop()");
+        self.line(format!("br label %{go_l}"));
+        self.start_block(&go_l);
+        self.line(format!("br label %{fin_l}"));
+        self.terminated = true;
+    }
+
+    /// After finally body: dispatch on exit kind (normal / return / break /
+    /// continue / reraise), chaining into an outer try's finally when needed.
+    fn emit_finally_dispatch(&mut self, exit_ptr: &str, end_l: &str) {
+        let kind = self.tmp();
+        self.line(format!("{kind} = load i32, ptr {exit_ptr}"));
+
+        let normal_l = self.fresh_block("try.x.normal");
+        let ret_l = self.fresh_block("try.x.ret");
+        let brk_l = self.fresh_block("try.x.brk");
+        let cont_l = self.fresh_block("try.x.cont");
+        let re_l = self.fresh_block("try.x.re");
+        let def_l = self.fresh_block("try.x.bad");
+
+        self.line(format!(
+            "switch i32 {kind}, label %{def_l} [ \
+             i32 {TRY_EXIT_NORMAL}, label %{normal_l} \
+             i32 {TRY_EXIT_RETURN}, label %{ret_l} \
+             i32 {TRY_EXIT_BREAK}, label %{brk_l} \
+             i32 {TRY_EXIT_CONTINUE}, label %{cont_l} \
+             i32 {TRY_EXIT_RERAISE}, label %{re_l} ]"
+        ));
+
+        // fall through after try
+        self.start_block(&normal_l);
+        self.line(format!("br label %{end_l}"));
+
+        // return — chain to outer finally or ret
+        self.start_block(&ret_l);
+        if self.tries.last().is_some() {
+            self.emit_chain_to_outer(TRY_EXIT_RETURN);
+        } else if self.fn_ret == Ty::None {
+            self.line("ret void");
+        } else {
+            let ptr = self.try_ret_ptr.clone().expect("ret slot");
+            let v = self.tmp();
+            self.line(format!("{v} = load {}, ptr {ptr}", lty(self.fn_ret)));
+            self.line(format!("ret {} {v}", lty(self.fn_ret)));
+        }
+        self.terminated = true;
+
+        // break (path only taken if a break ran inside this try)
+        self.start_block(&brk_l);
+        if self.outer_exited_by_break() {
+            self.emit_chain_to_outer(TRY_EXIT_BREAK);
+        } else if let Some((_, end)) = self.loops.last() {
+            let end = end.clone();
+            self.line(format!("br label %{end}"));
+        } else {
+            self.line("unreachable");
+        }
+        self.terminated = true;
+
+        // continue
+        self.start_block(&cont_l);
+        if self.outer_exited_by_break() {
+            self.emit_chain_to_outer(TRY_EXIT_CONTINUE);
+        } else if let Some((cont, _)) = self.loops.last() {
+            let cont = cont.clone();
+            self.line(format!("br label %{cont}"));
+        } else {
+            self.line("unreachable");
+        }
+        self.terminated = true;
+
+        // reraise: longjmp into an outer try's setjmp (frame must still be live),
+        // or print+exit if nothing catches. Do not jump to outer finally — CPython
+        // runs outer handlers first, then outer finally.
+        self.start_block(&re_l);
+        self.line("call void @pyrs_reraise()");
+        self.line("unreachable");
+        self.terminated = true;
+
+        self.start_block(&def_l);
+        self.line("unreachable");
+    }
+
+    fn emit_try(
+        &mut self,
+        body: &[Stmt],
+        handlers: &[(Option<ir::ExcType>, Option<String>, Vec<Stmt>)],
+        finally: &[Stmt],
+    ) {
+        let exit_ptr = self.tmp();
+        self.line(format!("{exit_ptr} = alloca i32, align 4"));
+        self.line(format!("store i32 {TRY_EXIT_NORMAL}, ptr {exit_ptr}"));
+        let live_ptr = self.tmp();
+        self.line(format!("{live_ptr} = alloca i32, align 4"));
+        self.line(format!("store i32 1, ptr {live_ptr}"));
+        // 0 = try body, 1 = except handler (second longjmp → finally/reraise)
+        let phase_ptr = self.tmp();
+        self.line(format!("{phase_ptr} = alloca i32, align 4"));
+        self.line(format!("store i32 0, ptr {phase_ptr}"));
+
+        let fin_l = self.fresh_block("try.finally");
+        let end_l = self.fresh_block("try.end");
+        self.tries.push(TryScope {
+            fin_l: fin_l.clone(),
+            end_l: end_l.clone(),
+            exit_ptr: exit_ptr.clone(),
+            live_ptr: live_ptr.clone(),
+            loops_at_entry: self.loops.len(),
+        });
+
+        let frame = self.tmp();
+        self.line(format!("{frame} = call ptr @pyrs_try_push()"));
+        let jc = self.tmp();
+        // setjmp on the frame pointer — jmp_buf is the first field
+        self.line(format!("{jc} = call i32 @setjmp(ptr {frame})"));
+        let ok = self.tmp();
+        self.line(format!("{ok} = icmp eq i32 {jc}, 0"));
+        let body_l = self.fresh_block("try.body");
+        let exc_l = self.fresh_block("try.exc");
+        self.line(format!("br i1 {ok}, label %{body_l}, label %{exc_l}"));
+
+        // ---- try body ----
+        self.start_block(&body_l);
+        self.emit_block(body);
+        if !self.terminated {
+            self.emit_try_exit(TRY_EXIT_NORMAL, None);
+        }
+
+        // ---- exception path (frame still live until structured exit) ----
+        self.start_block(&exc_l);
+        let phase = self.tmp();
+        self.line(format!("{phase} = load i32, ptr {phase_ptr}"));
+        let in_handler = self.tmp();
+        self.line(format!("{in_handler} = icmp ne i32 {phase}, 0"));
+        let hraise_l = self.fresh_block("try.hreraise");
+        let dispatch_l = self.fresh_block("try.hdispatch");
+        self.line(format!(
+            "br i1 {in_handler}, label %{hraise_l}, label %{dispatch_l}"
+        ));
+
+        // Second longjmp: raise/trap while running a handler → finally then reraise
+        self.start_block(&hraise_l);
+        self.emit_try_exit(TRY_EXIT_RERAISE, None);
+
+        // First longjmp: body exception → match handlers (do not pop yet)
+        self.start_block(&dispatch_l);
+        self.line(format!("store i32 1, ptr {phase_ptr}"));
+        let ety = self.tmp();
+        self.line(format!("{ety} = call i32 @pyrs_exc_type()"));
+
+        let mut next_check = String::new();
+        for (i, (filter, bind, hbody)) in handlers.iter().enumerate() {
+            let match_l = self.fresh_block(&format!("try.h{i}"));
+            let nomatch_l = self.fresh_block(&format!("try.h{i}.no"));
+            if i > 0 {
+                self.start_block(&next_check);
+            }
+            match filter {
+                None => {
+                    self.line(format!("br label %{match_l}"));
+                }
+                Some(exc) => {
+                    let cmp = self.tmp();
+                    self.line(format!("{cmp} = icmp eq i32 {ety}, {}", exc.tag()));
+                    self.line(format!("br i1 {cmp}, label %{match_l}, label %{nomatch_l}"));
+                }
+            }
+            self.start_block(&match_l);
+            if let Some(name) = bind {
+                let msg = self.tmp();
+                self.line(format!("{msg} = call ptr @pyrs_exc_message()"));
+                self.line(format!("store ptr {msg}, ptr %v.{name}"));
+            }
+            self.line("call void @pyrs_exc_clear()");
+            // Frame remains live so traps/raises in the handler longjmp here
+            // with phase=1 and take hraise_l → finally.
+            self.emit_block(hbody);
+            if !self.terminated {
+                self.emit_try_exit(TRY_EXIT_NORMAL, None);
+            }
+            next_check = nomatch_l;
+            if filter.is_none() {
+                self.start_block(&next_check);
+                self.line("unreachable");
+                next_check.clear();
+                break;
+            }
+        }
+        // unmatched (or bare try/finally): finally then reraise
+        if handlers.is_empty() {
+            self.emit_try_exit(TRY_EXIT_RERAISE, None);
+        } else if !next_check.is_empty() {
+            self.start_block(&next_check);
+            self.emit_try_exit(TRY_EXIT_RERAISE, None);
+        }
+
+        // ---- finally (only reached via emit_try_exit, which pops once) ----
+        let scope = self.tries.pop().expect("try scope");
+        self.start_block(&fin_l);
+        self.emit_block(finally);
+        if !self.terminated {
+            self.emit_finally_dispatch(&scope.exit_ptr, &scope.end_l);
+        }
+
+        self.start_block(&end_l);
     }
 
     fn emit_binary(&mut self, op: BinOp, left: &Expr, right: &Expr) -> String {
@@ -1097,12 +1780,15 @@ impl Emitter {
             return self.emit_short_circuit(op, left, right);
         }
 
-        // string / list operations dispatch to the runtime
+        // string / list / tuple operations dispatch to the runtime
         if left.ty == Ty::Str {
             return self.emit_str_binary(op, left, right);
         }
         if matches!(left.ty, Ty::List(_)) {
             return self.emit_list_binary(op, left, right);
+        }
+        if matches!(left.ty, Ty::Tuple(_)) {
+            return self.emit_tuple_binary(op, left, right);
         }
 
         let l = self.emit_expr(left);
@@ -1283,6 +1969,27 @@ impl Emitter {
                 }
             }
             other => unreachable!("bad list op {other:?}"),
+        }
+    }
+
+    fn emit_tuple_binary(&mut self, op: BinOp, left: &Expr, right: &Expr) -> String {
+        let l = self.emit_expr(left);
+        let r = self.emit_expr(right);
+        match op {
+            BinOp::Eq | BinOp::Ne => {
+                let c = self.tmp();
+                self.line(format!("{c} = call i32 @pyrs_tuple_eq(ptr {l}, ptr {r})"));
+                let eq = self.tmp();
+                self.line(format!("{eq} = icmp ne i32 {c}, 0"));
+                if matches!(op, BinOp::Eq) {
+                    eq
+                } else {
+                    let t = self.tmp();
+                    self.line(format!("{t} = xor i1 {eq}, true"));
+                    t
+                }
+            }
+            other => unreachable!("bad tuple op {other:?}"),
         }
     }
 

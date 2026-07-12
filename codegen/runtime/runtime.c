@@ -3,22 +3,47 @@
  * Printing matches CPython:
  * - floats use the shortest representation that round-trips, and whole
  *   floats keep their ".0" (1.0 prints as "1.0", not "1")
- * - bools print True/False; lists print like [1, 2, 3] / ['a', 'b']
+ * - bools print True/False; lists/tuples/dicts/sets print like CPython
  * - runtime errors (ZeroDivisionError, IndexError, ...) print to stderr
- *   and exit(1)
+ *   and exit(1), unless a try-frame is active (then longjmp to handler)
  *
- * Strings are immutable, length-prefixed blobs; lists are growable arrays
- * of 8-byte value slots. Both are heap-allocated and never freed — fine
- * for short-lived compiled programs, documented as a known limitation.
+ * Heap objects (str/list/tuple/dict/set) are never freed — fine for
+ * short-lived compiled programs, documented as a known limitation.
+ *
+ * Slot tags (shared list/tuple/dict/set): 0=int 1=float 2=bool 3=str
+ * 4+8*inner = nested list, 5 = tuple (self-describing), 6 = dict,
+ * 7 = set.
  */
 
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <setjmp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+/* exception type tags — keep in sync with ir::ExcType; OTHER is catchable
+ * only by bare `except:` (not by `except RuntimeError`). */
+#define PYRS_EXC_VALUE 1
+#define PYRS_EXC_KEY 2
+#define PYRS_EXC_INDEX 3
+#define PYRS_EXC_ZERODIV 4
+#define PYRS_EXC_TYPE 5
+#define PYRS_EXC_RUNTIME 6
+#define PYRS_EXC_OTHER 99
+
+/* value tags for heterogeneous containers */
+#define TAG_INT 0
+#define TAG_FLOAT 1
+#define TAG_BOOL 2
+#define TAG_STR 3
+#define TAG_TUPLE 5
+#define TAG_DICT 6
+#define TAG_SET 7
+/* list tags: 4 + 8 * elem_tag */
 
 /* layout shared with codegen: leading i64 length, then bytes (+ NUL) */
 typedef struct {
@@ -37,19 +62,164 @@ typedef struct {
 PyrsList *pyrs_list_new(long long cap);
 void pyrs_list_push(PyrsList *l, long long slot);
 
-_Noreturn void pyrs_die(const char *msg) {
+/* ---- exceptions (setjmp/longjmp try frames) ----
+ * Single-threaded process-global state (PyRs programs are not multi-threaded). */
+
+typedef struct PyrsExcFrame {
+    jmp_buf buf;
+    struct PyrsExcFrame *prev;
+} PyrsExcFrame;
+
+static PyrsExcFrame *g_exc_frames = NULL;
+static int g_exc_type = 0;
+static char g_exc_msg[512];
+
+static void *xmalloc(size_t n);
+
+static const char *exc_type_name(int ty) {
+    switch (ty) {
+    case PYRS_EXC_VALUE:
+        return "ValueError";
+    case PYRS_EXC_KEY:
+        return "KeyError";
+    case PYRS_EXC_INDEX:
+        return "IndexError";
+    case PYRS_EXC_ZERODIV:
+        return "ZeroDivisionError";
+    case PYRS_EXC_TYPE:
+        return "TypeError";
+    case PYRS_EXC_RUNTIME:
+        return "RuntimeError";
+    default:
+        return "Exception";
+    }
+}
+
+static int classify_exc_msg(const char *msg) {
+    if (strncmp(msg, "ValueError", 10) == 0) {
+        return PYRS_EXC_VALUE;
+    }
+    if (strncmp(msg, "KeyError", 8) == 0) {
+        return PYRS_EXC_KEY;
+    }
+    if (strncmp(msg, "IndexError", 10) == 0) {
+        return PYRS_EXC_INDEX;
+    }
+    if (strncmp(msg, "ZeroDivisionError", 17) == 0) {
+        return PYRS_EXC_ZERODIV;
+    }
+    if (strncmp(msg, "TypeError", 9) == 0) {
+        return PYRS_EXC_TYPE;
+    }
+    if (strncmp(msg, "RuntimeError", 12) == 0) {
+        return PYRS_EXC_RUNTIME;
+    }
+    /* UnboundLocalError, FileNotFoundError, EOFError, MemoryError, … —
+     * only bare `except:` matches (not RuntimeError). */
+    return PYRS_EXC_OTHER;
+}
+
+/* strip "Type: " prefix for the bound exception message */
+static const char *exc_msg_body(const char *full) {
+    const char *colon = strchr(full, ':');
+    if (colon != NULL && colon[1] == ' ') {
+        return colon + 2;
+    }
+    return full;
+}
+
+_Noreturn static void die_uncaught(const char *msg) {
     fflush(stdout);
     fputs(msg, stderr);
     fputc('\n', stderr);
     exit(1);
 }
 
+_Noreturn void pyrs_raise(int type, const char *msg) {
+    g_exc_type = type;
+    snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(type), msg ? msg : "");
+    if (g_exc_frames != NULL) {
+        longjmp(g_exc_frames->buf, 1);
+    }
+    die_uncaught(g_exc_msg);
+}
+
+_Noreturn void pyrs_die(const char *msg) {
+    int ty = classify_exc_msg(msg);
+    g_exc_type = ty;
+    snprintf(g_exc_msg, sizeof g_exc_msg, "%s", msg);
+    if (g_exc_frames != NULL) {
+        longjmp(g_exc_frames->buf, 1);
+    }
+    die_uncaught(msg);
+}
+
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
     if (p == NULL) {
-        pyrs_die("MemoryError: out of memory");
+        /* bypass catch frames — OOM is fatal */
+        fflush(stdout);
+        fputs("MemoryError: out of memory\n", stderr);
+        exit(1);
     }
     return p;
+}
+
+PyrsExcFrame *pyrs_try_push(void) {
+    PyrsExcFrame *f = xmalloc(sizeof(PyrsExcFrame));
+    f->prev = g_exc_frames;
+    g_exc_frames = f;
+    return f;
+}
+
+/* Note: do not wrap setjmp in a C function — longjmp must restore to the
+ * LLVM call site of setjmp (jmp_buf is the first field of PyrsExcFrame). */
+
+void pyrs_try_pop(void) {
+    if (g_exc_frames != NULL) {
+        g_exc_frames = g_exc_frames->prev;
+    }
+}
+
+int pyrs_exc_type(void) {
+    return g_exc_type;
+}
+
+/* message body only (no "Type: " prefix), as a PyrsStr */
+PyrsStr *pyrs_exc_message(void) {
+    const char *body = exc_msg_body(g_exc_msg);
+    size_t n = strlen(body);
+    PyrsStr *s = xmalloc(sizeof(long long) + n + 1);
+    s->len = (long long)n;
+    memcpy(s->data, body, n + 1);
+    return s;
+}
+
+void pyrs_exc_clear(void) {
+    g_exc_type = 0;
+    g_exc_msg[0] = '\0';
+}
+
+/* Set pending exception without longjmp (used so except-handlers can
+ * still run their try's finally before re-raising). */
+void pyrs_set_exc(int type, const char *msg) {
+    g_exc_type = type;
+    snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(type), msg ? msg : "");
+}
+
+/* Like pyrs_set_exc but `msg` is already a full "Type: body" or bare body
+ * from a die string — classify and store. */
+void pyrs_set_exc_msg(const char *msg) {
+    g_exc_type = classify_exc_msg(msg);
+    snprintf(g_exc_msg, sizeof g_exc_msg, "%s", msg ? msg : "RuntimeError");
+}
+
+/* re-raise the current exception (no active frame → print and exit) */
+_Noreturn void pyrs_reraise(void) {
+    if (g_exc_frames != NULL) {
+        longjmp(g_exc_frames->buf, 1);
+    }
+    die_uncaught(g_exc_msg[0] ? g_exc_msg : "RuntimeError: unknown error");
 }
 
 /* zero-initialized (null) str/list locals read before assignment land here
@@ -160,7 +330,54 @@ static void print_str_repr(const PyrsStr *s) {
     fputc(quote, stdout);
 }
 
-/* element tags match codegen: 0=int 1=float 2=bool 3=str */
+/* forward decls for nested printing */
+typedef struct PyrsTuple PyrsTuple;
+typedef struct PyrsDict PyrsDict;
+typedef struct PyrsSet PyrsSet;
+void pyrs_print_list(const PyrsList *l, int tag);
+void pyrs_print_tuple(const PyrsTuple *t);
+void pyrs_print_dict(const PyrsDict *d);
+void pyrs_print_set(const PyrsSet *s);
+
+static void print_slot(long long slot, int tag) {
+    switch (tag) {
+    case TAG_INT:
+        printf("%lld", slot);
+        break;
+    case TAG_FLOAT: {
+        double d;
+        memcpy(&d, &slot, sizeof d);
+        pyrs_print_float(d);
+        break;
+    }
+    case TAG_BOOL:
+        fputs(slot ? "True" : "False", stdout);
+        break;
+    case TAG_STR:
+        print_str_repr((const PyrsStr *)(uintptr_t)slot);
+        break;
+    case TAG_TUPLE:
+        pyrs_print_tuple((const PyrsTuple *)(uintptr_t)slot);
+        break;
+    case TAG_DICT:
+        pyrs_print_dict((const PyrsDict *)(uintptr_t)slot);
+        break;
+    case TAG_SET:
+        pyrs_print_set((const PyrsSet *)(uintptr_t)slot);
+        break;
+    default:
+        /* tag encoding for nested list: 4 + 8 * inner_tag */
+        if (tag >= 4 && ((tag - 4) % 8) == 0) {
+            pyrs_print_list((const PyrsList *)(uintptr_t)slot, (tag - 4) / 8);
+        } else {
+            printf("<object>");
+        }
+        break;
+    }
+}
+
+/* element tags match codegen: 0=int 1=float 2=bool 3=str; nested list 4+8*t;
+ * 5=tuple 6=dict 7=set */
 void pyrs_print_list(const PyrsList *l, int tag) {
     check_ref(l);
     fputc('[', stdout);
@@ -168,29 +385,7 @@ void pyrs_print_list(const PyrsList *l, int tag) {
         if (i > 0) {
             fputs(", ", stdout);
         }
-        long long slot = l->data[i];
-        switch (tag) {
-        case 0:
-            printf("%lld", slot);
-            break;
-        case 1: {
-            double d;
-            memcpy(&d, &slot, sizeof d);
-            pyrs_print_float(d);
-            break;
-        }
-        case 2:
-            fputs(slot ? "True" : "False", stdout);
-            break;
-        case 3:
-            print_str_repr((const PyrsStr *)slot);
-            break;
-        default:
-            /* tag >= 4: the element is itself a list; decode its element
-             * tag and recurse */
-            pyrs_print_list((const PyrsList *)slot, (tag - 4) / 8);
-            break;
-        }
+        print_slot(l->data[i], tag);
     }
     fputc(']', stdout);
 }
@@ -820,15 +1015,27 @@ PyrsList *pyrs_list_slice(const PyrsList *l, long long lo, long long hi, long lo
 }
 
 /* element tags match codegen: 0=int 1=float 2=bool 3=str;
- * list-of-X is 4 + 8 * tag(X) (recursive). */
+ * list-of-X is 4 + 8 * tag(X) (recursive); 5=tuple 6=dict 7=set. */
 static int slot_eq(long long a, long long b, int tag);
 int pyrs_list_eq(const PyrsList *a, const PyrsList *b, int tag);
+int pyrs_tuple_eq(const PyrsTuple *a, const PyrsTuple *b);
+int pyrs_dict_eq(const PyrsDict *a, const PyrsDict *b);
+int pyrs_set_eq(const PyrsSet *a, const PyrsSet *b);
 
 static int slot_eq(long long a, long long b, int tag) {
-    if (tag >= 4) {
+    if (tag == TAG_TUPLE) {
+        return pyrs_tuple_eq((const PyrsTuple *)(uintptr_t)a, (const PyrsTuple *)(uintptr_t)b);
+    }
+    if (tag == TAG_DICT) {
+        return pyrs_dict_eq((const PyrsDict *)(uintptr_t)a, (const PyrsDict *)(uintptr_t)b);
+    }
+    if (tag == TAG_SET) {
+        return pyrs_set_eq((const PyrsSet *)(uintptr_t)a, (const PyrsSet *)(uintptr_t)b);
+    }
+    if (tag >= 4 && ((tag - 4) % 8) == 0) {
         /* nested list: slots are list pointers; inner tag = (tag-4)/8 */
         int inner = (tag - 4) / 8;
-        return pyrs_list_eq((const PyrsList *)a, (const PyrsList *)b, inner);
+        return pyrs_list_eq((const PyrsList *)(uintptr_t)a, (const PyrsList *)(uintptr_t)b, inner);
     }
     switch (tag) {
     case 0:
@@ -1264,4 +1471,688 @@ long long pyrs_ipow(long long base, long long exp) {
         exp >>= 1;
     }
     return (long long)result;
+}
+
+/* ---- tuples ---- */
+
+/* Self-describing: each element carries its print/eq tag. Layout:
+ *   { i64 len; i64 *data; int *tags; }
+ * First field is len so pyrs_len works. */
+struct PyrsTuple {
+    long long len;
+    long long *data;
+    int *tags;
+};
+
+PyrsTuple *pyrs_tuple_new(long long n) {
+    if (n < 0) {
+        n = 0;
+    }
+    PyrsTuple *t = xmalloc(sizeof(PyrsTuple));
+    t->len = n;
+    t->data = n > 0 ? xmalloc((size_t)n * sizeof(long long)) : NULL;
+    t->tags = n > 0 ? xmalloc((size_t)n * sizeof(int)) : NULL;
+    return t;
+}
+
+void pyrs_tuple_set(PyrsTuple *t, long long i, long long slot, int tag) {
+    check_ref(t);
+    if (i < 0 || i >= t->len) {
+        pyrs_die("IndexError: tuple assignment index out of range");
+    }
+    t->data[i] = slot;
+    t->tags[i] = tag;
+}
+
+long long pyrs_tuple_get(const PyrsTuple *t, long long i) {
+    check_ref(t);
+    if (i < 0) {
+        i += t->len;
+    }
+    if (i < 0 || i >= t->len) {
+        pyrs_die("IndexError: tuple index out of range");
+    }
+    return t->data[i];
+}
+
+void pyrs_print_tuple(const PyrsTuple *t) {
+    check_ref(t);
+    fputc('(', stdout);
+    for (long long i = 0; i < t->len; i++) {
+        if (i > 0) {
+            fputs(", ", stdout);
+        }
+        print_slot(t->data[i], t->tags[i]);
+    }
+    if (t->len == 1) {
+        fputc(',', stdout);
+    }
+    fputc(')', stdout);
+}
+
+int pyrs_tuple_eq(const PyrsTuple *a, const PyrsTuple *b) {
+    check_ref(a);
+    check_ref(b);
+    if (a->len != b->len) {
+        return 0;
+    }
+    for (long long i = 0; i < a->len; i++) {
+        if (a->tags[i] != b->tags[i]) {
+            return 0;
+        }
+        if (!slot_eq(a->data[i], b->data[i], a->tags[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void pyrs_unpack_check(long long got, long long expected) {
+    if (got < expected) {
+        char buf[128];
+        snprintf(buf, sizeof buf,
+                 "ValueError: not enough values to unpack (expected %lld, got %lld)",
+                 expected, got);
+        pyrs_die(buf);
+    }
+    if (got > expected) {
+        char buf[128];
+        snprintf(buf, sizeof buf,
+                 "ValueError: too many values to unpack (expected %lld, got %lld)",
+                 expected, got);
+        pyrs_die(buf);
+    }
+}
+
+/* ---- dicts (open addressing + insertion order; keys: int/str) ---- */
+
+typedef struct {
+    long long key;
+    long long val;
+    int key_tag;
+    int val_tag;
+    unsigned char state; /* 0 empty, 1 full, 2 tomb */
+} DictSlot;
+
+struct PyrsDict {
+    long long len; /* item count — first field for pyrs_len */
+    long long cap;
+    DictSlot *table;
+    long long *order; /* table indices in insertion order */
+    long long order_len;
+    long long order_cap;
+};
+
+static unsigned long long hash_key(long long key, int tag) {
+    if (tag == TAG_INT) {
+        unsigned long long x = (unsigned long long)key;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31;
+        return x;
+    }
+    if (tag == TAG_STR) {
+        const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
+        unsigned long long h = 14695981039346656037ULL;
+        for (long long i = 0; i < s->len; i++) {
+            h ^= (unsigned char)s->data[i];
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+    pyrs_die("TypeError: unhashable dict/set key tag");
+    return 0;
+}
+
+static int key_eq(long long a, int at, long long b, int bt) {
+    if (at != bt) {
+        return 0;
+    }
+    return slot_eq(a, b, at);
+}
+
+PyrsDict *pyrs_dict_new(void) {
+    PyrsDict *d = xmalloc(sizeof(PyrsDict));
+    d->len = 0;
+    d->cap = 8;
+    d->table = xmalloc((size_t)d->cap * sizeof(DictSlot));
+    memset(d->table, 0, (size_t)d->cap * sizeof(DictSlot));
+    d->order_cap = 8;
+    d->order_len = 0;
+    d->order = xmalloc((size_t)d->order_cap * sizeof(long long));
+    return d;
+}
+
+static void dict_grow(PyrsDict *d);
+
+static long long dict_lookup(const PyrsDict *d, long long key, int key_tag, int *found) {
+    unsigned long long h = hash_key(key, key_tag);
+    long long mask = d->cap - 1;
+    long long i = (long long)(h & (unsigned long long)mask);
+    long long tomb = -1;
+    for (long long n = 0; n < d->cap; n++) {
+        DictSlot *s = &d->table[i];
+        if (s->state == 0) {
+            *found = 0;
+            return tomb >= 0 ? tomb : i;
+        }
+        if (s->state == 2) {
+            if (tomb < 0) {
+                tomb = i;
+            }
+        } else if (key_eq(s->key, s->key_tag, key, key_tag)) {
+            *found = 1;
+            return i;
+        }
+        i = (i + 1) & mask;
+    }
+    *found = 0;
+    return tomb >= 0 ? tomb : 0;
+}
+
+static void dict_grow(PyrsDict *d) {
+    long long old_cap = d->cap;
+    DictSlot *old = d->table;
+    long long *old_order = d->order;
+    long long old_order_len = d->order_len;
+
+    d->cap *= 2;
+    d->table = xmalloc((size_t)d->cap * sizeof(DictSlot));
+    memset(d->table, 0, (size_t)d->cap * sizeof(DictSlot));
+    d->order_cap = d->cap;
+    d->order = xmalloc((size_t)d->order_cap * sizeof(long long));
+    d->order_len = 0;
+    d->len = 0;
+
+    for (long long k = 0; k < old_order_len; k++) {
+        DictSlot *s = &old[old_order[k]];
+        if (s->state == 1) {
+            int found;
+            long long idx = dict_lookup(d, s->key, s->key_tag, &found);
+            d->table[idx] = *s;
+            d->table[idx].state = 1;
+            d->order[d->order_len++] = idx;
+            d->len++;
+        }
+    }
+    (void)old_cap;
+    (void)old; /* leaked */
+    (void)old_order;
+}
+
+void pyrs_dict_set(PyrsDict *d, long long key, int key_tag, long long val, int val_tag) {
+    check_ref(d);
+    if (d->len * 2 >= d->cap) {
+        dict_grow(d);
+    }
+    int found;
+    long long idx = dict_lookup(d, key, key_tag, &found);
+    if (found) {
+        d->table[idx].val = val;
+        d->table[idx].val_tag = val_tag;
+        return;
+    }
+    d->table[idx].key = key;
+    d->table[idx].val = val;
+    d->table[idx].key_tag = key_tag;
+    d->table[idx].val_tag = val_tag;
+    d->table[idx].state = 1;
+    if (d->order_len == d->order_cap) {
+        long long nc = d->order_cap * 2;
+        long long *no = xmalloc((size_t)nc * sizeof(long long));
+        memcpy(no, d->order, (size_t)d->order_len * sizeof(long long));
+        d->order = no;
+        d->order_cap = nc;
+    }
+    d->order[d->order_len++] = idx;
+    d->len++;
+}
+
+long long pyrs_dict_get(const PyrsDict *d, long long key, int key_tag) {
+    check_ref(d);
+    int found;
+    long long idx = dict_lookup(d, key, key_tag, &found);
+    if (!found) {
+        /* KeyError message like CPython */
+        if (key_tag == TAG_STR) {
+            /* build KeyError: '...' using repr-ish single quotes for simple keys */
+            const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
+            char buf[256];
+            if (s->len < 200) {
+                snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)s->len, s->data);
+            } else {
+                snprintf(buf, sizeof buf, "KeyError");
+            }
+            pyrs_die(buf);
+        } else {
+            char buf[64];
+            snprintf(buf, sizeof buf, "KeyError: %lld", key);
+            pyrs_die(buf);
+        }
+    }
+    return d->table[idx].val;
+}
+
+/* returns 1 and writes *out if found; else 0 */
+int pyrs_dict_get_default(const PyrsDict *d, long long key, int key_tag, long long *out) {
+    check_ref(d);
+    int found;
+    long long idx = dict_lookup(d, key, key_tag, &found);
+    if (!found) {
+        return 0;
+    }
+    *out = d->table[idx].val;
+    return 1;
+}
+
+void pyrs_dict_del(PyrsDict *d, long long key, int key_tag) {
+    check_ref(d);
+    int found;
+    long long idx = dict_lookup(d, key, key_tag, &found);
+    if (!found) {
+        if (key_tag == TAG_STR) {
+            const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
+            char buf[256];
+            snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)s->len, s->data);
+            pyrs_die(buf);
+        } else {
+            char buf[64];
+            snprintf(buf, sizeof buf, "KeyError: %lld", key);
+            pyrs_die(buf);
+        }
+    }
+    d->table[idx].state = 2;
+    d->len--;
+    /* remove from order */
+    for (long long i = 0; i < d->order_len; i++) {
+        if (d->order[i] == idx) {
+            memmove(&d->order[i], &d->order[i + 1],
+                    (size_t)(d->order_len - i - 1) * sizeof(long long));
+            d->order_len--;
+            break;
+        }
+    }
+}
+
+int pyrs_dict_contains(const PyrsDict *d, long long key, int key_tag) {
+    check_ref(d);
+    int found;
+    dict_lookup(d, key, key_tag, &found);
+    return found;
+}
+
+void pyrs_dict_clear(PyrsDict *d) {
+    check_ref(d);
+    memset(d->table, 0, (size_t)d->cap * sizeof(DictSlot));
+    d->len = 0;
+    d->order_len = 0;
+}
+
+long long pyrs_dict_pop(PyrsDict *d, long long key, int key_tag, int has_default,
+                        long long default_slot, long long *out) {
+    check_ref(d);
+    int found;
+    long long idx = dict_lookup(d, key, key_tag, &found);
+    if (!found) {
+        if (has_default) {
+            *out = default_slot;
+            return 1;
+        }
+        if (key_tag == TAG_STR) {
+            const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
+            char buf[256];
+            snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)s->len, s->data);
+            pyrs_die(buf);
+        } else {
+            char buf[64];
+            snprintf(buf, sizeof buf, "KeyError: %lld", key);
+            pyrs_die(buf);
+        }
+    }
+    *out = d->table[idx].val;
+    d->table[idx].state = 2;
+    d->len--;
+    for (long long i = 0; i < d->order_len; i++) {
+        if (d->order[i] == idx) {
+            memmove(&d->order[i], &d->order[i + 1],
+                    (size_t)(d->order_len - i - 1) * sizeof(long long));
+            d->order_len--;
+            break;
+        }
+    }
+    return 1;
+}
+
+PyrsList *pyrs_dict_keys(const PyrsDict *d) {
+    check_ref(d);
+    PyrsList *r = pyrs_list_new(d->len);
+    for (long long i = 0; i < d->order_len; i++) {
+        DictSlot *s = &d->table[d->order[i]];
+        if (s->state == 1) {
+            pyrs_list_push(r, s->key);
+        }
+    }
+    return r;
+}
+
+PyrsList *pyrs_dict_values(const PyrsDict *d) {
+    check_ref(d);
+    PyrsList *r = pyrs_list_new(d->len);
+    for (long long i = 0; i < d->order_len; i++) {
+        DictSlot *s = &d->table[d->order[i]];
+        if (s->state == 1) {
+            pyrs_list_push(r, s->val);
+        }
+    }
+    return r;
+}
+
+/* items: list of 2-tuples */
+PyrsList *pyrs_dict_items(const PyrsDict *d) {
+    check_ref(d);
+    PyrsList *r = pyrs_list_new(d->len);
+    for (long long i = 0; i < d->order_len; i++) {
+        DictSlot *s = &d->table[d->order[i]];
+        if (s->state != 1) {
+            continue;
+        }
+        PyrsTuple *t = pyrs_tuple_new(2);
+        pyrs_tuple_set(t, 0, s->key, s->key_tag);
+        pyrs_tuple_set(t, 1, s->val, s->val_tag);
+        pyrs_list_push(r, (long long)(uintptr_t)t);
+    }
+    return r;
+}
+
+/* iteration support: get key at insertion-order position i; returns 0 if done */
+int pyrs_dict_iter_key(const PyrsDict *d, long long i, long long *out_key) {
+    check_ref(d);
+    if (i < 0 || i >= d->order_len) {
+        return 0;
+    }
+    DictSlot *s = &d->table[d->order[i]];
+    if (s->state != 1) {
+        return 0;
+    }
+    *out_key = s->key;
+    return 1;
+}
+
+void pyrs_print_dict(const PyrsDict *d) {
+    check_ref(d);
+    fputc('{', stdout);
+    int first = 1;
+    for (long long i = 0; i < d->order_len; i++) {
+        DictSlot *s = &d->table[d->order[i]];
+        if (s->state != 1) {
+            continue;
+        }
+        if (!first) {
+            fputs(", ", stdout);
+        }
+        first = 0;
+        print_slot(s->key, s->key_tag);
+        fputs(": ", stdout);
+        print_slot(s->val, s->val_tag);
+    }
+    fputc('}', stdout);
+}
+
+/* structural equality (order-independent; values compared with slot_eq) */
+int pyrs_dict_eq(const PyrsDict *a, const PyrsDict *b) {
+    check_ref(a);
+    check_ref(b);
+    if (a->len != b->len) {
+        return 0;
+    }
+    for (long long i = 0; i < a->order_len; i++) {
+        DictSlot *s = &a->table[a->order[i]];
+        if (s->state != 1) {
+            continue;
+        }
+        int found;
+        long long idx = dict_lookup(b, s->key, s->key_tag, &found);
+        if (!found) {
+            return 0;
+        }
+        DictSlot *t = &b->table[idx];
+        if (s->val_tag != t->val_tag || !slot_eq(s->val, t->val, s->val_tag)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* ---- sets (same hash table shape as dict, values ignored) ---- */
+
+typedef struct {
+    long long key;
+    int key_tag;
+    unsigned char state;
+} SetSlot;
+
+struct PyrsSet {
+    long long len;
+    long long cap;
+    SetSlot *table;
+    long long *order;
+    long long order_len;
+    long long order_cap;
+};
+
+PyrsSet *pyrs_set_new(void) {
+    PyrsSet *s = xmalloc(sizeof(PyrsSet));
+    s->len = 0;
+    s->cap = 8;
+    s->table = xmalloc((size_t)s->cap * sizeof(SetSlot));
+    memset(s->table, 0, (size_t)s->cap * sizeof(SetSlot));
+    s->order_cap = 8;
+    s->order_len = 0;
+    s->order = xmalloc((size_t)s->order_cap * sizeof(long long));
+    return s;
+}
+
+static long long set_lookup(const PyrsSet *s, long long key, int key_tag, int *found) {
+    unsigned long long h = hash_key(key, key_tag);
+    long long mask = s->cap - 1;
+    long long i = (long long)(h & (unsigned long long)mask);
+    long long tomb = -1;
+    for (long long n = 0; n < s->cap; n++) {
+        SetSlot *e = &s->table[i];
+        if (e->state == 0) {
+            *found = 0;
+            return tomb >= 0 ? tomb : i;
+        }
+        if (e->state == 2) {
+            if (tomb < 0) {
+                tomb = i;
+            }
+        } else if (key_eq(e->key, e->key_tag, key, key_tag)) {
+            *found = 1;
+            return i;
+        }
+        i = (i + 1) & mask;
+    }
+    *found = 0;
+    return tomb >= 0 ? tomb : 0;
+}
+
+static void set_grow(PyrsSet *s) {
+    SetSlot *old = s->table;
+    long long *old_order = s->order;
+    long long old_order_len = s->order_len;
+    s->cap *= 2;
+    s->table = xmalloc((size_t)s->cap * sizeof(SetSlot));
+    memset(s->table, 0, (size_t)s->cap * sizeof(SetSlot));
+    s->order_cap = s->cap;
+    s->order = xmalloc((size_t)s->order_cap * sizeof(long long));
+    s->order_len = 0;
+    s->len = 0;
+    for (long long k = 0; k < old_order_len; k++) {
+        SetSlot *e = &old[old_order[k]];
+        if (e->state == 1) {
+            int found;
+            long long idx = set_lookup(s, e->key, e->key_tag, &found);
+            s->table[idx] = *e;
+            s->table[idx].state = 1;
+            s->order[s->order_len++] = idx;
+            s->len++;
+        }
+    }
+    (void)old;
+    (void)old_order;
+}
+
+void pyrs_set_add(PyrsSet *s, long long key, int key_tag) {
+    check_ref(s);
+    if (s->len * 2 >= s->cap) {
+        set_grow(s);
+    }
+    int found;
+    long long idx = set_lookup(s, key, key_tag, &found);
+    if (found) {
+        return;
+    }
+    s->table[idx].key = key;
+    s->table[idx].key_tag = key_tag;
+    s->table[idx].state = 1;
+    if (s->order_len == s->order_cap) {
+        long long nc = s->order_cap * 2;
+        long long *no = xmalloc((size_t)nc * sizeof(long long));
+        memcpy(no, s->order, (size_t)s->order_len * sizeof(long long));
+        s->order = no;
+        s->order_cap = nc;
+    }
+    s->order[s->order_len++] = idx;
+    s->len++;
+}
+
+void pyrs_set_remove(PyrsSet *s, long long key, int key_tag) {
+    check_ref(s);
+    int found;
+    long long idx = set_lookup(s, key, key_tag, &found);
+    if (!found) {
+        if (key_tag == TAG_STR) {
+            const PyrsStr *str = (const PyrsStr *)(uintptr_t)key;
+            char buf[256];
+            snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)str->len, str->data);
+            pyrs_die(buf);
+        } else {
+            char buf[64];
+            snprintf(buf, sizeof buf, "KeyError: %lld", key);
+            pyrs_die(buf);
+        }
+    }
+    s->table[idx].state = 2;
+    s->len--;
+    for (long long i = 0; i < s->order_len; i++) {
+        if (s->order[i] == idx) {
+            memmove(&s->order[i], &s->order[i + 1],
+                    (size_t)(s->order_len - i - 1) * sizeof(long long));
+            s->order_len--;
+            break;
+        }
+    }
+}
+
+void pyrs_set_discard(PyrsSet *s, long long key, int key_tag) {
+    check_ref(s);
+    int found;
+    long long idx = set_lookup(s, key, key_tag, &found);
+    if (!found) {
+        return;
+    }
+    s->table[idx].state = 2;
+    s->len--;
+    for (long long i = 0; i < s->order_len; i++) {
+        if (s->order[i] == idx) {
+            memmove(&s->order[i], &s->order[i + 1],
+                    (size_t)(s->order_len - i - 1) * sizeof(long long));
+            s->order_len--;
+            break;
+        }
+    }
+}
+
+int pyrs_set_contains(const PyrsSet *s, long long key, int key_tag) {
+    check_ref(s);
+    int found;
+    set_lookup(s, key, key_tag, &found);
+    return found;
+}
+
+void pyrs_set_clear(PyrsSet *s) {
+    check_ref(s);
+    memset(s->table, 0, (size_t)s->cap * sizeof(SetSlot));
+    s->len = 0;
+    s->order_len = 0;
+}
+
+int pyrs_set_iter_elem(const PyrsSet *s, long long i, long long *out) {
+    check_ref(s);
+    if (i < 0 || i >= s->order_len) {
+        return 0;
+    }
+    SetSlot *e = &s->table[s->order[i]];
+    if (e->state != 1) {
+        return 0;
+    }
+    *out = e->key;
+    return 1;
+}
+
+void pyrs_print_set(const PyrsSet *s) {
+    check_ref(s);
+    if (s->len == 0) {
+        fputs("set()", stdout);
+        return;
+    }
+    fputc('{', stdout);
+    int first = 1;
+    for (long long i = 0; i < s->order_len; i++) {
+        SetSlot *e = &s->table[s->order[i]];
+        if (e->state != 1) {
+            continue;
+        }
+        if (!first) {
+            fputs(", ", stdout);
+        }
+        first = 0;
+        print_slot(e->key, e->key_tag);
+    }
+    fputc('}', stdout);
+}
+
+int pyrs_set_eq(const PyrsSet *a, const PyrsSet *b) {
+    check_ref(a);
+    check_ref(b);
+    if (a->len != b->len) {
+        return 0;
+    }
+    for (long long i = 0; i < a->order_len; i++) {
+        SetSlot *e = &a->table[a->order[i]];
+        if (e->state != 1) {
+            continue;
+        }
+        int found;
+        set_lookup(b, e->key, e->key_tag, &found);
+        if (!found) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+PyrsList *pyrs_set_elements(const PyrsSet *s) {
+    check_ref(s);
+    PyrsList *r = pyrs_list_new(s->len);
+    for (long long i = 0; i < s->order_len; i++) {
+        SetSlot *e = &s->table[s->order[i]];
+        if (e->state == 1) {
+            pyrs_list_push(r, e->key);
+        }
+    }
+    return r;
 }

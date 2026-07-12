@@ -47,7 +47,44 @@ fn resolve_type(ty: ast::TypeName) -> ir::Ty {
         ast::TypeName::Str => ir::Ty::Str,
         ast::TypeName::File => ir::Ty::File,
         ast::TypeName::List(e) => ir::list_of(resolve_type(*e)),
+        ast::TypeName::Tuple(elems) => {
+            let ts: Vec<ir::Ty> = elems.iter().copied().map(resolve_type).collect();
+            ir::tuple_of(&ts)
+        }
+        // Key/element restrictions are enforced in resolve_type_checked when a
+        // span is available; bare resolve is used only for already-validated paths.
+        ast::TypeName::Dict { key, value } => ir::dict_of(resolve_type(*key), resolve_type(*value)),
+        ast::TypeName::Set(e) => ir::set_of(resolve_type(*e)),
         ast::TypeName::None => ir::Ty::None,
+    }
+}
+
+/// Resolve a type annotation with span, rejecting unsupported dict/set keys.
+fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
+    match ty {
+        ast::TypeName::Dict { key, value } => {
+            let k = resolve_type_checked(*key, span)?;
+            let v = resolve_type_checked(*value, span)?;
+            check_hashable_key(k, span, "dict")?;
+            Ok(ir::dict_of(k, v))
+        }
+        ast::TypeName::Set(e) => {
+            let elem = resolve_type_checked(*e, span)?;
+            check_hashable_key(elem, span, "set")?;
+            Ok(ir::set_of(elem))
+        }
+        ast::TypeName::List(e) => {
+            let elem = resolve_type_checked(*e, span)?;
+            Ok(ir::list_of(elem))
+        }
+        ast::TypeName::Tuple(elems) => {
+            let mut ts = Vec::with_capacity(elems.len());
+            for e in elems {
+                ts.push(resolve_type_checked(*e, span)?);
+            }
+            Ok(ir::tuple_of(&ts))
+        }
+        other => Ok(resolve_type(other)),
     }
 }
 
@@ -56,6 +93,31 @@ fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Ty> {
         ir::Ty::None => Err(err("list elements cannot be None", span)),
         ir::Ty::File => Err(err("files cannot be stored in lists yet", span)),
         other => Ok(other),
+    }
+}
+
+/// Keys for dict/set: only int and str in v0.9.
+fn check_hashable_key(ty: ir::Ty, span: Span, what: &str) -> SResult<()> {
+    match ty {
+        ir::Ty::Int | ir::Ty::Str => Ok(()),
+        other => Err(err(
+            format!(
+                "{what} keys/elements of type {other} are not supported yet \
+                 (only int and str)"
+            ),
+            span,
+        )),
+    }
+}
+
+fn ast_exc_to_ir(e: ast::ExcType) -> ir::ExcType {
+    match e {
+        ast::ExcType::ValueError => ir::ExcType::ValueError,
+        ast::ExcType::KeyError => ir::ExcType::KeyError,
+        ast::ExcType::IndexError => ir::ExcType::IndexError,
+        ast::ExcType::ZeroDivisionError => ir::ExcType::ZeroDivisionError,
+        ast::ExcType::TypeError => ir::ExcType::TypeError,
+        ast::ExcType::RuntimeError => ir::ExcType::RuntimeError,
     }
 }
 
@@ -131,8 +193,8 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 10] = [
-    "print", "len", "range", "input", "open", "abs", "min", "max", "sum", "sorted",
+const BUILTINS: [&str; 11] = [
+    "print", "len", "range", "input", "open", "abs", "min", "max", "sum", "sorted", "set",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -177,7 +239,7 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
             let mut params = Vec::new();
             let mut seen_names = std::collections::HashSet::new();
             for p in &f.params {
-                let ty = resolve_type(p.ty);
+                let ty = resolve_type_checked(p.ty, p.span)?;
                 if ty == ir::Ty::None {
                     return Err(err(
                         format!("parameter '{}' cannot have type None", p.name),
@@ -196,7 +258,10 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                     default: p.default.clone(),
                 });
             }
-            let ret = f.ret.map(resolve_type).unwrap_or(ir::Ty::None);
+            let ret = match f.ret {
+                Some(t) => resolve_type_checked(t, f.span)?,
+                Option::None => ir::Ty::None,
+            };
             funcs.insert(
                 f.name.clone(),
                 FuncSig {
@@ -219,9 +284,7 @@ fn collect_global_names(module: &ast::Module) -> std::collections::HashSet<Strin
         match &stmt.kind {
             ast::StmtKind::Assign { targets, .. } => {
                 for t in targets {
-                    if let ast::AssignTarget::Name { name, .. } = t {
-                        names.insert(name.clone());
-                    }
+                    collect_assign_names(t, &mut names);
                 }
             }
             ast::StmtKind::AugAssign {
@@ -234,6 +297,20 @@ fn collect_global_names(module: &ast::Module) -> std::collections::HashSet<Strin
         }
     }
     names
+}
+
+fn collect_assign_names(target: &ast::AssignTarget, names: &mut std::collections::HashSet<String>) {
+    match target {
+        ast::AssignTarget::Name { name, .. } => {
+            names.insert(name.clone());
+        }
+        ast::AssignTarget::Index { .. } => {}
+        ast::AssignTarget::Tuple(items) => {
+            for t in items {
+                collect_assign_names(t, names);
+            }
+        }
+    }
 }
 
 /// Build a module's import bindings (local name → target), validating that
@@ -554,7 +631,10 @@ fn lower_function(
         is_entry,
         declared_globals: std::collections::HashSet::new(),
         fn_name: f.name.clone(),
-        ret: f.ret.map(resolve_type).unwrap_or(ir::Ty::None),
+        ret: match f.ret {
+            Some(t) => resolve_type_checked(t, f.span)?,
+            Option::None => ir::Ty::None,
+        },
         locals: HashMap::new(),
         locals_order: Vec::new(),
         loop_depth: 0,
@@ -563,7 +643,7 @@ fn lower_function(
     };
 
     for p in &f.params {
-        let ty = resolve_type(p.ty);
+        let ty = resolve_type_checked(p.ty, p.span)?;
         if ctx.locals.insert(p.name.clone(), ty).is_some() {
             return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
         }
@@ -769,6 +849,56 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             }
             Ok(())
         }
+        ast::StmtKind::Delete { target } => lower_delete(target, stmt.span, ctx, out),
+        ast::StmtKind::Raise { exc, message } => {
+            let msg = lower_expr(message, ctx)?;
+            let msg = coerce(msg, ir::Ty::Str, message.span, "raise message")?;
+            out.push(ir::Stmt::Raise {
+                exc: ast_exc_to_ir(*exc),
+                message: msg,
+            });
+            Ok(())
+        }
+        ast::StmtKind::Try {
+            body,
+            handlers,
+            finally,
+        } => {
+            let body_ir = lower_block(body, ctx)?;
+            let mut handlers_ir = Vec::new();
+            for h in handlers {
+                let name = if let Some((n, span)) = &h.bind {
+                    // always a function local (even in the entry function), so
+                    // codegen can store to %v.<name>
+                    if let Some(existing) = ctx.locals.get(n) {
+                        if *existing != ir::Ty::Str {
+                            return Err(err(
+                                format!(
+                                    "type mismatch in assignment to '{n}': expected \
+                                     {existing}, found str"
+                                ),
+                                *span,
+                            ));
+                        }
+                    } else {
+                        ctx.locals.insert(n.clone(), ir::Ty::Str);
+                        ctx.locals_order.push((n.clone(), ir::Ty::Str));
+                    }
+                    Some(n.clone())
+                } else {
+                    None
+                };
+                let body_h = lower_block(&h.body, ctx)?;
+                handlers_ir.push((h.exc.map(ast_exc_to_ir), name, body_h));
+            }
+            let finally_ir = lower_block(finally, ctx)?;
+            out.push(ir::Stmt::Try {
+                body: body_ir,
+                handlers: handlers_ir,
+                finally: finally_ir,
+            });
+            Ok(())
+        }
         ast::StmtKind::AugAssign { target, op, value } => {
             lower_aug_assign(target, *op, value, stmt.span, ctx, out)
         }
@@ -790,6 +920,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     if a.ty == ir::Ty::File {
                         return Err(err("file objects cannot be printed yet", arg.span));
                     }
+                    // other types (tuple/dict/set/list/scalars) are printable
                     lowered_args.push(a);
                 }
                 out.push(ir::Stmt::Print(lowered_args));
@@ -857,11 +988,9 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
     }
 }
 
-/// `with open(...) as f:` — files only. Desugars to bind + body + close,
-/// with the close also inserted before every early exit (return, or a
-/// break/continue that leaves the with-block), matching Python's
-/// try/finally semantics. Runtime traps exit the process, so they need
-/// no handling.
+/// `with open(...) as f:` — files only. Desugars to bind +
+/// `try: body finally: f.close()`, so catchable raise/die still close
+/// the handle (same as CPython's context-manager finally).
 fn lower_with(
     item: &ast::Expr,
     target: Option<&(String, Span)>,
@@ -924,67 +1053,14 @@ fn lower_with(
         })
     };
 
-    let mut lowered = lower_block(body, ctx)?;
-    insert_closes(&mut lowered, &close_stmt(), false, ctx);
-    out.extend(lowered);
-    out.push(close_stmt());
+    // Lower as try/finally so catchable raise/die still closes the file.
+    let body_ir = lower_block(body, ctx)?;
+    out.push(ir::Stmt::Try {
+        body: body_ir,
+        handlers: vec![],
+        finally: vec![close_stmt()],
+    });
     Ok(())
-}
-
-/// Insert `close` before every statement that exits the with-block.
-/// `return` always exits (even from nested loops); `break`/`continue`
-/// exit only when they belong to a loop *enclosing* the with, i.e. when
-/// we are not inside a loop nested within the with-body.
-fn insert_closes(
-    stmts: &mut Vec<ir::Stmt>,
-    close: &ir::Stmt,
-    in_nested_loop: bool,
-    ctx: &mut FnCtx,
-) {
-    let mut i = 0;
-    while i < stmts.len() {
-        match &mut stmts[i] {
-            ir::Stmt::Return(value) => {
-                // evaluate the return value BEFORE closing: Python runs
-                // the finally after the return expression
-                if let Some(v) = value.take() {
-                    let ty = v.ty;
-                    let t = ctx.fresh_temp("with.ret", ty);
-                    let assign = ir::Stmt::Assign {
-                        name: t.clone(),
-                        value: v,
-                    };
-                    *value = Some(ir::Expr {
-                        ty,
-                        kind: ir::ExprKind::Local(t),
-                    });
-                    stmts.insert(i, close.clone());
-                    stmts.insert(i, assign);
-                    i += 2;
-                } else {
-                    stmts.insert(i, close.clone());
-                    i += 1;
-                }
-            }
-            ir::Stmt::Break | ir::Stmt::Continue if !in_nested_loop => {
-                stmts.insert(i, close.clone());
-                i += 1;
-            }
-            ir::Stmt::If { branches, orelse } => {
-                for (_, b) in branches.iter_mut() {
-                    insert_closes(b, close, in_nested_loop, ctx);
-                }
-                insert_closes(orelse, close, in_nested_loop, ctx);
-            }
-            ir::Stmt::While { body, step, .. } => {
-                // break/continue inside this loop stay inside the with
-                insert_closes(body, close, true, ctx);
-                insert_closes(step, close, true, ctx);
-            }
-            _ => {}
-        }
-        i += 1;
-    }
 }
 
 /// Method calls in statement position (`xs.append(v)`, `xs.pop()`,
@@ -1092,8 +1168,234 @@ fn lower_method_stmt(
             let call = lower_file_method(base_ir, method, method_span, args, ctx)?;
             Ok(ir::Stmt::ExprStmt(call))
         }
+        ir::Ty::Dict { key, value } => {
+            lower_dict_method_stmt(base_ir, *key, *value, method, method_span, args, ctx)
+        }
+        ir::Ty::Set(elem) => lower_set_method_stmt(base_ir, *elem, method, method_span, args, ctx),
         other => Err(err(
             format!("'{other}' has no method '{method}'"),
+            method_span,
+        )),
+    }
+}
+
+fn lower_dict_method_stmt(
+    base_ir: ir::Expr,
+    key_ty: ir::Ty,
+    val_ty: ir::Ty,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Stmt> {
+    match method {
+        "clear" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("clear() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Stmt::DictClear { dict: base_ir })
+        }
+        "get" | "pop" | "keys" | "values" | "items" => {
+            let call = lower_dict_method(base_ir, key_ty, val_ty, method, method_span, args, ctx)?;
+            Ok(ir::Stmt::ExprStmt(call))
+        }
+        _ => Err(err(
+            format!(
+                "dict method '{method}' is not supported yet (supported: get, pop, \
+                 keys, values, items, clear)"
+            ),
+            method_span,
+        )),
+    }
+}
+
+fn lower_set_method_stmt(
+    base_ir: ir::Expr,
+    elem_ty: ir::Ty,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Stmt> {
+    match method {
+        "add" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!("add() takes exactly one argument ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let v = lower_expr(&args[0], ctx)?;
+            let v = coerce(v, elem_ty, args[0].span, "set.add() argument")?;
+            Ok(ir::Stmt::SetAdd {
+                set: base_ir,
+                value: v,
+            })
+        }
+        "remove" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!("remove() takes exactly one argument ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let v = lower_expr(&args[0], ctx)?;
+            let v = coerce(v, elem_ty, args[0].span, "set.remove() argument")?;
+            Ok(ir::Stmt::SetRemove {
+                set: base_ir,
+                value: v,
+            })
+        }
+        "discard" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!(
+                        "discard() takes exactly one argument ({} given)",
+                        args.len()
+                    ),
+                    method_span,
+                ));
+            }
+            let v = lower_expr(&args[0], ctx)?;
+            let v = coerce(v, elem_ty, args[0].span, "set.discard() argument")?;
+            Ok(ir::Stmt::SetDiscard {
+                set: base_ir,
+                value: v,
+            })
+        }
+        "clear" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("clear() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Stmt::SetClear { set: base_ir })
+        }
+        _ => Err(err(
+            format!(
+                "set method '{method}' is not supported yet (supported: add, remove, \
+                 discard, clear)"
+            ),
+            method_span,
+        )),
+    }
+}
+
+fn lower_dict_method(
+    base_ir: ir::Expr,
+    key_ty: ir::Ty,
+    val_ty: ir::Ty,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    match method {
+        "get" => {
+            // Default is required: no first-class None return for missing keys.
+            if args.len() != 2 {
+                return Err(err(
+                    if args.len() == 1 {
+                        "dict.get(key) without a default is not supported yet \
+                         (None is not a first-class value); use get(key, default)"
+                            .to_string()
+                    } else {
+                        format!("get() takes 2 arguments ({} given)", args.len())
+                    },
+                    method_span,
+                ));
+            }
+            let key = lower_expr(&args[0], ctx)?;
+            let key = coerce(key, key_ty, args[0].span, "dict.get() key")?;
+            let d = lower_expr(&args[1], ctx)?;
+            let default = coerce(d, val_ty, args[1].span, "dict.get() default")?;
+            Ok(ir::Expr {
+                ty: val_ty,
+                kind: ir::ExprKind::DictGet {
+                    dict: Box::new(base_ir),
+                    key: Box::new(key),
+                    default: Box::new(default),
+                },
+            })
+        }
+        "pop" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(err(
+                    format!("pop() takes 1 or 2 arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let key = lower_expr(&args[0], ctx)?;
+            let key = coerce(key, key_ty, args[0].span, "dict.pop() key")?;
+            let default = if args.len() == 2 {
+                let d = lower_expr(&args[1], ctx)?;
+                Some(Box::new(coerce(
+                    d,
+                    val_ty,
+                    args[1].span,
+                    "dict.pop() default",
+                )?))
+            } else {
+                None
+            };
+            Ok(ir::Expr {
+                ty: val_ty,
+                kind: ir::ExprKind::DictPop {
+                    dict: Box::new(base_ir),
+                    key: Box::new(key),
+                    default,
+                },
+            })
+        }
+        "keys" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("keys() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::list_of(key_ty),
+                kind: ir::ExprKind::DictKeys(Box::new(base_ir)),
+            })
+        }
+        "values" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("values() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::list_of(val_ty),
+                kind: ir::ExprKind::DictValues(Box::new(base_ir)),
+            })
+        }
+        "items" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("items() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::list_of(ir::tuple_of(&[key_ty, val_ty])),
+                kind: ir::ExprKind::DictItems(Box::new(base_ir)),
+            })
+        }
+        "clear" => Err(err(
+            "dict.clear() returns None and cannot be used in an expression",
+            method_span,
+        )),
+        _ => Err(err(
+            format!(
+                "dict method '{method}' is not supported yet (supported: get, pop, \
+                 keys, values, items, clear)"
+            ),
             method_span,
         )),
     }
@@ -1363,14 +1665,45 @@ fn lower_assign(
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
-    let ann_ty = annotation.map(resolve_type);
-    // `xs: list[int] = [...]` / `= []`: propagate the element type
-    let lowered =
-        if let (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem))) = (&value.kind, ann_ty) {
+    let ann_ty = match annotation {
+        Some(t) => Some(resolve_type_checked(t, value.span)?),
+        Option::None => Option::None,
+    };
+    // Propagate expected types into empty / typed literals
+    let lowered = match (&value.kind, ann_ty) {
+        (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem))) => {
             lower_list_lit(items, Some(*elem), value.span, ctx)?
-        } else {
-            lower_expr(value, ctx)?
-        };
+        }
+        (ast::ExprKind::DictLit(items), Some(ir::Ty::Dict { key, value: val })) => {
+            lower_dict_lit(items, Some((*key, *val)), value.span, ctx)?
+        }
+        (ast::ExprKind::SetLit(items), Some(ir::Ty::Set(elem))) => {
+            lower_set_lit(items, Some(*elem), value.span, ctx)?
+        }
+        (ast::ExprKind::TupleLit(items), Some(ir::Ty::Tuple(elems))) => {
+            lower_tuple_lit(items, Some(elems), value.span, ctx)?
+        }
+        (
+            ast::ExprKind::Call {
+                func,
+                args,
+                keywords,
+                ..
+            },
+            Some(ir::Ty::Set(elem)),
+        ) if func == "set"
+            && args.is_empty()
+            && keywords.is_empty()
+            && !ctx.funcs().contains_key("set") =>
+        {
+            check_hashable_key(*elem, value.span, "set")?;
+            ir::Expr {
+                ty: ir::set_of(*elem),
+                kind: ir::ExprKind::SetNew,
+            }
+        }
+        _ => lower_expr(value, ctx)?,
+    };
     lower_assign_ir(target, ann_ty, lowered, value.span, ctx, out)
 }
 
@@ -1396,44 +1729,164 @@ fn lower_assign_ir(
                     value_span,
                 ));
             }
-            let (list_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
-            let value_ir = coerce(value_ir, elem, value_span, "list element assignment")?;
+            let (base_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
+            let value_ir = coerce(value_ir, elem, value_span, "item assignment")?;
             out.push(ir::Stmt::IndexAssign {
-                base: list_ir,
+                base: base_ir,
                 index: index_ir,
                 value: value_ir,
             });
             Ok(())
         }
+        ast::AssignTarget::Tuple(targets) => {
+            if ann_ty.is_some() {
+                return Err(err(
+                    "type annotations are only allowed on plain variable names",
+                    value_span,
+                ));
+            }
+            lower_unpack(targets, value_ir, value_span, ctx, out)
+        }
     }
 }
 
-/// Check and lower the target of `base[index] = ...`.
+fn lower_delete(
+    target: &ast::AssignTarget,
+    span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    match target {
+        ast::AssignTarget::Index { base, index } => {
+            let base_ir = lower_expr(base, ctx)?;
+            match base_ir.ty {
+                ir::Ty::Dict { key, .. } => {
+                    let key_ir = lower_expr(index, ctx)?;
+                    let key_ir = coerce(key_ir, *key, index.span, "dict key")?;
+                    out.push(ir::Stmt::IndexDelete {
+                        base: base_ir,
+                        index: key_ir,
+                    });
+                    Ok(())
+                }
+                other => Err(err(
+                    format!("'del' on '{other}' is not supported yet (only dict keys)"),
+                    span,
+                )),
+            }
+        }
+        _ => Err(err(
+            "'del' only supports dict item deletion (del d[key]) for now",
+            span,
+        )),
+    }
+}
+
+/// Unpack `value` into `targets` (tuple/list RHS).
+fn lower_unpack(
+    targets: &[ast::AssignTarget],
+    value_ir: ir::Expr,
+    value_span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    let n = targets.len() as i64;
+    let tmp = ctx.fresh_temp("unpack", value_ir.ty);
+    out.push(ir::Stmt::Assign {
+        name: tmp.clone(),
+        value: value_ir.clone(),
+    });
+    let seq = ir::Expr {
+        ty: value_ir.ty,
+        kind: ir::ExprKind::Local(tmp),
+    };
+
+    match value_ir.ty {
+        ir::Ty::Tuple(elems) => {
+            let got = elems.len() as i64;
+            if got < n {
+                return Err(err(
+                    format!("not enough values to unpack (expected {n}, got {got})"),
+                    value_span,
+                ));
+            }
+            if got > n {
+                return Err(err(
+                    format!("too many values to unpack (expected {n}, got {got})"),
+                    value_span,
+                ));
+            }
+            for (i, t) in targets.iter().enumerate() {
+                let elem = ir::Expr {
+                    ty: elems[i],
+                    kind: ir::ExprKind::Index {
+                        base: Box::new(seq.clone()),
+                        index: Box::new(int_const(i as i64)),
+                    },
+                };
+                lower_assign_ir(t, None, elem, value_span, ctx, out)?;
+            }
+            Ok(())
+        }
+        ir::Ty::List(elem_ty) => {
+            out.push(ir::Stmt::UnpackCheck {
+                len: ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Len(Box::new(seq.clone())),
+                },
+                expected: n,
+            });
+            for (i, t) in targets.iter().enumerate() {
+                let elem = ir::Expr {
+                    ty: *elem_ty,
+                    kind: ir::ExprKind::Index {
+                        base: Box::new(seq.clone()),
+                        index: Box::new(int_const(i as i64)),
+                    },
+                };
+                lower_assign_ir(t, None, elem, value_span, ctx, out)?;
+            }
+            Ok(())
+        }
+        other => Err(err(
+            format!("cannot unpack non-iterable {other} object"),
+            value_span,
+        )),
+    }
+}
+
+/// Check and lower the target of `base[index] = ...` (list or dict).
 fn lower_index_target(
     base: &ast::Expr,
     index: &ast::Expr,
     ctx: &mut FnCtx,
 ) -> SResult<(ir::Expr, ir::Ty, ir::Expr)> {
     let base_ir = lower_expr(base, ctx)?;
-    let elem = match base_ir.ty {
-        ir::Ty::List(e) => e,
-        ir::Ty::Str => {
-            return Err(err(
-                "'str' object does not support item assignment (strings are \
-                 immutable)",
-                base.span,
-            ));
+    match base_ir.ty {
+        ir::Ty::List(e) => {
+            let index_ir = lower_expr(index, ctx)?;
+            let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "list index")?;
+            Ok((base_ir, *e, index_ir))
         }
-        other => {
-            return Err(err(
-                format!("'{other}' object does not support item assignment"),
-                base.span,
-            ));
+        ir::Ty::Dict { key, value } => {
+            let key_ir = lower_expr(index, ctx)?;
+            let key_ir = coerce(key_ir, *key, index.span, "dict key")?;
+            Ok((base_ir, *value, key_ir))
         }
-    };
-    let index_ir = lower_expr(index, ctx)?;
-    let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "list index")?;
-    Ok((base_ir, *elem, index_ir))
+        ir::Ty::Str => Err(err(
+            "'str' object does not support item assignment (strings are \
+             immutable)",
+            base.span,
+        )),
+        ir::Ty::Tuple(_) => Err(err(
+            "'tuple' object does not support item assignment",
+            base.span,
+        )),
+        other => Err(err(
+            format!("'{other}' object does not support item assignment"),
+            base.span,
+        )),
+    }
 }
 
 /// Bind `name = value_ir`, inferring or checking the variable's type.
@@ -1580,8 +2033,9 @@ fn lower_aug_assign(
         ast::AssignTarget::Index { base, index } => {
             let (list_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
             let list_ty = list_ir.ty;
+            let idx_ty = index_ir.ty;
             let base_t = ctx.fresh_temp("aug.base", list_ty);
-            let idx_t = ctx.fresh_temp("aug.idx", ir::Ty::Int);
+            let idx_t = ctx.fresh_temp("aug.idx", idx_ty);
             out.push(ir::Stmt::Assign {
                 name: base_t.clone(),
                 value: list_ir,
@@ -1595,7 +2049,7 @@ fn lower_aug_assign(
                 kind: ir::ExprKind::Local(base_t),
             };
             let idx_local = ir::Expr {
-                ty: ir::Ty::Int,
+                ty: idx_ty,
                 kind: ir::ExprKind::Local(idx_t),
             };
             let current = ir::Expr {
@@ -1607,14 +2061,13 @@ fn lower_aug_assign(
             };
             let right = lower_expr(value, ctx)?;
             let combined = lower_binary(op, current, right, span)?;
-            let combined =
-                coerce(combined, elem, span, "list element assignment").map_err(|e| {
-                    Diagnostic::new(
-                        Phase::Semantic,
-                        format!("{}; a list element's type cannot change", e.message),
-                        e.span,
-                    )
-                })?;
+            let combined = coerce(combined, elem, span, "item assignment").map_err(|e| {
+                Diagnostic::new(
+                    Phase::Semantic,
+                    format!("{}; an item's type cannot change", e.message),
+                    e.span,
+                )
+            })?;
             out.push(ir::Stmt::IndexAssign {
                 base: base_local,
                 index: idx_local,
@@ -1622,6 +2075,10 @@ fn lower_aug_assign(
             });
             Ok(())
         }
+        ast::AssignTarget::Tuple(_) => Err(err(
+            "augmented assignment to a tuple is not supported",
+            span,
+        )),
     }
 }
 
@@ -1648,8 +2105,23 @@ fn lower_for(
     let seq = lower_expr(iter, ctx)?;
     match seq.ty {
         ir::Ty::File => lower_for_file(var, var_span, seq, body, orelse, ctx, out),
-        ir::Ty::List(_) | ir::Ty::Str => {
+        ir::Ty::List(_) | ir::Ty::Str | ir::Ty::Tuple(_) => {
             lower_for_indexed(var, var_span, seq, body, orelse, ctx, out)
+        }
+        ir::Ty::Dict { key, .. } => {
+            // `for k in d` iterates keys (insertion order)
+            let keys = ir::Expr {
+                ty: ir::list_of(*key),
+                kind: ir::ExprKind::DictKeys(Box::new(seq)),
+            };
+            lower_for_indexed(var, var_span, keys, body, orelse, ctx, out)
+        }
+        ir::Ty::Set(elem) => {
+            let els = ir::Expr {
+                ty: ir::list_of(*elem),
+                kind: ir::ExprKind::SetToList(Box::new(seq)),
+            };
+            lower_for_indexed(var, var_span, els, body, orelse, ctx, out)
         }
         other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
     }
@@ -1717,6 +2189,20 @@ fn rewrite_breaks_set_flag(stmts: Vec<ir::Stmt>, broke: &str) -> Vec<ir::Stmt> {
                         .map(|(c, b)| (c, rewrite_breaks_set_flag(b, broke)))
                         .collect(),
                     orelse: rewrite_breaks_set_flag(orelse, broke),
+                });
+            }
+            ir::Stmt::Try {
+                body,
+                handlers,
+                finally,
+            } => {
+                out.push(ir::Stmt::Try {
+                    body: rewrite_breaks_set_flag(body, broke),
+                    handlers: handlers
+                        .into_iter()
+                        .map(|(e, n, h)| (e, n, rewrite_breaks_set_flag(h, broke)))
+                        .collect(),
+                    finally: rewrite_breaks_set_flag(finally, broke),
                 });
             }
             other => out.push(other),
@@ -1828,6 +2314,23 @@ fn lower_for_indexed(
     let elem_ty = match seq.ty {
         ir::Ty::List(e) => *e,
         ir::Ty::Str => ir::Ty::Str,
+        ir::Ty::Tuple(elems) => {
+            if elems.is_empty() {
+                // loop body never runs; bind as int placeholder — use a dummy
+                ir::Ty::Int
+            } else {
+                let t0 = elems[0];
+                if elems.iter().all(|e| *e == t0) {
+                    t0
+                } else {
+                    return Err(err(
+                        "iterating a heterogeneous tuple is not supported yet; \
+                         unpack or index with constants",
+                        var_span,
+                    ));
+                }
+            }
+        }
         other => {
             return Err(err(
                 format!("internal error: lower_for_indexed on {other}"),
@@ -2144,7 +2647,13 @@ fn lower_condition(cond: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
 fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
     match value.ty {
         ir::Ty::Bool => Ok(value),
-        ir::Ty::Int | ir::Ty::Float | ir::Ty::Str | ir::Ty::List(_) => Ok(ir::Expr {
+        ir::Ty::Int
+        | ir::Ty::Float
+        | ir::Ty::Str
+        | ir::Ty::List(_)
+        | ir::Ty::Tuple(_)
+        | ir::Ty::Dict { .. }
+        | ir::Ty::Set(_) => Ok(ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::ToBool(Box::new(value)),
         }),
@@ -2231,6 +2740,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             }
         }
         ast::ExprKind::ListLit(items) => lower_list_lit(items, None, expr.span, ctx),
+        ast::ExprKind::TupleLit(items) => lower_tuple_lit(items, None, expr.span, ctx),
+        ast::ExprKind::DictLit(items) => lower_dict_lit(items, None, expr.span, ctx),
+        ast::ExprKind::SetLit(items) => lower_set_lit(items, None, expr.span, ctx),
         ast::ExprKind::ListComp {
             elem,
             var,
@@ -2240,25 +2752,85 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         } => lower_list_comp(elem, var, *var_span, iter, cond.as_deref(), expr.span, ctx),
         ast::ExprKind::Index { base, index } => {
             let base_ir = lower_expr(base, ctx)?;
-            let result_ty = match base_ir.ty {
-                ir::Ty::List(e) => *e,
-                ir::Ty::Str => ir::Ty::Str,
-                other => {
-                    return Err(err(
-                        format!("'{other}' object is not subscriptable"),
-                        base.span,
-                    ));
+            match base_ir.ty {
+                ir::Ty::List(e) => {
+                    let index_ir = lower_expr(index, ctx)?;
+                    let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "index")?;
+                    Ok(ir::Expr {
+                        ty: *e,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(base_ir),
+                            index: Box::new(index_ir),
+                        },
+                    })
                 }
-            };
-            let index_ir = lower_expr(index, ctx)?;
-            let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "index")?;
-            Ok(ir::Expr {
-                ty: result_ty,
-                kind: ir::ExprKind::Index {
-                    base: Box::new(base_ir),
-                    index: Box::new(index_ir),
-                },
-            })
+                ir::Ty::Str => {
+                    let index_ir = lower_expr(index, ctx)?;
+                    let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "index")?;
+                    Ok(ir::Expr {
+                        ty: ir::Ty::Str,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(base_ir),
+                            index: Box::new(index_ir),
+                        },
+                    })
+                }
+                ir::Ty::Tuple(elems) => {
+                    let index_ir = lower_expr(index, ctx)?;
+                    let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "index")?;
+                    // Result type: if constant index, use that element type; else
+                    // require homogeneous tuple or reject.
+                    let result_ty = if let ir::ExprKind::ConstInt(i) = index_ir.kind {
+                        let mut idx = i;
+                        if idx < 0 {
+                            idx += elems.len() as i64;
+                        }
+                        if idx >= 0 && (idx as usize) < elems.len() {
+                            elems[idx as usize]
+                        } else {
+                            return Err(err("tuple index out of range", index.span));
+                        }
+                    } else if elems.is_empty() {
+                        return Err(err(
+                            "cannot index empty tuple with a dynamic index",
+                            base.span,
+                        ));
+                    } else {
+                        let t0 = elems[0];
+                        if elems.iter().all(|e| *e == t0) {
+                            t0
+                        } else {
+                            return Err(err(
+                                "dynamic indexing into a heterogeneous tuple is not supported; \
+                                 use a constant index",
+                                index.span,
+                            ));
+                        }
+                    };
+                    Ok(ir::Expr {
+                        ty: result_ty,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(base_ir),
+                            index: Box::new(index_ir),
+                        },
+                    })
+                }
+                ir::Ty::Dict { key, value } => {
+                    let key_ir = lower_expr(index, ctx)?;
+                    let key_ir = coerce(key_ir, *key, index.span, "dict key")?;
+                    Ok(ir::Expr {
+                        ty: *value,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(base_ir),
+                            index: Box::new(key_ir),
+                        },
+                    })
+                }
+                other => Err(err(
+                    format!("'{other}' object is not subscriptable"),
+                    base.span,
+                )),
+            }
         }
         ast::ExprKind::Attribute {
             base,
@@ -2363,6 +2935,25 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     }
                     lower_file_method(base_ir, method, *method_span, args, ctx)
                 }
+                ir::Ty::Dict { key, value } => {
+                    lower_dict_method(base_ir, *key, *value, method, *method_span, args, ctx)
+                }
+                ir::Ty::Set(_) => match method.as_str() {
+                    "add" | "remove" | "discard" | "clear" => Err(err(
+                        format!(
+                            "set.{method}(...) returns None and cannot be used in an \
+                             expression"
+                        ),
+                        *method_span,
+                    )),
+                    _ => Err(err(
+                        format!(
+                            "set method '{method}' is not supported yet (supported: add, \
+                             remove, discard, clear)"
+                        ),
+                        *method_span,
+                    )),
+                },
                 other => Err(err(
                     format!("'{other}' has no method '{method}'"),
                     *method_span,
@@ -2941,6 +3532,192 @@ fn lower_list_lit(
     })
 }
 
+fn lower_tuple_lit(
+    items: &[ast::Expr],
+    expected: Option<&[ir::Ty]>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if items.is_empty() {
+        if let Some(elems) = expected
+            && !elems.is_empty()
+        {
+            return Err(err(
+                format!(
+                    "type mismatch in tuple literal: expected tuple with {} elements, got 0",
+                    elems.len()
+                ),
+                span,
+            ));
+        }
+        return Ok(ir::Expr {
+            ty: ir::tuple_of(&[]),
+            kind: ir::ExprKind::TupleLit(vec![]),
+        });
+    }
+    let mut lowered = Vec::new();
+    for item in items {
+        let e = lower_expr(item, ctx)?;
+        if e.ty == ir::Ty::None || e.ty == ir::Ty::File {
+            return Err(err(format!("tuple elements cannot be {}", e.ty), item.span));
+        }
+        lowered.push((e, item.span));
+    }
+    if let Some(elems) = expected {
+        if elems.len() != lowered.len() {
+            return Err(err(
+                format!(
+                    "type mismatch in tuple literal: expected {} elements, got {}",
+                    elems.len(),
+                    lowered.len()
+                ),
+                span,
+            ));
+        }
+        let mut coerced = Vec::new();
+        let mut tys = Vec::new();
+        for (i, (item, item_span)) in lowered.into_iter().enumerate() {
+            let c = coerce(item, elems[i], item_span, "tuple element")?;
+            tys.push(c.ty);
+            coerced.push(c);
+        }
+        return Ok(ir::Expr {
+            ty: ir::tuple_of(&tys),
+            kind: ir::ExprKind::TupleLit(coerced),
+        });
+    }
+    let tys: Vec<ir::Ty> = lowered.iter().map(|(e, _)| e.ty).collect();
+    let items_ir: Vec<ir::Expr> = lowered.into_iter().map(|(e, _)| e).collect();
+    Ok(ir::Expr {
+        ty: ir::tuple_of(&tys),
+        kind: ir::ExprKind::TupleLit(items_ir),
+    })
+}
+
+fn lower_dict_lit(
+    items: &[(ast::Expr, ast::Expr)],
+    expected: Option<(ir::Ty, ir::Ty)>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if items.is_empty() {
+        let (k, v) = expected.ok_or_else(|| {
+            err(
+                "cannot infer the type of an empty dict; annotate the variable, \
+                 e.g. 'd: dict[str, int] = {}'",
+                span,
+            )
+        })?;
+        check_hashable_key(k, span, "dict")?;
+        return Ok(ir::Expr {
+            ty: ir::dict_of(k, v),
+            kind: ir::ExprKind::DictNew,
+        });
+    }
+    let mut pairs = Vec::new();
+    for (k, v) in items {
+        let kr = lower_expr(k, ctx)?;
+        let vr = lower_expr(v, ctx)?;
+        pairs.push((kr, k.span, vr, v.span));
+    }
+    let (key_ty, val_ty) = match expected {
+        Some((k, v)) => (k, v),
+        None => {
+            let mut kt = pairs[0].0.ty;
+            let mut vt = pairs[0].2.ty;
+            for (kr, kspan, vr, vspan) in &pairs[1..] {
+                kt = join_elem_types(kt, kr.ty).ok_or_else(|| {
+                    err(
+                        format!("dict keys must share one type; found {kt} and {}", kr.ty),
+                        *kspan,
+                    )
+                })?;
+                vt = join_elem_types(vt, vr.ty).unwrap_or(vt);
+                if vt != vr.ty {
+                    // try join for values
+                    vt = join_elem_types(vt, vr.ty).ok_or_else(|| {
+                        err(
+                            format!("dict values must share one type; found {vt} and {}", vr.ty),
+                            *vspan,
+                        )
+                    })?;
+                }
+            }
+            (kt, vt)
+        }
+    };
+    check_hashable_key(key_ty, span, "dict")?;
+    if val_ty == ir::Ty::None || val_ty == ir::Ty::File {
+        return Err(err(
+            format!("dict values of type {val_ty} are not supported"),
+            span,
+        ));
+    }
+    let mut out_pairs = Vec::new();
+    for (kr, kspan, vr, vspan) in pairs {
+        let k = coerce(kr, key_ty, kspan, "dict key")?;
+        let v = coerce(vr, val_ty, vspan, "dict value")?;
+        out_pairs.push((k, v));
+    }
+    Ok(ir::Expr {
+        ty: ir::dict_of(key_ty, val_ty),
+        kind: ir::ExprKind::DictLit(out_pairs),
+    })
+}
+
+fn lower_set_lit(
+    items: &[ast::Expr],
+    expected: Option<ir::Ty>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if items.is_empty() {
+        let elem = expected.ok_or_else(|| {
+            err(
+                "cannot infer the element type of an empty set; use set() with an \
+                 annotation, e.g. 's: set[int] = set()'",
+                span,
+            )
+        })?;
+        check_hashable_key(elem, span, "set")?;
+        return Ok(ir::Expr {
+            ty: ir::set_of(elem),
+            kind: ir::ExprKind::SetNew,
+        });
+    }
+    let mut lowered = Vec::new();
+    for item in items {
+        lowered.push((lower_expr(item, ctx)?, item.span));
+    }
+    let elem = match expected {
+        Some(e) => e,
+        None => {
+            let mut ty = lowered[0].0.ty;
+            for (item, item_span) in &lowered[1..] {
+                ty = join_elem_types(ty, item.ty).ok_or_else(|| {
+                    err(
+                        format!(
+                            "set elements must share one type; found {} and {}",
+                            ty, item.ty
+                        ),
+                        *item_span,
+                    )
+                })?;
+            }
+            ty
+        }
+    };
+    check_hashable_key(elem, span, "set")?;
+    let mut coerced = Vec::new();
+    for (item, item_span) in lowered {
+        coerced.push(coerce(item, elem, item_span, "set element")?);
+    }
+    Ok(ir::Expr {
+        ty: ir::set_of(elem),
+        kind: ir::ExprKind::SetLit(coerced),
+    })
+}
+
 fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
     match (a, b) {
         _ if a == b => Some(a),
@@ -3158,6 +3935,11 @@ fn lower_call(
                      in an expression",
                 span,
             )),
+            "set" => Err(err(
+                "set() requires a type annotation on the target, e.g. \
+                 's: set[int] = set()'",
+                span,
+            )),
             "len" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -3166,7 +3948,14 @@ fn lower_call(
                     ));
                 }
                 let arg = lower_expr(&args[0], ctx)?;
-                if !matches!(arg.ty, ir::Ty::Str | ir::Ty::List(_)) {
+                if !matches!(
+                    arg.ty,
+                    ir::Ty::Str
+                        | ir::Ty::List(_)
+                        | ir::Ty::Tuple(_)
+                        | ir::Ty::Dict { .. }
+                        | ir::Ty::Set(_)
+                ) {
                     return Err(err(
                         format!("object of type '{}' has no len()", arg.ty),
                         args[0].span,
@@ -3441,7 +4230,13 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
         },
         ast::TypeName::Bool => match value.ty {
             ir::Ty::Bool => Ok(value),
-            ir::Ty::Int | ir::Ty::Float | ir::Ty::Str | ir::Ty::List(_) => Ok(ir::Expr {
+            ir::Ty::Int
+            | ir::Ty::Float
+            | ir::Ty::Str
+            | ir::Ty::List(_)
+            | ir::Ty::Tuple(_)
+            | ir::Ty::Dict { .. }
+            | ir::Ty::Set(_) => Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::ToBool(Box::new(value)),
             }),
@@ -3464,6 +4259,15 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             other => Err(err(format!("str() cannot convert {other} yet"), span)),
         },
         ast::TypeName::List(_) => Err(err("list(...) conversions are not supported", span)),
+        ast::TypeName::Tuple(_) => Err(err("tuple(...) conversions are not supported", span)),
+        ast::TypeName::Dict { .. } => Err(err(
+            "dict(...) conversions are not supported; use a literal or annotate '{}'",
+            span,
+        )),
+        ast::TypeName::Set(_) => Err(err(
+            "set(iterable) is not supported yet; use a set literal or set() with annotation",
+            span,
+        )),
         ast::TypeName::File => Err(err(
             "file() is not a conversion; use open(path) to open a file",
             span,
@@ -3567,6 +4371,10 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
     // ---- list + / * ----
     if matches!(l.ty, ir::Ty::List(_)) || matches!(r.ty, ir::Ty::List(_)) {
         return lower_list_binary(op, l, r, span);
+    }
+    // ---- tuple equality ----
+    if matches!(l.ty, ir::Ty::Tuple(_)) || matches!(r.ty, ir::Ty::Tuple(_)) {
+        return lower_tuple_binary(op, l, r, span);
     }
 
     match op {
@@ -3676,7 +4484,7 @@ fn comparison_ir_op(op: ast::BinOp) -> ir::BinOp {
     }
 }
 
-/// `needle in haystack` / `not in`: substring test or list membership.
+/// `needle in haystack` / `not in`: substring, list/set membership, dict keys.
 fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
     let needle = match r.ty {
         ir::Ty::Str => {
@@ -3692,6 +4500,11 @@ fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResu
             return Err(err("'in' is not supported for lists of lists yet", span));
         }
         ir::Ty::List(elem) => coerce(l, *elem, span, "'in' operand")?,
+        ir::Ty::Dict { key, .. } => coerce(l, *key, span, "'in' dict key")?,
+        ir::Ty::Set(elem) => coerce(l, *elem, span, "'in' set element")?,
+        ir::Ty::Tuple(_) => {
+            return Err(err("membership test on tuples is not supported yet", span));
+        }
         other => {
             return Err(err(format!("'{other}' does not support 'in'"), span));
         }
@@ -3713,6 +4526,36 @@ fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResu
         });
     }
     Ok(contains)
+}
+
+fn lower_tuple_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match op {
+        ast::BinOp::Eq | ast::BinOp::NotEq => match (l.ty, r.ty) {
+            (ir::Ty::Tuple(a), ir::Ty::Tuple(b)) if a == b => Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: if matches!(op, ast::BinOp::Eq) {
+                        ir::BinOp::Eq
+                    } else {
+                        ir::BinOp::Ne
+                    },
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+            }),
+            (ir::Ty::Tuple(_), ir::Ty::Tuple(_)) => {
+                Err(err(format!("cannot compare {} and {}", l.ty, r.ty), span))
+            }
+            _ => Err(err(
+                format!("'{}' is not comparable with '{}'", l.ty, r.ty),
+                span,
+            )),
+        },
+        other => Err(err(
+            format!("operator '{other}' is not supported for tuples yet"),
+            span,
+        )),
+    }
 }
 
 fn lower_list_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
@@ -3861,8 +4704,8 @@ fn block_returns(stmts: &[ir::Stmt]) -> bool {
 fn stmt_returns(stmt: &ir::Stmt) -> bool {
     match stmt {
         ir::Stmt::Return(_) => true,
-        // Die exits the process; the path cannot fall through
-        ir::Stmt::Die(_) => true,
+        // Die / Raise exit the process or transfer; cannot fall through
+        ir::Stmt::Die(_) | ir::Stmt::Raise { .. } => true,
         ir::Stmt::If { branches, orelse } => {
             !orelse.is_empty()
                 && branches.iter().all(|(_, body)| block_returns(body))
@@ -3872,8 +4715,49 @@ fn stmt_returns(stmt: &ir::Stmt) -> bool {
         ir::Stmt::While { cond, body, .. } => {
             matches!(cond.kind, ir::ExprKind::ConstBool(true)) && !loop_breaks(body)
         }
+        // No fall-through past the try. Finally runs on every exit; if it
+        // never falls through (return/raise), the try never falls through.
+        // Otherwise combine body + handlers (raise in body alone is not
+        // enough when a handler can fall through).
+        ir::Stmt::Try {
+            body,
+            handlers,
+            finally,
+        } => {
+            if block_returns(finally) {
+                return true;
+            }
+            if !block_returns(body) {
+                return false;
+            }
+            if !block_may_raise(body) {
+                return true;
+            }
+            handlers.iter().all(|(_, _, h)| block_returns(h))
+        }
         _ => false,
     }
+}
+
+/// Conservative: body may transfer via raise/die (so except handlers matter).
+fn block_may_raise(stmts: &[ir::Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        ir::Stmt::Raise { .. } | ir::Stmt::Die(_) => true,
+        ir::Stmt::If { branches, orelse } => {
+            branches.iter().any(|(_, b)| block_may_raise(b)) || block_may_raise(orelse)
+        }
+        ir::Stmt::While { body, step, .. } => block_may_raise(body) || block_may_raise(step),
+        ir::Stmt::Try {
+            body,
+            handlers,
+            finally,
+        } => {
+            block_may_raise(body)
+                || handlers.iter().any(|(_, _, h)| block_may_raise(h))
+                || block_may_raise(finally)
+        }
+        _ => false,
+    })
 }
 
 /// Does this loop body contain a `break` for *this* loop (not a nested one)?
@@ -3885,6 +4769,15 @@ fn loop_breaks(stmts: &[ir::Stmt]) -> bool {
         }
         // a break inside a nested while belongs to that while
         ir::Stmt::While { .. } => false,
+        ir::Stmt::Try {
+            body,
+            handlers,
+            finally,
+        } => {
+            loop_breaks(body)
+                || handlers.iter().any(|(_, _, h)| loop_breaks(h))
+                || loop_breaks(finally)
+        }
         _ => false,
     })
 }
@@ -4791,5 +5684,129 @@ print(count([]))
     fn error_fstring_dot_nf_on_str() {
         let e = analyze_err("s = \"hi\"\nt = f\"{s:.2f}\"\n");
         assert!(e.message.contains("format code"), "{}", e.message);
+    }
+
+    #[test]
+    fn tuple_literal_and_unpack() {
+        let m = analyze_ok("a, b = 1, 2\nprint(a)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(
+            entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::Assign { .. }))
+        );
+    }
+
+    #[test]
+    fn tuple_unpack_length_mismatch_is_error() {
+        let e = analyze_err("a, b = (1,)\n");
+        assert!(e.message.contains("not enough values"), "{}", e.message);
+        let e = analyze_err("a, b = (1, 2, 3)\n");
+        assert!(e.message.contains("too many values"), "{}", e.message);
+    }
+
+    #[test]
+    fn dict_key_type_rejected_in_annotation() {
+        let e = analyze_err("d: dict[float, int] = {}\n");
+        assert!(
+            e.message.contains("not supported") || e.message.contains("only int"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn dict_get_requires_default() {
+        let e = analyze_err("d: dict[str, int] = {\"a\": 1}\nx = d.get(\"a\")\n");
+        assert!(e.message.contains("default"), "{}", e.message);
+    }
+
+    #[test]
+    fn set_empty_needs_annotation() {
+        let e = analyze_err("s = set()\n");
+        assert!(
+            e.message.contains("annotation") || e.message.contains("set()"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn hetero_tuple_for_is_error() {
+        let e = analyze_err("t = (1, \"a\")\nfor x in t:\n    print(x)\n");
+        assert!(e.message.contains("heterogeneous"), "{}", e.message);
+    }
+
+    #[test]
+    fn raise_and_try_lower() {
+        let m = analyze_ok(
+            "\
+try:
+    raise ValueError(\"x\")
+except ValueError as e:
+    print(e)
+finally:
+    print(\"f\")
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(entry.body.iter().any(|s| matches!(s, ir::Stmt::Try { .. })));
+    }
+
+    #[test]
+    fn raise_counts_as_return_path() {
+        let m = analyze_ok(
+            "\
+def f(x: int) -> int:
+    if x < 0:
+        raise ValueError(\"neg\")
+    return x
+
+print(f(1))
+",
+        );
+        assert_eq!(find_func(&m, "f").ret, ir::Ty::Int);
+    }
+
+    #[test]
+    fn try_raise_except_pass_missing_return() {
+        // body raises but except falls through — not a valid -> int path
+        let e = analyze_err(
+            "\
+def f() -> int:
+    try:
+        raise ValueError(\"x\")
+    except ValueError:
+        pass
+print(1)
+",
+        );
+        assert!(
+            e.message.contains("return") || e.message.contains("end of its body"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn try_return_is_ok_with_dead_handler() {
+        let m = analyze_ok(
+            "\
+def f() -> int:
+    try:
+        return 1
+    except ValueError:
+        pass
+print(f())
+",
+        );
+        assert_eq!(find_func(&m, "f").ret, ir::Ty::Int);
+    }
+
+    #[test]
+    fn tuple_membership_not_supported_yet() {
+        let e = analyze_err("print(1 in (1, 2))\n");
+        assert!(e.message.contains("not supported yet"), "{}", e.message);
     }
 }

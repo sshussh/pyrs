@@ -136,6 +136,12 @@ pub enum Token {
     File,
     #[token("list")]
     List,
+    #[token("tuple")]
+    Tuple,
+    #[token("dict")]
+    Dict,
+    #[token("set")]
+    Set,
 
     // Literals
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
@@ -292,6 +298,9 @@ fn token_text(token: &Token) -> &'static str {
         Token::Str => "str",
         Token::File => "file",
         Token::List => "list",
+        Token::Tuple => "tuple",
+        Token::Dict => "dict",
+        Token::Set => "set",
         Token::Plus => "+",
         Token::Minus => "-",
         Token::Star => "*",

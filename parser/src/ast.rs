@@ -3,8 +3,8 @@
 use common::Span;
 
 /// A builtin type name as written in annotations (`x: int`, `-> float`).
-/// `List` interns its element (`&'static`) so the enum stays `Copy` while
-/// types nest (`list[list[int]]`).
+/// `List` / container types intern nested pieces (`&'static`) so the enum
+/// stays `Copy` while types nest (`list[list[int]]`, `tuple[int, str]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeName {
     Int,
@@ -14,6 +14,15 @@ pub enum TypeName {
     /// Open file handle from `open(...)` (not CPython's typing.IO name).
     File,
     List(&'static TypeName),
+    /// Heterogeneous fixed-arity tuple: `tuple[int, str]`, empty `tuple[()]`.
+    Tuple(&'static [TypeName]),
+    /// `dict[K, V]` — keys are restricted in semantic (int/str).
+    Dict {
+        key: &'static TypeName,
+        value: &'static TypeName,
+    },
+    /// `set[T]` — elements restricted like dict keys in semantic.
+    Set(&'static TypeName),
     /// `-> None`: the function returns nothing.
     None,
 }
@@ -27,8 +36,53 @@ impl std::fmt::Display for TypeName {
             TypeName::Str => write!(f, "str"),
             TypeName::File => write!(f, "file"),
             TypeName::List(e) => write!(f, "list[{e}]"),
+            TypeName::Tuple(elems) => {
+                if elems.is_empty() {
+                    return write!(f, "tuple[()]");
+                }
+                write!(f, "tuple[")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                write!(f, "]")
+            }
+            TypeName::Dict { key, value } => write!(f, "dict[{key}, {value}]"),
+            TypeName::Set(e) => write!(f, "set[{e}]"),
             TypeName::None => write!(f, "None"),
         }
+    }
+}
+
+/// Exception type name used in `raise` / `except`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcType {
+    ValueError,
+    KeyError,
+    IndexError,
+    ZeroDivisionError,
+    TypeError,
+    RuntimeError,
+}
+
+impl ExcType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExcType::ValueError => "ValueError",
+            ExcType::KeyError => "KeyError",
+            ExcType::IndexError => "IndexError",
+            ExcType::ZeroDivisionError => "ZeroDivisionError",
+            ExcType::TypeError => "TypeError",
+            ExcType::RuntimeError => "RuntimeError",
+        }
+    }
+}
+
+impl std::fmt::Display for ExcType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -83,6 +137,8 @@ pub enum AssignTarget {
         base: Expr,
         index: Expr,
     },
+    /// `a, b = ...` / nested unpacking targets.
+    Tuple(Vec<AssignTarget>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +178,10 @@ pub enum StmtKind {
         op: BinOp,
         value: Expr,
     },
+    /// `del target` — currently `del d[k]` for dicts.
+    Delete {
+        target: AssignTarget,
+    },
     ExprStmt(Expr),
     /// `global name, ...` — declares that assignments in this function
     /// target module-level variables.
@@ -146,9 +206,30 @@ pub enum StmtKind {
         target: Option<(String, Span)>,
         body: Vec<Stmt>,
     },
+    /// `raise ExcType(msg)` — msg is a str expression.
+    Raise {
+        exc: ExcType,
+        message: Expr,
+    },
+    /// `try` / `except` / `finally`.
+    Try {
+        body: Vec<Stmt>,
+        handlers: Vec<ExceptHandler>,
+        finally: Vec<Stmt>,
+    },
     Pass,
     Break,
     Continue,
+}
+
+/// One `except` clause under a `try`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExceptHandler {
+    /// `None` = bare `except:`.
+    pub exc: Option<ExcType>,
+    /// Optional `as name` binding (message string at runtime).
+    pub bind: Option<(String, Span)>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +358,12 @@ pub enum ExprKind {
     JoinedStr(Vec<FStringPart>),
     /// `[a, b, c]`
     ListLit(Vec<Expr>),
+    /// `(a, b)`, `(a,)`, `()` — also bare `a, b` in assign/return contexts.
+    TupleLit(Vec<Expr>),
+    /// `{k: v, ...}`
+    DictLit(Vec<(Expr, Expr)>),
+    /// `{a, b, ...}` — nonempty; empty set is `set()`.
+    SetLit(Vec<Expr>),
     /// `[elem for var in iter if cond]`
     ListComp {
         elem: Box<Expr>,

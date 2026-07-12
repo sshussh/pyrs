@@ -113,7 +113,6 @@ impl Parser {
                 Ok(())
             }
             Token::Dedent | Token::EOF => Ok(()),
-            Token::Comma => Err(self.error("tuples and multiple assignment are not supported yet")),
             other => Err(self.error(format!(
                 "expected end of line after statement, found {}",
                 other.describe()
@@ -144,7 +143,7 @@ impl Parser {
             Token::Class => Err(self.error("classes are not supported yet")),
             Token::Import => self.parse_import(),
             Token::From => self.parse_from_import(),
-            Token::Try | Token::Raise => Err(self.error("exceptions are not supported yet")),
+            Token::Try => self.parse_try(),
             Token::Match => Err(self.error("'match' statements are not supported yet")),
             Token::With => self.parse_with(),
             Token::Indent => Err(self.error("unexpected indent")),
@@ -163,11 +162,22 @@ impl Parser {
                 self.advance();
                 let value = match self.peek() {
                     Token::Newline | Token::Dedent | Token::EOF => None,
-                    _ => Some(self.parse_expr()?),
+                    _ => Some(self.parse_tuple_or_expr()?),
                 };
                 let end = value.as_ref().map(|e| e.span).unwrap_or(start);
                 Ok(Stmt {
                     kind: StmtKind::Return(value),
+                    span: start.to(end),
+                })
+            }
+            Token::Raise => self.parse_raise(),
+            Token::Del => {
+                self.advance();
+                let target_expr = self.parse_tuple_or_expr()?;
+                let target = self.expr_to_target(target_expr)?;
+                let end = target_span(&target);
+                Ok(Stmt {
+                    kind: StmtKind::Delete { target },
                     span: start.to(end),
                 })
             }
@@ -215,7 +225,7 @@ impl Parser {
     /// Parse an expression, then decide: plain/annotated/augmented
     /// assignment (if a valid target) or an expression statement.
     fn parse_assign_or_expr(&mut self) -> PResult<Stmt> {
-        let expr = self.parse_expr()?;
+        let expr = self.parse_tuple_or_expr()?;
 
         let aug_op = match self.peek() {
             Token::PlusEq => Some(BinOp::Add),
@@ -233,7 +243,7 @@ impl Parser {
             let mut targets = vec![self.expr_to_target(expr)?];
             // `a = b = c = value` — more targets while RHS is itself assigned
             let value = loop {
-                let next = self.parse_expr()?;
+                let next = self.parse_tuple_or_expr()?;
                 if self.peek() == &Token::Eq {
                     self.advance();
                     targets.push(self.expr_to_target(next)?);
@@ -263,7 +273,7 @@ impl Parser {
                 Token::Eq,
                 "after type annotation (declarations require a value)",
             )?;
-            let value = self.parse_expr()?;
+            let value = self.parse_tuple_or_expr()?;
             if self.peek() == &Token::Eq {
                 return Err(
                     self.error("type annotations are not allowed in multi-target assignment")
@@ -282,6 +292,9 @@ impl Parser {
         }
 
         if let Some(op) = aug_op {
+            if matches!(expr.kind, ExprKind::TupleLit(_)) {
+                return Err(self.error("illegal expression for augmented assignment"));
+            }
             self.advance();
             let target = self.expr_to_target(expr)?;
             let value = self.parse_expr()?;
@@ -299,6 +312,48 @@ impl Parser {
         })
     }
 
+    /// `expr (',' expr)* [',']` — a single expression, or a tuple when a
+    /// comma appears (including trailing comma for 1-tuples).
+    fn parse_tuple_or_expr(&mut self) -> PResult<Expr> {
+        let first = self.parse_expr()?;
+        if self.peek() != &Token::Comma {
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while self.eat(&Token::Comma) {
+            if self.tuple_list_ends() {
+                break;
+            }
+            items.push(self.parse_expr()?);
+        }
+        let span = items[0].span.to(items.last().unwrap().span);
+        Ok(Expr {
+            kind: ExprKind::TupleLit(items),
+            span,
+        })
+    }
+
+    fn tuple_list_ends(&self) -> bool {
+        matches!(
+            self.peek(),
+            Token::Newline
+                | Token::Dedent
+                | Token::EOF
+                | Token::RParen
+                | Token::RBracket
+                | Token::RBrace
+                | Token::Colon
+                | Token::Eq
+                | Token::PlusEq
+                | Token::MinusEq
+                | Token::StarEq
+                | Token::SlashEq
+                | Token::DoubleSlashEq
+                | Token::PercentEq
+                | Token::DoubleStarEq
+        )
+    }
+
     fn expr_to_target(&self, expr: Expr) -> PResult<AssignTarget> {
         match expr.kind {
             ExprKind::Name(name) => Ok(AssignTarget::Name {
@@ -309,6 +364,20 @@ impl Parser {
                 base: *base,
                 index: *index,
             }),
+            ExprKind::TupleLit(items) => {
+                if items.is_empty() {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        "cannot assign to empty tuple",
+                        expr.span,
+                    ));
+                }
+                let mut targets = Vec::with_capacity(items.len());
+                for item in items {
+                    targets.push(self.expr_to_target(item)?);
+                }
+                Ok(AssignTarget::Tuple(targets))
+            }
             _ => Err(Diagnostic::new(
                 Phase::Parse,
                 "cannot assign to this expression",
@@ -367,16 +436,186 @@ impl Parser {
                 self.expect(Token::RBracket, "to close 'list[...]'")?;
                 Ok(TypeName::List(Box::leak(Box::new(elem))))
             }
+            Token::Tuple => {
+                self.advance();
+                self.expect(Token::LBracket, "after 'tuple' (e.g. 'tuple[int, str]')")?;
+                // empty tuple type: tuple[()]
+                if self.peek() == &Token::LParen {
+                    self.advance();
+                    self.expect(Token::RParen, "inside empty tuple type 'tuple[()]'")?;
+                    self.expect(Token::RBracket, "to close 'tuple[()]'")?;
+                    return Ok(TypeName::Tuple(&[]));
+                }
+                let mut elems = Vec::new();
+                if self.peek() != &Token::RBracket {
+                    loop {
+                        let elem = self.parse_type_name("inside 'tuple[...]'")?;
+                        if elem == TypeName::None {
+                            return Err(self.error("tuple elements cannot be None"));
+                        }
+                        if elem == TypeName::File {
+                            return Err(self.error("tuple elements cannot be file"));
+                        }
+                        elems.push(elem);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                        if self.peek() == &Token::RBracket {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Token::RBracket, "to close 'tuple[...]'")?;
+                Ok(TypeName::Tuple(Box::leak(elems.into_boxed_slice())))
+            }
+            Token::Dict => {
+                self.advance();
+                self.expect(Token::LBracket, "after 'dict' (e.g. 'dict[str, int]')")?;
+                let key = self.parse_type_name("as dict key type")?;
+                self.expect(Token::Comma, "between dict key and value types")?;
+                let value = self.parse_type_name("as dict value type")?;
+                if key == TypeName::None || value == TypeName::None {
+                    return Err(self.error("dict key/value types cannot be None"));
+                }
+                if key == TypeName::File || value == TypeName::File {
+                    return Err(self.error("dict key/value types cannot be file"));
+                }
+                self.expect(Token::RBracket, "to close 'dict[...]'")?;
+                Ok(TypeName::Dict {
+                    key: Box::leak(Box::new(key)),
+                    value: Box::leak(Box::new(value)),
+                })
+            }
+            Token::Set => {
+                self.advance();
+                self.expect(Token::LBracket, "after 'set' (e.g. 'set[int]')")?;
+                let elem = self.parse_type_name("inside 'set[...]'")?;
+                if elem == TypeName::None {
+                    return Err(self.error("set elements cannot be None"));
+                }
+                if elem == TypeName::File {
+                    return Err(self.error("set elements cannot be file"));
+                }
+                self.expect(Token::RBracket, "to close 'set[...]'")?;
+                Ok(TypeName::Set(Box::leak(Box::new(elem))))
+            }
             Token::None => {
                 self.advance();
                 Ok(TypeName::None)
             }
             other => Err(self.error(format!(
-                "expected a type ('int', 'float', 'bool', 'str', 'file', 'list[...]' or 'None') {}, found {}",
+                "expected a type ('int', 'float', 'bool', 'str', 'file', 'list[...]', \
+                 'tuple[...]', 'dict[...]', 'set[...]' or 'None') {}, found {}",
                 context,
                 other.describe()
             ))),
         }
+    }
+
+    fn parse_raise(&mut self) -> PResult<Stmt> {
+        let start = self.expect(Token::Raise, "")?;
+        let (exc, exc_span) = self.parse_exc_type("after 'raise'")?;
+        self.expect(
+            Token::LParen,
+            "after exception type (e.g. raise ValueError(\"msg\"))",
+        )?;
+        let message = self.parse_expr()?;
+        let close = self.expect(Token::RParen, "after raise argument")?;
+        Ok(Stmt {
+            kind: StmtKind::Raise { exc, message },
+            span: start.to(close).to(exc_span),
+        })
+    }
+
+    fn parse_exc_type(&mut self, context: &str) -> PResult<(ExcType, Span)> {
+        let span = self.peek_span();
+        let name = match self.peek().clone() {
+            Token::Ident(n) => {
+                self.advance();
+                n
+            }
+            other => {
+                return Err(self.error(format!(
+                    "expected an exception type {}, found {}",
+                    context,
+                    other.describe()
+                )));
+            }
+        };
+        let exc = match name.as_str() {
+            "ValueError" => ExcType::ValueError,
+            "KeyError" => ExcType::KeyError,
+            "IndexError" => ExcType::IndexError,
+            "ZeroDivisionError" => ExcType::ZeroDivisionError,
+            "TypeError" => ExcType::TypeError,
+            "RuntimeError" => ExcType::RuntimeError,
+            other => {
+                return Err(Diagnostic::new(
+                    Phase::Parse,
+                    format!(
+                        "unknown exception type '{other}'; supported: ValueError, KeyError, \
+                         IndexError, ZeroDivisionError, TypeError, RuntimeError"
+                    ),
+                    span,
+                ));
+            }
+        };
+        Ok((exc, span))
+    }
+
+    fn parse_try(&mut self) -> PResult<Stmt> {
+        let start = self.expect(Token::Try, "")?;
+        let body = self.parse_block("'try' body")?;
+        let mut handlers = Vec::new();
+        while self.peek() == &Token::Except {
+            self.advance();
+            let (exc, bind) = if self.peek() == &Token::Colon {
+                (None, None)
+            } else {
+                let (exc, _) = self.parse_exc_type("after 'except'")?;
+                let bind = if self.eat(&Token::As) {
+                    let (name, span) = self.expect_ident("after 'as'")?;
+                    Some((name, span))
+                } else {
+                    None
+                };
+                (Some(exc), bind)
+            };
+            let handler_body = self.parse_block("'except' body")?;
+            handlers.push(ExceptHandler {
+                exc,
+                bind,
+                body: handler_body,
+            });
+        }
+        let finally = if self.peek() == &Token::Finally {
+            self.advance();
+            self.parse_block("'finally' body")?
+        } else {
+            vec![]
+        };
+        if handlers.is_empty() && finally.is_empty() {
+            return Err(self.error("expected 'except' or 'finally' after 'try'"));
+        }
+        // bare except must be last
+        let mut saw_bare = false;
+        for h in &handlers {
+            if saw_bare {
+                return Err(self.error("default 'except:' must be last"));
+            }
+            if h.exc.is_none() {
+                saw_bare = true;
+            }
+        }
+        let end = self.peek_span();
+        Ok(Stmt {
+            kind: StmtKind::Try {
+                body,
+                handlers,
+                finally,
+            },
+            span: start.to(end),
+        })
     }
 
     fn parse_funcdef(&mut self) -> PResult<Stmt> {
@@ -1047,6 +1286,21 @@ impl Parser {
                 "list() is not supported; use a literal like '[]' with a type \
                  annotation, e.g. 'xs: list[int] = []'",
             )),
+            // `set()` empty constructor (typed via annotation in semantic)
+            Token::Set => {
+                self.advance();
+                self.expect(Token::LParen, "after 'set'")?;
+                let close = self.expect(Token::RParen, "after set() (empty set only)")?;
+                Ok(Expr {
+                    kind: ExprKind::Call {
+                        func: "set".to_string(),
+                        func_span: span,
+                        args: vec![],
+                        keywords: vec![],
+                    },
+                    span: span.to(close),
+                })
+            }
             Token::Ident(name) => {
                 self.advance();
                 if self.peek() == &Token::LParen {
@@ -1070,12 +1324,30 @@ impl Parser {
             }
             Token::LParen => {
                 self.advance();
-                let expr = self.parse_expr()?;
+                if self.peek() == &Token::RParen {
+                    let close = self.expect(Token::RParen, "to close empty tuple")?;
+                    return Ok(Expr {
+                        kind: ExprKind::TupleLit(vec![]),
+                        span: span.to(close),
+                    });
+                }
+                let first = self.parse_expr()?;
                 if self.peek() == &Token::Comma {
-                    return Err(self.error("tuples are not supported yet"));
+                    let mut items = vec![first];
+                    while self.eat(&Token::Comma) {
+                        if self.peek() == &Token::RParen {
+                            break;
+                        }
+                        items.push(self.parse_expr()?);
+                    }
+                    let close = self.expect(Token::RParen, "to close the tuple")?;
+                    return Ok(Expr {
+                        kind: ExprKind::TupleLit(items),
+                        span: span.to(close),
+                    });
                 }
                 self.expect(Token::RParen, "to close the parenthesized expression")?;
-                Ok(expr)
+                Ok(first)
             }
             Token::LBracket => {
                 self.advance();
@@ -1134,7 +1406,50 @@ impl Parser {
                     span: span.to(close),
                 })
             }
-            Token::LBrace => Err(self.error("dicts and sets are not supported yet")),
+            Token::LBrace => {
+                self.advance();
+                if self.peek() == &Token::RBrace {
+                    let close = self.expect(Token::RBrace, "to close empty dict")?;
+                    return Ok(Expr {
+                        kind: ExprKind::DictLit(vec![]),
+                        span: span.to(close),
+                    });
+                }
+                let first = self.parse_expr()?;
+                if self.eat(&Token::Colon) {
+                    // dict: `{k: v, ...}`
+                    let first_v = self.parse_expr()?;
+                    let mut items = vec![(first, first_v)];
+                    while self.eat(&Token::Comma) {
+                        if self.peek() == &Token::RBrace {
+                            break;
+                        }
+                        let k = self.parse_expr()?;
+                        self.expect(Token::Colon, "after dict key")?;
+                        let v = self.parse_expr()?;
+                        items.push((k, v));
+                    }
+                    let close = self.expect(Token::RBrace, "to close the dict literal")?;
+                    Ok(Expr {
+                        kind: ExprKind::DictLit(items),
+                        span: span.to(close),
+                    })
+                } else {
+                    // set: `{a, b, ...}` (must be nonempty — `{}` is dict)
+                    let mut items = vec![first];
+                    while self.eat(&Token::Comma) {
+                        if self.peek() == &Token::RBrace {
+                            break;
+                        }
+                        items.push(self.parse_expr()?);
+                    }
+                    let close = self.expect(Token::RBrace, "to close the set literal")?;
+                    Ok(Expr {
+                        kind: ExprKind::SetLit(items),
+                        span: span.to(close),
+                    })
+                }
+            }
             Token::Lambda => Err(self.error("'lambda' is not supported yet")),
             other => Err(self.error(format!(
                 "expected an expression, found {}",
@@ -1148,6 +1463,14 @@ fn target_span(target: &AssignTarget) -> Span {
     match target {
         AssignTarget::Name { span, .. } => *span,
         AssignTarget::Index { base, index } => base.span.to(index.span),
+        AssignTarget::Tuple(items) => {
+            let first = items
+                .first()
+                .map(target_span)
+                .unwrap_or_else(|| Span::new(0, 0));
+            let last = items.last().map(target_span).unwrap_or(first);
+            first.to(last)
+        }
     }
 }
 
@@ -1373,9 +1696,15 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
                 rebase_spans(step, span);
             }
         }
-        ExprKind::ListLit(items) => {
+        ExprKind::ListLit(items) | ExprKind::TupleLit(items) | ExprKind::SetLit(items) => {
             for item in items {
                 rebase_spans(item, span);
+            }
+        }
+        ExprKind::DictLit(items) => {
+            for (k, v) in items {
+                rebase_spans(k, span);
+                rebase_spans(v, span);
             }
         }
         ExprKind::ListComp {
@@ -1972,9 +2301,97 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn error_tuple_assignment() {
-        let e = parse_err("a, b = 1, 2\n");
-        assert!(e.message.contains("not supported"), "{}", e.message);
+    fn parses_tuple_unpack_assignment() {
+        let m = parse_ok("a, b = 1, 2\n");
+        let StmtKind::Assign { targets, value, .. } = &m.body[0].kind else {
+            panic!("expected assign");
+        };
+        assert!(matches!(targets[0], AssignTarget::Tuple(_)));
+        assert!(matches!(value.kind, ExprKind::TupleLit(ref xs) if xs.len() == 2));
+    }
+
+    #[test]
+    fn parses_tuple_literal() {
+        let m = parse_ok("t = (1, 2)\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected assign");
+        };
+        assert!(matches!(value.kind, ExprKind::TupleLit(ref xs) if xs.len() == 2));
+    }
+
+    #[test]
+    fn parses_dict_and_set_literals() {
+        let m = parse_ok("d = {\"a\": 1}\ns = {1, 2}\n");
+        assert!(matches!(
+            &m.body[0].kind,
+            StmtKind::Assign { value, .. } if matches!(value.kind, ExprKind::DictLit(_))
+        ));
+        assert!(matches!(
+            &m.body[1].kind,
+            StmtKind::Assign { value, .. } if matches!(value.kind, ExprKind::SetLit(_))
+        ));
+    }
+
+    #[test]
+    fn parses_try_except() {
+        let m = parse_ok(
+            "\
+try:
+    x = 1
+except ValueError:
+    x = 2
+",
+        );
+        assert!(matches!(m.body[0].kind, StmtKind::Try { .. }));
+    }
+
+    #[test]
+    fn parses_empty_and_one_tuples() {
+        let m = parse_ok("t = ()\nu = (1,)\n");
+        assert!(matches!(
+            &m.body[0].kind,
+            StmtKind::Assign { value, .. } if matches!(&value.kind, ExprKind::TupleLit(xs) if xs.is_empty())
+        ));
+        assert!(matches!(
+            &m.body[1].kind,
+            StmtKind::Assign { value, .. } if matches!(&value.kind, ExprKind::TupleLit(xs) if xs.len() == 1)
+        ));
+    }
+
+    #[test]
+    fn parses_raise_and_try_finally_as() {
+        let m = parse_ok(
+            "\
+raise ValueError(\"x\")
+try:
+    pass
+except ValueError as e:
+    pass
+finally:
+    pass
+",
+        );
+        assert!(matches!(m.body[0].kind, StmtKind::Raise { .. }));
+        let StmtKind::Try {
+            handlers, finally, ..
+        } = &m.body[1].kind
+        else {
+            panic!("expected try");
+        };
+        assert!(handlers[0].bind.is_some());
+        assert!(!finally.is_empty());
+    }
+
+    #[test]
+    fn parses_container_type_annotations() {
+        let m = parse_ok(
+            "\
+t: tuple[int, str] = (1, \"a\")
+d: dict[str, int] = {}
+s: set[int] = set()
+",
+        );
+        assert_eq!(m.body.len(), 3);
     }
 
     #[test]

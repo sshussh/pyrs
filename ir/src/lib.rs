@@ -11,8 +11,8 @@ pub fn ping() -> String {
 
 /// A resolved runtime type.
 ///
-/// `List` holds a `&'static` element type (interned via [`list_of`]) so
-/// `Ty` stays `Copy` while types nest arbitrarily (`list[list[int]]`).
+/// Container variants hold interned pieces so `Ty` stays `Copy` while types
+/// nest (`list[list[int]]`, `tuple[int, str]`, `dict[str, list[int]]`).
 /// The tiny leaked allocations live for the compiler process — fine for a
 /// batch compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,15 @@ pub enum Ty {
     Str,
     /// Growable list; elements may themselves be lists
     List(&'static Ty),
+    /// Fixed-arity heterogeneous tuple
+    Tuple(&'static [Ty]),
+    /// Hash map; key is Int or Str
+    Dict {
+        key: &'static Ty,
+        value: &'static Ty,
+    },
+    /// Hash set; element is Int or Str
+    Set(&'static Ty),
     /// An open file handle from `open(...)`
     File,
     /// Absence of a value: `None` returns / bare functions
@@ -37,6 +46,24 @@ pub fn list_of(elem: Ty) -> Ty {
     Ty::List(Box::leak(Box::new(elem)))
 }
 
+/// Intern a tuple type from element types.
+pub fn tuple_of(elems: &[Ty]) -> Ty {
+    Ty::Tuple(Box::leak(elems.to_vec().into_boxed_slice()))
+}
+
+/// Intern a dict type.
+pub fn dict_of(key: Ty, value: Ty) -> Ty {
+    Ty::Dict {
+        key: Box::leak(Box::new(key)),
+        value: Box::leak(Box::new(value)),
+    }
+}
+
+/// Intern a set type.
+pub fn set_of(elem: Ty) -> Ty {
+    Ty::Set(Box::leak(Box::new(elem)))
+}
+
 impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -45,9 +72,52 @@ impl std::fmt::Display for Ty {
             Ty::Bool => write!(f, "bool"),
             Ty::Str => write!(f, "str"),
             Ty::List(e) => write!(f, "list[{e}]"),
+            Ty::Tuple(elems) => {
+                if elems.is_empty() {
+                    return write!(f, "tuple[()]");
+                }
+                write!(f, "tuple[")?;
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                write!(f, "]")
+            }
+            Ty::Dict { key, value } => write!(f, "dict[{key}, {value}]"),
+            Ty::Set(e) => write!(f, "set[{e}]"),
             Ty::File => write!(f, "file"),
             Ty::None => write!(f, "None"),
         }
+    }
+}
+
+/// Exception type tags matching the C runtime (`pyrs_raise` / handlers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcType {
+    ValueError = 1,
+    KeyError = 2,
+    IndexError = 3,
+    ZeroDivisionError = 4,
+    TypeError = 5,
+    RuntimeError = 6,
+}
+
+impl ExcType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExcType::ValueError => "ValueError",
+            ExcType::KeyError => "KeyError",
+            ExcType::IndexError => "IndexError",
+            ExcType::ZeroDivisionError => "ZeroDivisionError",
+            ExcType::TypeError => "TypeError",
+            ExcType::RuntimeError => "RuntimeError",
+        }
+    }
+
+    pub fn tag(self) -> i32 {
+        self as i32
     }
 }
 
@@ -85,11 +155,16 @@ pub enum Stmt {
         name: String,
         value: Expr,
     },
-    /// `base[index] = value` — base is a list.
+    /// `base[index] = value` — base is a list or dict.
     IndexAssign {
         base: Expr,
         index: Expr,
         value: Expr,
+    },
+    /// `del base[index]` — dict only.
+    IndexDelete {
+        base: Expr,
+        index: Expr,
     },
     /// `list.append(value)`
     ListAppend {
@@ -122,6 +197,29 @@ pub enum Stmt {
     ListSort {
         list: Expr,
     },
+    /// `dict.clear()`
+    DictClear {
+        dict: Expr,
+    },
+    /// `set.add(value)`
+    SetAdd {
+        set: Expr,
+        value: Expr,
+    },
+    /// `set.remove(value)` — traps if missing.
+    SetRemove {
+        set: Expr,
+        value: Expr,
+    },
+    /// `set.discard(value)` — no-op if missing.
+    SetDiscard {
+        set: Expr,
+        value: Expr,
+    },
+    /// `set.clear()`
+    SetClear {
+        set: Expr,
+    },
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
         orelse: Vec<Stmt>,
@@ -138,8 +236,26 @@ pub enum Stmt {
     ExprStmt(Expr),
     /// The `print` builtin: space-separated values, trailing newline.
     Print(Vec<Expr>),
-    /// Abort with a runtime error message (exit code 1).
+    /// Abort with a runtime error message (exit code 1), or raise into a
+    /// surrounding try frame when one is active.
     Die(String),
+    /// Runtime length check for unpacking: `pyrs_unpack_check(len, expected)`.
+    UnpackCheck {
+        len: Expr,
+        expected: i64,
+    },
+    /// `raise ExcType(msg)` — msg is a str.
+    Raise {
+        exc: ExcType,
+        message: Expr,
+    },
+    /// try / except / finally. Handlers: (type filter or catch-all, optional
+    /// local name bound to the message str, body).
+    Try {
+        body: Vec<Stmt>,
+        handlers: Vec<(Option<ExcType>, Option<String>, Vec<Stmt>)>,
+        finally: Vec<Stmt>,
+    },
     Break,
     Continue,
 }
@@ -197,7 +313,7 @@ pub enum ExprKind {
         op: UnOp,
         operand: Box<Expr>,
     },
-    /// `base[index]`: str → str (one character), list[T] → T.
+    /// `base[index]`: str → str, list[T] → T, tuple → element, dict → value.
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
@@ -217,8 +333,8 @@ pub enum ExprKind {
         func: StrFn,
         args: Vec<Expr>,
     },
-    /// `needle in haystack`: str-in-str substring or element-in-list.
-    /// The needle is already coerced to the element type. Result is Bool.
+    /// `needle in haystack`: str-in-str, element-in-list/set, key-in-dict.
+    /// The needle is already coerced. Result is Bool.
     Contains {
         needle: Box<Expr>,
         haystack: Box<Expr>,
@@ -239,13 +355,43 @@ pub enum ExprKind {
     ListNew {
         cap: Box<Expr>,
     },
+    /// Tuple literal; `ty` is `Tuple([...])`.
+    TupleLit(Vec<Expr>),
+    /// Dict literal; `ty` is `Dict { key, value }`.
+    DictLit(Vec<(Expr, Expr)>),
+    /// Empty dict with known key/value types (from annotation or `dict()`).
+    DictNew,
+    /// Set literal; `ty` is `Set(elem)`.
+    SetLit(Vec<Expr>),
+    /// Empty set with known element type.
+    SetNew,
+    /// `d.get(key, default)` — default is required (no first-class None).
+    DictGet {
+        dict: Box<Expr>,
+        key: Box<Expr>,
+        default: Box<Expr>,
+    },
+    /// `d.pop(key)` / `d.pop(key, default)`.
+    DictPop {
+        dict: Box<Expr>,
+        key: Box<Expr>,
+        default: Option<Box<Expr>>,
+    },
+    /// `d.keys()` → list of keys.
+    DictKeys(Box<Expr>),
+    /// `d.values()` → list of values.
+    DictValues(Box<Expr>),
+    /// `d.items()` → list of `(key, value)` tuples.
+    DictItems(Box<Expr>),
+    /// Materialize set elements as a list (for iteration).
+    SetToList(Box<Expr>),
     /// Statements evaluated for effect, then a result expression — the
     /// hook that lets loops live inside expressions (comprehensions).
     Block {
         stmts: Vec<Stmt>,
         result: Box<Expr>,
     },
-    /// `len(x)` for str or list.
+    /// `len(x)` for str, list, tuple, dict, set.
     Len(Box<Expr>),
     /// `abs(x)` for int or float (bool is promoted to int first).
     /// Result type matches the operand. `abs(i64::MIN)` wraps (no bigints).
@@ -277,7 +423,7 @@ pub enum ExprKind {
         value: Box<Expr>,
         precision: u32,
     },
-    /// truthiness test → bool: numerics `!= 0`, str/list `len != 0`
+    /// truthiness test → bool: numerics `!= 0`, containers `len != 0`
     ToBool(Box<Expr>),
 }
 
