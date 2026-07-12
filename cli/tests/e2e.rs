@@ -2294,3 +2294,50 @@ print([{\"a\": 1}] == [{\"a\": 2}])
     assert_eq!(out, "True\nTrue\nFalse\n");
 }
 
+#[test]
+fn set_basic_ops() {
+    let out = run_program(
+        "set_basic",
+        "\
+s: set[int] = {1, 2, 3}
+print(1 in s)
+s.add(4)
+print(len(s))
+s.discard(2)
+print(2 in s)
+s2: set[int] = set()
+s2.add(10)
+print(s2)
+",
+    );
+    assert_eq!(out, "True\n4\nFalse\n{10}\n");
+}
+
+#[test]
+fn set_extra_ops() {
+    let out = run_program(
+        "set_extra",
+        "\
+s: set[int] = set()
+print(s)
+s.add(3)
+s.add(1)
+s.add(2)
+for x in s:
+    print(x)
+s.remove(1)
+print(1 in s)
+s.clear()
+print(len(s))
+",
+    );
+    assert_eq!(out, "set()\n3\n1\n2\nFalse\n0\n");
+}
+
+#[test]
+fn set_remove_keyerror() {
+    let (code, err) = run_program_expect_fail("set_rm", "s: set[int] = {1}\ns.remove(2)\n");
+    assert_eq!(code, 1);
+    assert!(err.contains("KeyError: 2"), "{err}");
+}
+
