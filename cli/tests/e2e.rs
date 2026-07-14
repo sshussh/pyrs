@@ -4310,6 +4310,49 @@ print(n)
 }
 
 #[test]
+fn none_optional_union_and_or_matches_python() {
+    // Captured from python3 (never invent stdout).
+    let out = run_program(
+        "none_union",
+        "\
+print(None)
+print(0 or \"x\")
+print(None or 3)
+print(1 and None)
+x: int | None = None
+print(x)
+x = 5
+print(x)
+print(x is None)
+print(x is not None)
+y: int | None = None
+print(y is None)
+d: dict[str, int] = {\"a\": 1}
+print(d.get(\"a\"))
+print(d.get(\"b\"))
+print(d.get(\"b\") or 0)
+",
+    );
+    assert_eq!(
+        out,
+        "\
+None
+x
+3
+None
+None
+5
+False
+True
+True
+1
+None
+0
+"
+    );
+}
+
+#[test]
 fn multi_name_import_matches_python() {
     let out = run_project(
         "multi_import",
@@ -4391,16 +4434,17 @@ print(d.get(\"missing\", 9))
 }
 
 #[test]
-fn dict_get_bare_miss_keyerror() {
-    let (code, err) = run_program_expect_fail(
+fn dict_get_bare_miss_returns_none() {
+    // CPython: bare get returns None on miss (was KeyError in PyRs before Optional).
+    let out = run_program(
         "dict_get_miss",
         "\
 d: dict[str, int] = {\"a\": 1}
 print(d.get(\"missing\"))
+print(d.get(\"a\"))
 ",
     );
-    assert_eq!(code, 1);
-    assert!(err.contains("KeyError"), "stderr: {err}");
+    assert_eq!(out, "None\n1\n");
 }
 
 #[test]
