@@ -15,6 +15,37 @@ pub fn ping() -> String {
 
 type PResult<T> = Result<T, Diagnostic>;
 
+/// Flatten nested unions, dedup, and intern as `TypeName::Union` (or a single
+/// type when only one unique member remains). Order is kept stable: first
+/// occurrence order after flatten (semantic re-sorts via `ir::union_of`).
+fn intern_type_union(members: &[TypeName]) -> TypeName {
+    fn flatten(t: TypeName, out: &mut Vec<TypeName>) {
+        match t {
+            TypeName::Union(ms) => {
+                for m in ms {
+                    flatten(*m, out);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut flat = Vec::new();
+    for m in members {
+        flatten(*m, &mut flat);
+    }
+    let mut unique = Vec::new();
+    for m in flat {
+        if !unique.contains(&m) {
+            unique.push(m);
+        }
+    }
+    match unique.len() {
+        0 => TypeName::None, // should not happen for valid Optional/|
+        1 => unique[0],
+        _ => TypeName::Union(Box::leak(unique.into_boxed_slice())),
+    }
+}
+
 /// Parse a full module from source text (lexes internally).
 pub fn parse(source: &str) -> PResult<Module> {
     let tokens = lexer::lex(source)?;
@@ -401,7 +432,21 @@ impl Parser {
         }
     }
 
+    /// Type annotation: atoms joined by `|` into unions (`int | None`).
     fn parse_type_name(&mut self, context: &str) -> PResult<TypeName> {
+        let first = self.parse_type_atom(context)?;
+        if self.peek() != &Token::Pipe {
+            return Ok(first);
+        }
+        let mut members = vec![first];
+        while self.eat(&Token::Pipe) {
+            members.push(self.parse_type_atom(context)?);
+        }
+        Ok(intern_type_union(&members))
+    }
+
+    /// Single type atom (no top-level `|`). Handles `Optional[T]`.
+    fn parse_type_atom(&mut self, context: &str) -> PResult<TypeName> {
         match self.peek() {
             Token::Int => {
                 self.advance();
@@ -427,12 +472,11 @@ impl Parser {
                 self.advance();
                 self.expect(Token::LBracket, "after 'list' (e.g. 'list[int]')")?;
                 let elem = self.parse_type_name("inside 'list[...]'")?;
-                if elem == TypeName::None {
-                    return Err(self.error("list elements cannot be None"));
-                }
                 if elem == TypeName::File {
                     return Err(self.error("list elements cannot be file"));
                 }
+                // None / unions (e.g. list[int | None]) are allowed; pure list[None]
+                // is accepted syntactically and checked in semantic if needed.
                 self.expect(Token::RBracket, "to close 'list[...]'")?;
                 Ok(TypeName::List(Box::leak(Box::new(elem))))
             }
@@ -456,6 +500,9 @@ impl Parser {
                         if elem == TypeName::File {
                             return Err(self.error("tuple elements cannot be file"));
                         }
+                        if matches!(elem, TypeName::Union(_)) {
+                            return Err(self.error("tuple elements cannot be union types yet"));
+                        }
                         elems.push(elem);
                         if !self.eat(&Token::Comma) {
                             break;
@@ -474,11 +521,17 @@ impl Parser {
                 let key = self.parse_type_name("as dict key type")?;
                 self.expect(Token::Comma, "between dict key and value types")?;
                 let value = self.parse_type_name("as dict value type")?;
-                if key == TypeName::None || value == TypeName::None {
-                    return Err(self.error("dict key/value types cannot be None"));
+                // Keys must be concrete int/str (semantic enforces); values may
+                // be Optional/unions. Pure None key/value rejected here for keys;
+                // value None alone is ok as Optional-ish and checked in semantic.
+                if key == TypeName::None {
+                    return Err(self.error("dict key types cannot be None"));
                 }
                 if key == TypeName::File || value == TypeName::File {
                     return Err(self.error("dict key/value types cannot be file"));
+                }
+                if matches!(key, TypeName::Union(_)) {
+                    return Err(self.error("dict key types cannot be unions (only int or str)"));
                 }
                 self.expect(Token::RBracket, "to close 'dict[...]'")?;
                 Ok(TypeName::Dict {
@@ -496,6 +549,9 @@ impl Parser {
                 if elem == TypeName::File {
                     return Err(self.error("set elements cannot be file"));
                 }
+                if matches!(elem, TypeName::Union(_)) {
+                    return Err(self.error("set elements cannot be unions (only int or str)"));
+                }
                 self.expect(Token::RBracket, "to close 'set[...]'")?;
                 Ok(TypeName::Set(Box::leak(Box::new(elem))))
             }
@@ -503,9 +559,20 @@ impl Parser {
                 self.advance();
                 Ok(TypeName::None)
             }
+            Token::Ident(name) if name == "Optional" => {
+                self.advance();
+                self.expect(Token::LBracket, "after 'Optional' (e.g. 'Optional[int]')")?;
+                let inner = self.parse_type_name("inside 'Optional[...]'")?;
+                // Optional takes exactly one type argument (which may itself be a union).
+                if self.peek() == &Token::Comma {
+                    return Err(self.error("Optional[...] takes exactly one type argument"));
+                }
+                self.expect(Token::RBracket, "to close 'Optional[...]'")?;
+                Ok(intern_type_union(&[inner, TypeName::None]))
+            }
             other => Err(self.error(format!(
                 "expected a type ('int', 'float', 'bool', 'str', 'file', 'list[...]', \
-                 'tuple[...]', 'dict[...]', 'set[...]' or 'None') {}, found {}",
+                 'tuple[...]', 'dict[...]', 'set[...]', 'Optional[T]', or 'None') {}, found {}",
                 context,
                 other.describe()
             ))),
@@ -1047,7 +1114,7 @@ impl Parser {
     }
 
     /// The comparison operator at the cursor, with how many tokens it
-    /// spans (`not in` is two).
+    /// spans (`not in` / `is not` are two).
     fn comparison_op(&self) -> Option<(BinOp, usize)> {
         match self.peek() {
             Token::EqEq => Some((BinOp::Eq, 1)),
@@ -1058,6 +1125,8 @@ impl Parser {
             Token::GtEq => Some((BinOp::GtEq, 1)),
             Token::In => Some((BinOp::In, 1)),
             Token::Not if self.peek2() == &Token::In => Some((BinOp::NotIn, 2)),
+            Token::Is if self.peek2() == &Token::Not => Some((BinOp::IsNot, 2)),
+            Token::Is => Some((BinOp::Is, 1)),
             _ => None,
         }
     }
@@ -2820,6 +2889,66 @@ s: set[int] = set()
 ",
         );
         assert_eq!(m.body.len(), 3);
+    }
+
+    #[test]
+    fn parses_union_and_optional_types() {
+        let m = parse_ok("x: int | None = None\n");
+        let StmtKind::Assign { annotation, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let Some(TypeName::Union(ms)) = annotation else {
+            panic!("expected Union annotation, got {annotation:?}");
+        };
+        assert!(ms.contains(&TypeName::Int));
+        assert!(ms.contains(&TypeName::None));
+
+        let m = parse_ok("y: Optional[int] = None\n");
+        let StmtKind::Assign { annotation, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        let Some(TypeName::Union(ms)) = annotation else {
+            panic!("expected Optional → Union, got {annotation:?}");
+        };
+        assert!(ms.contains(&TypeName::Int));
+        assert!(ms.contains(&TypeName::None));
+
+        let m = parse_ok("z: str | int | None = 1\n");
+        let StmtKind::Assign { annotation, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        let Some(TypeName::Union(ms)) = annotation else {
+            panic!("expected 3-way Union, got {annotation:?}");
+        };
+        assert_eq!(ms.len(), 3);
+
+        let m = parse_ok("d: dict[str, int | None] = {}\n");
+        let StmtKind::Assign { annotation, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        let Some(TypeName::Dict { value, .. }) = annotation else {
+            panic!();
+        };
+        assert!(matches!(value, TypeName::Union(_)));
+    }
+
+    #[test]
+    fn parses_is_and_is_not() {
+        let m = parse_ok("b = x is None\nc = x is not None\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        assert!(matches!(value.kind, ExprKind::Binary { op: BinOp::Is, .. }));
+        let StmtKind::Assign { value, .. } = &m.body[1].kind else {
+            panic!();
+        };
+        assert!(matches!(
+            value.kind,
+            ExprKind::Binary {
+                op: BinOp::IsNot,
+                ..
+            }
+        ));
     }
 
     #[test]

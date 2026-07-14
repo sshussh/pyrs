@@ -44,6 +44,9 @@
 #define TAG_TUPLE 5
 #define TAG_DICT 6
 #define TAG_SET 7
+/* heap box for union/Optional values in containers: { i32 print_tag, i64 payload }
+ * print_tag = -1 means None; otherwise a normal TAG_* for the active member. */
+#define TAG_UNION 8
 /* list tags: 4 + 8 * elem_tag */
 
 /* layout shared with codegen: leading i64 length, then bytes (+ NUL) */
@@ -340,6 +343,12 @@ void pyrs_print_tuple(const PyrsTuple *t);
 void pyrs_print_dict(const PyrsDict *d);
 void pyrs_print_set(const PyrsSet *s);
 
+/* Union box layout matches codegen: { i32 print_tag; i64 payload } */
+typedef struct {
+    int print_tag;
+    long long payload;
+} PyrsUnionBox;
+
 static void print_slot(long long slot, int tag) {
     switch (tag) {
     case TAG_INT:
@@ -366,6 +375,15 @@ static void print_slot(long long slot, int tag) {
     case TAG_SET:
         pyrs_print_set((const PyrsSet *)(uintptr_t)slot);
         break;
+    case TAG_UNION: {
+        const PyrsUnionBox *u = (const PyrsUnionBox *)(uintptr_t)slot;
+        if (u->print_tag < 0) {
+            fputs("None", stdout);
+        } else {
+            print_slot(u->payload, u->print_tag);
+        }
+        break;
+    }
     default:
         /* tag encoding for nested list: 4 + 8 * inner_tag */
         if (tag >= 4 && ((tag - 4) % 8) == 0) {

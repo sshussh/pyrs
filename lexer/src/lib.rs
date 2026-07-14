@@ -320,6 +320,9 @@ pub enum Token {
     Dot,
     #[token("->")]
     Arrow,
+    /// `|` — used only in type unions (`int | None`); not a bitwise-or expr.
+    #[token("|")]
+    Pipe,
 
     // indentation
     #[regex(r"\r?\n")]
@@ -427,6 +430,7 @@ fn token_text(token: &Token) -> &'static str {
         Token::Comma => ",",
         Token::Dot => ".",
         Token::Arrow => "->",
+        Token::Pipe => "|",
         _ => "?",
     }
 }

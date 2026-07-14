@@ -23,8 +23,11 @@ pub enum TypeName {
     },
     /// `set[T]` — elements restricted like dict keys in semantic.
     Set(&'static TypeName),
-    /// `-> None`: the function returns nothing.
+    /// `None` type (annotation or union member). Function `-> None` returns nothing.
     None,
+    /// `A | B | ...` or `Optional[T]` (flattened/sorted in semantic).
+    /// At least two members after parsing (parser intern helper).
+    Union(&'static [TypeName]),
 }
 
 impl std::fmt::Display for TypeName {
@@ -52,6 +55,15 @@ impl std::fmt::Display for TypeName {
             TypeName::Dict { key, value } => write!(f, "dict[{key}, {value}]"),
             TypeName::Set(e) => write!(f, "set[{e}]"),
             TypeName::None => write!(f, "None"),
+            TypeName::Union(ms) => {
+                for (i, m) in ms.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{m}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -272,6 +284,10 @@ pub enum BinOp {
     In,
     /// `not in`
     NotIn,
+    /// `is` — identity; only `is None` / `is not None` in semantic for now
+    Is,
+    /// `is not`
+    IsNot,
     And,
     Or,
 }
@@ -294,6 +310,8 @@ impl std::fmt::Display for BinOp {
             BinOp::GtEq => ">=",
             BinOp::In => "in",
             BinOp::NotIn => "not in",
+            BinOp::Is => "is",
+            BinOp::IsNot => "is not",
             BinOp::And => "and",
             BinOp::Or => "or",
         };

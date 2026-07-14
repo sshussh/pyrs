@@ -37,8 +37,12 @@ pub enum Ty {
     Set(&'static Ty),
     /// An open file handle from `open(...)`
     File,
-    /// Absence of a value: `None` returns / bare functions
+    /// The `None` value type (first-class). Function `-> None` still lowers
+    /// to LLVM `void`; expression-level None is a real value (`i8` 0).
     None,
+    /// Tagged union of at least two distinct members (flattened, sorted,
+    /// interned). Lowers to LLVM `{ i32, i64 }` (tag + payload slot).
+    Union(&'static [Ty]),
 }
 
 /// Intern a list type: `list_of(Ty::Int)` is `list[int]`.
@@ -62,6 +66,113 @@ pub fn dict_of(key: Ty, value: Ty) -> Ty {
 /// Intern a set type.
 pub fn set_of(elem: Ty) -> Ty {
     Ty::Set(Box::leak(Box::new(elem)))
+}
+
+/// Total order for union members: None < Bool < Int < Float < Str < List <
+/// Tuple < Dict < Set < File. Nested containers compare recursively.
+/// Unions should not nest (flatten first).
+pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn rank(t: &Ty) -> u8 {
+        match t {
+            Ty::None => 0,
+            Ty::Bool => 1,
+            Ty::Int => 2,
+            Ty::Float => 3,
+            Ty::Str => 4,
+            Ty::List(_) => 5,
+            Ty::Tuple(_) => 6,
+            Ty::Dict { .. } => 7,
+            Ty::Set(_) => 8,
+            Ty::File => 9,
+            Ty::Union(_) => 10,
+        }
+    }
+    match (a, b) {
+        (Ty::List(x), Ty::List(y)) => ty_cmp(x, y),
+        (Ty::Set(x), Ty::Set(y)) => ty_cmp(x, y),
+        (Ty::Dict { key: k1, value: v1 }, Ty::Dict { key: k2, value: v2 }) => {
+            ty_cmp(k1, k2).then_with(|| ty_cmp(v1, v2))
+        }
+        (Ty::Tuple(x), Ty::Tuple(y)) => {
+            for (ex, ey) in x.iter().zip(y.iter()) {
+                let c = ty_cmp(ex, ey);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Ty::Union(x), Ty::Union(y)) => {
+            for (ex, ey) in x.iter().zip(y.iter()) {
+                let c = ty_cmp(ex, ey);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// Flatten nested unions into a flat list of atomic members.
+pub fn flatten_union_members(ty: Ty) -> Vec<Ty> {
+    match ty {
+        Ty::Union(ms) => {
+            let mut out = Vec::new();
+            for m in ms {
+                out.extend(flatten_union_members(*m));
+            }
+            out
+        }
+        other => vec![other],
+    }
+}
+
+/// Build a union type from members: flatten, dedup, sort, intern.
+/// Returns a single type if only one unique member remains.
+/// Panics if `members` is empty after flatten (callers must not pass empty).
+pub fn union_of(members: &[Ty]) -> Ty {
+    let mut flat = Vec::new();
+    for m in members {
+        flat.extend(flatten_union_members(*m));
+    }
+    // dedup then sort (stable total order)
+    let mut unique: Vec<Ty> = Vec::new();
+    for m in flat {
+        if !unique.contains(&m) {
+            unique.push(m);
+        }
+    }
+    unique.sort_by(ty_cmp);
+    match unique.len() {
+        0 => panic!("union_of: empty member list"),
+        1 => unique[0],
+        _ => Ty::Union(Box::leak(unique.into_boxed_slice())),
+    }
+}
+
+/// `T | None` (Optional[T]).
+pub fn optional_of(t: Ty) -> Ty {
+    union_of(&[t, Ty::None])
+}
+
+/// Index of `member` in a union's sorted member list, if present.
+pub fn union_member_index(union: Ty, member: Ty) -> Option<usize> {
+    match union {
+        Ty::Union(ms) => ms.iter().position(|m| *m == member),
+        _ => None,
+    }
+}
+
+/// Whether `ty` is a union that includes `None`.
+pub fn is_optional(ty: Ty) -> bool {
+    match ty {
+        Ty::None => true,
+        Ty::Union(ms) => ms.contains(&Ty::None),
+        _ => false,
+    }
 }
 
 impl std::fmt::Display for Ty {
@@ -89,6 +200,15 @@ impl std::fmt::Display for Ty {
             Ty::Set(e) => write!(f, "set[{e}]"),
             Ty::File => write!(f, "file"),
             Ty::None => write!(f, "None"),
+            Ty::Union(ms) => {
+                for (i, m) in ms.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{m}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -274,6 +394,19 @@ pub enum ExprKind {
     ConstFloat(f64),
     ConstBool(bool),
     ConstStr(String),
+    /// The `None` literal. Type is always `Ty::None` (value-level; not void).
+    ConstNone,
+    /// Wrap a concrete value (or sub-union) into a union type.
+    /// `expr.ty` is the target union; `value.ty` is a member or sub-union.
+    ToUnion {
+        value: Box<Expr>,
+    },
+    /// `value is None` / `value is not None`. Result is Bool.
+    IsNone {
+        value: Box<Expr>,
+        /// When true, this is `is not None`.
+        not: bool,
+    },
     /// Load a local variable.
     Local(String),
     /// Load a module-level global.
@@ -367,8 +500,9 @@ pub enum ExprKind {
     SetLit(Vec<Expr>),
     /// Empty set with known element type.
     SetNew,
-    /// `d.get(key, default)`. Bare `get(key)` is lowered as indexing
-    /// (KeyError on miss) until Optional/None returns exist.
+    /// `d.get(key, default)`. Result type is on `expr.ty` (may be
+    /// `optional_of(val)` for bare get). On hit the value is converted to
+    /// `expr.ty` when needed; on miss the default is used as-is.
     DictGet {
         dict: Box<Expr>,
         key: Box<Expr>,

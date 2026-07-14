@@ -56,6 +56,10 @@ fn resolve_type(ty: ast::TypeName) -> ir::Ty {
         ast::TypeName::Dict { key, value } => ir::dict_of(resolve_type(*key), resolve_type(*value)),
         ast::TypeName::Set(e) => ir::set_of(resolve_type(*e)),
         ast::TypeName::None => ir::Ty::None,
+        ast::TypeName::Union(ms) => {
+            let ts: Vec<ir::Ty> = ms.iter().copied().map(resolve_type).collect();
+            ir::union_of(&ts)
+        }
     }
 }
 
@@ -66,6 +70,9 @@ fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
             let k = resolve_type_checked(*key, span)?;
             let v = resolve_type_checked(*value, span)?;
             check_hashable_key(k, span, "dict")?;
+            if v == ir::Ty::File {
+                return Err(err("dict values cannot be file", span));
+            }
             Ok(ir::dict_of(k, v))
         }
         ast::TypeName::Set(e) => {
@@ -75,14 +82,34 @@ fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
         }
         ast::TypeName::List(e) => {
             let elem = resolve_type_checked(*e, span)?;
+            if elem == ir::Ty::File {
+                return Err(err("list elements cannot be file", span));
+            }
             Ok(ir::list_of(elem))
         }
         ast::TypeName::Tuple(elems) => {
             let mut ts = Vec::with_capacity(elems.len());
             for e in elems {
-                ts.push(resolve_type_checked(*e, span)?);
+                let t = resolve_type_checked(*e, span)?;
+                if t == ir::Ty::None || matches!(t, ir::Ty::Union(_)) || t == ir::Ty::File {
+                    return Err(err(
+                        format!("tuple elements of type {t} are not supported"),
+                        span,
+                    ));
+                }
+                ts.push(t);
             }
             Ok(ir::tuple_of(&ts))
+        }
+        ast::TypeName::Union(ms) => {
+            let mut ts = Vec::with_capacity(ms.len());
+            for m in ms {
+                ts.push(resolve_type_checked(*m, span)?);
+            }
+            if ts.is_empty() {
+                return Err(err("empty union type", span));
+            }
+            Ok(ir::union_of(&ts))
         }
         other => Ok(resolve_type(other)),
     }
@@ -90,8 +117,9 @@ fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
 
 fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Ty> {
     match ty {
-        ir::Ty::None => Err(err("list elements cannot be None", span)),
         ir::Ty::File => Err(err("files cannot be stored in lists yet", span)),
+        // Pure None list elements are allowed only as part of a union annotation
+        // path; a bare None elem type is rejected when building untyped lists.
         other => Ok(other),
     }
 }
@@ -2478,12 +2506,6 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             }
             // evaluate RHS once, then assign right-to-left (Python order)
             let value_ir = lower_expr(value, ctx)?;
-            if value_ir.ty == ir::Ty::None {
-                return Err(err(
-                    "cannot assign: the expression has no value (returns None)",
-                    value.span,
-                ));
-            }
             let tmp = ctx.fresh_temp("multi", value_ir.ty);
             out.push(ir::Stmt::Assign {
                 name: tmp.clone(),
@@ -2577,18 +2599,12 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 }
                 let plain = require_plain_args(args, "print", e.span)?;
                 let mut lowered_args = Vec::new();
-                for (i, arg) in plain.iter().enumerate() {
+                for arg in plain.iter() {
                     let a = lower_expr(arg, ctx)?;
-                    if a.ty == ir::Ty::None {
-                        return Err(err(
-                            format!("print argument {} has no value (returns None)", i + 1),
-                            arg.span,
-                        ));
-                    }
                     if a.ty == ir::Ty::File {
                         return Err(err("file objects cannot be printed yet", arg.span));
                     }
-                    // other types (tuple/dict/set/list/scalars) are printable
+                    // None, unions, tuples/dicts/sets/lists/scalars are printable
                     lowered_args.push(a);
                 }
                 out.push(ir::Stmt::Print(lowered_args));
@@ -2980,8 +2996,7 @@ fn lower_dict_method(
 ) -> SResult<ir::Expr> {
     match method {
         "get" => {
-            // Bare get(key): KeyError on miss (no Optional/None return yet).
-            // get(key, default) is CPython-identical.
+            // Bare get(key) → Optional[V] (None on miss). get(key, default) keeps V.
             if args.is_empty() || args.len() > 2 {
                 return Err(err(
                     format!("get() takes 1 or 2 arguments ({} given)", args.len()),
@@ -2991,12 +3006,14 @@ fn lower_dict_method(
             let key = lower_expr(&args[0], ctx)?;
             let key = coerce(key, key_ty, args[0].span, "dict.get() key")?;
             if args.len() == 1 {
-                // Same trap as d[key] until Optional returns exist.
+                let result_ty = ir::optional_of(val_ty);
+                let default = coerce(const_none(), result_ty, method_span, "dict.get() default")?;
                 return Ok(ir::Expr {
-                    ty: val_ty,
-                    kind: ir::ExprKind::Index {
-                        base: Box::new(base_ir),
-                        index: Box::new(key),
+                    ty: result_ty,
+                    kind: ir::ExprKind::DictGet {
+                        dict: Box::new(base_ir),
+                        key: Box::new(key),
+                        default: Box::new(default),
                     },
                 });
             }
@@ -3607,9 +3624,7 @@ fn bind_name(
 
     let target_ty = match (annotation, existing) {
         (Some(ann_ty), existing) => {
-            if ann_ty == ir::Ty::None {
-                return Err(err("cannot declare a variable of type None", name_span));
-            }
+            // Pure `None` annotation is allowed (variable holds only None); unions too.
             if let Some(existing) = existing
                 && existing != ann_ty
             {
@@ -3624,18 +3639,8 @@ fn bind_name(
             ann_ty
         }
         (None, Some(existing)) => existing,
-        (None, None) => match value_ir.ty {
-            ir::Ty::None => {
-                return Err(err(
-                    format!(
-                        "cannot assign to '{name}': the expression has no value \
-                         (returns None)"
-                    ),
-                    value_span,
-                ));
-            }
-            ty => ty,
-        },
+        // First assignment fixes the type, including pure None or a union.
+        (None, None) => value_ir.ty,
     };
 
     let value_expr = coerce_assign(value_ir, target_ty, name, value_span)?;
@@ -4302,8 +4307,111 @@ fn coerce_assign(value: ir::Expr, target: ir::Ty, name: &str, span: Span) -> SRe
     })
 }
 
-/// Insert implicit promotion casts (`bool → int → float`) or fail.
+/// Wrap `value` into a union type (identity if already that union).
+fn to_union(value: ir::Expr, union: ir::Ty) -> ir::Expr {
+    if value.ty == union {
+        return value;
+    }
+    ir::Expr {
+        ty: union,
+        kind: ir::ExprKind::ToUnion {
+            value: Box::new(value),
+        },
+    }
+}
+
+/// Whether every member of `src` appears in `dst` (both unions or concrete).
+fn union_is_subset(src: ir::Ty, dst: ir::Ty) -> bool {
+    let src_ms = ir::flatten_union_members(src);
+    let dst_ms = ir::flatten_union_members(dst);
+    src_ms.iter().all(|m| dst_ms.iter().any(|d| d == m))
+}
+
+/// Insert implicit promotion casts (`bool → int → float`), union wraps, or fail.
 fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir::Expr> {
+    if value.ty == target {
+        return Ok(value);
+    }
+    // Concrete numeric promotions
+    match (value.ty, target) {
+        (ir::Ty::Bool, ir::Ty::Int) => {
+            return Ok(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::BoolToInt(Box::new(value)),
+            });
+        }
+        (ir::Ty::Int, ir::Ty::Float) => {
+            return Ok(ir::Expr {
+                ty: ir::Ty::Float,
+                kind: ir::ExprKind::IntToFloat(Box::new(value)),
+            });
+        }
+        (ir::Ty::Bool, ir::Ty::Float) => {
+            let as_int = ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::BoolToInt(Box::new(value)),
+            };
+            return Ok(ir::Expr {
+                ty: ir::Ty::Float,
+                kind: ir::ExprKind::IntToFloat(Box::new(as_int)),
+            });
+        }
+        _ => {}
+    }
+
+    // Target is a union: wrap a member or re-target a sub-union.
+    if matches!(target, ir::Ty::Union(_)) {
+        // Sub-union ⊆ target
+        if matches!(value.ty, ir::Ty::Union(_)) && union_is_subset(value.ty, target) {
+            return Ok(to_union(value, target));
+        }
+        // Exact member
+        if ir::flatten_union_members(target).contains(&value.ty) {
+            return Ok(to_union(value, target));
+        }
+        // Promote into a numeric member (e.g. bool → int|None)
+        for m in ir::flatten_union_members(target) {
+            if m == value.ty {
+                return Ok(to_union(value, target));
+            }
+            // try numeric promotion into this member only
+            if let Ok(promoted) = coerce_numeric_into(value.clone(), m) {
+                return Ok(to_union(promoted, target));
+            }
+        }
+        return Err(err(
+            format!(
+                "type mismatch in {what}: expected {target}, found {}",
+                value.ty
+            ),
+            span,
+        ));
+    }
+
+    // Value is a union, target is a concrete member — reject (no runtime unwrap).
+    if matches!(value.ty, ir::Ty::Union(_)) {
+        return Err(err(
+            format!(
+                "cannot use {} as {target} in {what}; use 'is None' check or provide a \
+                 default with 'or'",
+                value.ty
+            ),
+            span,
+        ));
+    }
+
+    // None → only ok for None target (handled by equality) or unions (above)
+    Err(err(
+        format!(
+            "type mismatch in {what}: expected {target}, found {}",
+            value.ty
+        ),
+        span,
+    ))
+}
+
+/// Numeric-only promotion of `value` into concrete `target` (no unions).
+fn coerce_numeric_into(value: ir::Expr, target: ir::Ty) -> SResult<ir::Expr> {
     if value.ty == target {
         return Ok(value);
     }
@@ -4326,10 +4434,7 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
                 kind: ir::ExprKind::IntToFloat(Box::new(as_int)),
             })
         }
-        (found, expected) => Err(err(
-            format!("type mismatch in {what}: expected {expected}, found {found}"),
-            span,
-        )),
+        _ => Err(err("no numeric promotion", Span { start: 0, end: 0 })),
     }
 }
 
@@ -4342,13 +4447,15 @@ fn lower_condition(cond: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
 fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
     match value.ty {
         ir::Ty::Bool => Ok(value),
-        ir::Ty::Int
+        ir::Ty::None
+        | ir::Ty::Int
         | ir::Ty::Float
         | ir::Ty::Str
         | ir::Ty::List(_)
         | ir::Ty::Tuple(_)
         | ir::Ty::Dict { .. }
-        | ir::Ty::Set(_) => Ok(ir::Expr {
+        | ir::Ty::Set(_)
+        | ir::Ty::Union(_) => Ok(ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::ToBool(Box::new(value)),
         }),
@@ -4356,6 +4463,13 @@ fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
             format!("a value of type {other} cannot be used as a condition"),
             span,
         )),
+    }
+}
+
+fn const_none() -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::None,
+        kind: ir::ExprKind::ConstNone,
     }
 }
 
@@ -4374,10 +4488,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             ty: ir::Ty::Str,
             kind: ir::ExprKind::ConstStr(s.clone()),
         }),
-        ast::ExprKind::NoneLit => Err(err(
-            "'None' cannot be used in an expression here",
-            expr.span,
-        )),
+        ast::ExprKind::NoneLit => Ok(const_none()),
         ast::ExprKind::Name(name) => {
             if let Some((_, storage, ty)) = ctx
                 .comp_renames
@@ -5494,7 +5605,7 @@ fn lower_dict_lit(
         }
     };
     check_hashable_key(key_ty, span, "dict")?;
-    if val_ty == ir::Ty::None || val_ty == ir::Ty::File {
+    if val_ty == ir::Ty::File {
         return Err(err(
             format!("dict values of type {val_ty} are not supported"),
             span,
@@ -5573,6 +5684,14 @@ fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
         | (ir::Ty::Float, ir::Ty::Bool)
         | (ir::Ty::Bool, ir::Ty::Float) => Some(ir::Ty::Float),
         (ir::Ty::Int, ir::Ty::Bool) | (ir::Ty::Bool, ir::Ty::Int) => Some(ir::Ty::Int),
+        // Grow optionals/unions in homogeneous containers (list/dict values).
+        _ if a == ir::Ty::None
+            || b == ir::Ty::None
+            || matches!(a, ir::Ty::Union(_))
+            || matches!(b, ir::Ty::Union(_)) =>
+        {
+            Some(join_types(a, b))
+        }
         _ => Option::None,
     }
 }
@@ -7009,6 +7128,7 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             span,
         )),
         ast::TypeName::None => Err(err("None is not a conversion", span)),
+        ast::TypeName::Union(_) => Err(err("union types are not a conversion", span)),
     }
 }
 
@@ -7092,27 +7212,45 @@ fn unify_numeric(
     }
 }
 
-/// Unify operand types for `and`/`or`: same type, or numeric promote
-/// (`bool`→`int`→`float`). Result type is the shared operand type.
+/// Join two types for `and`/`or`: equal → that type; both numeric → promote;
+/// otherwise flatten into a union of all atomic members.
+fn join_types(a: ir::Ty, b: ir::Ty) -> ir::Ty {
+    if a == b {
+        return a;
+    }
+    let a_num = matches!(a, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
+    let b_num = matches!(b, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
+    if a_num && b_num {
+        // same rules as unify_numeric without building exprs
+        return match (a, b) {
+            (ir::Ty::Float, _) | (_, ir::Ty::Float) => ir::Ty::Float,
+            (ir::Ty::Int, _) | (_, ir::Ty::Int) => ir::Ty::Int,
+            _ => ir::Ty::Bool,
+        };
+    }
+    let mut members = ir::flatten_union_members(a);
+    members.extend(ir::flatten_union_members(b));
+    ir::union_of(&members)
+}
+
+/// Unify operand types for `and`/`or`: same type, numeric promote, or union.
 fn unify_and_or(l: ir::Expr, r: ir::Expr, span: Span) -> SResult<(ir::Expr, ir::Expr, ir::Ty)> {
+    // Same type: keep as-is (including both bool — do not promote to int).
     if l.ty == r.ty {
         let ty = l.ty;
         return Ok((l, r, ty));
     }
-    // Numeric sides: bool/int/float promote like other operators.
+    // Differing numeric sides: bool/int/float promote like other operators.
     let l_num = matches!(l.ty, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
     let r_num = matches!(r.ty, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
     if l_num && r_num {
         return unify_numeric(l, r, span, "'and'/'or'");
     }
-    Err(err(
-        format!(
-            "'and'/'or' operands must share a type (or both be numeric); \
-             found {} and {}",
-            l.ty, r.ty
-        ),
-        span,
-    ))
+    // Otherwise form a union and coerce both sides to it.
+    let result_ty = join_types(l.ty, r.ty);
+    let l = coerce(l, result_ty, span, "'and'/'or' left operand")?;
+    let r = coerce(r, result_ty, span, "'and'/'or' right operand")?;
+    Ok((l, r, result_ty))
 }
 
 /// Math stdlib unary intrinsic name → IR op (bodies replaced when lowering
@@ -7133,12 +7271,49 @@ fn math_intrinsic(name: &str) -> Option<ir::MathOp> {
     })
 }
 
+/// `expr is None` / `expr is not None` (either operand may be the None literal).
+fn lower_is_none(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    let not = matches!(op, ast::BinOp::IsNot);
+    let l_none = matches!(l.kind, ir::ExprKind::ConstNone) || l.ty == ir::Ty::None;
+    let r_none = matches!(r.kind, ir::ExprKind::ConstNone) || r.ty == ir::Ty::None;
+    let value = match (l_none, r_none) {
+        (false, true) => l,
+        (true, false) => r,
+        (true, true) => {
+            // `None is None` → True; `None is not None` → False
+            return Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::ConstBool(!not),
+            });
+        }
+        (false, false) => {
+            return Err(err(
+                "'is' / 'is not' only support comparison with None \
+                 (e.g. 'x is None' or 'x is not None')",
+                span,
+            ));
+        }
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::IsNone {
+            value: Box::new(value),
+            not,
+        },
+    })
+}
+
 fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
     let describe = format!("operator '{op}'");
 
     // membership tests work on str and list; check before type dispatch
     if matches!(op, ast::BinOp::In | ast::BinOp::NotIn) {
         return lower_contains(op, l, r, span);
+    }
+
+    // `is` / `is not` — only `… is None` / `… is not None` (either side).
+    if matches!(op, ast::BinOp::Is | ast::BinOp::IsNot) {
+        return lower_is_none(op, l, r, span);
     }
 
     // ---- string operations ----
@@ -7245,6 +7420,9 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
         }
         ast::BinOp::In | ast::BinOp::NotIn => {
             unreachable!("in/not-in are handled above")
+        }
+        ast::BinOp::Is | ast::BinOp::IsNot => {
+            unreachable!("is/is not are handled above")
         }
     }
 }
@@ -8592,15 +8770,46 @@ print(count([]))
     }
 
     #[test]
-    fn dict_bare_get_lowers_to_index() {
-        // Bare get(key) → Index (KeyError on miss until Optional returns).
+    fn dict_bare_get_returns_optional() {
+        // Bare get(key) → Optional[V] (None on miss).
         let m = analyze_ok("d: dict[str, int] = {\"a\": 1}\nx = d.get(\"a\")\n");
         let entry = find_func(&m, ENTRY_NAME);
         let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
-            panic!();
+            panic!("{:?}", entry.body);
         };
-        assert_eq!(value.ty, ir::Ty::Int);
-        assert!(matches!(value.kind, ir::ExprKind::Index { .. }));
+        assert_eq!(value.ty, ir::optional_of(ir::Ty::Int));
+        assert!(matches!(value.kind, ir::ExprKind::DictGet { .. }));
+    }
+
+    #[test]
+    fn optional_assign_and_reject_as_int() {
+        let m = analyze_ok("x: int | None = None\nx = 5\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(
+            entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::GlobalAssign { .. }))
+        );
+        let e = analyze_err("x: int | None = None\ny: int = x\n");
+        assert!(
+            e.message.contains("cannot use") || e.message.contains("is None"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn is_none_lowers() {
+        let m = analyze_ok("x: int | None = 1\nb = x is None\nc = x is not None\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let has_is = entry.body.iter().any(|s| match s {
+            ir::Stmt::GlobalAssign { value, .. } => {
+                matches!(value.kind, ir::ExprKind::IsNone { .. })
+            }
+            _ => false,
+        });
+        assert!(has_is, "expected IsNone in IR: {:?}", entry.body);
     }
 
     #[test]
