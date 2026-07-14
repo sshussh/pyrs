@@ -1551,7 +1551,8 @@ fn input_at_eof_traps_like_python() {
 fn import_of_unknown_module_is_error() {
     let dir = TempDir::new("importerr");
     let src = dir.0.join("prog.py");
-    fs::write(&src, "import os\nprint(1)\n").unwrap();
+    // Use a name that is not in the embedded / disk stdlib.
+    fs::write(&src, "import totally_missing_xyz\nprint(1)\n").unwrap();
     let out = Command::new(PYRS)
         .args(["compile", "-i"])
         .arg(&src)
@@ -1559,7 +1560,10 @@ fn import_of_unknown_module_is_error() {
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("No module named 'os'"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("No module named 'totally_missing_xyz'"),
+        "stderr: {stderr}"
+    );
 }
 
 // ---- v0.6: file I/O ----
@@ -3138,9 +3142,8 @@ fn deferred_non_simple_parent_value_is_error() {
         "main.py",
     );
     assert!(
-        stderr.contains(
-            "cannot import name 'VERSION' from partially initialized package 'utilpkg'"
-        ),
+        stderr
+            .contains("cannot import name 'VERSION' from partially initialized package 'utilpkg'"),
         "stderr: {stderr}"
     );
     assert!(
@@ -3605,4 +3608,272 @@ finally:
 ",
     );
     assert_eq!(out, "fin_nested\nfin_inner\nouter b\nfin_outer\n");
+}
+
+// ---- stdlib os.path (v0.11) ----
+
+#[test]
+fn stdlib_os_path_join_dirname_basename_matches_python() {
+    // Expected stdout captured from the same program under python3 (POSIX).
+    let src = "\
+from os.path import join, dirname, basename
+import os.path
+
+print(join(\"a\", \"b\"))
+print(join(\"/a\", \"b\"))
+print(join(\"a\", \"/b\"))
+print(join(\"a/\", \"b\"))
+print(join(\"\", \"b\"))
+print(join(\"a\", \"\"))
+print(join(\"a/b\", \"c/d\"))
+print(join(\"/\", \"a\"))
+print(join(\"a\", \"/\"))
+print(join(\"\", \"\"))
+print(join(\"/\", \"\"))
+print(join(\"\", \"/\"))
+print(dirname(\"/a/b/c\"))
+print(dirname(\"/a/b/c/\"))
+print(dirname(\"c\"))
+print(dirname(\"/\"))
+print(dirname(\"\"))
+print(dirname(\"a/\"))
+print(dirname(\"a/b\"))
+print(dirname(\"a/b/\"))
+print(basename(\"/a/b/c\"))
+print(basename(\"/a/b/c/\"))
+print(basename(\"c\"))
+print(basename(\"/\"))
+print(basename(\"\"))
+print(basename(\"a/\"))
+print(basename(\"a/b\"))
+print(basename(\"a/b/\"))
+print(os.path.join(\"x\", \"y\"))
+print(os.path.dirname(\"/p/q\"))
+print(os.path.basename(\"/p/q\"))
+";
+    let out = run_program("stdlib_os_path", src);
+    assert_eq!(
+        out,
+        "a/b\n\
+/a/b\n\
+/b\n\
+a/b\n\
+b\n\
+a/\n\
+a/b/c/d\n\
+/a\n\
+/\n\
+\n\
+/\n\
+/\n\
+/a/b\n\
+/a/b/c\n\
+\n\
+/\n\
+\n\
+a\n\
+a\n\
+a/b\n\
+c\n\
+\n\
+c\n\
+\n\
+\n\
+\n\
+b\n\
+\n\
+x/y\n\
+/p\n\
+q\n"
+    );
+}
+
+#[test]
+fn stdlib_os_path_from_import_and_dotted_import() {
+    let out = run_program(
+        "stdlib_os_path_forms",
+        "\
+from os.path import join as j
+import os.path as op
+print(j(\"foo\", \"bar\"))
+print(op.dirname(\"/x/y/z\"))
+print(op.basename(\"/x/y/z\"))
+",
+    );
+    assert_eq!(out, "foo/bar\n/x/y\nz\n");
+}
+
+#[test]
+fn stdlib_os_import_then_path_attr() {
+    // `os/__init__.py` re-exports `path` so `import os` then `os.path` works.
+    let out = run_program(
+        "stdlib_os_attr",
+        "\
+import os
+print(os.path.join(\"a\", \"b\"))
+print(os.path.dirname(\"/a/b\"))
+",
+    );
+    assert_eq!(out, "a/b\n/a\n");
+}
+
+#[test]
+fn user_os_path_shadows_stdlib() {
+    // Entry-dir module wins over stdlib/embed on name clash.
+    let out = run_project(
+        "user_shadow_os",
+        &[
+            ("os/__init__.py", "from . import path\n"),
+            (
+                "os/path.py",
+                "def join(a: str, b: str) -> str:\n    return \"USER:\" + a + \":\" + b\n",
+            ),
+            (
+                "main.py",
+                "from os.path import join\nprint(join(\"a\", \"b\"))\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "USER:a:b\n");
+}
+
+#[test]
+fn from_os_import_path_matches_python() {
+    // fromlist on embedded package that re-exports `path`.
+    let out = run_program(
+        "from_os_import_path",
+        "\
+from os import path
+print(path.join(\"a\", \"b\"))
+print(path.dirname(\"/x/y\"))
+",
+    );
+    assert_eq!(out, "a/b\n/x\n");
+}
+
+#[test]
+fn stdlib_os_path_missing_name_is_error() {
+    let dir = TempDir::new("os_path_missing_name");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "from os.path import totally_missing\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot import name 'totally_missing' from 'os.path'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn stdlib_os_missing_submodule_is_error() {
+    let dir = TempDir::new("os_nope");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "import os.nope\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("No module named 'os.nope'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn pyrs_stdlib_env_provides_module() {
+    // PYRS_STDLIB is searched after entry and can supply a plain module.
+    let dir = TempDir::new("pyrs_stdlib_env");
+    let std = dir.0.join("std");
+    fs::create_dir_all(&std).unwrap();
+    fs::write(std.join("envmod.py"), "VALUE: int = 99\n").unwrap();
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "import envmod\nprint(envmod.VALUE)\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(&src)
+        .env("PYRS_STDLIB", &std)
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "99\n");
+}
+
+#[test]
+fn pyrs_stdlib_incomplete_package_blocks_workspace_child() {
+    // Incomplete package under PYRS_STDLIB must not split with workspace/embed os.path.
+    let dir = TempDir::new("pyrs_stdlib_incomplete");
+    let std = dir.0.join("std");
+    fs::create_dir_all(std.join("os")).unwrap();
+    fs::write(std.join("os/__init__.py"), "# incomplete shadow\n").unwrap();
+    // no path.py under PYRS_STDLIB
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "import os.path\nprint(1)\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .env("PYRS_STDLIB", &std)
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success(), "expected split-package failure");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("No module named 'os.path'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn empty_pyrs_stdlib_falls_through_to_embed_or_workspace() {
+    // Empty PYRS_STDLIB directory: still stacked after entry; real stdlib
+    // (workspace/embed) remains available for os.path.
+    let dir = TempDir::new("pyrs_stdlib_empty");
+    let std = dir.0.join("empty_std");
+    fs::create_dir_all(&std).unwrap();
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "from os.path import join\nprint(join(\"e\", \"f\"))\n",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(&src)
+        .env("PYRS_STDLIB", &std)
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "e/f\n");
+}
+
+#[test]
+fn incomplete_entry_os_package_does_not_use_stdlib_path() {
+    let out_fail = compile_project_expect_fail(
+        "incomplete_entry_os",
+        &[
+            ("os/__init__.py", "# user incomplete package\n"),
+            ("main.py", "import os.path\nprint(1)\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        out_fail.contains("No module named 'os.path'"),
+        "stderr: {out_fail}"
+    );
 }
