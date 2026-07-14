@@ -4180,3 +4180,444 @@ fn incomplete_entry_os_package_does_not_use_stdlib_path() {
         "stderr: {out_fail}"
     );
 }
+
+// ---- Batch A / v0.12 features ----
+
+#[test]
+fn min_max_iterable_matches_python() {
+    let out = run_program(
+        "minmax_list",
+        "\
+print(min([3, 1, 4, 1, 5]))
+print(max([3, 1, 4, 1, 5]))
+print(min([1.5, -2.0, 3.0]))
+print(max([1.5, -2.0, 3.0]))
+print(min([True, False, True]))
+print(max([False, True]))
+xs: list[int] = [10, -3, 7]
+print(min(xs), max(xs))
+print(min(-3, 2), max([1, 9, 3]))
+",
+    );
+    assert_eq!(
+        out,
+        "\
+1
+5
+-2.0
+3.0
+False
+True
+-3 10
+-3 9
+"
+    );
+}
+
+#[test]
+fn min_empty_list_traps() {
+    let (code, err) = run_program_expect_fail(
+        "min_empty",
+        "\
+xs: list[int] = []
+print(min(xs))
+",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("min() iterable argument is empty"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn max_empty_list_traps() {
+    let (code, err) = run_program_expect_fail(
+        "max_empty",
+        "\
+xs: list[int] = []
+print(max(xs))
+",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("max() iterable argument is empty"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn and_or_return_operands_matches_python() {
+    let out = run_program(
+        "and_or_ops",
+        "\
+print(0 or 5)
+print(3 or 5)
+print(\"\" or \"x\")
+print(\"a\" and \"b\")
+print(0 and 5)
+print(1 and 2)
+print(0.0 or 1.5)
+print(2.5 and 3.5)
+empty: list[int] = []
+print(empty or [1])
+print([0] and [1, 2])
+print(True and False or True)
+",
+    );
+    assert_eq!(
+        out,
+        "\
+5
+3
+x
+b
+0
+2
+1.5
+3.5
+[1]
+[1, 2]
+True
+"
+    );
+}
+
+#[test]
+fn and_or_short_circuit_side_effects() {
+    // Right side of `or` skipped when left is truthy; right of `and` skipped when left is falsy.
+    let out = run_program(
+        "and_or_sc",
+        "\
+n = 0
+
+def bump() -> int:
+    global n
+    n = n + 1
+    return 5
+
+print(1 or bump())
+print(n)
+print(0 or bump())
+print(n)
+print(0 and bump())
+print(n)
+print(1 and bump())
+print(n)
+",
+    );
+    assert_eq!(out, "1\n0\n5\n1\n0\n1\n5\n2\n");
+}
+
+#[test]
+fn multi_name_import_matches_python() {
+    let out = run_project(
+        "multi_import",
+        &[
+            ("a.py", "def fa() -> int:\n    return 1\n"),
+            ("b.py", "def fb() -> int:\n    return 2\n"),
+            ("main.py", "import a, b as bee\nprint(a.fa(), bee.fb())\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "1 2\n");
+}
+
+#[test]
+fn try_else_matches_python() {
+    let out = run_program(
+        "try_else",
+        "\
+try:
+    x = 1
+except:
+    print(\"exc\")
+else:
+    print(\"else\")
+print(\"after\")
+try:
+    raise ValueError(\"boom\")
+except ValueError:
+    print(\"caught\")
+else:
+    print(\"else-skip\")
+try:
+    x = 1
+except ValueError:
+    print(\"exc\")
+else:
+    print(\"else2\")
+finally:
+    print(\"fin\")
+try:
+    try:
+        x = 1
+    except ValueError:
+        print(\"inner\")
+    else:
+        raise RuntimeError(\"from-else\")
+    finally:
+        print(\"inner-fin\")
+except RuntimeError as e:
+    print(\"outer\", e)
+",
+    );
+    assert_eq!(
+        out,
+        "\
+else
+after
+caught
+else2
+fin
+inner-fin
+outer from-else
+"
+    );
+}
+
+#[test]
+fn dict_get_bare_and_default() {
+    let out = run_program(
+        "dict_get",
+        "\
+d: dict[str, int] = {\"a\": 1, \"b\": 2}
+print(d.get(\"a\"))
+print(d.get(\"a\", 9))
+print(d.get(\"missing\", 9))
+",
+    );
+    assert_eq!(out, "1\n1\n9\n");
+}
+
+#[test]
+fn dict_get_bare_miss_keyerror() {
+    let (code, err) = run_program_expect_fail(
+        "dict_get_miss",
+        "\
+d: dict[str, int] = {\"a\": 1}
+print(d.get(\"missing\"))
+",
+    );
+    assert_eq!(code, 1);
+    assert!(err.contains("KeyError"), "stderr: {err}");
+}
+
+#[test]
+fn stdlib_math_matches_python() {
+    let out = run_program(
+        "stdlib_math",
+        "\
+import math
+print(math.pi)
+print(math.e)
+print(math.sqrt(4.0))
+print(math.sin(0.0), math.cos(0.0), math.tan(0.0))
+print(math.floor(3.7), math.ceil(3.2))
+print(math.floor(-3.2), math.ceil(-3.2))
+print(math.fabs(-2.5))
+print(math.exp(0.0))
+print(math.log(math.e))
+print(math.log10(100.0))
+from math import sqrt, pi
+print(sqrt(9.0), pi)
+",
+    );
+    assert_eq!(
+        out,
+        "\
+3.141592653589793
+2.718281828459045
+2.0
+0.0 1.0 0.0
+3 4
+-4 -3
+2.5
+1.0
+1.0
+2.0
+3.0 3.141592653589793
+"
+    );
+}
+
+// ---- v0.12 batch B: os.getcwd, *args/**kwargs, closures, json ----
+
+#[test]
+fn os_getcwd_matches_python() {
+    let dir = TempDir::new("getcwd");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "import os\nprint(os.getcwd())\n").unwrap();
+    let py = Command::new("python3")
+        .arg(&src)
+        .current_dir(&dir.0)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    let out = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(&src)
+        .current_dir(&dir.0)
+        .output()
+        .expect("pyrs");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&py.stdout)
+    );
+}
+
+#[test]
+fn starargs_and_kwargs_match_python() {
+    let src = "\
+def f(x: int, *args: int) -> int:
+    s = x
+    for a in args:
+        s = s + a
+    return s
+
+def g(x: int, **kwargs: int) -> int:
+    s = x
+    for k in kwargs:
+        s = s + kwargs[k]
+    return s
+
+print(f(1, 2, 3))
+print(f(10))
+xs: list[int] = [4, 5]
+print(f(1, *xs))
+print(g(1, a=2, b=3))
+print(f(1, 2, *xs))
+";
+    let out = run_program("starargs", src);
+    assert_eq!(out, "6\n10\n10\n6\n12\n");
+}
+
+#[test]
+fn kwargs_unexpected_is_compile_error() {
+    let dir = TempDir::new("kwerr");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "def f(a: int) -> int:\n    return a\nprint(f(b=1))\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unexpected keyword argument"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn nested_function_captures_by_value() {
+    let src = "\
+def make(n: int) -> int:
+    def add(x: int) -> int:
+        return x + n
+    return add(5)
+
+def fact(n: int) -> int:
+    def go(k: int, acc: int) -> int:
+        if k <= 1:
+            return acc
+        return go(k - 1, acc * k)
+    return go(n, 1)
+
+print(make(3))
+print(fact(5))
+";
+    let out = run_program("closure", src);
+    assert_eq!(out, "8\n120\n");
+}
+
+#[test]
+fn nested_function_return_is_rejected() {
+    let dir = TempDir::new("ret_nested");
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "def outer(n: int) -> int:\n    def inner(x: int) -> int:\n        return x + n\n    return inner\n",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a value") || stderr.contains("not supported"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn json_dumps_and_typed_loads_match_python() {
+    // dumps parity vs CPython; loads_* are PyRs-only helpers (compare values).
+    let src = "\
+import json
+from json import dumps, loads_int, loads_list_int, loads_dict_str_int, loads_str, loads_bool
+
+print(dumps(42))
+print(dumps([1, 2, 3]))
+print(dumps({\"a\": 1, \"b\": 2}))
+print(dumps(True))
+print(dumps(\"hi\"))
+print(loads_int(\"99\"))
+print(loads_list_int(\"[1, 2, 3]\"))
+d = loads_dict_str_int('{\"x\": 7}')
+print(d[\"x\"])
+print(loads_str('\"hello\"'))
+print(loads_bool(\"true\"))
+print(json.dumps([1, 2]))
+";
+    let out = run_program("json_sub", src);
+    assert_eq!(
+        out,
+        "42\n\
+[1, 2, 3]\n\
+{\"a\": 1, \"b\": 2}\n\
+true\n\
+\"hi\"\n\
+99\n\
+[1, 2, 3]\n\
+7\n\
+hello\n\
+True\n\
+[1, 2]\n"
+    );
+}
+
+#[test]
+fn os_path_join_multi_arg_matches_python() {
+    let src = "\
+from os.path import join
+print(join(\"a\", \"b\", \"c\"))
+print(join(\"/a\", \"b\", \"/c\", \"d\"))
+print(join(\"a\"))
+";
+    let out = run_program("join_multi", src);
+    assert_eq!(out, "a/b/c\n/c/d\na\n");
+}
+
+#[test]
+fn star_call_fixed_arity() {
+    let src = "\
+def add3(a: int, b: int, c: int) -> int:
+    return a + b + c
+
+xs: list[int] = [2, 3]
+print(add3(1, *xs))
+print(add3(*[1, 2, 3]))
+";
+    let out = run_program("star_fixed", src);
+    assert_eq!(out, "6\n6\n");
+}
