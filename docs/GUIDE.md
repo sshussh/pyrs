@@ -194,10 +194,13 @@ cannot assign to them via `nonlocal`).
 
 ### Types
 
-`int`, `float`, `bool`, `str`, `file`, `list[T]`, `tuple[T1, T2, …]`
-(empty: `tuple[()]`), `dict[K, V]`, `set[T]`, and `None` (return only).
-Dict keys and set elements are restricted to `int` and `str`.
-
+`int`, `float`, `bool`, `str`, `None`, unions (`T | U | …`),
+`Optional[T]` (= `T | None`), `file`, `list[T]`, `tuple[T1, T2, …]`
+(empty: `tuple[()]`), `dict[K, V]`, `set[T]`.
+Dict keys and set elements are restricted to `int` and `str`. List
+elements and dict values may be Optional/unions. Function `-> None`
+still means “returns nothing” (void); expression-level `None` is a real
+value.
 
 | type | representation | notes |
 |------|----------------|-------|
@@ -205,14 +208,19 @@ Dict keys and set elements are restricted to `int` and `str`.
 | `float` | IEEE-754 double | |
 | `bool`  | `True` / `False` | assignable where int/float is expected |
 | `str`   | immutable string | heap-allocated, length-prefixed |
+| `None`  | the None singleton | falsy; printable; first-class value |
+| `T \| U` / `Optional[T]` | tagged union `{tag, payload}` | members flattened/sorted; no nested unions |
 | `file`  | open file handle | from `open(...)`; usable in params/returns; not in lists |
-| `list[T]` | growable homogeneous list | `T` is any type incl. another list (`list[list[float]]`); not `file` |
+| `list[T]` | growable homogeneous list | `T` is any type incl. another list or Optional; not `file` |
 | `tuple[T1, …]` | fixed-arity heterogeneous tuple | empty `tuple[()]`; index / len / unpack / iterate (homogeneous) |
-| `dict[K, V]` | hash map, insertion order | `K` is `int` or `str`; empty `{}` needs annotation |
+| `dict[K, V]` | hash map, insertion order | `K` is `int` or `str`; `V` may be Optional/union; empty `{}` needs annotation |
 | `set[T]` | hash set, insertion order | `T` is `int` or `str`; empty via `s: set[int] = set()` |
 
 Implicit promotions (mypy-flavored): `bool → int → float`. They apply in
-arithmetic, assignments, arguments, and returns:
+arithmetic, assignments, arguments, and returns. A concrete value may be
+wrapped into a union that includes its type (`5` → `int | None`). Using
+a union where a concrete member is required is a **compile error** —
+narrow with `is None` / `or` instead (no automatic unwrap):
 
 ```python
 def halve(x: float) -> float:
@@ -258,7 +266,7 @@ From lowest to highest precedence:
 | 1 | `or` |
 | 2 | `and` |
 | 3 | `not x` |
-| 4 | `==  !=  <  <=  >  >=  in  not in` (chainable) |
+| 4 | `==  !=  <  <=  >  >=  in  not in  is  is not` (chainable; `is` only with `None`) |
 | 5 | `+  -` |
 | 6 | `*  /  //  %` |
 | 7 | `-x  +x` (unary) |
@@ -284,11 +292,17 @@ if 0 <= x < len(xs):    # exactly one evaluation of each operand
     ...
 ```
 
+`None` is falsy. `x is None` / `x is not None` test for the None tag on
+optionals (or are constant for pure `None` / non-optional values).
+
 `and` / `or` / `not` accept any value via truthiness (nonzero numbers,
-non-empty strings and lists are truthy) and short-circuit. Like Python,
-`and` / `or` yield an **operand** (not always `bool`): `0 or 5` is `5`,
-`"" or "x"` is `"x"`, `"a" and "b"` is `"b"`. Both sides must share a
-type (or both be numeric, with the usual `bool`→`int`→`float` unify).
+non-empty strings and lists are truthy; `None` is falsy) and short-circuit.
+Like Python, `and` / `or` yield an **operand** (not always `bool`):
+`0 or 5` is `5`, `0 or "x"` is `"x"` (typed as `int | str`),
+`None or 3` is `3`, `"" or "x"` is `"x"`, `"a" and "b"` is `"b"`.
+Same-type and both-numeric operands keep the previous rules
+(`bool`→`int`→`float` unify); otherwise the result is a union of the
+operands' members.
 
 `in` / `not in` test substrings and list membership:
 
@@ -986,20 +1000,23 @@ deliberate exceptions:
    a known limitation for long-running ones.
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
-11. **Bare `dict.get(k)` raises `KeyError` on a missing key** (CPython
-    returns `None`). Use `get(k, default)` for miss defaults. Hit paths
-    match CPython.
+11. **No control-flow narrowing of Optionals** — `if x is not None: …`
+    does not refine `x` to the non-None member; use `x or default` or
+    keep the union type.
 
-Container notes (v0.12):
+Container notes (v0.13):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`
   and methods are not supported yet.
-- **dict:** keys are `int` or `str` only; bare `get` → `KeyError` on miss
-  (no Optional/`None` return yet); `keys`/`values`/`items` return lists
-  (not views); insertion-order iteration over keys.
+- **dict:** keys are `int` or `str` only; bare `get(k)` returns
+  `Optional[V]` (`None` on miss); `get(k, default)` keeps value type;
+  `keys`/`values`/`items` return lists (not views); insertion-order
+  iteration over keys.
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
   `{}` is always an empty dict.
+- **unions / Optional:** first-class `None`; `T | U` and `Optional[T]`;
+  `is`/`is not` only with `None`; `|` is not a bitwise-or expression.
 
 Exception notes: `except E as e` binds the message `str`, not an exception
 object. Other traps (`EOFError`, `FileNotFoundError`, …) match bare

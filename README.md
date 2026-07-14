@@ -38,18 +38,20 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.12)
+## The language (v0.13)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.13.0**, not 1.0) until it is ready for
+milestone after this one is **0.14.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label.
 
 A statically-typed Python subset:
 
-- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `list[T]`,
+- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `None`,
+  unions (`int | None`, `str | int | None`), `Optional[T]`, `list[T]`,
   `tuple[T1, T2, …]`, `dict[K, V]`, `set[T]` — including nested lists
-  (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only
+  (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only;
+  list elements and dict values may be Optional/unions
 - **Functions:** `def` with mandatory parameter annotations
   (`def f(x: int, y: int = 0) -> int:`), defaults and keyword args,
   recursion, forward references; pass/return tuples and other containers
@@ -62,8 +64,9 @@ A statically-typed Python subset:
   `try`/`except`/`else`/`finally`
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
-  `and`/`or`/`not` (short-circuit; `and`/`or` return an operand, not
-  always `bool`), casts
+  `is`/`is not` (only with `None` for now), `and`/`or`/`not`
+  (short-circuit; `and`/`or` return an operand, not always `bool`, and
+  may yield a union when operands differ, e.g. `0 or "x"`), casts
   `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, `min()`/`max()`
   (two args or one `list[int|float|bool]`), `sum()` on
   `list[int]`/`list[float]`, indexing with
@@ -95,7 +98,7 @@ A statically-typed Python subset:
 - **Dicts:** `dict[K, V]` with `K` in `{int, str}`; literal `{k: v}`,
   `{}` (needs annotation); get/set, `del d[k]`, `in` on keys, `len`,
   insertion-order key iteration; methods `get` (with default, or bare
-  `get(k)` which raises `KeyError` on miss until Optional/`None` returns),
+  `get(k)` → `Optional[V]` / `None` on miss),
   `pop`, `keys`/`values`/`items` (return lists), `clear`
 - **Sets:** `set[T]` with `T` in `{int, str}`; nonempty `{a, b}`, empty
   `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`, `in`, `len`,
@@ -158,30 +161,33 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.12): no bigints (int is 64-bit and wraps), `min`/`max`
+Known limits (v0.13): no bigints (int is 64-bit and wraps), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
 not the int `1`); iterable `min`/`max` is only for
 `list[int|float|bool]` (empty list → ValueError like CPython),
-`and`/`or` require compatible operand types (same type, or both
-numeric), `x ** e` with a *dynamic* negative int exponent traps (a
-constant like `2 ** -1` works and gives float), int↔float comparisons
-convert the int to float (exactness loss past 2^53), list literals
-coerce mixed numerics to one element type, `nan in [nan]` is False (no
-identity semantics), str methods use ASCII case/whitespace rules, heap
-memory is never freed, files support text modes "r"/"w"/"a" only
-(`with`, `for line in f`, and `file` params/returns work; no
-`list[file]` or printing files), no `from m import *`, namespace packages
-without `__init__.py`, imports only at module top level (not inside
-`if`/functions), a package importing itself by name, or treating modules
-as first-class values beyond attribute/call chains; `os.path` is POSIX
-only (no Windows paths); nested functions capture outer locals by value
-at each call (no `nonlocal`, no returning local functions); `*args` /
-`**kwargs` on defs and `*`/`**` unpacking in calls are supported for
-homogeneous list/dict types; `json` has no dynamic `loads`;
-full f-string format specs (beyond `{x:.Nf}`) are unsupported,
-unparenthesized multi-line f-string expressions and same-delimiter
-nested triples inside `{...}` are unsupported, no `__doc__` attribute
-on functions/modules, dict/set keys are only `int`/`str`,
+no control-flow narrowing of Optionals (use `x or default` / `is None`;
+cannot assign `int | None` to `int` without a check), `is`/`is not`
+only with `None` (no general identity), `|` is only for type unions
+(not bitwise-or expressions), `x ** e` with a *dynamic* negative int
+exponent traps (a constant like `2 ** -1` works and gives float),
+int↔float comparisons convert the int to float (exactness loss past
+2^53), list literals coerce mixed numerics to one element type, `nan
+in [nan]` is False (no identity semantics), str methods use ASCII
+case/whitespace rules, heap memory is never freed, files support text
+modes "r"/"w"/"a" only (`with`, `for line in f`, and `file`
+params/returns work; no `list[file]` or printing files), no `from m
+import *`, namespace packages without `__init__.py`, imports only at
+module top level (not inside `if`/functions), a package importing itself
+by name, or treating modules as first-class values beyond attribute/call
+chains; `os.path` is POSIX only (no Windows paths); nested functions
+capture outer locals by value at each call (no `nonlocal`, no returning
+local functions); `*args` / `**kwargs` on defs and `*`/`**` unpacking in
+calls are supported for homogeneous list/dict types; `json` has no
+dynamic `loads`; full f-string format specs (beyond `{x:.Nf}`) are
+unsupported, unparenthesized multi-line f-string expressions and
+same-delimiter nested triples inside `{...}` are unsupported, no
+`__doc__` attribute on functions/modules, dict/set keys are only
+`int`/`str`,
 bare `dict.get(k)` raises `KeyError` on miss (no first-class `None`
 return yet — use `get(k, default)` for defaults),
 `keys`/`values`/`items` return lists (not view objects), no starred
@@ -271,4 +277,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.12.0 && git push origin v0.12.0`.
+Release tags: `git tag v0.13.0 && git push origin v0.13.0`.

@@ -18,7 +18,7 @@ surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
 0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
 **PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
 use** (not merely because the minor is large). Current milestone:
-**v0.12** / `0.12.0`. Optional release tags: `vX.Y.Z`.
+**v0.13** / `0.13.0`. Optional release tags: `vX.Y.Z`.
 
 ---
 
@@ -323,7 +323,7 @@ programs** link only the object file from the shim plus `runtime.c`.
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.12 subset):**
+**Today (v0.13 subset):**
 
 - Static types after first assignment; cannot rebind a name to a
   different type.
@@ -447,8 +447,8 @@ These are product constraints that affect design choices:
 | Typing           | Required params; fixed types                         | Optional typing + more dynamism                                           |
 | Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
-| Language surface | Subset (see README v0.12); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
-| Product version  | `0.12.0` (and later `0.13.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
+| Language surface | Subset (see README v0.13); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
+| Product version  | `0.13.0` (and later `0.14.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
 generators, nested functions / closures, `lambda`, `from m import *`,
