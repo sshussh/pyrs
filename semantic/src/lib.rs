@@ -21,7 +21,7 @@
 //! The program entry is the top-level script statements; if there are none
 //! but a zero-parameter `main` is defined, `main()` is called instead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use common::{Diagnostic, Phase, Span};
 use parser::ast;
@@ -182,6 +182,23 @@ struct ModuleCtx<'a> {
     /// Partial package init: parent → child → (name → ty) for simple
     /// assignments in the parent **before** the import that loads the child.
     partial_prelim: &'a HashMap<String, HashMap<String, HashMap<String, ir::Ty>>>,
+    /// Func names defined in parent **before** the import that loads the child
+    /// (parent → child → names). Visible at child module top level mid-init.
+    partial_funcs: &'a HashMap<String, HashMap<String, HashSet<String>>>,
+    /// Full simple-assign surface of each package (entire body). Used for
+    /// **deferred** parent attribute loads inside child function bodies.
+    package_final_values: &'a HashMap<String, HashMap<String, ir::Ty>>,
+    /// Own function tables (all modules). Deferred parent calls use these
+    /// when the parent is not yet in `mods`.
+    all_own_funcs: &'a HashMap<String, HashMap<String, FuncSig>>,
+    /// Last top-level export kind per module (Module vs Symbol).
+    last_exports: &'a HashMap<String, HashMap<String, LastExport>>,
+    /// `from … import` value/function re-export origins per module:
+    /// local name → (origin module, origin name). Used for deferred parent
+    /// access while the parent package is not yet in `mods`.
+    reexport_origins: &'a HashMap<String, HashMap<String, (String, String)>>,
+    /// Re-export names bound on parent before each child load (mid-init hasattr).
+    partial_reexports: &'a HashMap<String, HashMap<String, HashSet<String>>>,
 }
 
 impl ModuleCtx<'_> {
@@ -195,9 +212,24 @@ impl ModuleCtx<'_> {
         }
     }
 
-    /// Names visible on `parent` while lowering `self.module` under partial init.
+    /// Names visible on `parent` while lowering `self.module` under partial init
+    /// (child **module body** only — names assigned before the child-loading import).
     fn partial_parent_globals(&self, parent: &str) -> Option<&HashMap<String, ir::Ty>> {
         self.partial_prelim
+            .get(parent)
+            .and_then(|by_child| by_child.get(self.module))
+    }
+
+    /// Parent function names defined before this child was loaded (mid-init module body).
+    fn partial_parent_funcs(&self, parent: &str) -> Option<&HashSet<String>> {
+        self.partial_funcs
+            .get(parent)
+            .and_then(|by_child| by_child.get(self.module))
+    }
+
+    /// Parent re-export names bound before this child was loaded.
+    fn partial_parent_reexports(&self, parent: &str) -> Option<&HashSet<String>> {
+        self.partial_reexports
             .get(parent)
             .and_then(|by_child| by_child.get(self.module))
     }
@@ -532,7 +564,7 @@ fn stmt_loads_child(stmt: &ast::Stmt, parent: &str, child: &str) -> bool {
 
 /// For each parent package P and child module C under P: simple assignment
 /// types in P **before** the first statement that loads C (CPython partial
-/// init: later names are not visible to the child).
+/// init: later names are not visible at child **module top level**).
 /// Map: parent → child → (name → ty).
 fn build_partial_prelim(
     modules: &[ModuleInput],
@@ -541,9 +573,6 @@ fn build_partial_prelim(
         modules.iter().map(|m| (m.name.as_str(), m.ast)).collect();
     let mut out: HashMap<String, HashMap<String, HashMap<String, ir::Ty>>> = HashMap::new();
     for m in modules {
-        let Some(parent) = m.name.rsplit_once('.').map(|(p, _)| p) else {
-            continue;
-        };
         // Walk each ancestor package
         let parts: Vec<&str> = m.name.split('.').collect();
         for i in 1..parts.len() {
@@ -562,7 +591,124 @@ fn build_partial_prelim(
                 .or_default()
                 .insert(m.name.clone(), tys);
         }
-        let _ = parent;
+    }
+    out
+}
+
+/// Func names defined in parent **before** the import that loads each child
+/// (visible for mid-init module-level calls, like CPython).
+fn build_partial_funcs(
+    modules: &[ModuleInput],
+) -> HashMap<String, HashMap<String, HashSet<String>>> {
+    let by_name: HashMap<&str, &ast::Module> =
+        modules.iter().map(|m| (m.name.as_str(), m.ast)).collect();
+    let mut out: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+    for m in modules {
+        let parts: Vec<&str> = m.name.split('.').collect();
+        for i in 1..parts.len() {
+            let parent_name = parts[..i].join(".");
+            let Some(parent_ast) = by_name.get(parent_name.as_str()) else {
+                continue;
+            };
+            let mut names = HashSet::new();
+            for stmt in &parent_ast.body {
+                if stmt_loads_child(stmt, &parent_name, &m.name) {
+                    break;
+                }
+                if let ast::StmtKind::FuncDef(f) = &stmt.kind {
+                    names.insert(f.name.clone());
+                }
+            }
+            out.entry(parent_name)
+                .or_default()
+                .insert(m.name.clone(), names);
+        }
+    }
+    out
+}
+
+/// All simple assignments in each module body (full package surface for deferred
+/// parent attribute loads inside child **function** bodies after parent finishes).
+fn build_package_final_values(modules: &[ModuleInput]) -> HashMap<String, HashMap<String, ir::Ty>> {
+    let mut out = HashMap::new();
+    for m in modules {
+        let mut tys = HashMap::new();
+        for stmt in &m.ast.body {
+            record_simple_assign(stmt, &mut tys);
+        }
+        out.insert(m.name.clone(), tys);
+    }
+    out
+}
+
+/// Names bound by `from … import` on parent **before** each child is loaded
+/// (re-exports visible mid-init via hasattr).
+fn build_partial_reexports(
+    modules: &[ModuleInput],
+) -> HashMap<String, HashMap<String, HashSet<String>>> {
+    let by_name: HashMap<&str, &ast::Module> =
+        modules.iter().map(|m| (m.name.as_str(), m.ast)).collect();
+    let mut out: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+    for m in modules {
+        let parts: Vec<&str> = m.name.split('.').collect();
+        for i in 1..parts.len() {
+            let parent_name = parts[..i].join(".");
+            let Some(parent_ast) = by_name.get(parent_name.as_str()) else {
+                continue;
+            };
+            let mut names = HashSet::new();
+            for stmt in &parent_ast.body {
+                if stmt_loads_child(stmt, &parent_name, &m.name) {
+                    break;
+                }
+                if let ast::StmtKind::FromImport {
+                    names: imported, ..
+                } = &stmt.kind
+                {
+                    for (name, alias, _) in imported {
+                        let local = alias.as_ref().unwrap_or(name);
+                        names.insert(local.clone());
+                    }
+                }
+            }
+            out.entry(parent_name)
+                .or_default()
+                .insert(m.name.clone(), names);
+        }
+    }
+    out
+}
+
+/// Local → (origin module, origin name) for Symbol re-exports on each module.
+/// Only names whose **last** top-level binding is a `from … import`.
+fn build_reexport_origins(
+    modules: &[ModuleInput],
+    all_imports: &[HashMap<String, ImportBinding>],
+    last_exports: &HashMap<String, HashMap<String, LastExport>>,
+) -> HashMap<String, HashMap<String, (String, String)>> {
+    let mut out: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
+    for (i, m) in modules.iter().enumerate() {
+        let mut map = HashMap::new();
+        for (local, binding) in &all_imports[i] {
+            let ImportBinding::Symbol {
+                module: src,
+                name: src_name,
+            } = binding
+            else {
+                continue;
+            };
+            if matches!(
+                last_exports.get(&m.name).and_then(|e| e.get(local)),
+                Some(LastExport::Module(_))
+            ) {
+                continue;
+            }
+            if !last_binding_is_from_import(m.ast, local) {
+                continue;
+            }
+            map.insert(local.clone(), (src.clone(), src_name.clone()));
+        }
+        out.insert(m.name.clone(), map);
     }
     out
 }
@@ -849,6 +995,11 @@ fn collect_assign_names(target: &ast::AssignTarget, names: &mut std::collections
 /// imported modules and symbols exist. Uses each source module's **last
 /// top-level export** (Module vs Symbol) so re-exports and same-named
 /// submodules follow source order.
+///
+/// CPython `fromlist` short-circuits on `hasattr`: if a package already
+/// bound a name as a value/function, a later `from . import same_name` does
+/// not replace that binding with a self-ref or submodule. We keep the prior
+/// Symbol origin (or skip inserting a self-ref for own assign/`def`).
 fn collect_imports(
     module: &ast::Module,
     self_name: &str,
@@ -858,8 +1009,27 @@ fn collect_imports(
     submodules: &HashMap<String, HashMap<String, String>>,
 ) -> SResult<HashMap<String, ImportBinding>> {
     let mut imports: HashMap<String, ImportBinding> = HashMap::new();
+    // Names already bound on this module as Symbol exports (assign/def/reexport)
+    // while walking in source order — for hasattr short-circuit on self-imports.
+    let mut self_value_bound: HashSet<String> = HashSet::new();
     for stmt in &module.body {
         match &stmt.kind {
+            ast::StmtKind::FuncDef(f) => {
+                self_value_bound.insert(f.name.clone());
+            }
+            ast::StmtKind::Assign { targets, .. } => {
+                let mut names = HashSet::new();
+                for t in targets {
+                    collect_assign_names(t, &mut names);
+                }
+                self_value_bound.extend(names);
+            }
+            ast::StmtKind::AugAssign {
+                target: ast::AssignTarget::Name { name, .. },
+                ..
+            } => {
+                self_value_bound.insert(name.clone());
+            }
             ast::StmtKind::Import {
                 module: m,
                 alias,
@@ -895,9 +1065,25 @@ fn collect_imports(
                     let sub_full = submodules.get(m).and_then(|s| s.get(name)).cloned();
                     let is_func = export_funcs.get(m).is_some_and(|f| f.contains_key(name));
                     let is_value = export_values.get(m).is_some_and(|g| g.contains(name));
+
+                    // `from <self> import name` when name is already a value/func
+                    // on self: CPython hasattr short-circuit — keep prior origin.
+                    if m == self_name
+                        && (self_value_bound.contains(name)
+                            || matches!(imports.get(&local), Some(ImportBinding::Symbol { .. })))
+                    {
+                        // Do not overwrite a prior Symbol re-export with a
+                        // self-ref; do not insert a useless Symbol { self, name }.
+                        if !imports.contains_key(&local) {
+                            // Own assign/def only — no import binding needed.
+                        }
+                        self_value_bound.insert(local);
+                        continue;
+                    }
+
                     match export {
                         Some(LastExport::Module(full)) => {
-                            imports.insert(local, ImportBinding::Module(full));
+                            imports.insert(local.clone(), ImportBinding::Module(full));
                         }
                         Some(LastExport::Symbol) => {
                             if !is_func && !is_value && sub_full.is_none() {
@@ -907,26 +1093,30 @@ fn collect_imports(
                                 ));
                             }
                             imports.insert(
-                                local,
+                                local.clone(),
                                 ImportBinding::Symbol {
                                     module: m.clone(),
                                     name: name.clone(),
                                 },
                             );
+                            if m == self_name || is_func || is_value {
+                                self_value_bound.insert(local);
+                            }
                         }
                         None => {
                             // Source has no last-export entry (e.g. empty package
                             // exporting only a not-yet-mapped name).
                             if let Some(full) = sub_full {
-                                imports.insert(local, ImportBinding::Module(full));
+                                imports.insert(local.clone(), ImportBinding::Module(full));
                             } else if is_func || is_value {
                                 imports.insert(
-                                    local,
+                                    local.clone(),
                                     ImportBinding::Symbol {
                                         module: m.clone(),
                                         name: name.clone(),
                                     },
                                 );
+                                self_value_bound.insert(local);
                             } else {
                                 return Err(err(
                                     format!("cannot import name '{name}' from '{m}'"),
@@ -967,6 +1157,9 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
     let export_values = expand_export_values(modules, &assigned_names, &export_funcs, &submodules);
     let last_exports = compute_last_exports(modules, &submodules, &export_funcs, &export_values);
     let partial_prelim = build_partial_prelim(modules);
+    let partial_funcs = build_partial_funcs(modules);
+    let partial_reexports = build_partial_reexports(modules);
+    let package_final_values = build_package_final_values(modules);
 
     // pass 2: import bindings (validated against the export surface)
     let mut all_imports: Vec<HashMap<String, ImportBinding>> = Vec::new();
@@ -982,6 +1175,9 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
         .map_err(|d| d.with_file(i))?;
         all_imports.push(imports);
     }
+
+    // Re-export origins for deferred parent attribute/call resolution.
+    let reexport_origins = build_reexport_origins(modules, &all_imports, &last_exports);
 
     // pass 3: lower each module in dependency order, accumulating results
     let mut mods: HashMap<String, ModuleData> = HashMap::new();
@@ -999,6 +1195,12 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
             mods: &mods,
             submodules: &submodules,
             partial_prelim: &partial_prelim,
+            partial_funcs: &partial_funcs,
+            package_final_values: &package_final_values,
+            all_own_funcs: &own_funcs,
+            last_exports: &last_exports,
+            reexport_origins: &reexport_origins,
+            partial_reexports: &partial_reexports,
         };
 
         let mut globals: HashMap<String, ir::Ty> = HashMap::new();
@@ -1323,26 +1525,61 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 out.extend(init_calls_for(module));
             }
             for (name, _, nspan) in names {
-                if let Some(full) = ctx
+                // CPython fromlist: only load/run a submodule when the source
+                // package does not already have that name as a value/function
+                // (hasattr short-circuit). LastExport::Symbol → skip submodule init.
+                let last = ctx
                     .mctx
-                    .submodules
-                    .get(module)
-                    .and_then(|kids| kids.get(name))
-                {
-                    out.extend(init_calls_for(full));
+                    .last_exports
+                    .get(module.as_str())
+                    .and_then(|e| e.get(name));
+                let is_submodule_init = match last {
+                    Some(LastExport::Module(full)) => {
+                        out.extend(init_calls_for(full));
+                        true
+                    }
+                    Some(LastExport::Symbol) => {
+                        // value/function binding wins — do not run submodule body
+                        false
+                    }
+                    None => {
+                        if let Some(full) = ctx
+                            .mctx
+                            .submodules
+                            .get(module)
+                            .and_then(|kids| kids.get(name))
+                        {
+                            out.extend(init_calls_for(full));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if is_submodule_init {
                     continue;
                 }
-                // Partial package init: value names must already be assigned
-                // on the parent before this child was loaded.
+                // Partial package init: at child **module top level**, names
+                // must already be on the parent before this child was loaded
+                // (simple assigns or defs — CPython ImportError mid-init).
+                // Deferred use inside function bodies is handled at load/call sites.
                 if !module.is_empty()
                     && !ctx.mctx.mods.contains_key(module.as_str())
                     && is_strict_package_prefix(module, ctx.mctx.module)
                 {
-                    let visible = ctx
+                    let visible_val = ctx
                         .mctx
                         .partial_parent_globals(module)
                         .is_some_and(|g| g.contains_key(name));
-                    if !visible {
+                    let visible_fn = ctx
+                        .mctx
+                        .partial_parent_funcs(module)
+                        .is_some_and(|s| s.contains(name));
+                    let visible_reexport = ctx
+                        .mctx
+                        .partial_parent_reexports(module)
+                        .is_some_and(|s| s.contains(name));
+                    if !visible_val && !visible_fn && !visible_reexport {
                         return Err(err(
                             format!(
                                 "cannot import name '{name}' from partially initialized \
@@ -3365,19 +3602,19 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                                 expr.span,
                             ));
                         }
-                        // Parent package not yet fully lowered (partial init).
-                        if let Some(ty) = ctx
-                            .mctx
-                            .partial_parent_globals(module)
-                            .and_then(|g| g.get(real))
-                            .copied()
-                        {
-                            return Ok(ir::Expr {
-                                ty,
-                                kind: ir::ExprKind::GlobalLoad(qual(module, real)),
-                            });
-                        }
+                        // Parent package not yet fully lowered (partial / deferred).
                         if is_strict_package_prefix(module, ctx.mctx.module) {
+                            if let Some((om, on, ty)) = resolve_parent_value(
+                                ctx,
+                                module,
+                                real,
+                                /*for_module_body*/ ctx.is_entry,
+                            ) {
+                                return Ok(ir::Expr {
+                                    ty,
+                                    kind: ir::ExprKind::GlobalLoad(qual(&om, &on)),
+                                });
+                            }
                             return Err(err(
                                 format!(
                                     "cannot import name '{real}' from partially initialized \
@@ -3566,17 +3803,48 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         *attr_span,
                     ));
                 }
-                // Partial package init: parent not fully lowered yet.
-                if let Some(ty) = ctx
-                    .mctx
-                    .partial_parent_globals(&real)
-                    .and_then(|g| g.get(attr))
-                    .copied()
-                {
-                    return Ok(ir::Expr {
-                        ty,
-                        kind: ir::ExprKind::GlobalLoad(qual(&real, attr)),
-                    });
+                // Partial package init / deferred parent access: parent not
+                // fully lowered yet. Module body of child: only names assigned
+                // before the child-loading import. Function bodies: full
+                // parent simple-assign surface (CPython deferred lookup).
+                if is_strict_package_prefix(&real, ctx.mctx.module) {
+                    if let Some((om, on, ty)) = resolve_parent_value(
+                        ctx,
+                        &real,
+                        attr,
+                        /*for_module_body*/ ctx.is_entry,
+                    ) {
+                        return Ok(ir::Expr {
+                            ty,
+                            kind: ir::ExprKind::GlobalLoad(qual(&om, &on)),
+                        });
+                    }
+                    // Mid-init submodule attr: not a first-class value here.
+                    if ctx
+                        .mctx
+                        .submodules
+                        .get(&real)
+                        .is_some_and(|kids| kids.contains_key(attr))
+                        && !matches!(
+                            ctx.mctx.last_exports.get(&real).and_then(|e| e.get(attr)),
+                            Some(LastExport::Symbol)
+                        )
+                    {
+                        return Err(err(
+                            format!(
+                                "module '{real}.{attr}' is not a value; use \
+                                 '{real}.{attr}.<name>' or call a function on it"
+                            ),
+                            *attr_span,
+                        ));
+                    }
+                    return Err(err(
+                        format!(
+                            "cannot import name '{attr}' from partially initialized \
+                             package '{real}' (most likely due to a circular import)"
+                        ),
+                        *attr_span,
+                    ));
                 }
                 if ctx
                     .mctx
@@ -3588,15 +3856,6 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         format!(
                             "module '{real}.{attr}' is not a value; use \
                              '{real}.{attr}.<name>' or call a function on it"
-                        ),
-                        *attr_span,
-                    ));
-                }
-                if is_strict_package_prefix(&real, ctx.mctx.module) {
-                    return Err(err(
-                        format!(
-                            "cannot import name '{attr}' from partially initialized \
-                             package '{real}' (most likely due to a circular import)"
                         ),
                         *attr_span,
                     ));
@@ -4574,6 +4833,197 @@ fn lower_call_with_sig(
     })
 }
 
+/// Resolve a value attribute on a parent package that is not yet in `mods`.
+/// Returns `(origin_module, origin_name, ty)` for the IR global load.
+/// `for_module_body`: child module top-level (partial only); otherwise deferred
+/// full surface including re-exports (function bodies after parent finishes).
+fn resolve_parent_value(
+    ctx: &FnCtx,
+    parent: &str,
+    name: &str,
+    for_module_body: bool,
+) -> Option<(String, String, ir::Ty)> {
+    if for_module_body {
+        if let Some(ty) = ctx
+            .mctx
+            .partial_parent_globals(parent)
+            .and_then(|g| g.get(name).copied())
+        {
+            return Some((parent.to_string(), name.to_string(), ty));
+        }
+        if ctx
+            .mctx
+            .partial_parent_reexports(parent)
+            .is_some_and(|s| s.contains(name))
+        {
+            return resolve_reexport_value(ctx, parent, name);
+        }
+        return None;
+    }
+
+    // Deferred: last from-import re-export wins over earlier own assign.
+    if ctx
+        .mctx
+        .reexport_origins
+        .get(parent)
+        .is_some_and(|m| m.contains_key(name))
+        && let Some(got) = resolve_reexport_value(ctx, parent, name)
+    {
+        return Some(got);
+    }
+    if let Some(ty) = ctx
+        .mctx
+        .package_final_values
+        .get(parent)
+        .and_then(|g| g.get(name).copied())
+        .or_else(|| {
+            ctx.mctx
+                .partial_parent_globals(parent)
+                .and_then(|g| g.get(name).copied())
+        })
+    {
+        return Some((parent.to_string(), name.to_string(), ty));
+    }
+    resolve_reexport_value(ctx, parent, name)
+}
+
+/// Follow `reexport_origins` (and finished `mods` reexports) to a loadable value.
+fn resolve_reexport_value(
+    ctx: &FnCtx,
+    module: &str,
+    name: &str,
+) -> Option<(String, String, ir::Ty)> {
+    let mut m = module.to_string();
+    let mut n = name.to_string();
+    for _ in 0..32 {
+        if let Some((om, on)) = ctx
+            .mctx
+            .reexport_origins
+            .get(&m)
+            .and_then(|map| map.get(&n))
+            .cloned()
+        {
+            m = om;
+            n = on;
+            continue;
+        }
+        if let Some(data) = ctx.mctx.mods.get(&m) {
+            if let Some((om, on)) = data.reexports.get(&n).cloned() {
+                m = om;
+                n = on;
+                continue;
+            }
+            if let Some(ty) = data.globals.get(&n).copied() {
+                return Some((m, n, ty));
+            }
+            return None;
+        }
+        if let Some(ty) = ctx
+            .mctx
+            .package_final_values
+            .get(&m)
+            .and_then(|g| g.get(&n))
+            .copied()
+        {
+            return Some((m, n, ty));
+        }
+        return None;
+    }
+    None
+}
+
+/// Resolve a parent function while the parent is mid-init / not in `mods`.
+/// Returns `(ir_func_name, sig)`.
+fn resolve_parent_func(
+    ctx: &FnCtx,
+    parent: &str,
+    name: &str,
+    for_module_body: bool,
+) -> Option<(String, FuncSig)> {
+    if for_module_body {
+        if ctx
+            .mctx
+            .partial_parent_funcs(parent)
+            .is_some_and(|s| s.contains(name))
+            && let Some(sig) = ctx
+                .mctx
+                .all_own_funcs
+                .get(parent)
+                .and_then(|f| f.get(name).cloned())
+        {
+            return Some((qual(parent, name), sig));
+        }
+        if ctx
+            .mctx
+            .partial_parent_reexports(parent)
+            .is_some_and(|s| s.contains(name))
+        {
+            return resolve_reexport_func(ctx, parent, name);
+        }
+        return None;
+    }
+
+    // Deferred: re-export last wins.
+    if ctx
+        .mctx
+        .reexport_origins
+        .get(parent)
+        .is_some_and(|m| m.contains_key(name))
+        && let Some(got) = resolve_reexport_func(ctx, parent, name)
+    {
+        return Some(got);
+    }
+    if let Some(sig) = ctx
+        .mctx
+        .all_own_funcs
+        .get(parent)
+        .and_then(|f| f.get(name).cloned())
+    {
+        return Some((qual(parent, name), sig));
+    }
+    resolve_reexport_func(ctx, parent, name)
+}
+
+fn resolve_reexport_func(ctx: &FnCtx, module: &str, name: &str) -> Option<(String, FuncSig)> {
+    let mut m = module.to_string();
+    let mut n = name.to_string();
+    for _ in 0..32 {
+        if let Some((om, on)) = ctx
+            .mctx
+            .reexport_origins
+            .get(&m)
+            .and_then(|map| map.get(&n))
+            .cloned()
+        {
+            m = om;
+            n = on;
+            continue;
+        }
+        if let Some(data) = ctx.mctx.mods.get(&m) {
+            if let Some((om, on)) = data.reexports.get(&n).cloned() {
+                m = om;
+                n = on;
+                continue;
+            }
+            if let Some(sig) = data.funcs.get(&n).cloned() {
+                return Some((qual(&m, &n), sig));
+            }
+            return None;
+        }
+        if let Some(sig) = ctx
+            .mctx
+            .all_own_funcs
+            .get(&m)
+            .and_then(|f| f.get(&n))
+            .cloned()
+        {
+            return Some((qual(&m, &n), sig));
+        }
+        return None;
+    }
+    None
+}
+
 /// `module.func(args)` — a call into another module (including re-exports).
 fn lower_module_call(
     real: &str,
@@ -4584,8 +5034,21 @@ fn lower_module_call(
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     let Some(data) = ctx.mctx.mods.get(real) else {
-        // Never panic: parent package mid-init has no ModuleData yet.
+        // Parent package mid-init has no ModuleData yet.
         if is_strict_package_prefix(real, ctx.mctx.module) {
+            if let Some((ir_name, sig)) =
+                resolve_parent_func(ctx, real, method, /*for_module_body*/ ctx.is_entry)
+            {
+                return lower_call_with_sig(
+                    method,
+                    ir_name,
+                    &sig,
+                    args,
+                    keywords,
+                    method_span,
+                    ctx,
+                );
+            }
             return Err(err(
                 format!(
                     "cannot import name '{method}' from partially initialized \
@@ -4667,6 +5130,11 @@ fn lower_call(
             ));
         }
         if is_strict_package_prefix(&module, ctx.mctx.module) {
+            if let Some((ir_name, sig)) =
+                resolve_parent_func(ctx, &module, &name, /*for_module_body*/ ctx.is_entry)
+            {
+                return lower_call_with_sig(func, ir_name, &sig, args, keywords, span, ctx);
+            }
             return Err(err(
                 format!(
                     "cannot import name '{name}' from partially initialized \

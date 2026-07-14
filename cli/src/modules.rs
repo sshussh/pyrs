@@ -62,7 +62,12 @@ pub fn load_program(root: &Path) -> Result<Vec<Loaded>, LoadError> {
 
     let mut out = Vec::new();
     for name in state.order {
-        let p = state.modules.remove(&name).unwrap();
+        let p = state.modules.remove(&name).ok_or_else(|| {
+            LoadError(format!(
+                "internal error: module '{name}' missing from load graph after topo order \
+                 (loader invariant broken)"
+            ))
+        })?;
         out.push(Loaded {
             name,
             display: p.display,
@@ -262,9 +267,16 @@ fn parse_module(
 
 /// Absolute module dependencies from a (relative-rewritten) AST.
 /// Only **top-level** import statements are collected (same as semantic).
+///
+/// CPython `fromlist` uses `hasattr` on the source package: if a name is
+/// already bound (assign/`def`/prior import), a same-named submodule is **not**
+/// loaded. Self-imports use a bound-so-far walk; external `from pkg import name`
+/// consults the package's final top-level bindings (parse package file) so a
+/// value/`def`/re-export on the package does not pull in a same-named submodule.
 fn collect_deps(module: &ast::Module, self_name: &str, base: &Path) -> Vec<(String, common::Span)> {
     let mut deps = Vec::new();
     let mut seen = HashSet::new();
+    let mut bound: HashSet<String> = HashSet::new();
     let mut push = |mod_name: String, span: common::Span| {
         if mod_name != "sys" && mod_name != self_name && seen.insert(mod_name.clone()) {
             deps.push((mod_name, span));
@@ -273,10 +285,30 @@ fn collect_deps(module: &ast::Module, self_name: &str, base: &Path) -> Vec<(Stri
 
     for stmt in &module.body {
         match &stmt.kind {
+            ast::StmtKind::FuncDef(f) => {
+                bound.insert(f.name.clone());
+            }
+            ast::StmtKind::Assign { targets, .. } => {
+                for t in targets {
+                    collect_bound_names(t, &mut bound);
+                }
+            }
+            ast::StmtKind::AugAssign {
+                target: ast::AssignTarget::Name { name, .. },
+                ..
+            } => {
+                bound.insert(name.clone());
+            }
             ast::StmtKind::Import {
-                module: m, span, ..
+                module: m,
+                alias,
+                span,
             } if m != "sys" => {
                 push(m.clone(), *span);
+                let local = alias
+                    .clone()
+                    .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
+                bound.insert(local);
             }
             ast::StmtKind::FromImport {
                 module: m,
@@ -287,22 +319,99 @@ fn collect_deps(module: &ast::Module, self_name: &str, base: &Path) -> Vec<(Stri
                 if m != "sys" && !m.is_empty() && m != self_name {
                     push(m.clone(), *span);
                 }
-                // `from pkg import mod` may refer to a submodule
-                for (import_name, _, nspan) in names {
+                // `from pkg import mod` may refer to a submodule (fromlist).
+                for (import_name, alias, nspan) in names {
                     let sub = if m.is_empty() {
                         import_name.clone()
                     } else {
                         format!("{m}.{import_name}")
                     };
                     if module_exists(base, &sub) {
-                        push(sub, *nspan);
+                        let from_self = m == self_name || m.is_empty();
+                        if from_self {
+                            // hasattr(self, name) mid-init
+                            if !bound.contains(import_name) {
+                                push(sub, *nspan);
+                            }
+                        } else if !package_binds_name(base, m, import_name) {
+                            // External fromlist: load submodule only if package
+                            // does not already bind the name after full init.
+                            push(sub, *nspan);
+                        }
                     }
+                    let local = alias.clone().unwrap_or_else(|| import_name.clone());
+                    bound.insert(local);
                 }
             }
             _ => {}
         }
     }
     deps
+}
+
+/// Whether `package` binds `name` at the end of its top-level body (any
+/// assign/`def`/import). Used for external fromlist hasattr short-circuit.
+/// Returns false if the package cannot be read/parsed (caller may still load
+/// the package itself as a dep).
+fn package_binds_name(base: &Path, package: &str, name: &str) -> bool {
+    let Some((path, _)) = resolve_module_path(base, package) else {
+        return false;
+    };
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(ast) = parser::parse(&source) else {
+        return false;
+    };
+    let mut bound = HashSet::new();
+    for stmt in &ast.body {
+        match &stmt.kind {
+            ast::StmtKind::FuncDef(f) => {
+                bound.insert(f.name.clone());
+            }
+            ast::StmtKind::Assign { targets, .. } => {
+                for t in targets {
+                    collect_bound_names(t, &mut bound);
+                }
+            }
+            ast::StmtKind::AugAssign {
+                target: ast::AssignTarget::Name { name: n, .. },
+                ..
+            } => {
+                bound.insert(n.clone());
+            }
+            ast::StmtKind::Import {
+                module: m, alias, ..
+            } => {
+                let local = alias
+                    .clone()
+                    .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
+                bound.insert(local);
+            }
+            ast::StmtKind::FromImport { names, .. } => {
+                for (import_name, alias, _) in names {
+                    let local = alias.clone().unwrap_or_else(|| import_name.clone());
+                    bound.insert(local);
+                }
+            }
+            _ => {}
+        }
+    }
+    bound.contains(name)
+}
+
+fn collect_bound_names(target: &ast::AssignTarget, names: &mut HashSet<String>) {
+    match target {
+        ast::AssignTarget::Name { name, .. } => {
+            names.insert(name.clone());
+        }
+        ast::AssignTarget::Index { .. } => {}
+        ast::AssignTarget::Tuple(items) => {
+            for t in items {
+                collect_bound_names(t, names);
+            }
+        }
+    }
 }
 
 /// Turn relative `from` imports into absolute (`level = 0`) in place.
