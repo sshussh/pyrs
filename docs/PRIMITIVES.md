@@ -57,7 +57,7 @@ A symbol belongs in the **primitive kit** if **at least one** is true:
 
 | Not a primitive | Why | Examples |
 |-----------------|-----|----------|
-| Pure composition of existing ops | Can be PyRs later | `os.path.join`, many `functools` helpers |
+| Pure composition of existing ops | Prefer PyRs stdlib | `os.path.join` (shipped v0.11), many `functools` helpers |
 | Full library formats/protocols | Belongs in stdlib | `json.loads`, HTTP client |
 | “Nice script helper” with no layout/OS need | Wait for stdlib or write in user code | ad-hoc pretty printers |
 
@@ -187,21 +187,25 @@ only as a one-off emit path unless it is pure IR (`len`/index).
 
 | Phase | Stdlib stance | Explanation |
 |-------|---------------|-------------|
-| **Now (kit incomplete)** | No large `stdlib/` tree | Finish str/list/file/builtins; add types (tuple, dict) as primitives |
-| **Packages ready** | Introduce `stdlib/` on import path | Real modules, not semantic special cases |
+| **Packages + path (v0.11)** | Repo `stdlib/` + multi-root load + **embed in `pyrs`** | Real modules (`os.path`), not semantic special cases; binary is standalone |
 | **Steady state** | Most modules in **PyRs** | Call builtins/methods + `_pyrs` / `_posix` for leftovers |
 | **New C for stdlib?** | Only new **primitive families** | e.g. regex engine, not `pathlib` logic |
 
-### Example split for a future module
+### Example split (current + future)
 
 | Module piece | Implementation | Explanation |
 |--------------|----------------|-------------|
-| `math.sin` / `sqrt` | C or LLVM intrinsic via kit | libm / hardware |
+| `os.path.join` / `dirname` / `basename` | **Pure PyRs** in `stdlib/os/path.py` (v0.11) | POSIX subset; 2-arg `join` only |
+| `math.sin` / `sqrt` | C or LLVM intrinsic via kit | libm / hardware (not shipped yet) |
 | `math.prod` (subset) | PyRs over list/numeric primitives | No need for C |
-| `os.getcwd` | C primitive | OS |
-| `os.path.join` | Pure PyRs strings | Composition |
-| `json.loads` | Pure PyRs | Needs **dict** + exceptions in the language |
+| `os.getcwd` | C primitive | OS (not shipped yet) |
+| `json.loads` | Pure PyRs | Needs **dict** + exceptions (dict exists; module not shipped) |
 | `sys.argv` | Kit (today special-cased) | Migrate toward real module when ready |
+
+**Embed rule:** edit `.py` files under workspace `stdlib/`; rebuild `pyrs`
+to refresh the embedded copy. Search order keeps entry dir and
+`PYRS_STDLIB` ahead of embed so tests/dev can shadow without patching the
+binary.
 
 ---
 
@@ -234,7 +238,7 @@ below) as symbols are added.
 | `open` | io | no | C | yes | yes | |
 | `xs.insert` | list | med | C | … | … | example gap |
 | `dict` get/set | dict | yes | C (+ IR later?) | … | … | planned family |
-| `os.path.join` | *(stdlib)* | no | PyRs later | — | — | not a kit entry |
+| `os.path.join` | *(stdlib)* | no | PyRs (`stdlib/os/path.py`) | yes (v0.11) | yes | 2-arg POSIX; not a kit entry |
 
 ---
 

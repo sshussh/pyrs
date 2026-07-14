@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.10)
+## The language (v0.11)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.11.0**, not 1.0) until it is ready for
+milestone after this one is **0.12.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label.
 
@@ -112,10 +112,19 @@ A statically-typed Python subset:
   package init (child module top level may read simple parent assigns
   set before the child import; child function bodies may use deferred
   parent attrs/calls after full init); a directory with `__init__.py` is
-  a package; module bodies run once at the import site (like Python);
-  absolute imports resolve relative to the entry script's directory.
-  Cycles and missing modules/names are compile errors that point at the
-  offending file
+  a package; module bodies run once at the import site (like Python).
+  Import search order (stacked, first hit wins): (1) entry script
+  directory, (2) `PYRS_STDLIB` if set, (3) workspace `stdlib/` when present
+  (dev; not XOR with env), (4) **embedded** stdlib inside the `pyrs`
+  binary (always; no companion directory needed). User code shadows
+  stdlib; once a package is found under one origin, children stay there
+  (no split packages). Cycles and missing modules/names are compile
+  errors that point at the offending file
+- **Stdlib (subset):** pure-PyRs `os.path` — `join(a, b)` (two args only),
+  `dirname`, `basename` (POSIX semantics). `import os` / `import os.path` /
+  `from os.path import join` work; there is no full `os` (no `getcwd`,
+  env, etc.) and no other batteries yet (`math` not provided). `import
+  sys` remains special-cased for `sys.argv`
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 
@@ -136,7 +145,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.10): no bigints (int is 64-bit and wraps), `and`/`or`
+Known limits (v0.11): no bigints (int is 64-bit and wraps), `and`/`or`
 return `bool` rather than the operand, `min`/`max` take exactly two
 numeric args (no iterable form yet) and unify to a common type
 (`min(1, 1.5)` is `1.0`, not the int `1`), `x ** e` with a *dynamic*
@@ -150,7 +159,9 @@ returns work; no `list[file]` or printing files), no `from m import *`,
 namespace packages without `__init__.py`, multi-name `import a, b`,
 imports only at module top level (not inside `if`/functions), a package
 importing itself by name, or treating modules as first-class values
-beyond attribute/call chains;
+beyond attribute/call chains; `os.path.join` is two-argument and POSIX
+only (no `*`args, no Windows paths); no full `os` / `math` / other
+stdlib yet;
 full f-string format specs (beyond `{x:.Nf}`) are unsupported, dict/set
 keys are only `int`/`str`,
 `dict.get` requires a default (no bare `None` return),
@@ -241,4 +252,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.10.0 && git push origin v0.10.0`.
+Release tags: `git tag v0.11.0 && git push origin v0.11.0`.

@@ -633,9 +633,25 @@ only structural difference).
 
 ### Modules and packages
 
-Split a program across files and packages. Absolute imports resolve
-relative to the entry script's directory (exactly like `python main.py`).
-A directory with `__init__.py` counts as a package.
+Split a program across files and packages. A directory with `__init__.py`
+counts as a package.
+
+**Import search order** (stacked; first hit wins — user code shadows the
+stdlib):
+
+1. Directory of the **entry script** (like `sys.path[0]` for `python main.py`)
+2. **`PYRS_STDLIB`** if set and is a directory (dev/test override)
+3. Workspace **`stdlib/`** when present next to the checkout (dev convenience;
+   searched even when `PYRS_STDLIB` is set — not XOR)
+4. **Embedded** stdlib baked into the `pyrs` binary (always available; a
+   relocated compiler needs no companion `stdlib/` directory)
+
+**No split packages:** once a top-level package is found under one origin
+(entry / env / workspace / embed), its submodules resolve only there. An
+incomplete user `os/` package does **not** pick `os.path` from the stdlib.
+
+Compiled user programs remain standalone natives: stdlib sources are
+compiled into the program at compile time once modules load.
 
 ```python
 # geometry.py                          # utilpkg/__init__.py  (package)
@@ -655,6 +671,31 @@ from utilpkg import mathx              # submodule as a local name
 print(geometry.circle_area(2.0))
 print(utilpkg.mathx.square(6), m.square(3))
 ```
+
+### Standard library (subset)
+
+Sources live under the repo `stdlib/` tree and are embedded into `pyrs` at
+compiler build time. Prefer real package imports — only `sys` is special-cased.
+
+| Module | Surface | Notes |
+|--------|---------|-------|
+| `sys` | `sys.argv` | Special-cased (not a `.py` file) |
+| `os.path` | `join(a, b)`, `dirname(p)`, `basename(p)` | Pure PyRs; **POSIX** only; `join` is **two-argument** (no `*args`) |
+
+```python
+from os.path import join, dirname, basename
+import os.path
+
+print(join("a", "b"))           # a/b
+print(join("a", "/b"))          # /b  (absolute second wins)
+print(dirname("/a/b/c"))        # /a/b
+print(basename("/a/b/c"))       # c
+print(os.path.join("x", "y"))
+```
+
+`import os` works (`os/__init__.py` re-exports `path`). There is **no** full
+`os` (no `getcwd`, environment, process APIs) and **no** `math` or other
+batteries yet.
 
 Relative imports are allowed **inside packages** (same rules as CPython
 for the cases we claim):
@@ -830,7 +871,7 @@ deliberate exceptions:
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
 
-Container notes (v0.10):
+Container notes (v0.11):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`

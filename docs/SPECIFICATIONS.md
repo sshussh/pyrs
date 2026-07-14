@@ -18,7 +18,7 @@ surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
 0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
 **PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
 use** (not merely because the minor is large). Current milestone:
-**v0.10** / `0.10.0`. Optional release tags: `vX.Y.Z`.
+**v0.11** / `0.11.0`. Optional release tags: `vX.Y.Z`.
 
 ---
 
@@ -254,14 +254,25 @@ programs** link only the object file from the shim plus `runtime.c`.
 
 ## 6. Multi-module compilation
 
-**Resolution model (v0.10):**
+**Resolution model (v0.11):**
 
-- Absolute imports resolve relative to the **entry script’s directory**
-  (like `sys.path[0]` when running `python root.py`). No full `sys.path`
-  search.
+- Absolute imports search multiple roots (first hit wins; no full CPython
+  `sys.path`):
+  1. **Entry script directory** (user code; shadows everything else)
+  2. **`PYRS_STDLIB`** if set and is a directory (dev/test shadowing)
+  3. Workspace **`stdlib/`** next to the `cli` crate when present (dev only;
+     stacked after env, not XOR — both may appear)
+  4. **Embedded** stdlib sources compiled into the `pyrs` binary
+     (`cli/build.rs` embeds `stdlib/**/*.py`; synthetic display paths like
+     `<stdlib>/os/path.py`)
+- **No split packages:** once a top-level package is found under a given
+  origin (filesystem root or embed), submodules resolve only under that
+  same origin (CPython package `__path__` spirit). An incomplete user
+  `os/` does not pick `os.path` from stdlib/embed.
 - A directory with `__init__.py` is a **package**. `import pkg.mod` loads
-  `<rootdir>/pkg/__init__.py` then `<rootdir>/pkg/mod.py` (or a nested
-  package’s `__init__.py`). Intermediate path components must be packages.
+  the package init then the submodule (or a nested package’s `__init__.py`).
+  Intermediate path components must be packages. Embedded packages use the
+  same layout (`os/__init__.py`, `os/path.py`).
 - Supported forms: `import M` / `import M as A`, `import pkg.mod` /
   `import pkg.mod as m`, `from M import x, y as z`, `from pkg.mod import
   x`, `from pkg import mod` (submodule), and relative imports inside
@@ -273,8 +284,9 @@ programs** link only the object file from the shim plus `runtime.c`.
   `ROOT_NAME`); other modules use fully-qualified dotted names
   (`utils`, `pkg.mod`).
 - `import sys` is special-cased (exposes `sys.argv`); it is not loaded
-  as a file. Other stdlib modules are not provided unless added later
-  under an explicit design ([PRIMITIVES.md](PRIMITIVES.md)).
+  as a file. The first real stdlib package is pure-PyRs **`os.path`**
+  (`join` two-arg POSIX, `dirname`, `basename`); see
+  [PRIMITIVES.md](PRIMITIVES.md).
 - Cycles and missing modules/names are compile errors with spans pointing
   at the importing file.
 - Package `__init__.py` may import its own submodules (partial package
@@ -310,7 +322,7 @@ programs** link only the object file from the shim plus `runtime.c`.
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.10 subset):**
+**Today (v0.11 subset):**
 
 - Static types after first assignment; cannot rebind a name to a
   different type.
@@ -432,9 +444,9 @@ These are product constraints that affect design choices:
 | Memory           | Never free heap strings/lists                        | GC / freeing **before 1.0**                                               |
 | Typing           | Required params; fixed types                         | Optional typing + more dynamism                                           |
 | Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
-| stdlib           | `sys` special-case only                              | Mostly PyRs modules on the kit later; no large stdlib without design      |
-| Language surface | Subset (see README v0.10); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
-| Product version  | `0.10.0` (and later `0.11.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
+| stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
+| Language surface | Subset (see README v0.11); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
+| Product version  | `0.11.0` (and later `0.12.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
 generators, nested functions / closures, `lambda`, `from m import *`,
@@ -442,8 +454,8 @@ f-string format codes beyond `{x:.Nf}`, `*args`/`**kwargs`. Prefer
 compile-time rejection with a clear message over silent wrong behavior.
 
 **Strategy:** finish optimized **primitives** (IR + C) for current and new
-core types before a real stdlib tree. Do not grow `runtime.c` with
-high-level libraries.
+core types; grow pure-PyRs **stdlib** modules under repo `stdlib/` (embedded
+into `pyrs`). Do not grow `runtime.c` with high-level libraries.
 
 ---
 
