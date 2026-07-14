@@ -2359,6 +2359,26 @@ def f(n: int) -> int:
     }
 
     #[test]
+    fn star_import_is_rejected() {
+        let e = parse_err("from m import *\n");
+        assert!(
+            e.message.contains("from module import *") && e.message.contains("not supported"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn multi_name_import_statement_is_rejected() {
+        let e = parse_err("import a, b\n");
+        assert!(
+            e.message.contains("several modules") && e.message.contains("not supported"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
     fn error_assign_to_expression() {
         let e = parse_err("f(x) = 3\n");
         assert!(e.message.contains("cannot assign"), "{}", e.message);
