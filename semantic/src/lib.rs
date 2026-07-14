@@ -6062,6 +6062,71 @@ print(fib(10))
     }
 
     #[test]
+    fn function_and_module_docstrings_are_ok() {
+        // First statement that is a string literal (docstring) is a no-op
+        // expression statement — not a bare-name / empty-body error. `__doc__`
+        // is not stored; runtime effect matches programs that only use docs.
+        let m = analyze_ok(
+            "\
+\"\"\"module documentation\"\"\"
+
+def f() -> int:
+    \"\"\"function documentation\"\"\"
+    return 42
+
+print(f())
+",
+        );
+        let f = find_func(&m, "f");
+        // docstring + return
+        assert!(
+            f.body.len() >= 2,
+            "expected docstring ExprStmt then return, got {:?}",
+            f.body
+        );
+        assert!(
+            matches!(
+                &f.body[0],
+                ir::Stmt::ExprStmt(ir::Expr {
+                    kind: ir::ExprKind::ConstStr(s),
+                    ..
+                }) if s == "function documentation"
+            ),
+            "first body stmt should be the docstring ConstStr, got {:?}",
+            f.body[0]
+        );
+        assert!(matches!(f.body[1], ir::Stmt::Return(Some(_))));
+
+        let entry = find_func(&m, ENTRY_NAME);
+        // module docstring then print(f())
+        assert!(
+            matches!(
+                &entry.body[0],
+                ir::Stmt::ExprStmt(ir::Expr {
+                    kind: ir::ExprKind::ConstStr(s),
+                    ..
+                }) if s == "module documentation"
+            ),
+            "entry should start with module docstring, got {:?}",
+            entry.body[0]
+        );
+    }
+
+    #[test]
+    fn triple_quoted_string_value_lowers() {
+        let m = analyze_ok("s = \"\"\"a\nb\"\"\"\nprint(s)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!("expected GlobalAssign, got {:?}", entry.body[0]);
+        };
+        assert!(
+            matches!(&value.kind, ir::ExprKind::ConstStr(s) if s == "a\nb"),
+            "{:?}",
+            value.kind
+        );
+    }
+
+    #[test]
     fn int_promotes_to_float_in_mixed_arithmetic() {
         let m = analyze_ok("x = 1 + 2.5\n");
         let entry = find_func(&m, ENTRY_NAME);

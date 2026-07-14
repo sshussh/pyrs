@@ -1794,6 +1794,168 @@ mod tests {
     }
 
     #[test]
+    fn parses_triple_quoted_string_literal() {
+        let m = parse_ok("s = \"\"\"a\nb\"\"\"\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::Str(s) if s == "a\nb"),
+            "{:?}",
+            value.kind
+        );
+
+        let m = parse_ok("s = '''x\ny'''\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        assert!(matches!(&value.kind, ExprKind::Str(s) if s == "x\ny"));
+    }
+
+    #[test]
+    fn parses_triple_quoted_fstring() {
+        let m = parse_ok("s = f\"\"\"a\nb {x}\"\"\"\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::JoinedStr(parts) = &value.kind else {
+            panic!("expected JoinedStr, got {:?}", value.kind);
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], FStringPart::Literal(s) if s == "a\nb "));
+        assert!(matches!(&parts[1], FStringPart::Expr { format: None, .. }));
+
+        let m = parse_ok("s = f'''{{x}} is {y:.2f}'''\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::JoinedStr(parts) = &value.kind else {
+            panic!("expected JoinedStr");
+        };
+        assert!(matches!(&parts[0], FStringPart::Literal(s) if s == "{x} is "));
+        assert!(matches!(
+            &parts[1],
+            FStringPart::Expr {
+                format: Some(FStringFormat::DotNf { precision: 2 }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn error_unterminated_triple_fstring() {
+        let e = parse_err("s = f\"\"\"no close\n");
+        assert!(
+            e.message.contains("unterminated triple-quoted f-string"),
+            "{}",
+            e.message
+        );
+        assert_eq!(e.phase, Phase::Lex);
+    }
+
+    #[test]
+    fn parses_parenthesized_multiline_fstring_expr() {
+        // Parentheses enable implicit line joining inside the fragment.
+        let m = parse_ok("s = f\"\"\"{(x +\n1)}\"\"\"\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::JoinedStr(parts) = &value.kind else {
+            panic!("expected JoinedStr, got {:?}", value.kind);
+        };
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(
+            &parts[0],
+            FStringPart::Expr {
+                expr: e,
+                format: None
+            } if matches!(e.kind, ExprKind::Binary { .. })
+        ));
+    }
+
+    #[test]
+    fn error_unparenthesized_multiline_fstring_expr() {
+        let e = parse_err("s = f\"\"\"{x +\n1}\"\"\"\n");
+        assert!(
+            e.message
+                .contains("expected an expression, found end of line"),
+            "{}",
+            e.message
+        );
+        assert!(e.message.contains("f-string"), "{}", e.message);
+    }
+
+    #[test]
+    fn error_same_delimiter_nested_triple_in_fstring() {
+        let e = parse_err("s = f\"\"\"{\"\"\"nested\"\"\"}\"\"\"\n");
+        assert!(
+            e.message.contains("unterminated '{' in f-string"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn parses_different_delimiter_nested_triple_in_fstring() {
+        let m = parse_ok("s = f\"\"\"{'''nested'''}\"\"\"\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::JoinedStr(parts) = &value.kind else {
+            panic!("expected JoinedStr");
+        };
+        assert!(matches!(
+            &parts[0],
+            FStringPart::Expr {
+                expr: e,
+                format: None
+            } if matches!(&e.kind, ExprKind::Str(s) if s == "nested")
+        ));
+    }
+
+    #[test]
+    fn parses_module_and_function_docstrings_as_expr_stmts() {
+        let m = parse_ok(
+            "\
+\"\"\"module doc\"\"\"
+def f() -> int:
+    \"\"\"func doc\"\"\"
+    return 1
+print(f())
+",
+        );
+        assert!(matches!(
+            &m.body[0].kind,
+            StmtKind::ExprStmt(Expr {
+                kind: ExprKind::Str(s),
+                ..
+            }) if s == "module doc"
+        ));
+        let StmtKind::FuncDef(f) = &m.body[1].kind else {
+            panic!("expected FuncDef");
+        };
+        assert!(matches!(
+            &f.body[0].kind,
+            StmtKind::ExprStmt(Expr {
+                kind: ExprKind::Str(s),
+                ..
+            }) if s == "func doc"
+        ));
+        assert!(matches!(f.body[1].kind, StmtKind::Return(Some(_))));
+    }
+
+    #[test]
+    fn error_unterminated_triple_string() {
+        let e = parse_err("s = \"\"\"no close\n");
+        assert!(
+            e.message.contains("unterminated triple-quoted"),
+            "{}",
+            e.message
+        );
+        assert_eq!(e.phase, Phase::Lex);
+    }
+
+    #[test]
     fn parses_if_elif_else() {
         let m = parse_ok("if x < 1:\n    y = 1\nelif x < 2:\n    y = 2\nelse:\n    y = 3\n");
         let StmtKind::If { branches, orelse } = &m.body[0].kind else {

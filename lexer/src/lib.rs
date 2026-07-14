@@ -13,12 +13,24 @@ pub fn ping() -> String {
     String::from("pong")
 }
 
-fn unescape(slice: &str) -> String {
-    // strip the surrounding quotes, then process escapes
-    let inner = &slice[1..slice.len() - 1];
+/// Process escape sequences in the interior of a string literal (no
+/// surrounding quotes). Same rules for single-line and triple-quoted forms.
+///
+/// Physical newlines are normalized like CPython's tokenizer: `\r\n` and
+/// lone `\r` become `\n`. A backslash immediately before a physical newline
+/// is a line continuation and contributes no characters.
+fn unescape_contents(inner: &str) -> String {
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
+        if c == '\r' {
+            // universal-newline: \r\n and \r → \n
+            if chars.as_str().starts_with('\n') {
+                chars.next();
+            }
+            out.push('\n');
+            continue;
+        }
         if c != '\\' {
             out.push(c);
             continue;
@@ -31,6 +43,13 @@ fn unescape(slice: &str) -> String {
             Some('\\') => out.push('\\'),
             Some('\'') => out.push('\''),
             Some('"') => out.push('"'),
+            // line continuation inside the literal: consume the newline
+            Some('\n') => {}
+            Some('\r') => {
+                if chars.as_str().starts_with('\n') {
+                    chars.next();
+                }
+            }
             // unknown escape: keep it verbatim, like CPython
             Some(other) => {
                 out.push('\\');
@@ -40,6 +59,72 @@ fn unescape(slice: &str) -> String {
         }
     }
     out
+}
+
+/// Strip one surrounding quote character from each end, then unescape.
+fn unescape(slice: &str) -> String {
+    unescape_contents(&slice[1..slice.len() - 1])
+}
+
+/// After matching the opening `"""`, scan for the closing delimiter,
+/// apply escapes, and extend the logos span via `bump`. Returns `None`
+/// (unterminated) after consuming the rest of the input so the error
+/// span covers the whole open string.
+fn lex_triple_double(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    lex_triple(lex, b'"')
+}
+
+/// After matching the opening `'''`, scan for the closing delimiter.
+fn lex_triple_single(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    lex_triple(lex, b'\'')
+}
+
+fn lex_triple(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
+    let rem = lex.remainder();
+    let bytes = rem.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'\\' {
+            // skip the backslash and the escaped unit; for line
+            // continuation also skip a full \r\n pair so the closer is
+            // not mis-scanned. Content decoding still runs in unescape.
+            i += 1;
+            if i < bytes.len() {
+                if bytes[i] == b'\r' {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'\n' {
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if bytes[i] == quote && bytes[i + 1] == quote && bytes[i + 2] == quote {
+            let inner = &rem[..i];
+            lex.bump(i + 3);
+            return Some(unescape_contents(inner));
+        }
+        i += 1;
+    }
+    // unterminated: consume remainder so diagnostics cover the open text
+    lex.bump(rem.len());
+    None
+}
+
+/// After matching the opening `f"""` / `f'''`, scan for the matching
+/// closing triple quotes (same rules as plain triples), unescape the
+/// interior, and return content only (no leading `f`, no surrounding
+/// quotes) for the parser's `parse_fstring`.
+fn lex_triple_fstring(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    // logos has already matched the opener; slice is `f"""` or `f'''`.
+    let quote = match lex.slice().as_bytes().last() {
+        Some(b'"') => b'"',
+        Some(b'\'') => b'\'',
+        _ => return None,
+    };
+    lex_triple(lex, quote)
 }
 
 #[derive(Logos, Debug, Clone, PartialEq)]
@@ -151,11 +236,21 @@ pub enum Token {
     #[regex(r"([0-9][0-9_]*\.[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?", |lex| lex.slice().replace('_', "").parse::<f64>().ok())]
     #[regex(r"[0-9][0-9_]*[eE][+-]?[0-9]+", |lex| lex.slice().replace('_', "").parse::<f64>().ok())]
     Floatlit(f64),
+    // Triple-quoted forms first: the opening delimiter is longer than a
+    // single quote, so logos prefers them over empty `""` / `''`. The
+    // callback extends the span through the closing `"""` / `'''` and
+    // preserves interior newlines as part of the string value.
+    #[token("\"\"\"", lex_triple_double)]
+    #[token("'''", lex_triple_single)]
     #[regex(r#""([^"\\\n]|\\.)*""#, |lex| unescape(lex.slice()))]
     #[regex(r#"'([^'\\\n]|\\.)*'"#, |lex| unescape(lex.slice()))]
     Strlit(String),
     /// f-string raw content, escapes processed but `{`/`}` preserved for
-    /// the parser to split into literal and expression parts
+    /// the parser to split into literal and expression parts.
+    /// Triple-quoted openers first so `f"""` / `f'''` are not misparsed
+    /// as empty `f""`/`f''` plus junk.
+    #[token("f\"\"\"", lex_triple_fstring)]
+    #[token("f'''", lex_triple_fstring)]
     #[regex(r#"f"([^"\\\n]|\\.)*""#, |lex| unescape(&lex.slice()[1..]))]
     #[regex(r#"f'([^'\\\n]|\\.)*'"#, |lex| unescape(&lex.slice()[1..]))]
     FStrlit(String),
@@ -478,11 +573,17 @@ impl<'a> Iterator for Lexer<'a> {
                     return Some(Ok((token, span)));
                 }
                 Some(Err(())) => {
-                    return Some(Err(Diagnostic::new(
-                        Phase::Lex,
-                        format!("unexpected character {:?}", self.inner.slice()),
-                        span,
-                    )));
+                    let slice = self.inner.slice();
+                    // Callbacks return None for unclosed triple-quoted
+                    // strings / f-strings (span bumped through remainder).
+                    let message = if slice.starts_with("f\"\"\"") || slice.starts_with("f'''") {
+                        "unterminated triple-quoted f-string literal".to_string()
+                    } else if slice.starts_with("\"\"\"") || slice.starts_with("'''") {
+                        "unterminated triple-quoted string literal".to_string()
+                    } else {
+                        format!("unexpected character {:?}", slice)
+                    };
+                    return Some(Err(Diagnostic::new(Phase::Lex, message, span)));
                 }
                 Option::None => {
                     if self.emitted_eof {
@@ -658,6 +759,262 @@ mod test {
                 Token::Strlit("world".to_string()),
                 Token::Strlit("a\nb".to_string()),
                 Token::Strlit("q\"q".to_string()),
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_triple_double_quoted_string() {
+        assert_eq!(
+            kinds(r#""""hello""""#),
+            vec![Token::Strlit("hello".to_string()), Token::EOF]
+        );
+        // empty triple
+        assert_eq!(
+            kinds("\"\"\"\"\"\""),
+            vec![Token::Strlit(String::new()), Token::EOF]
+        );
+        // multi-line content; interior newlines stay in the value
+        assert_eq!(
+            kinds("\"\"\"a\nb\"\"\""),
+            vec![Token::Strlit("a\nb".to_string()), Token::EOF]
+        );
+        // single and double quotes inside are fine
+        assert_eq!(
+            kinds(r#""""he said "hi" and 'bye'""""#),
+            vec![
+                Token::Strlit("he said \"hi\" and 'bye'".to_string()),
+                Token::EOF
+            ]
+        );
+        // escapes match single-line strings
+        assert_eq!(
+            kinds(r#""""a\nb\t\"c""""#),
+            vec![Token::Strlit("a\nb\t\"c".to_string()), Token::EOF]
+        );
+    }
+
+    #[test]
+    fn test_triple_single_quoted_string() {
+        assert_eq!(
+            kinds("'''hello'''"),
+            vec![Token::Strlit("hello".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("'''a\nb'''"),
+            vec![Token::Strlit("a\nb".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds(r#"'''it\'s fine'''"#),
+            vec![Token::Strlit("it's fine".to_string()), Token::EOF]
+        );
+    }
+
+    #[test]
+    fn test_triple_string_does_not_disturb_indent() {
+        // Newlines inside a triple string are content, not NEWLINE tokens;
+        // the next statement still sees the surrounding indent level.
+        assert_eq!(
+            kinds("def f():\n    s = \"\"\"a\nb\"\"\"\n    return s\n"),
+            vec![
+                Token::Def,
+                Token::Ident("f".to_string()),
+                Token::LParen,
+                Token::RParen,
+                Token::Colon,
+                Token::Newline,
+                Token::Indent,
+                Token::Ident("s".to_string()),
+                Token::Eq,
+                Token::Strlit("a\nb".to_string()),
+                Token::Newline,
+                Token::Return,
+                Token::Ident("s".to_string()),
+                Token::Newline,
+                Token::Dedent,
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unterminated_triple_string_is_error() {
+        let err = lex("\"\"\"unclosed").unwrap_err();
+        assert!(
+            err.message.contains("unterminated triple-quoted"),
+            "{}",
+            err.message
+        );
+        // span covers the open text through EOF
+        assert_eq!(err.span.start, 0);
+        assert_eq!(err.span.end, "\"\"\"unclosed".len());
+
+        let multi = "'''also unclosed\nmore";
+        let err = lex(multi).unwrap_err();
+        assert!(
+            err.message.contains("unterminated triple-quoted"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.span.start, 0);
+        assert_eq!(err.span.end, multi.len());
+    }
+
+    #[test]
+    fn test_triple_crlf_and_cr_normalized_to_lf() {
+        // CPython tokenizer: physical \r\n and lone \r inside triples → \n
+        assert_eq!(
+            kinds("\"\"\"a\r\nb\"\"\""),
+            vec![Token::Strlit("a\nb".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("\"\"\"a\rb\"\"\""),
+            vec![Token::Strlit("a\nb".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("'''a\r\nb'''"),
+            vec![Token::Strlit("a\nb".to_string()), Token::EOF]
+        );
+    }
+
+    #[test]
+    fn test_backslash_newline_line_continuation_in_triple() {
+        // """a\<newline>b""" → "ab"
+        assert_eq!(
+            kinds("\"\"\"a\\\nb\"\"\""),
+            vec![Token::Strlit("ab".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("\"\"\"a\\\r\nb\"\"\""),
+            vec![Token::Strlit("ab".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("'''a\\\nb'''"),
+            vec![Token::Strlit("ab".to_string()), Token::EOF]
+        );
+    }
+
+    #[test]
+    fn test_triple_fstring_content() {
+        assert_eq!(
+            kinds(r#"f"""hello""""#),
+            vec![Token::FStrlit("hello".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("f'''hello'''"),
+            vec![Token::FStrlit("hello".to_string()), Token::EOF]
+        );
+        // empty triple f-string
+        assert_eq!(
+            kinds("f\"\"\"\"\"\""),
+            vec![Token::FStrlit(String::new()), Token::EOF]
+        );
+        // multi-line; interior newlines stay; braces preserved for parser
+        assert_eq!(
+            kinds("f\"\"\"a\nb {x}\"\"\""),
+            vec![Token::FStrlit("a\nb {x}".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("f'''a\nb {x}'''"),
+            vec![Token::FStrlit("a\nb {x}".to_string()), Token::EOF]
+        );
+        // single/double quotes inside are fine; escapes match plain triples
+        assert_eq!(
+            kinds(r#"f"""he said "hi" {x}""""#),
+            vec![Token::FStrlit("he said \"hi\" {x}".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds(r#"f"""a\nb\t\"c""""#),
+            vec![Token::FStrlit("a\nb\t\"c".to_string()), Token::EOF]
+        );
+        // {{ / }} brace escapes left for the parser
+        assert_eq!(
+            kinds(r#"f"""{{x}} is {x}""""#),
+            vec![Token::FStrlit("{{x}} is {x}".to_string()), Token::EOF]
+        );
+    }
+
+    #[test]
+    fn test_triple_fstring_crlf_and_line_continuation() {
+        assert_eq!(
+            kinds("f\"\"\"a\r\nb {x}\"\"\""),
+            vec![Token::FStrlit("a\nb {x}".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("f\"\"\"a\rb {x}\"\"\""),
+            vec![Token::FStrlit("a\nb {x}".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("f\"\"\"a\\\nb{x}\"\"\""),
+            vec![Token::FStrlit("ab{x}".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("f\"\"\"a\\\r\nb{x}\"\"\""),
+            vec![Token::FStrlit("ab{x}".to_string()), Token::EOF]
+        );
+        assert_eq!(
+            kinds("f'''a\\\nb{x}'''"),
+            vec![Token::FStrlit("ab{x}".to_string()), Token::EOF]
+        );
+    }
+
+    #[test]
+    fn test_triple_fstring_does_not_disturb_indent() {
+        assert_eq!(
+            kinds("def f():\n    s = f\"\"\"a\nb {x}\"\"\"\n    return s\n"),
+            vec![
+                Token::Def,
+                Token::Ident("f".to_string()),
+                Token::LParen,
+                Token::RParen,
+                Token::Colon,
+                Token::Newline,
+                Token::Indent,
+                Token::Ident("s".to_string()),
+                Token::Eq,
+                Token::FStrlit("a\nb {x}".to_string()),
+                Token::Newline,
+                Token::Return,
+                Token::Ident("s".to_string()),
+                Token::Newline,
+                Token::Dedent,
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unterminated_triple_fstring_is_error() {
+        let err = lex("f\"\"\"unclosed").unwrap_err();
+        assert!(
+            err.message.contains("unterminated triple-quoted f-string"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.span.start, 0);
+        assert_eq!(err.span.end, "f\"\"\"unclosed".len());
+
+        let multi = "f'''also unclosed\nmore";
+        let err = lex(multi).unwrap_err();
+        assert!(
+            err.message.contains("unterminated triple-quoted f-string"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.span.start, 0);
+        assert_eq!(err.span.end, multi.len());
+    }
+
+    #[test]
+    fn test_module_docstring_tokens() {
+        assert_eq!(
+            kinds("\"\"\"module doc\"\"\"\nprint\n"),
+            vec![
+                Token::Strlit("module doc".to_string()),
+                Token::Newline,
+                Token::Ident("print".to_string()),
+                Token::Newline,
                 Token::EOF,
             ]
         );
