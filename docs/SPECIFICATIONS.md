@@ -13,9 +13,12 @@ crate boundaries, IR contract, runtime ABI, and build/link strategy.
 | [`EXTENDING.md`](EXTENDING.md) | Contributor guide: how to add features         |
 | [`AGENTS.md`](../AGENTS.md)    | Conventions for automated agents               |
 
-**Versioning:** the language surface is labeled **v0.9** (README / GUIDE).
-Workspace crate versions and the CLI version (`env!("CARGO_PKG_VERSION")`)
-must match that milestone. Release tags use the same number (`v0.9.0`).
+**Versioning:** SemVer **MAJOR.MINOR.PATCH**, one number for language
+surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
+0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
+**PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
+use** (not merely because the minor is large). Current milestone:
+**v0.10** / `0.10.0`. Optional release tags: `vX.Y.Z`.
 
 ---
 
@@ -251,41 +254,59 @@ programs** link only the object file from the shim plus `runtime.c`.
 
 ## 6. Multi-module compilation
 
-**Resolution model (current, stopgap):**
+**Resolution model (v0.10):**
 
-- Imports are resolved relative to the **entry script’s directory**
-  (like `sys.path[0]` when running `python root.py`).
-- `import utils` / `import utils as u` / `from utils import x, y as z`
-  load `<rootdir>/utils.py` only. No packages, `import a.b`,
-  `from . import x`, `from m import *`, multi-name `import a, b`, or
-  `sys.path` search.
+- Absolute imports resolve relative to the **entry script’s directory**
+  (like `sys.path[0]` when running `python root.py`). No full `sys.path`
+  search.
+- A directory with `__init__.py` is a **package**. `import pkg.mod` loads
+  `<rootdir>/pkg/__init__.py` then `<rootdir>/pkg/mod.py` (or a nested
+  package’s `__init__.py`). Intermediate path components must be packages.
+- Supported forms: `import M` / `import M as A`, `import pkg.mod` /
+  `import pkg.mod as m`, `from M import x, y as z`, `from pkg.mod import
+  x`, `from pkg import mod` (submodule), and relative imports inside
+  packages (`from . import x`, `from .mod import y`, `from .. import z`).
+- Relative imports are rewritten to absolute names at load time using the
+  importer’s `__package__`. They are illegal in non-packages / top-level
+  scripts (`attempted relative import with no known parent package`).
 - The root module’s synthetic name is **`__main__`** (`ENTRY_NAME` /
-  `ROOT_NAME`); dependency modules keep their file stem as the import name.
+  `ROOT_NAME`); other modules use fully-qualified dotted names
+  (`utils`, `pkg.mod`).
 - `import sys` is special-cased (exposes `sys.argv`); it is not loaded
   as a file. Other stdlib modules are not provided unless added later
   under an explicit design ([PRIMITIVES.md](PRIMITIVES.md)).
 - Cycles and missing modules/names are compile errors with spans pointing
   at the importing file.
+- Package `__init__.py` may import its own submodules (partial package
+  init; not treated as a cycle). Re-exports are visible as package
+  attributes and via `from pkg import name`. **Last top-level binding**
+  decides Module vs value for a name. Partial init exposes only simple
+  parent assignments that appear before the child-loading import.
+- Still unsupported: `from m import *`, namespace packages (no
+  `__init__.py`), multi-name `import a, b`, imports nested in blocks,
+  dynamic import. Load-time diagnostics use phase tag `load`.
 
 **Pipeline:**
 
-1. `cli::modules::load_program` parses the root and dependencies, detects
-   cycles, returns modules in **topological order** (dependencies first,
-   root last). The vector index is the diagnostic **file id**.
+1. `cli::modules::load_program` parses the root and dependencies (including
+   parent packages), rewrites relative imports, detects cycles, returns
+   modules in **topological order** (dependencies first, root last). The
+   vector index is the diagnostic **file id**.
 2. `semantic::analyze_program` collects signatures and global surfaces,
-   validates import bindings, lowers each module with a per-module
-   namespace (root keeps bare IR names; others use `module.` prefixes),
-   and merges into one `ir::Module`.
-3. Module bodies run at the import site (like Python); one linked
-   executable contains the whole program.
-
-Full packages and relative imports are planned to replace this model.
+   validates import bindings (including package submodules), lowers each
+   module with a per-module namespace (root keeps bare IR names; others
+   use dotted `module.` prefixes, e.g. `pkg.mod.fn`), and merges into one
+   `ir::Module`. Nested attribute chains (`pkg.mod.x`) resolve at compile
+   time.
+3. Module bodies run at the import site (like Python); parent package
+   inits run before children; one linked executable contains the whole
+   program.
 
 ---
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.9 subset):**
+**Today (v0.10 subset):**
 
 - Static types after first assignment; cannot rebind a name to a
   different type.
@@ -385,9 +406,8 @@ Changing a layout or tag encoding requires a coordinated edit of
    compile real binaries (including multi-file module projects).
 3. **Local CI gate:** `make ci` → rustfmt check, clippy (`-D warnings`),
    full workspace tests, example parity vs `python3`.
-4. **`make examples`:** currently globs `examples/*.py` only (top-level
-   scripts). Multi-file demos under `examples/modules/` are covered by
-   e2e tests; extending the Makefile glob is a known chore.
+4. **`make examples`:** globs `examples/*.py`, `examples/modules/*.py`,
+   and `examples/packages/main.py` (package tree entry point).
 5. **GitHub Actions:** `.github/workflows/ci.yml` mirrors `make ci`;
    separate workflows exist for benches, docs, and releases.
 6. **Benchmarks:** `benchmarks/run.sh` verifies byte-identical output
@@ -404,18 +424,18 @@ These are product constraints that affect design choices:
 
 | Area             | Current                                              | Direction                                                                 |
 | ---------------- | ---------------------------------------------------- | ------------------------------------------------------------------------- |
-| Modules          | Sibling `.py` next to entry; `import` / `from` / `as` | Full packages + relative imports                                          |
+| Modules          | Packages + relative imports; sibling modules         | `from m import *`, namespace pkgs, richer package semantics if needed   |
 | Memory           | Never free heap strings/lists                        | GC / freeing **before 1.0**                                               |
 | Typing           | Required params; fixed types                         | Optional typing + more dynamism                                           |
 | Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | `sys` special-case only                              | Mostly PyRs modules on the kit later; no large stdlib without design      |
-| Language surface | Subset (see README v0.9)                             | Grow toward CPython drop-in                                               |
+| Language surface | Subset (see README v0.10); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
+| Product version  | `0.10.0` (and later `0.11.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
-dicts, sets, tuples, exceptions / `try`, generators, nested functions /
-closures, `lambda`, packages, f-string format codes beyond `{x:.Nf}`,
-`*args`/`**kwargs`. Prefer compile-time rejection with a clear message
-over silent wrong behavior.
+generators, nested functions / closures, `lambda`, `from m import *`,
+f-string format codes beyond `{x:.Nf}`, `*args`/`**kwargs`. Prefer
+compile-time rejection with a clear message over silent wrong behavior.
 
 **Strategy:** finish optimized **primitives** (IR + C) for current and new
 core types before a real stdlib tree. Do not grow `runtime.c` with

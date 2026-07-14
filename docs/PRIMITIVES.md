@@ -22,7 +22,7 @@ Companion docs: [SPECIFICATIONS.md](SPECIFICATIONS.md) (architecture),
 **Explanation:** Builtins and type methods define the *language runtime*.
 The stdlib is *product surface* that should not force every algorithm into
 C. Special-casing `sys` was fine once; do not special-case every future
-module the same way — use real imports once packages exist.
+module the same way — use real package imports for new stdlib modules.
 
 ---
 
@@ -154,7 +154,7 @@ families in this table. They consume families. New C is justified when a
 | Fully typed ops, no sugar | **ir** | Enums like `StrFn`, expr/stmt nodes |
 | Inline vs `call @pyrs_*` | **codegen / emit** | Performance policy lives here |
 | Bytes, libc, trap strings | **runtime.c** (or later `.c` modules) | Single place for layout + messages |
-| Import path, multi-file | **cli** + packages (later) | Stdlib discovery, not per-module special cases |
+| Import path, multi-file | **cli** modules loader (packages supported) | Stdlib discovery, not per-module special cases |
 
 Every primitive should be a **vertical slice**:
 
@@ -213,11 +213,11 @@ only as a one-off emit path unless it is pure IR (`len`/index).
 | **1. Finish current types** | str/list/file/numeric builtins completeness | Scripts rarely need new C for text/list/file work |
 | **2. Type primitives** | tuple → dict (→ set) | Data model enough for real programs |
 | **3. Control plane** | Minimal exceptions; **GC/RC before 1.0** | Long-running programs viable; traps become catchable over time |
-| **4. Modules** | Packages + stdlib path + optional `_pyrs` | `import` loads stdlib `.py` |
+| **4. Modules** | Stdlib path + optional `_pyrs` (packages exist) | `import` loads stdlib `.py` |
 | **5. Stdlib growth** | PyRs modules on the kit | C only for new primitive families |
 
-**Explanation:** Do not start a large pure-PyRs stdlib before packages and
-enough types exist. Do not implement `json` in C as a substitute for dict.
+**Explanation:** Do not start a large pure-PyRs stdlib before enough types
+exist. Do not implement `json` in C as a substitute for dict.
 
 ---
 
@@ -248,6 +248,6 @@ below) as symbols are added.
 | Stdlib | **Mostly PyRs** on top of the kit; thin C extensions only |
 | Performance | Kit structure is right; **inline hot paths**; don’t reimplement kit ops in PyRs |
 | `runtime.c` growth | **Finite families only**; no high-level libraries |
-| 1.0 gate | **Memory management** required; never-free is interim |
+| 1.0 gate | **Real-world readiness** (incl. **memory management**); stay on `0.y` until then; never-free is interim |
 
 When unsure, re-run the [decision table](#4-decision-table-use-when-adding-a-symbol) and assign a **family** before writing code.

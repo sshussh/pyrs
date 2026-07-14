@@ -76,7 +76,7 @@ Useful day-to-day targets:
 ```console
 $ make run FILE=examples/fib.py
 $ make emit-llvm FILE=prog.py     # writes prog.ll
-$ make examples                   # parity for examples/*.py
+$ make examples                   # parity: examples/*.py, modules/, packages/main.py
 $ make bench                      # benchmarks vs CPython
 ```
 
@@ -280,8 +280,8 @@ features.
 4. **Unit tests** per crate; **e2e** for real binaries; multi-file via
    `run_project` / `compile_project_expect_fail`.
 5. **Gate:** `make ci` (fmt-check, clippy `-D warnings`, tests, example
-   parity). Note: `make examples` currently globs `examples/*.py` only;
-   multi-file demos under `examples/modules/` are covered by e2e.
+   parity). `make examples` globs `examples/*.py`,
+   `examples/modules/*.py`, and `examples/packages/main.py`.
 
 ---
 

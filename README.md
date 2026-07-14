@@ -38,7 +38,12 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.9)
+## The language (v0.10)
+
+Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
+milestone after this one is **0.11.0**, not 1.0) until it is ready for
+**real-world use**; only then **1.0.0**. Crate versions and
+`pyrs --version` match this label.
 
 A statically-typed Python subset:
 
@@ -97,12 +102,16 @@ A statically-typed Python subset:
   `.read()`/`.readline()`/`.readlines()`/`.write()`/`.close()`,
   `with open(...) as f:` blocks, and CPython's exact error messages —
   compiled programs are real CLI tools
-- **Modules:** split a program across files — `import utils`,
-  `import utils as u`, `from utils import helper, X as Y`; module
-  functions and globals are visible across files, module bodies run
-  once at the import site (like Python), and imports resolve relative
-  to the entry script's directory. Cycles and missing modules/names are
-  compile errors that point at the offending file
+- **Modules & packages:** split a program across files and packages —
+  `import utils`, `import pkg.mod` / `import pkg.mod as m`,
+  `from pkg.mod import name`, `from pkg import mod`, package re-exports
+  in `__init__.py` (`from .mod import f` / `from . import mod`; last
+  top-level binding wins), relative forms inside packages, and partial
+  package init (child may read simple parent assigns set before the
+  child import); a directory with `__init__.py` is a package; module
+  bodies run once at the import site (like Python); absolute imports
+  resolve relative to the entry script's directory. Cycles and missing
+  modules/names are compile errors that point at the offending file
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 
@@ -123,7 +132,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.9): no bigints (int is 64-bit and wraps), `and`/`or`
+Known limits (v0.10): no bigints (int is 64-bit and wraps), `and`/`or`
 return `bool` rather than the operand, `min`/`max` take exactly two
 numeric args (no iterable form yet) and unify to a common type
 (`min(1, 1.5)` is `1.0`, not the int `1`), `x ** e` with a *dynamic*
@@ -133,15 +142,17 @@ past 2^53), list literals coerce mixed numerics to one element type,
 `nan in [nan]` is False (no identity semantics), str methods use ASCII
 case/whitespace rules, heap memory is never freed, files support text
 modes "r"/"w"/"a" only (`with`, `for line in f`, and `file` params/
-returns work; no `list[file]` or printing files), imports are single
-sibling modules only (no packages, `import a.b`, `from m import *`, or
-relative imports), full f-string format specs (beyond `{x:.Nf}`) are
-unsupported, dict/set keys are only `int`/`str`, `dict.get` requires a
-default (no bare `None` return), `keys`/`values`/`items` return lists
-(not view objects), no starred unpack `*a`, no tuple methods, dynamic
-indexing of heterogeneous tuples is rejected at compile time, `try`
-has no `else` clause, and classes / generators / closures / `lambda` /
-`*args` are not in yet.
+returns work; no `list[file]` or printing files), no `from m import *`,
+namespace packages without `__init__.py`, multi-name `import a, b`,
+imports only at module top level (not inside `if`/functions), or
+treating modules as first-class values beyond attribute/call chains;
+full f-string format specs (beyond `{x:.Nf}`) are unsupported, dict/set
+keys are only `int`/`str`,
+`dict.get` requires a default (no bare `None` return),
+`keys`/`values`/`items` return lists (not view objects), no starred
+unpack `*a`, no tuple methods, dynamic indexing of heterogeneous tuples
+is rejected at compile time, `try` has no `else` clause, and classes /
+generators / closures / `lambda` / `*args` are not in yet.
 
 Errors come with source snippets:
 
@@ -225,4 +236,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.9.0 && git push origin v0.9.0`.
+Release tags: `git tag v0.10.0 && git push origin v0.10.0`.

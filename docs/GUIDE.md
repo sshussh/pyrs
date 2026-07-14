@@ -28,6 +28,9 @@ machine code through LLVM. There is no interpreter and no VM at runtime —
    - [Functions](#functions)
    - [Built-in functions](#built-in-functions)
    - [Comments and line continuation](#comments-and-line-continuation)
+   - [Files](#files)
+   - [Standard input and arguments](#standard-input-and-arguments)
+   - [Modules and packages](#modules-and-packages)
 6. [Runtime errors](#6-runtime-errors)
 7. [Compiler diagnostics](#7-compiler-diagnostics)
 8. [Differences from CPython](#8-differences-from-cpython)
@@ -113,7 +116,7 @@ what PyRs hands to LLVM, readable and diffable.
 $ pyrs run -i prog.py [-O 2]
 ```
 
-When the program imports sibling modules, the whole import graph is
+When the program imports other modules or packages, the whole import graph is
 compiled and linked into the one executable. `run` compiles to a
 temporary directory, executes, cleans up, and exits with the program's
 exit code (0 on success, 1 if the program traps with a
@@ -628,45 +631,83 @@ For a compiled binary they're just process arguments: `./tool a b c`.
 `sys.argv[0]` is the binary path (Python shows the script path — the
 only structural difference).
 
-### Modules
+### Modules and packages
 
-Split a program across files. Imports resolve relative to the entry
-script's directory (exactly like `python main.py`):
+Split a program across files and packages. Absolute imports resolve
+relative to the entry script's directory (exactly like `python main.py`).
+A directory with `__init__.py` counts as a package.
 
 ```python
-# geometry.py
-PI = 3.14159
-def circle_area(r: float) -> float:
+# geometry.py                          # utilpkg/__init__.py  (package)
+PI = 3.14159                           # utilpkg/mathx.py
+def circle_area(r: float) -> float:    #   def square(n: int) -> int: ...
     return PI * r * r
 
 # main.py
 import geometry
-import geometry as geo          # aliases work
-from geometry import PI         # and `as`: from geometry import PI as pi
+import geometry as geo
+from geometry import PI
+import utilpkg.mathx                   # loads utilpkg/__init__.py then mathx
+import utilpkg.mathx as m              # alias binds the leaf module
+from utilpkg.mathx import square
+from utilpkg import mathx              # submodule as a local name
 
 print(geometry.circle_area(2.0))
-print(geo.circle_area(3.0), PI)
+print(utilpkg.mathx.square(6), m.square(3))
 ```
 
-- `import M` / `import M as A` — reach the module's functions and
-  globals as `M.func(...)` / `M.value`.
-- `from M import a, b as c` — bring names directly into scope.
+Relative imports are allowed **inside packages** (same rules as CPython
+for the cases we claim):
+
+```python
+# utilpkg/a.py
+from . import b            # sibling submodule
+from .b import Z           # name from sibling
+from ..other import x      # parent package (when nested)
+```
+
+- `import M` / `import M as A` — module functions and globals as
+  `M.func(...)` / `M.value`.
+- `import pkg.mod` — binds the top-level name `pkg`; access the leaf as
+  `pkg.mod....`. Parent packages initialize first.
+- `import pkg.mod as m` — binds `m` to the leaf module.
+- `from M import a, b as c` — bring names into scope (functions, globals,
+  or submodules of a package).
+- **Package re-exports:** a package `__init__.py` may
+  `from .mod import name` (or `from . import mod`). Those names are then
+  available as `pkg.name` and `from pkg import name`.
+- **Last top-level binding wins** for a name on a package (assign vs
+  `from` value re-export vs `from . import submodule`): whichever appears
+  last in the package body is what `from pkg import name` / `pkg.name`
+  sees.
+- **Partial package init:** while a package `__init__` imports a child,
+  the child may read **simple** parent assignments (literals / annotated
+  assigns) that appear **before** that import — e.g. `VERSION = 1` then
+  `from .mod import f` allows the child `from . import VERSION`. Names
+  bound only after the child-loading import are not visible (compile
+  error, CPython-like). Attribute access `pkg.VERSION` under partial
+  init uses the same rule; calling a parent function via `pkg.g()` while
+  the parent is mid-init is rejected with a clear diagnostic (not a
+  crash). Only simple assignments are typed for partial init today.
 - A module's top-level code runs **once**, at the point its first
-  `import` is reached (depth-first, like Python) — so a shared module
-  imported by several files initializes a single time.
+  `import` is reached (depth-first, like Python).
 - To mutate another module's global, call a function in that module
   that uses `global` (assigning `M.x = v` from outside is not
   supported); `from M import x` then reassigning `x` just makes a local,
   as in Python.
 
-Errors are compile-time and point at the offending file: importing a
-module that does not exist (`No module named 'foo'`), importing a name a
-module does not define (`cannot import name 'bar' from 'foo'`), and
-import cycles are all rejected.
+Errors are compile-time and point at the offending file: missing modules
+(`No module named 'foo'`), intermediate non-packages
+(`'foo' is not a package`), missing names
+(`cannot import name 'bar' from 'foo'`), import cycles between unrelated
+modules, relative imports outside a package, and relative imports that
+go above the top-level package.
 
-Not supported yet: packages and dotted names (`import a.b`),
-`from M import *`, relative imports (`from . import x`), importing inside
-a function, and re-assigning another module's attributes.
+Still unsupported: `from M import *`, namespace packages (no
+`__init__.py`), multi-name `import a, b` on one line, imports inside
+functions or other blocks (only **module top-level** statements),
+modules as first-class values beyond attribute/call chains, and
+re-assigning another module's attributes from outside.
 
 ## 6. Runtime errors
 
@@ -772,7 +813,7 @@ deliberate exceptions:
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
 
-Container notes (v0.9):
+Container notes (v0.10):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`
@@ -787,11 +828,11 @@ Exception notes: `except E as e` binds the message `str`, not an exception
 object. Other traps (`EOFError`, `FileNotFoundError`, …) match bare
 `except:` only, not `except RuntimeError`.
 
-Not implemented yet (clear compile errors): classes, packages/relative
-imports, `match`, generators/`yield`, `lambda`, nested functions,
-closures, `nonlocal`, full f-string format specs beyond `{x:.Nf}`,
-`*args`/`**kwargs`, starred unpack, and most remaining methods on
-tuple/dict/set.
+Not implemented yet (clear compile errors): classes, `from M import *`,
+namespace packages, `match`, generators/`yield`, `lambda`, nested
+functions, closures, `nonlocal`, full f-string format specs beyond
+`{x:.Nf}`, `*args`/`**kwargs`, starred unpack, and most remaining
+methods on tuple/dict/set.
 
 ## 9. Performance
 
