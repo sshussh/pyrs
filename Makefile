@@ -91,7 +91,7 @@ ci: fmt-check clippy test examples ## Full gate: format + lints + tests + exampl
 .PHONY: examples
 examples: release ## Run every example and diff its output against python3
 	@fail=0; \
-	for ex in examples/*.py examples/modules/*.py; do \
+	for ex in examples/*.py examples/modules/*.py examples/packages/main.py; do \
 	    got=$$($(PYRS) run -i $$ex 2>&1); \
 	    want=$$($(PYTHON) $$ex 2>&1); \
 	    if [ "$$got" = "$$want" ]; then \
