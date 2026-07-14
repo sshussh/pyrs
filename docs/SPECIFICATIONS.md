@@ -18,7 +18,7 @@ surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
 0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
 **PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
 use** (not merely because the minor is large). Current milestone:
-**v0.11** / `0.11.0`. Optional release tags: `vX.Y.Z`.
+**v0.12** / `0.12.0`. Optional release tags: `vX.Y.Z`.
 
 ---
 
@@ -298,9 +298,10 @@ programs** link only the object file from the shim plus `runtime.c`.
   **module top level** sees only simple parent assigns/`def`s before the
   child-loading import; child **function bodies** may use deferred parent
   attributes/calls after full parent init.
+- Multi-name `import a, b as c` is supported.
 - Still unsupported: `from m import *`, namespace packages (no
-  `__init__.py`), multi-name `import a, b`, imports nested in blocks,
-  dynamic import. Load-time diagnostics use phase tag `load`.
+  `__init__.py`), imports nested in blocks, dynamic import. Load-time
+  diagnostics use phase tag `load`.
 
 **Pipeline:**
 
@@ -322,7 +323,7 @@ programs** link only the object file from the shim plus `runtime.c`.
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.11 subset):**
+**Today (v0.12 subset):**
 
 - Static types after first assignment; cannot rebind a name to a
   different type.
@@ -334,8 +335,8 @@ programs** link only the object file from the shim plus `runtime.c`.
 - Implicit promotions: `bool → int → float` in arithmetic, args, returns.
 - Function-wide local scoping with `global` for writes to module globals
   (Python-like).
-- Minimal exceptions: `raise` + `try`/`except`/`finally` via setjmp frames
-  (process-global, single-threaded); runtime traps (`pyrs_die`) are
+- Minimal exceptions: `raise` + `try`/`except`/`else`/`finally` via setjmp
+  frames (process-global, single-threaded); runtime traps (`pyrs_die`) are
   catchable. `return`/`break`/`continue` pop the frame and run `finally`.
   Named traps only: other prefixes match bare `except:` only.
 
@@ -346,8 +347,9 @@ programs** link only the object file from the shim plus `runtime.c`.
 - Document every intentional deviation in README/GUIDE until removed.
 
 Documented deviations (non-exhaustive; see GUIDE § Differences): 64-bit
-wrapping ints, `and`/`or` return `bool`, ASCII-only string case/whitespace
-rules, no GC, dynamic negative int `**` traps, etc.
+wrapping ints, `and`/`or` require compatible types, bare `dict.get`
+KeyError on miss, ASCII-only string case/whitespace rules, no GC, dynamic
+negative int `**` traps, etc.
 
 ---
 
@@ -445,8 +447,8 @@ These are product constraints that affect design choices:
 | Typing           | Required params; fixed types                         | Optional typing + more dynamism                                           |
 | Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
-| Language surface | Subset (see README v0.11); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
-| Product version  | `0.11.0` (and later `0.12.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
+| Language surface | Subset (see README v0.12); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
+| Product version  | `0.12.0` (and later `0.13.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
 generators, nested functions / closures, `lambda`, `from m import *`,

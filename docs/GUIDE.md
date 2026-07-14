@@ -189,7 +189,8 @@ bump()
 print(counter)          # 1
 ```
 
-`nonlocal` is not supported (there are no nested functions yet).
+`nonlocal` is not supported (nested functions may **read** outer locals but
+cannot assign to them via `nonlocal`).
 
 ### Types
 
@@ -284,8 +285,10 @@ if 0 <= x < len(xs):    # exactly one evaluation of each operand
 ```
 
 `and` / `or` / `not` accept any value via truthiness (nonzero numbers,
-non-empty strings and lists are truthy) and short-circuit. They return
-`bool` — see [Differences from CPython](#8-differences-from-cpython).
+non-empty strings and lists are truthy) and short-circuit. Like Python,
+`and` / `or` yield an **operand** (not always `bool`): `0 or 5` is `5`,
+`"" or "x"` is `"x"`, `"a" and "b"` is `"b"`. Both sides must share a
+type (or both be numeric, with the usual `bool`→`int`→`float` unify).
 
 `in` / `not in` test substrings and list membership:
 
@@ -551,7 +554,14 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - Default values and keyword arguments work (`def f(a: int, b: int = 1)`
   and `f(1, b=2)`). Defaults are re-evaluated at each call that needs
   them (so `def f(xs: list[int] = [])` does not share one list across
-  calls — a deliberate deviation from CPython). No `*args` / `**kwargs`.
+  calls — a deliberate deviation from CPython).
+- `*args: T` packs extra positionals into `list[T]`; `**kwargs: T` packs
+  extra keywords into `dict[str, T]`. Call-site unpacking `f(1, *xs)` and
+  `f(**d)` works for homogeneous `list` / `dict[str, …]` values.
+- Nested `def` is allowed inside functions. Free variables from the outer
+  function are **captured by value** at each call. Nested functions may
+  recurse. Returning a nested function as a value is not supported;
+  `nonlocal` is not supported.
 - A function declared `-> T` must return on every path — the compiler
   checks this (an infinite `while True:` without `break` counts as
   not falling through).
@@ -560,8 +570,22 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - Function names are internally prefixed, so naming a function `printf`
   or `malloc` cannot collide with the C library.
 
-Not supported yet: `*args` / `**kwargs`, nested functions, closures,
-`lambda`, and redefining a function.
+```python
+def total(x: int, *args: int) -> int:
+    s = x
+    for a in args:
+        s = s + a
+    return s
+
+def make(n: int) -> int:
+    def add(x: int) -> int:
+        return x + n
+    return add(5)
+
+print(total(1, 2, 3), make(3))  # 6 8
+```
+
+Not supported yet: `lambda`, and redefining a function.
 
 ### Built-in functions
 
@@ -570,7 +594,8 @@ Not supported yet: `*args` / `**kwargs`, nested functions, closures,
 | `print(a, b, ...)` | any values, any count | space-separated, newline at end |
 | `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
-| `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg; 2-arg only) |
+| `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg) |
+| `min(xs)` / `max(xs)` | `list[int\|float\|bool]` | element type; empty list → `ValueError: … iterable argument is empty` |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
 | `sorted(xs)` | `list[int\|float\|bool\|str]` | new sorted list (no `key=`/`reverse=`) |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
@@ -730,22 +755,55 @@ compiler build time. Prefer real package imports — only `sys` is special-cased
 | Module | Surface | Notes |
 |--------|---------|-------|
 | `sys` | `sys.argv` | Special-cased (not a `.py` file) |
-| `os.path` | `join(a, b)`, `dirname(p)`, `basename(p)` | Pure PyRs; **POSIX** only; `join` is **two-argument** (no `*args`) |
+| `os` | `getcwd() -> str` | C runtime (`pyrs_os_getcwd`); package re-exports `path` |
+| `os.path` | `join(a, *parts)`, `dirname`, `basename` | Pure PyRs; **POSIX** only |
+| `math` | `pi`/`e` + unary float ops | Compiler intrinsics / libm |
+| `json` | `dumps(x)`, typed `loads_*` | See below; no dynamic `loads` |
 
 ```python
 from os.path import join, dirname, basename
+import os
 import os.path
 
 print(join("a", "b"))           # a/b
-print(join("a", "/b"))          # /b  (absolute second wins)
+print(join("a", "b", "c"))      # a/b/c  (*parts)
+print(join("a", "/b"))          # /b  (absolute later segment wins)
 print(dirname("/a/b/c"))        # /a/b
 print(basename("/a/b/c"))       # c
 print(os.path.join("x", "y"))
+print(os.getcwd())              # current working directory
 ```
 
-`import os` works (`os/__init__.py` re-exports `path`). There is **no** full
-`os` (no `getcwd`, environment, process APIs) and **no** `math` or other
-batteries yet.
+**`math`** (embedded stdlib) provides constants and unary float functions
+backed by LLVM intrinsics / libm:
+
+```python
+import math
+from math import sqrt, pi
+
+print(math.pi, math.e)
+print(sqrt(9.0), math.sin(0.0), math.floor(3.7), math.fabs(-2.5))
+```
+
+Supported: `pi`, `e`, `sqrt`, `sin`, `cos`, `tan`, `log`, `log10`,
+`exp`, `floor`/`ceil` (return `int` like CPython), `fabs`. No
+`math.pow`, `isfinite`, multi-arg `log`, etc. yet.
+
+**`json`** (embedded) supports:
+
+- `json.dumps(x)` for `int`, `float`, `bool`, `str`, homogeneous
+  `list[...]` of those, and `dict[str, ...]` of those (nested lists/dicts
+  allowed when elements are json-able). Spacing matches CPython defaults.
+- Typed loaders (not CPython names): `loads_int`, `loads_float`,
+  `loads_bool`, `loads_str`, `loads_list_int` / `_float` / `_str` /
+  `_bool`, `loads_dict_str_int` / `_float` / `_str` / `_bool`.
+- There is **no** dynamic `json.loads` (no object model for mixed values).
+
+```python
+import json
+print(json.dumps([1, 2, 3]))          # [1, 2, 3]
+print(json.loads_list_int("[1, 2]"))  # [1, 2]
+```
 
 Relative imports are allowed **inside packages** (same rules as CPython
 for the cases we claim):
@@ -809,13 +867,15 @@ Errors are compile-time and point at the offending file: missing modules
 modules, relative imports outside a package, and relative imports that
 go above the top-level package.
 
+Multi-name imports work: `import a, b as c` loads each module and binds
+aliases like CPython.
+
 Still unsupported: `from M import *`, namespace packages (no
-`__init__.py`), multi-name `import a, b` on one line, imports inside
-functions or other blocks (only **module top-level** statements),
-modules as first-class values beyond attribute/call chains,
-re-assigning another module's attributes from outside, and a package
-**importing itself** by name (`import utilpkg` inside
-`utilpkg/__init__.py` is a compile error).
+`__init__.py`), imports inside functions or other blocks (only **module
+top-level** statements), modules as first-class values beyond
+attribute/call chains, re-assigning another module's attributes from
+outside, and a package **importing itself** by name (`import utilpkg`
+inside `utilpkg/__init__.py` is a compile error).
 
 ## 6. Runtime errors
 
@@ -836,9 +896,13 @@ Supported exception types for `raise` / typed `except`: `ValueError`,
 `KeyError`, `IndexError`, `ZeroDivisionError`, `TypeError`, `RuntimeError`.
 Bare `except:` catches all (including traps like `FileNotFoundError` /
 `UnboundLocalError` that are not among the named types). The bound name
-is the message string (not a full exception object). `try` has no `else`
-clause. `return` / `break` / `continue` inside `try` run `finally` and
-pop the catch frame before leaving (CPython-compatible).
+is the message string (not a full exception object). `try`/`except` may
+have an `else` clause (runs only on normal completion of the try body;
+skipped after a handled exception; exceptions raised in `else` are not
+caught by the same `try`'s handlers). `else` requires at least one
+`except` (not `try`/`finally` alone). `return` / `break` / `continue`
+inside `try` run `finally` and pop the catch frame before leaving
+(CPython-compatible).
 
 | error | raised by |
 |-------|-----------|
@@ -897,8 +961,10 @@ deliberate exceptions:
 
 1. **`int` is 64-bit** and wraps on overflow; there are no big integers.
    Integer literals beyond ±2⁶³ don't lex.
-2. **`and`/`or` return `bool`**, not the winning operand
-   (`0 or "x"` is `True`, not `"x"`).
+2. **`and`/`or` require compatible types** (same type, or both numeric).
+   Mixed non-numeric pairs like `0 or "x"` are a compile error (CPython
+   returns `"x"`). When types match, the winning operand is returned
+   (`0 or 5` is `5`).
 3. **Static types.** Variables can't change type; lists are homogeneous
    (mixed numeric literals coerce to the joined type — `[1, 2.5]` becomes
    `[1.0, 2.5]`); annotations on parameters are mandatory. Promotions
@@ -920,15 +986,18 @@ deliberate exceptions:
    a known limitation for long-running ones.
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
+11. **Bare `dict.get(k)` raises `KeyError` on a missing key** (CPython
+    returns `None`). Use `get(k, default)` for miss defaults. Hit paths
+    match CPython.
 
-Container notes (v0.11):
+Container notes (v0.12):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`
   and methods are not supported yet.
-- **dict:** keys are `int` or `str` only; `get` requires a default
-  (no bare `None`); `keys`/`values`/`items` return lists (not views);
-  insertion-order iteration over keys.
+- **dict:** keys are `int` or `str` only; bare `get` → `KeyError` on miss
+  (no Optional/`None` return yet); `keys`/`values`/`items` return lists
+  (not views); insertion-order iteration over keys.
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
   `{}` is always an empty dict.
 
@@ -937,13 +1006,12 @@ object. Other traps (`EOFError`, `FileNotFoundError`, …) match bare
 `except:` only, not `except RuntimeError`.
 
 Not implemented yet (clear compile errors): classes, `from M import *`,
-namespace packages, `match`, generators/`yield`, `lambda`, nested
-functions, closures, `nonlocal`, full f-string format specs beyond
+namespace packages, `match`, generators/`yield`, `lambda`, returning nested
+functions as values, `nonlocal` writes, full f-string format specs beyond
 `{x:.Nf}`, unparenthesized multi-line expressions inside f-string
 `{...}` (parenthesize instead), same-delimiter triple quotes nested
-inside an f-string expression, `__doc__` attribute access,
-`*args`/`**kwargs`, starred unpack, and most remaining methods on
-tuple/dict/set.
+inside an f-string expression, `__doc__` attribute access, dynamic
+`json.loads`, and most remaining methods on tuple/dict/set.
 
 ## 9. Performance
 

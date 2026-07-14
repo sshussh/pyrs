@@ -151,7 +151,7 @@ Before adding something large, decide *which layer* it belongs to
 | Builtin / type method | `len`, `abs`, `str.find`, `list.append` | Compiler + IR and/or C kit |
 | Hot path | list index, `len`, `abs` | Prefer **LLVM IR / intrinsics** |
 | Cold / OS / layouts | `str.split`, `open`, slot mutators | **`runtime.c`** |
-| High-level library | `os.path` (v0.11 subset shipped), future `math` / `json` | **PyRs modules** under `stdlib/` (embedded) — not unbounded C |
+| High-level library | `os.path` + `math` (v0.12 subset shipped), future `json` | **PyRs modules** under `stdlib/` (embedded) — not unbounded C |
 
 Do **not** implement a high-level stdlib feature only in `runtime.c` if it
 could be composed from primitives once the language is ready.
@@ -518,7 +518,9 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `Block { stmts, result }` | statements inside expressions (comprehensions) |
 | `Abs` | `abs(x)` via LLVM abs/fabs |
 | `Min` / `Max` | 2-arg `min`/`max` (numeric; select on compare) |
+| `MinList` / `MaxList` | 1-arg `min`/`max` over list (empty → ValueError) |
 | `Sum` | `sum(list[int\|float])` open-coded loop |
+| `MathCall { op, arg }` | `math.*` unary intrinsics (float; floor/ceil → int) |
 | Numeric / string casts / `ToBool` | `int`/`float`/`bool`/`str` and truthiness |
 
 ### `StrFn` (current)
@@ -537,6 +539,8 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 - `FloorDiv` / `Mod` follow Python floored semantics.
 - `Pow`: int → `pyrs_ipow` (dynamic negative exponent traps); float →
   guarded `llvm.pow`.
+- `And` / `Or` short-circuit and yield an operand (shared type); codegen
+  branches on truthiness and phis the operand LLVM type.
 - On `str`: `Add` = concat, `Mul` = repeat, comparisons are lexicographic.
 
 ---

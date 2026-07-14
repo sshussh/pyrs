@@ -187,7 +187,7 @@ only as a one-off emit path unless it is pure IR (`len`/index).
 
 | Phase | Stdlib stance | Explanation |
 |-------|---------------|-------------|
-| **Packages + path (v0.11)** | Repo `stdlib/` + multi-root load + **embed in `pyrs`** | Real modules (`os.path`), not semantic special cases; binary is standalone |
+| **Packages + path (v0.11+)** | Repo `stdlib/` + multi-root load + **embed in `pyrs`** | Real modules (`os.path`, `math`), not semantic special cases; binary is standalone |
 | **Steady state** | Most modules in **PyRs** | Call builtins/methods + `_pyrs` / `_posix` for leftovers |
 | **New C for stdlib?** | Only new **primitive families** | e.g. regex engine, not `pathlib` logic |
 
@@ -195,10 +195,11 @@ only as a one-off emit path unless it is pure IR (`len`/index).
 
 | Module piece | Implementation | Explanation |
 |--------------|----------------|-------------|
-| `os.path.join` / `dirname` / `basename` | **Pure PyRs** in `stdlib/os/path.py` (v0.11) | POSIX subset; 2-arg `join` only |
-| `math.sin` / `sqrt` | C or LLVM intrinsic via kit | libm / hardware (not shipped yet) |
+| `os.path.join` / `dirname` / `basename` | **Pure PyRs** in `stdlib/os/path.py` | POSIX; `join(a, *parts)` |
+| `math.sin` / `sqrt` | LLVM intrinsic / libm via `MathCall` IR | shipped in `stdlib/math.py` (v0.12) |
+| `json.dumps` / `loads_*` | C runtime + module stubs | dumps polymorphic; typed loads only |
 | `math.prod` (subset) | PyRs over list/numeric primitives | No need for C |
-| `os.getcwd` | C primitive | OS (not shipped yet) |
+| `os.getcwd` | C primitive (`pyrs_os_getcwd`) | shipped v0.12 |
 | `json.loads` | Pure PyRs | Needs **dict** + exceptions (dict exists; module not shipped) |
 | `sys.argv` | Kit (today special-cased) | Migrate toward real module when ready |
 

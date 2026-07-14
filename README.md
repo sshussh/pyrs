@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.11)
+## The language (v0.12)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.12.0**, not 1.0) until it is ready for
+milestone after this one is **0.13.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label.
 
@@ -59,12 +59,14 @@ A statically-typed Python subset:
   sets, `break`/`continue`, assignments (plain, annotated, multi-target,
   unpacking `a, b = t`, augmented — including `xs[i] += v`),
   `del d[k]`, `return`, `pass`, `raise ExcType("msg")`,
-  `try`/`except`/`finally`
+  `try`/`except`/`else`/`finally`
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
-  `and`/`or`/`not` (short-circuit), casts
+  `and`/`or`/`not` (short-circuit; `and`/`or` return an operand, not
+  always `bool`), casts
   `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, `min()`/`max()`
-  (two arguments), `sum()` on `list[int]`/`list[float]`, indexing with
+  (two args or one `list[int|float|bool]`), `sum()` on
+  `list[int]`/`list[float]`, indexing with
   negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
   `print(...)` with any mix of values (including tuples/dicts/sets)
 - **f-strings:** `f"x={x}, next={x + 1}"` and multi-line `f"""…"""` /
@@ -92,14 +94,15 @@ A statically-typed Python subset:
   `()`; index (incl. negative); `len`; unpacking; print like CPython
 - **Dicts:** `dict[K, V]` with `K` in `{int, str}`; literal `{k: v}`,
   `{}` (needs annotation); get/set, `del d[k]`, `in` on keys, `len`,
-  insertion-order key iteration; methods `get` (with default), `pop`,
-  `keys`/`values`/`items` (return lists), `clear`
+  insertion-order key iteration; methods `get` (with default, or bare
+  `get(k)` which raises `KeyError` on miss until Optional/`None` returns),
+  `pop`, `keys`/`values`/`items` (return lists), `clear`
 - **Sets:** `set[T]` with `T` in `{int, str}`; nonempty `{a, b}`, empty
   `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`, `in`, `len`,
   iteration
 - **Exceptions:** `raise ValueError("msg")` (and KeyError, IndexError,
   ZeroDivisionError, TypeError, RuntimeError); `try`/`except`/`except
-  Type as e`/`finally`; uncaught traps print CPython-like messages and
+  Type as e`/`else`/`finally`; uncaught traps print CPython-like messages and
   exit 1; runtime traps are catchable inside `try`
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
@@ -109,28 +112,30 @@ A statically-typed Python subset:
   `with open(...) as f:` blocks, and CPython's exact error messages —
   compiled programs are real CLI tools
 - **Modules & packages:** split a program across files and packages —
-  `import utils`, `import pkg.mod` / `import pkg.mod as m`,
-  `from pkg.mod import name`, `from pkg import mod`, package re-exports
-  in `__init__.py` (`from .mod import f` / `from . import mod`; last
-  top-level binding wins, with CPython fromlist hasattr short-circuit so
-  assign/`def` then `from . import same_name` keeps the value and does
-  not run the submodule), relative forms inside packages, and partial
-  package init (child module top level may read simple parent assigns
-  set before the child import; child function bodies may use deferred
-  parent attrs/calls after full init); a directory with `__init__.py` is
-  a package; module bodies run once at the import site (like Python).
-  Import search order (stacked, first hit wins): (1) entry script
-  directory, (2) `PYRS_STDLIB` if set, (3) workspace `stdlib/` when present
-  (dev; not XOR with env), (4) **embedded** stdlib inside the `pyrs`
-  binary (always; no companion directory needed). User code shadows
+  `import utils`, `import a, b as c` (multi-name), `import pkg.mod` /
+  `import pkg.mod as m`, `from pkg.mod import name`, `from pkg import mod`,
+  package re-exports in `__init__.py` (`from .mod import f` / `from .
+  import mod`; last top-level binding wins, with CPython fromlist hasattr
+  short-circuit so assign/`def` then `from . import same_name` keeps the
+  value and does not run the submodule), relative forms inside packages,
+  and partial package init (child module top level may read simple parent
+  assigns set before the child import; child function bodies may use
+  deferred parent attrs/calls after full init); a directory with
+  `__init__.py` is a package; module bodies run once at the import site
+  (like Python). Import search order (stacked, first hit wins): (1) entry
+  script directory, (2) `PYRS_STDLIB` if set, (3) workspace `stdlib/` when
+  present (dev; not XOR with env), (4) **embedded** stdlib inside the
+  `pyrs` binary (always; no companion directory needed). User code shadows
   stdlib; once a package is found under one origin, children stay there
   (no split packages). Cycles and missing modules/names are compile
   errors that point at the offending file
-- **Stdlib (subset):** pure-PyRs `os.path` — `join(a, b)` (two args only),
-  `dirname`, `basename` (POSIX semantics). `import os` / `import os.path` /
-  `from os.path import join` work; there is no full `os` (no `getcwd`,
-  env, etc.) and no other batteries yet (`math` not provided). `import
-  sys` remains special-cased for `sys.argv`
+- **Stdlib (subset):** pure-PyRs `os.path` — `join(a, *parts)` (POSIX),
+  `dirname`, `basename`; `os.getcwd()` (C runtime); `math` — constants
+  `pi`/`e` and unary `sqrt`/`sin`/`cos`/`tan`/`log`/`log10`/`exp`/
+  `floor`/`ceil`/`fabs` (intrinsics / libm); `json.dumps` for int/float/
+  bool/str and homogeneous list/dict-of-str, plus typed `json.loads_*`
+  helpers (no dynamic `json.loads`). `import sys` remains special-cased
+  for `sys.argv`
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 
@@ -151,32 +156,36 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.11): no bigints (int is 64-bit and wraps), `and`/`or`
-return `bool` rather than the operand, `min`/`max` take exactly two
-numeric args (no iterable form yet) and unify to a common type
-(`min(1, 1.5)` is `1.0`, not the int `1`), `x ** e` with a *dynamic*
-negative int exponent traps (a constant like `2 ** -1` works and gives
-float), int↔float comparisons convert the int to float (exactness loss
-past 2^53), list literals coerce mixed numerics to one element type,
-`nan in [nan]` is False (no identity semantics), str methods use ASCII
-case/whitespace rules, heap memory is never freed, files support text
-modes "r"/"w"/"a" only (`with`, `for line in f`, and `file` params/
-returns work; no `list[file]` or printing files), no `from m import *`,
-namespace packages without `__init__.py`, multi-name `import a, b`,
-imports only at module top level (not inside `if`/functions), a package
-importing itself by name, or treating modules as first-class values
-beyond attribute/call chains; `os.path.join` is two-argument and POSIX
-only (no `*`args, no Windows paths); no full `os` / `math` / other
-stdlib yet;
+Known limits (v0.12): no bigints (int is 64-bit and wraps), `min`/`max`
+two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
+not the int `1`); iterable `min`/`max` is only for
+`list[int|float|bool]` (empty list → ValueError like CPython),
+`and`/`or` require compatible operand types (same type, or both
+numeric), `x ** e` with a *dynamic* negative int exponent traps (a
+constant like `2 ** -1` works and gives float), int↔float comparisons
+convert the int to float (exactness loss past 2^53), list literals
+coerce mixed numerics to one element type, `nan in [nan]` is False (no
+identity semantics), str methods use ASCII case/whitespace rules, heap
+memory is never freed, files support text modes "r"/"w"/"a" only
+(`with`, `for line in f`, and `file` params/returns work; no
+`list[file]` or printing files), no `from m import *`, namespace packages
+without `__init__.py`, imports only at module top level (not inside
+`if`/functions), a package importing itself by name, or treating modules
+as first-class values beyond attribute/call chains; `os.path` is POSIX
+only (no Windows paths); nested functions capture outer locals by value
+at each call (no `nonlocal`, no returning local functions); `*args` /
+`**kwargs` on defs and `*`/`**` unpacking in calls are supported for
+homogeneous list/dict types; `json` has no dynamic `loads`;
 full f-string format specs (beyond `{x:.Nf}`) are unsupported,
 unparenthesized multi-line f-string expressions and same-delimiter
 nested triples inside `{...}` are unsupported, no `__doc__` attribute
 on functions/modules, dict/set keys are only `int`/`str`,
-`dict.get` requires a default (no bare `None` return),
+bare `dict.get(k)` raises `KeyError` on miss (no first-class `None`
+return yet — use `get(k, default)` for defaults),
 `keys`/`values`/`items` return lists (not view objects), no starred
 unpack `*a`, no tuple methods, dynamic indexing of heterogeneous tuples
-is rejected at compile time, `try` has no `else` clause, and classes /
-generators / closures / `lambda` / `*args` are not in yet.
+is rejected at compile time, and classes / generators / closures /
+`lambda` / `*args` are not in yet.
 
 Errors come with source snippets:
 
@@ -260,4 +269,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.11.0 && git push origin v0.11.0`.
+Release tags: `git tag v0.12.0 && git push origin v0.12.0`.
