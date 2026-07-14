@@ -1,3 +1,5 @@
 /target
-main.py
+/main.py
 a.out
+__pycache__/
+*.py[cod]
