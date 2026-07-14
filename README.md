@@ -129,13 +129,15 @@ A statically-typed Python subset:
   stdlib; once a package is found under one origin, children stay there
   (no split packages). Cycles and missing modules/names are compile
   errors that point at the offending file
-- **Stdlib (subset):** pure-PyRs `os.path` — `join(a, *parts)` (POSIX),
-  `dirname`, `basename`; `os.getcwd()` (C runtime); `math` — constants
-  `pi`/`e` and unary `sqrt`/`sin`/`cos`/`tan`/`log`/`log10`/`exp`/
-  `floor`/`ceil`/`fabs` (intrinsics / libm); `json.dumps` for int/float/
-  bool/str and homogeneous list/dict-of-str, plus typed `json.loads_*`
-  helpers (no dynamic `json.loads`). `import sys` remains special-cased
-  for `sys.argv`
+- **Stdlib (subset, frozen):** pure-PyRs `os.path` — `join(a, *parts)`
+  (POSIX), `dirname`, `basename`; `os.getcwd()` (C runtime); `math` —
+  constants `pi`/`e` and unary `sqrt`/`sin`/`cos`/`tan`/`log`/`log10`/
+  `exp`/`floor`/`ceil`/`fabs` (intrinsics / libm); `json.dumps` for
+  int/float/bool/str and homogeneous list/dict-of-str, plus typed
+  `json.loads_*` helpers (no dynamic `json.loads`). `import sys` remains
+  special-cased for `sys.argv`. **No new stdlib until the core language
+  is far enough for pure-PyRs libraries** (see roadmap / `AGENTS.md`);
+  interim modules may be rewritten pure later
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 

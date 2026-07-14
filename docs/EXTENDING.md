@@ -151,10 +151,12 @@ Before adding something large, decide *which layer* it belongs to
 | Builtin / type method | `len`, `abs`, `str.find`, `list.append` | Compiler + IR and/or C kit |
 | Hot path | list index, `len`, `abs` | Prefer **LLVM IR / intrinsics** |
 | Cold / OS / layouts | `str.split`, `open`, slot mutators | **`runtime.c`** |
-| High-level library | `os.path` + `math` (v0.12 subset shipped), future `json` | **PyRs modules** under `stdlib/` (embedded) — not unbounded C |
+| High-level library | `os.path` (pure); interim `math`/`json` stubs | **Later: pure PyRs** under `stdlib/` — not unbounded C |
 
-Do **not** implement a high-level stdlib feature only in `runtime.c` if it
-could be composed from primitives once the language is ready.
+Do **not** grow the stdlib while the core language is still the priority
+(owner policy: language first, then pure-PyRs libraries). Do **not**
+implement a high-level stdlib feature only in `runtime.c` if it could be
+composed from primitives once the language is ready.
 
 ---
 

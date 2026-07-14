@@ -183,25 +183,32 @@ only as a one-off emit path unless it is pure IR (`len`/index).
 
 ---
 
-## 9. Stdlib approach (after the kit)
+## 9. Stdlib approach (after the core language)
+
+**Owner policy:** do **not** grow the stdlib until the **core language** is
+far enough along that libraries can be written in **pure PyRs**. Load path
++ embed stay; new modules and large expansions wait. C is for **primitive
+families** (libm, OS, regex, …), not for high-level library logic that the
+language cannot yet express (e.g. dynamic `json.loads` without a value /
+optional model).
 
 | Phase | Stdlib stance | Explanation |
 |-------|---------------|-------------|
-| **Packages + path (v0.11+)** | Repo `stdlib/` + multi-root load + **embed in `pyrs`** | Real modules (`os.path`, `math`), not semantic special cases; binary is standalone |
-| **Steady state** | Most modules in **PyRs** | Call builtins/methods + `_pyrs` / `_posix` for leftovers |
-| **New C for stdlib?** | Only new **primitive families** | e.g. regex engine, not `pathlib` logic |
+| **Now (core-first)** | Freeze stdlib surface | No new modules; no expanding `math` / `json` / `os` via stubs |
+| **Interim (shipped)** | Small `stdlib/` + some special cases | `os.path` pure; `math` / `json` / `getcwd` may use kit stubs — rewrite pure later |
+| **Steady state** | Most modules in **PyRs** | Call builtins/methods + thin `_pyrs` / `_posix` for leftovers |
+| **New C for stdlib?** | Only new **primitive families** | e.g. regex engine, not `pathlib` or JSON grammar in C |
 
-### Example split (current + future)
+### Example split (current + later)
 
 | Module piece | Implementation | Explanation |
 |--------------|----------------|-------------|
-| `os.path.join` / `dirname` / `basename` | **Pure PyRs** in `stdlib/os/path.py` | POSIX; `join(a, *parts)` |
-| `math.sin` / `sqrt` | LLVM intrinsic / libm via `MathCall` IR | shipped in `stdlib/math.py` (v0.12) |
-| `json.dumps` / `loads_*` | C runtime + module stubs | dumps polymorphic; typed loads only |
-| `math.prod` (subset) | PyRs over list/numeric primitives | No need for C |
-| `os.getcwd` | C primitive (`pyrs_os_getcwd`) | shipped v0.12 |
-| `json.loads` | Pure PyRs | Needs **dict** + exceptions (dict exists; module not shipped) |
-| `sys.argv` | Kit (today special-cased) | Migrate toward real module when ready |
+| `os.path.join` / `dirname` / `basename` | **Pure PyRs** in `stdlib/os/path.py` | Model for later libs; `join(a, *parts)` |
+| `math.sin` / `sqrt` | LLVM / libm via kit (interim) | True primitive; thin pure wrappers later if desired |
+| `json.dumps` / typed `loads_*` | C + stubs (interim) | Prefer pure PyRs once typing/dynamism allows |
+| `json.loads` (dynamic) | **Later, pure PyRs** | Needs optional/union/`Any` or a value model — language first |
+| `os.getcwd` | C primitive (interim) | OS family is a legitimate thin C edge |
+| `sys.argv` | Kit special-case today | Migrate toward real module when ready |
 
 **Embed rule:** edit `.py` files under workspace `stdlib/`; rebuild `pyrs`
 to refresh the embedded copy. Search order keeps entry dir and
@@ -216,13 +223,15 @@ binary.
 |-------|--------|----------------|
 | **0. Catalog** | Families + hot/cold + parity notes | Written checklist (this doc + tracking list) |
 | **1. Finish current types** | str/list/file/numeric builtins completeness | Scripts rarely need new C for text/list/file work |
-| **2. Type primitives** | tuple → dict (→ set) | Data model enough for real programs |
-| **3. Control plane** | Minimal exceptions; **GC/RC before 1.0** | Long-running programs viable; traps become catchable over time |
-| **4. Modules** | Stdlib path + optional `_pyrs` (packages exist) | `import` loads stdlib `.py` |
-| **5. Stdlib growth** | PyRs modules on the kit | C only for new primitive families |
+| **2. Type primitives** | tuple → dict (→ set) | Data model enough for real programs (**done subset**) |
+| **3. Control plane** | Exceptions; **GC/RC before 1.0**; closures/*args growth | Long-running programs; catchable traps |
+| **4. Core language** | Typing/dynamism, remaining syntax, kit parity | Can write real libraries without compiler stubs |
+| **5. Modules path** | Already: multi-root + embed | `import` loads stdlib `.py` |
+| **6. Stdlib growth** | **Pure PyRs** modules on the kit | C only for primitive families — **after** phase 4 |
 
-**Explanation:** Do not start a large pure-PyRs stdlib before enough types
-exist. Do not implement `json` in C as a substitute for dict.
+**Explanation:** Do not grow a large stdlib (especially in C) before the
+core language can host pure-PyRs implementations. Do not implement `json`
+logic in C as a substitute for missing types/dynamism.
 
 ---
 
