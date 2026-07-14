@@ -224,14 +224,21 @@ binary.
 | **0. Catalog** | Families + hot/cold + parity notes | Written checklist (this doc + tracking list) |
 | **1. Finish current types** | str/list/file/numeric builtins completeness | Scripts rarely need new C for text/list/file work |
 | **2. Type primitives** | tuple → dict (→ set) | Data model enough for real programs (**done subset**) |
-| **3. Control plane** | Exceptions; **GC/RC before 1.0**; closures/*args growth | Long-running programs; catchable traps |
-| **4. Core language** | Typing/dynamism, remaining syntax, kit parity | Can write real libraries without compiler stubs |
+| **3. Control plane** | Exceptions; closures/*args growth (no GC yet) | Catchable traps; nested functions usable |
+| **4. Core language** | Typing/dynamism, narrowing, kit, generators, … | Can write real libraries without compiler stubs |
 | **5. Modules path** | Already: multi-root + embed | `import` loads stdlib `.py` |
-| **6. Stdlib growth** | **Pure PyRs** modules on the kit | C only for primitive families — **after** phase 4 |
+| **6. Stdlib growth** | **Pure PyRs** modules on the kit | C only for primitive families — after phase 4 (may overlap late core) |
+| **7. Final pair** | **Classes**, then **GC/RC/free** (or reverse) | Owner: these are the **last two** core features |
+| **8. 1.0** | Real-world readiness | GC done + surface/stability bar |
 
 **Explanation:** Do not grow a large stdlib (especially in C) before the
 core language can host pure-PyRs implementations. Do not implement `json`
 logic in C as a substitute for missing types/dynamism.
+
+**Owner priority:** implement **classes** and **garbage collection /
+heap freeing** only after all other planned core-language work. They are
+the final two core features. Never-free is interim until phase 7; GC
+remains required for **1.0**.
 
 ---
 

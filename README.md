@@ -43,7 +43,10 @@ pyrs parse   -i prog.py             # dump the AST
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
 milestone after this one is **0.14.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
-`pyrs --version` match this label.
+`pyrs --version` match this label. Core-language growth comes first;
+**classes** and **GC / heap freeing** are planned as the **last two**
+core features (never-free is interim; GC is still required for 1.0).
+No new stdlib until the language can host pure-PyRs libraries.
 
 A statically-typed Python subset:
 

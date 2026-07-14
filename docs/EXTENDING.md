@@ -155,8 +155,11 @@ Before adding something large, decide *which layer* it belongs to
 
 Do **not** grow the stdlib while the core language is still the priority
 (owner policy: language first, then pure-PyRs libraries). Do **not**
-implement a high-level stdlib feature only in `runtime.c` if it could be
-composed from primitives once the language is ready.
+start **classes** or **GC / heap freeing** until other core work is done
+— they are the **last two** core features (see `PRIMITIVES.md` /
+`AGENTS.md`). Do **not** implement a high-level stdlib feature only in
+`runtime.c` if it could be composed from primitives once the language is
+ready.
 
 ---
 
