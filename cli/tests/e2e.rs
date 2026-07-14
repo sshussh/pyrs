@@ -459,6 +459,309 @@ print(\"apple\" < \"banana\", \"abc\" == \"abc\", \"abc\" != \"abd\")
 }
 
 #[test]
+fn triple_quoted_strings_and_docstrings_match_python() {
+    // Expected stdout captured from python3 (not invented).
+    let source = "\
+\"\"\"module doc\"\"\"
+s = \"\"\"a
+b\"\"\"
+print(s)
+def f() -> int:
+    \"\"\"func doc\"\"\"
+    return 42
+print(f())
+print(\"\"\"hi\"\"\")
+t = '''x
+y'''
+print(t)
+print(\"\"\"\"\"\")
+nested = \"\"\"he said \"hi\" \"\"\"
+print(nested)
+esc = \"\"\"a\\nb\\t\\\"c\"\"\"
+print(esc)
+";
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(source)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "python3 failed: {}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    let expected = String::from_utf8(py.stdout).unwrap();
+    let out = run_program("triple_strings", source);
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn triple_string_in_function_body_preserves_indent() {
+    let source = "\
+def f() -> int:
+    s = \"\"\"a
+b\"\"\"
+    return len(s)
+print(f())
+";
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(source)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    let expected = String::from_utf8(py.stdout).unwrap();
+    let out = run_program("triple_indent", source);
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn unterminated_triple_string_is_compile_error() {
+    let dir = TempDir::new("unterminated_triple");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "s = \"\"\"no close\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unterminated triple-quoted"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn triple_crlf_and_backslash_newline_match_python() {
+    // Binary sources: CRLF physical newlines and \<newline> line continuation.
+    // Expected output captured by running the same bytes under python3.
+    // Avoid ord/repr (not in surface); use len + equality to a known LF string.
+    let dir = TempDir::new("triple_parity_edges");
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "crlf",
+            b"s = \"\"\"a\r\nb\"\"\"\nprint(len(s))\nprint(s == \"a\\nb\")\nprint(s)\n",
+        ),
+        (
+            "lone_cr",
+            b"s = \"\"\"a\rb\"\"\"\nprint(len(s))\nprint(s == \"a\\nb\")\nprint(s)\n",
+        ),
+        (
+            "bs_nl",
+            b"s = \"\"\"a\\\nb\"\"\"\nprint(len(s))\nprint(s == \"ab\")\nprint(s)\n",
+        ),
+        (
+            "bs_crlf",
+            b"s = \"\"\"a\\\r\nb\"\"\"\nprint(len(s))\nprint(s == \"ab\")\nprint(s)\n",
+        ),
+    ];
+    for (tag, bytes) in cases {
+        let src = dir.0.join(format!("{tag}.py"));
+        fs::write(&src, bytes).unwrap();
+        let py = Command::new("python3").arg(&src).output().expect("python3");
+        assert!(
+            py.status.success(),
+            "python3 {tag} failed: {}",
+            String::from_utf8_lossy(&py.stderr)
+        );
+        let expected = String::from_utf8(py.stdout).unwrap();
+        let out = Command::new(PYRS)
+            .args(["run", "-i"])
+            .arg(&src)
+            .output()
+            .expect("pyrs");
+        assert!(
+            out.status.success(),
+            "pyrs {tag} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "mismatch for {tag}"
+        );
+    }
+}
+
+#[test]
+fn triple_quoted_fstrings_match_python() {
+    // Expected stdout captured from python3 (not invented).
+    let source = r#"
+name = "world"
+x = 3
+y = 1.5
+print(f"""hello {name}
+line2 {x}""")
+print(f'''a {x} b''')
+print(f"""{{x}} is {x}""")
+print(f"""val={x:.2f}""")
+print(f"""a
+b {x}""")
+print(f"""pi-ish {y:.1f}""")
+print(f"""he said "hi" {x}""")
+print(f'''it's {name}''')
+print(f"""a\nb {x}""")
+print(f"""a\
+b{x}""")
+"#;
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(source)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "python3 failed: {}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    let expected = String::from_utf8(py.stdout).unwrap();
+    let out = run_program("triple_fstrings", source);
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn triple_fstring_crlf_and_backslash_newline_match_python() {
+    let dir = TempDir::new("triple_fstring_edges");
+    let cases: &[(&str, &[u8])] = &[
+        (
+            "crlf",
+            b"x = 3\ns = f\"\"\"a\r\nb {x}\"\"\"\nprint(len(s))\nprint(s == \"a\\nb 3\")\nprint(s)\n",
+        ),
+        (
+            "lone_cr",
+            b"x = 3\ns = f\"\"\"a\rb {x}\"\"\"\nprint(len(s))\nprint(s == \"a\\nb 3\")\nprint(s)\n",
+        ),
+        (
+            "bs_nl",
+            b"x = 3\ns = f\"\"\"a\\\nb{x}\"\"\"\nprint(len(s))\nprint(s == \"ab3\")\nprint(s)\n",
+        ),
+        (
+            "bs_crlf",
+            b"x = 3\ns = f\"\"\"a\\\r\nb{x}\"\"\"\nprint(len(s))\nprint(s == \"ab3\")\nprint(s)\n",
+        ),
+    ];
+    for (tag, bytes) in cases {
+        let src = dir.0.join(format!("{tag}.py"));
+        fs::write(&src, bytes).unwrap();
+        let py = Command::new("python3").arg(&src).output().expect("python3");
+        assert!(
+            py.status.success(),
+            "python3 {tag} failed: {}",
+            String::from_utf8_lossy(&py.stderr)
+        );
+        let expected = String::from_utf8(py.stdout).unwrap();
+        let out = Command::new(PYRS)
+            .args(["run", "-i"])
+            .arg(&src)
+            .output()
+            .expect("pyrs");
+        assert!(
+            out.status.success(),
+            "pyrs {tag} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            expected,
+            "mismatch for {tag}"
+        );
+    }
+}
+
+#[test]
+fn unterminated_triple_fstring_is_compile_error() {
+    let dir = TempDir::new("unterminated_triple_fstring");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "s = f\"\"\"no close\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unterminated triple-quoted f-string"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn triple_fstring_parenthesized_multiline_expr_match_python() {
+    // Multi-line *literal* content is fine; multi-line *expressions*
+    // work when parenthesized (implicit line joining). Different-delimiter
+    // nested triples inside `{...}` also work. Expected from python3.
+    let source = r#"
+x = 3
+print(f"""{(x +
+1)}""")
+print(f"""{(
+x
+)}""")
+print(f"""{'''nested'''}""")
+print(f'''{"""nested"""}''')
+"#;
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(source)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "python3 failed: {}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    let expected = String::from_utf8(py.stdout).unwrap();
+    let out = run_program("triple_fstring_paren_expr", source);
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn unparenthesized_multiline_fstring_expr_is_compile_error() {
+    // Documented limit: physical newlines inside `{...}` without () fail.
+    let dir = TempDir::new("ml_fstr_expr");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "x = 3\nprint(f\"\"\"{x +\n1}\"\"\")\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("expected an expression, found end of line"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("f-string"),
+        "stderr should mention f-string: {stderr}"
+    );
+}
+
+#[test]
+fn same_delimiter_nested_triple_in_fstring_is_compile_error() {
+    // Documented limit: same-delimiter triples inside `{...}` close the
+    // outer f-string early (lexer is not brace-aware).
+    let dir = TempDir::new("nested_same_triple");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "print(f\"\"\"{\"\"\"nested\"\"\"}\"\"\")\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .expect("spawn");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unterminated '{' in f-string"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn string_iteration_and_truthiness() {
     let out = run_program(
         "striter",
