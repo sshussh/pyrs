@@ -1972,12 +1972,21 @@ fn comprehension_multiple_clauses_are_rejected() {
 
 // ---- modules (multi-file imports) ----
 
+/// Write project files (creating parent dirs for package paths).
+fn write_project(dir: &std::path::Path, files: &[(&str, &str)]) {
+    for (name, body) in files {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, body).unwrap();
+    }
+}
+
 /// Write several files into a temp dir and run the root, returning stdout.
 fn run_project(tag: &str, files: &[(&str, &str)], root: &str) -> String {
     let dir = TempDir::new(tag);
-    for (name, body) in files {
-        fs::write(dir.0.join(name), body).unwrap();
-    }
+    write_project(&dir.0, files);
     let out = Command::new(PYRS)
         .args(["run", "-i"])
         .arg(dir.0.join(root))
@@ -1995,9 +2004,7 @@ fn run_project(tag: &str, files: &[(&str, &str)], root: &str) -> String {
 /// Compile a project expecting a compile-time failure; returns stderr.
 fn compile_project_expect_fail(tag: &str, files: &[(&str, &str)], root: &str) -> String {
     let dir = TempDir::new(tag);
-    for (name, body) in files {
-        fs::write(dir.0.join(name), body).unwrap();
-    }
+    write_project(&dir.0, files);
     let out = Command::new(PYRS)
         .args(["compile", "-i"])
         .arg(dir.0.join(root))
@@ -2147,6 +2154,508 @@ fn circular_imports_are_rejected() {
         "main.py",
     );
     assert!(stderr.contains("circular import"), "stderr: {stderr}");
+}
+
+// ---- packages and relative imports (v0.10) ----
+
+#[test]
+fn package_dotted_import_matches_python() {
+    let out = run_project(
+        "pkg_basic",
+        &[
+            ("utilpkg/__init__.py", "print(\"init pkg\")\nVER = 1\n"),
+            (
+                "utilpkg/mathx.py",
+                "print(\"init mod\")\n\
+                 PI = 3.5\n\
+                 def square(n: int) -> int:\n    return n * n\n",
+            ),
+            (
+                "main.py",
+                "import utilpkg.mathx\n\
+                 print(utilpkg.mathx.square(6))\n\
+                 print(utilpkg.mathx.PI)\n\
+                 print(utilpkg.VER)\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "init pkg\ninit mod\n36\n3.5\n1\n");
+}
+
+#[test]
+fn package_import_as_alias() {
+    let out = run_project(
+        "pkg_alias",
+        &[
+            ("utilpkg/__init__.py", ""),
+            (
+                "utilpkg/mathx.py",
+                "def add(a: int, b: int) -> int:\n    return a + b\n",
+            ),
+            (
+                "main.py",
+                "import utilpkg.mathx as m\n\
+                 print(m.add(2, 3))\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn from_package_module_import() {
+    let out = run_project(
+        "pkg_from",
+        &[
+            ("utilpkg/__init__.py", ""),
+            (
+                "utilpkg/mathx.py",
+                "PI = 3.25\n\
+                 def twice(n: int) -> int:\n    return n * 2\n",
+            ),
+            (
+                "main.py",
+                "from utilpkg.mathx import PI as pi, twice\n\
+                 print(pi, twice(4))\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "3.25 8\n");
+}
+
+#[test]
+fn from_package_import_submodule() {
+    let out = run_project(
+        "pkg_from_sub",
+        &[
+            ("utilpkg/__init__.py", ""),
+            ("utilpkg/mathx.py", "V = 7\n"),
+            (
+                "main.py",
+                "from utilpkg import mathx\n\
+                 print(mathx.V)\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn import_package_only() {
+    let out = run_project(
+        "pkg_only",
+        &[
+            ("utilpkg/__init__.py", "print(\"init\")\nVAL = 42\n"),
+            ("main.py", "import utilpkg\nprint(utilpkg.VAL)\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "init\n42\n");
+}
+
+#[test]
+fn relative_import_sibling() {
+    let out = run_project(
+        "pkg_rel",
+        &[
+            ("utilpkg/__init__.py", ""),
+            ("utilpkg/b.py", "Z = 99\nprint(\"b\")\n"),
+            (
+                "utilpkg/a.py",
+                "from . import b\n\
+                 from .b import Z\n\
+                 print(\"a\", Z, b.Z)\n",
+            ),
+            ("main.py", "import utilpkg.a\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "b\na 99 99\n");
+}
+
+#[test]
+fn relative_import_parent() {
+    let out = run_project(
+        "pkg_rel_parent",
+        &[
+            ("utilpkg/__init__.py", "P = 1\n"),
+            ("utilpkg/sub/__init__.py", ""),
+            ("utilpkg/a.py", "print(\"a loaded\")\n"),
+            (
+                "utilpkg/sub/c.py",
+                "from .. import P\n\
+                 from .. import a\n\
+                 print(P)\n",
+            ),
+            ("main.py", "import utilpkg.sub.c\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "a loaded\n1\n");
+}
+
+#[test]
+fn relative_import_in_non_package_is_error() {
+    let stderr =
+        compile_project_expect_fail("rel_top", &[("main.py", "from . import x\n")], "main.py");
+    assert!(
+        stderr.contains("attempted relative import with no known parent package"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn nested_package_attribute_chain() {
+    let out = run_project(
+        "pkg_nested",
+        &[
+            ("utilpkg/__init__.py", "print(\"pkg\")\n"),
+            ("utilpkg/sub/__init__.py", "print(\"sub\")\n"),
+            ("utilpkg/sub/m.py", "print(\"m\")\nX = 3\n"),
+            (
+                "main.py",
+                "import utilpkg.sub.m\n\
+                 print(utilpkg.sub.m.X)\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "pkg\nsub\nm\n3\n");
+}
+
+#[test]
+fn missing_package_module_is_error() {
+    let stderr = compile_project_expect_fail(
+        "pkg_missing",
+        &[
+            ("utilpkg/__init__.py", ""),
+            ("main.py", "import utilpkg.nope\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("No module named 'utilpkg.nope'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn package_init_reexports_submodule() {
+    // Common layout: `__init__.py` does `from .mod import …` (partial package init).
+    let out = run_project(
+        "pkg_reexport",
+        &[
+            (
+                "utilpkg/__init__.py",
+                "from .mod import f, VAL\nprint(\"init pkg\")\n",
+            ),
+            (
+                "utilpkg/mod.py",
+                "VAL = 7\n\
+                 def f() -> int:\n    return VAL\n\
+                 print(\"init mod\")\n",
+            ),
+            (
+                "main.py",
+                "import utilpkg\n\
+                 print(utilpkg.VAL, utilpkg.f())\n\
+                 from utilpkg import VAL as v, f\n\
+                 print(v, f())\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "init mod\ninit pkg\n7 7\n7 7\n");
+}
+
+#[test]
+fn package_from_dot_import_mod_binds_module() {
+    // `from . import mod` must re-export the submodule, not a scalar Symbol.
+    let out = run_project(
+        "pkg_from_dot_mod",
+        &[
+            ("utilpkg/__init__.py", "from . import mod\n"),
+            ("utilpkg/mod.py", "X = 5\ndef f() -> int:\n    return X\n"),
+            (
+                "main.py",
+                "import utilpkg\n\
+                 from utilpkg import mod\n\
+                 print(mod.X, mod.f(), utilpkg.mod.X)\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "5 5 5\n");
+}
+
+#[test]
+fn child_imports_parent_name_during_partial_init() {
+    // Parent sets VERSION then imports child; child does `from . import VERSION`.
+    let out = run_project(
+        "pkg_child_parent",
+        &[
+            ("utilpkg/__init__.py", "VERSION = 1\nfrom .mod import f\n"),
+            (
+                "utilpkg/mod.py",
+                "from . import VERSION\n\
+                 def f() -> int:\n    return VERSION\n",
+            ),
+            (
+                "main.py",
+                "import utilpkg\nprint(utilpkg.f(), utilpkg.VERSION)\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "1 1\n");
+}
+
+#[test]
+fn import_after_assignment_reexport_wins() {
+    // Last binding wins: import after assignment → function re-export.
+    let out = run_project(
+        "pkg_import_last",
+        &[
+            (
+                "utilpkg/__init__.py",
+                "helper = 99\nfrom .mod import helper\n",
+            ),
+            ("utilpkg/mod.py", "def helper() -> int:\n    return 1\n"),
+            ("main.py", "import utilpkg\nprint(utilpkg.helper())\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn value_reexport_after_submodule_last_wins() {
+    // Last binding: value re-export overwrites same-named submodule for both
+    // `from utilpkg import mod` and attribute `utilpkg.mod`.
+    let out = run_project(
+        "pkg_value_last",
+        &[
+            (
+                "utilpkg/__init__.py",
+                "from . import mod\nfrom .other import mod\n",
+            ),
+            ("utilpkg/other.py", "mod = 42\n"),
+            ("utilpkg/mod.py", "X = 7\n"),
+            (
+                "main.py",
+                "import utilpkg\n\
+                 from utilpkg import mod\n\
+                 print(mod)\n\
+                 print(utilpkg.mod)\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "42\n42\n");
+}
+
+#[test]
+fn assign_after_child_import_not_visible_to_child() {
+    // CPython: AFTER is not visible while loading the child.
+    let stderr = compile_project_expect_fail(
+        "pkg_after_partial",
+        &[
+            (
+                "utilpkg/__init__.py",
+                "VERSION = 1\nfrom .mod import f\nAFTER = 2\n",
+            ),
+            (
+                "utilpkg/mod.py",
+                "from . import VERSION\nfrom . import AFTER\ndef f() -> int:\n    return VERSION\n",
+            ),
+            ("main.py", "import utilpkg\nprint(utilpkg.f())\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("partially initialized") || stderr.contains("cannot import name 'AFTER'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn child_reads_parent_attr_during_partial_init() {
+    // `import utilpkg` + `utilpkg.VERSION` while parent mid-init.
+    let out = run_project(
+        "pkg_attr_partial",
+        &[
+            ("utilpkg/__init__.py", "VERSION = 1\nfrom .mod import f\n"),
+            (
+                "utilpkg/mod.py",
+                "import utilpkg\n\
+                 def f() -> int:\n    return utilpkg.VERSION\n",
+            ),
+            ("main.py", "import utilpkg\nprint(utilpkg.f())\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn child_call_parent_func_during_partial_is_error() {
+    // Call via parent module object during partial init: diagnostic, not panic.
+    let stderr = compile_project_expect_fail(
+        "pkg_call_partial",
+        &[
+            (
+                "utilpkg/__init__.py",
+                "def g() -> int:\n    return 3\nfrom .mod import f\n",
+            ),
+            (
+                "utilpkg/mod.py",
+                "import utilpkg\n\
+                 def f() -> int:\n    return utilpkg.g()\n",
+            ),
+            ("main.py", "import utilpkg\nprint(utilpkg.f())\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("partially initialized") || stderr.contains("no attribute"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("panic"), "must not panic: {stderr}");
+}
+
+#[test]
+fn relative_import_beyond_top_level_is_error() {
+    let stderr = compile_project_expect_fail(
+        "rel_beyond",
+        &[
+            ("utilpkg/__init__.py", "from ... import x\n"),
+            ("main.py", "import utilpkg\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("attempted relative import beyond top-level package"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn intermediate_module_is_not_a_package() {
+    let stderr = compile_project_expect_fail(
+        "not_pkg",
+        &[("foo.py", "X = 1\n"), ("main.py", "import foo.bar\n")],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("No module named 'foo.bar'") && stderr.contains("is not a package"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn package_missing_exported_name_is_error() {
+    let stderr = compile_project_expect_fail(
+        "pkg_no_name",
+        &[
+            ("utilpkg/__init__.py", "X = 1\n"),
+            ("main.py", "from utilpkg import nope\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("cannot import name 'nope' from 'utilpkg'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn package_scoped_cycle_is_rejected() {
+    // True mutual imports between sibling modules still fail at load time.
+    let stderr = compile_project_expect_fail(
+        "pkg_cycle",
+        &[
+            ("utilpkg/__init__.py", ""),
+            (
+                "utilpkg/a.py",
+                "from . import b\ndef fa() -> int:\n    return 1\n",
+            ),
+            (
+                "utilpkg/b.py",
+                "from . import a\ndef fb() -> int:\n    return 2\n",
+            ),
+            ("main.py", "import utilpkg.a\n"),
+        ],
+        "main.py",
+    );
+    assert!(stderr.contains("circular import"), "stderr: {stderr}");
+}
+
+#[test]
+fn relative_from_parent_other_module() {
+    let out = run_project(
+        "pkg_rel_other",
+        &[
+            ("utilpkg/__init__.py", ""),
+            ("utilpkg/sub/__init__.py", ""),
+            ("utilpkg/other.py", "Z = 3\n"),
+            ("utilpkg/sub/m.py", "from ..other import Z\nprint(Z)\n"),
+            ("main.py", "import utilpkg.sub.m\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "3\n");
+}
+
+#[test]
+fn assignment_after_reexport_wins() {
+    // CPython: later binding in `__init__` overwrites the re-export.
+    let out = run_project(
+        "pkg_shadow",
+        &[
+            (
+                "utilpkg/__init__.py",
+                "from .mod import helper\nhelper = 99\n",
+            ),
+            ("utilpkg/mod.py", "def helper() -> int:\n    return 1\n"),
+            ("main.py", "import utilpkg\nprint(utilpkg.helper)\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "99\n");
+}
+
+#[test]
+fn nested_import_in_if_is_rejected() {
+    let stderr = compile_project_expect_fail(
+        "nested_imp",
+        &[("main.py", "if True:\n    import mathx\n")],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("imports are only supported at module top level"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn directory_without_init_is_not_a_package() {
+    let stderr = compile_project_expect_fail(
+        "ns_pkg",
+        &[
+            ("utilpkg/mod.py", "X = 1\n"),
+            ("main.py", "import utilpkg.mod\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("No module named 'utilpkg.mod'")
+            || stderr.contains("No module named 'utilpkg'"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
