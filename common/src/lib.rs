@@ -46,6 +46,8 @@ impl From<Range<usize>> for Span {
 pub enum Phase {
     Lex,
     Parse,
+    /// Module graph resolution (`import` / packages) in the driver.
+    Load,
     Semantic,
     Codegen,
 }
@@ -55,6 +57,7 @@ impl fmt::Display for Phase {
         match self {
             Phase::Lex => write!(f, "lex"),
             Phase::Parse => write!(f, "parse"),
+            Phase::Load => write!(f, "load"),
             Phase::Semantic => write!(f, "semantic"),
             Phase::Codegen => write!(f, "codegen"),
         }

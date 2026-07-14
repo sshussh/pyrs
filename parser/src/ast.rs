@@ -186,15 +186,20 @@ pub enum StmtKind {
     /// `global name, ...` — declares that assignments in this function
     /// target module-level variables.
     Global(Vec<(String, Span)>),
-    /// `import module [as alias]`.
+    /// `import module [as alias]` — `module` may be dotted (`pkg.mod`).
     Import {
         module: String,
         alias: Option<String>,
         span: Span,
     },
-    /// `from module import name [as alias], ...`.
+    /// `from module import name [as alias], ...` and relative forms
+    /// (`from . import x`, `from ..pkg import y`). `level` is the number of
+    /// leading dots (0 = absolute). `module` is the path after the dots
+    /// (empty for `from . import x`).
     FromImport {
         module: String,
+        /// Number of leading dots: 0 absolute, 1 = `.`, 2 = `..`, …
+        level: u32,
         /// (imported name, optional local alias, span of the name)
         names: Vec<(String, Option<String>, Span)>,
         span: Span,

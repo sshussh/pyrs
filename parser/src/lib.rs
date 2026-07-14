@@ -765,12 +765,22 @@ impl Parser {
         }
     }
 
+    /// `pkg.mod.sub` — one or more identifiers separated by dots.
+    fn parse_dotted_name(&mut self, context: &str) -> PResult<(String, Span)> {
+        let (mut name, start) = self.expect_ident(context)?;
+        let mut end = start;
+        while self.eat(&Token::Dot) {
+            let (part, span) = self.expect_ident("after '.' in module name")?;
+            name.push('.');
+            name.push_str(&part);
+            end = span;
+        }
+        Ok((name, start.to(end)))
+    }
+
     fn parse_import(&mut self) -> PResult<Stmt> {
         let start = self.expect(Token::Import, "")?;
-        let (module, mspan) = self.expect_ident("after 'import'")?;
-        if self.peek() == &Token::Dot {
-            return Err(self.error("dotted module names (packages) are not supported yet"));
-        }
+        let (module, mspan) = self.parse_dotted_name("after 'import'")?;
         let alias = if self.eat(&Token::As) {
             Some(self.expect_ident("after 'as'")?.0)
         } else {
@@ -796,10 +806,19 @@ impl Parser {
 
     fn parse_from_import(&mut self) -> PResult<Stmt> {
         let start = self.expect(Token::From, "")?;
-        let (module, _) = self.expect_ident("after 'from'")?;
-        if self.peek() == &Token::Dot {
-            return Err(self.error("dotted module names (packages) are not supported yet"));
+        // leading dots: relative import (`from .x`, `from ..`, `from ...pkg`)
+        let mut level = 0u32;
+        while self.eat(&Token::Dot) {
+            level += 1;
         }
+        let module = if matches!(self.peek(), Token::Ident(_)) {
+            self.parse_dotted_name("after 'from'")?.0
+        } else if level > 0 {
+            // `from . import name` / `from .. import name`
+            String::new()
+        } else {
+            return Err(self.error("expected module name after 'from'"));
+        };
         self.expect(Token::Import, "after the module name")?;
         if self.peek() == &Token::Star {
             return Err(self.error("'from module import *' is not supported yet"));
@@ -821,6 +840,7 @@ impl Parser {
         let stmt = Stmt {
             kind: StmtKind::FromImport {
                 module,
+                level,
                 names,
                 span: start.to(end),
             },
@@ -2291,6 +2311,50 @@ def f(n: int) -> int:
         assert!(matches!(
             &m.body[0].kind,
             StmtKind::Import { module, .. } if module == "sys"
+        ));
+    }
+
+    #[test]
+    fn parses_dotted_import() {
+        let m = parse_ok("import pkg.mod as m\n");
+        assert!(matches!(
+            &m.body[0].kind,
+            StmtKind::Import {
+                module,
+                alias: Some(a),
+                ..
+            } if module == "pkg.mod" && a == "m"
+        ));
+    }
+
+    #[test]
+    fn parses_relative_from_import() {
+        let m = parse_ok("from . import sibling\nfrom ..pkg import x as y\nfrom .mod import z\n");
+        assert!(matches!(
+            &m.body[0].kind,
+            StmtKind::FromImport {
+                module,
+                level: 1,
+                names,
+                ..
+            } if module.is_empty() && names[0].0 == "sibling"
+        ));
+        assert!(matches!(
+            &m.body[1].kind,
+            StmtKind::FromImport {
+                module,
+                level: 2,
+                names,
+                ..
+            } if module == "pkg" && names[0].0 == "x" && names[0].1.as_deref() == Some("y")
+        ));
+        assert!(matches!(
+            &m.body[2].kind,
+            StmtKind::FromImport {
+                module,
+                level: 1,
+                ..
+            } if module == "mod"
         ));
     }
 

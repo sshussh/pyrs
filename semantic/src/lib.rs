@@ -96,7 +96,7 @@ fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Ty> {
     }
 }
 
-/// Keys for dict/set: only int and str in v0.9.
+/// Keys for dict/set: only int and str in the current language surface.
 fn check_hashable_key(ty: ir::Ty, span: Span, what: &str) -> SResult<()> {
     match ty {
         ir::Ty::Int | ir::Ty::Str => Ok(()),
@@ -160,6 +160,10 @@ enum ImportBinding {
 struct ModuleData {
     funcs: HashMap<String, FuncSig>,
     globals: HashMap<String, ir::Ty>,
+    /// Names bound by `from … import` into this module: local → (origin module,
+    /// origin name). Attribute loads and calls use the origin IR symbol.
+    /// Local assignments in this module win over re-exports of the same name.
+    reexports: HashMap<String, (String, String)>,
 }
 
 /// Read-only per-module context threaded into every function lowering.
@@ -172,6 +176,12 @@ struct ModuleCtx<'a> {
     imports: &'a HashMap<String, ImportBinding>,
     /// Fully analyzed dependency modules, keyed by name.
     mods: &'a HashMap<String, ModuleData>,
+    /// Parent module → (child short name → fully-qualified child name) for
+    /// every module in the program (built before lowering).
+    submodules: &'a HashMap<String, HashMap<String, String>>,
+    /// Partial package init: parent → child → (name → ty) for simple
+    /// assignments in the parent **before** the import that loads the child.
+    partial_prelim: &'a HashMap<String, HashMap<String, HashMap<String, ir::Ty>>>,
 }
 
 impl ModuleCtx<'_> {
@@ -183,6 +193,13 @@ impl ModuleCtx<'_> {
         } else {
             format!("{}.", self.module)
         }
+    }
+
+    /// Names visible on `parent` while lowering `self.module` under partial init.
+    fn partial_parent_globals(&self, parent: &str) -> Option<&HashMap<String, ir::Ty>> {
+        self.partial_prelim
+            .get(parent)
+            .and_then(|by_child| by_child.get(self.module))
     }
 }
 
@@ -206,6 +223,80 @@ fn init_call(module: &str) -> ir::Stmt {
             args: vec![],
         },
     })
+}
+
+/// Init calls for `module` and every parent package (`pkg` then `pkg.mod`).
+fn init_calls_for(module: &str) -> Vec<ir::Stmt> {
+    let parts: Vec<&str> = module.split('.').collect();
+    let mut out = Vec::with_capacity(parts.len());
+    for i in 1..=parts.len() {
+        out.push(init_call(&parts[..i].join(".")));
+    }
+    out
+}
+
+/// Top-level name bound by `import a.b.c` (without `as`): `a`.
+fn import_bind_name(module: &str, alias: &Option<String>) -> String {
+    alias
+        .clone()
+        .unwrap_or_else(|| module.split('.').next().unwrap_or(module).to_string())
+}
+
+/// Module object referred to by `import a.b.c` / `import a.b.c as x`.
+/// Without alias, the local name is the top-level package `a`.
+fn import_bound_module(module: &str, alias: &Option<String>) -> String {
+    if alias.is_some() {
+        module.to_string()
+    } else {
+        module.split('.').next().unwrap_or(module).to_string()
+    }
+}
+
+/// Build parent → child short name → full name for all modules in the program.
+fn build_submodule_map(module_names: &[String]) -> HashMap<String, HashMap<String, String>> {
+    let mut map: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for name in module_names {
+        if let Some((parent, child)) = name.rsplit_once('.') {
+            map.entry(parent.to_string())
+                .or_default()
+                .insert(child.to_string(), name.clone());
+        }
+    }
+    map
+}
+
+/// True if `parent` is a dotted package prefix of `child` (`pkg` of `pkg.mod`).
+fn is_strict_package_prefix(parent: &str, child: &str) -> bool {
+    child.len() > parent.len()
+        && child.as_bytes().get(parent.len()) == Some(&b'.')
+        && child.starts_with(parent)
+}
+
+/// If `expr` is a chain of attributes rooted at an imported module name,
+/// resolve it to the fully-qualified module name (`pkg.mod`).
+///
+/// Does **not** step into a name that the parent last-bound as a value or
+/// function re-export (so `pkg.mod` stays a value when `__init__` re-exported
+/// `mod` over the submodule).
+fn resolve_module_path(expr: &ast::Expr, ctx: &FnCtx) -> Option<String> {
+    match &expr.kind {
+        ast::ExprKind::Name(n) => ctx.module_alias(n),
+        ast::ExprKind::Attribute { base, attr, .. } => {
+            let parent = resolve_module_path(base, ctx)?;
+            if let Some(data) = ctx.mctx.mods.get(&parent) {
+                // Value or function export wins over the submodule of the same name.
+                if data.globals.contains_key(attr) || data.funcs.contains_key(attr) {
+                    return None;
+                }
+            }
+            ctx.mctx
+                .submodules
+                .get(&parent)
+                .and_then(|kids| kids.get(attr))
+                .cloned()
+        }
+        _ => None,
+    }
 }
 
 /// Analyze a single module (no file imports beyond `sys`). Used by tests
@@ -276,9 +367,10 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
     Ok((funcs, order))
 }
 
-/// The names a module binds at the top level (assignment targets), so
-/// `from M import x` can be validated before M is lowered.
-fn collect_global_names(module: &ast::Module) -> std::collections::HashSet<String> {
+/// Names bound by top-level assignment / augassign only (not imports).
+/// Used so `from . import mod` is not mistaken for a scalar global that
+/// shadows the submodule.
+fn collect_assigned_names(module: &ast::Module) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     for stmt in &module.body {
         match &stmt.kind {
@@ -299,6 +391,446 @@ fn collect_global_names(module: &ast::Module) -> std::collections::HashSet<Strin
     names
 }
 
+/// Export value names: own assignments plus `from … import` value re-exports
+/// (fixpoint). Submodule imports are excluded so they stay Module bindings.
+fn expand_export_values(
+    modules: &[ModuleInput],
+    assigned: &HashMap<String, std::collections::HashSet<String>>,
+    export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+    submodules: &HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, std::collections::HashSet<String>> {
+    let mut export = assigned.clone();
+    loop {
+        let mut changed = false;
+        for m in modules {
+            for stmt in &m.ast.body {
+                let ast::StmtKind::FromImport {
+                    module: src, names, ..
+                } = &stmt.kind
+                else {
+                    continue;
+                };
+                for (name, alias, _) in names {
+                    let local = alias.as_ref().unwrap_or(name);
+                    // Submodule: not a value export.
+                    if submodules
+                        .get(src.as_str())
+                        .is_some_and(|s| s.contains_key(name))
+                    {
+                        continue;
+                    }
+                    // Function re-exports live in export_funcs, not values.
+                    if export_funcs
+                        .get(src.as_str())
+                        .is_some_and(|f| f.contains_key(name))
+                    {
+                        continue;
+                    }
+                    if !export
+                        .get(src.as_str())
+                        .is_some_and(|g| g.contains(name.as_str()))
+                    {
+                        continue;
+                    }
+                    if export
+                        .entry(m.name.clone())
+                        .or_default()
+                        .insert(local.clone())
+                    {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    export
+}
+
+fn single_assign_name(targets: &[ast::AssignTarget]) -> Option<String> {
+    if targets.len() != 1 {
+        return None;
+    }
+    match &targets[0] {
+        ast::AssignTarget::Name { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn literal_expr_ty(e: &ast::Expr) -> Option<ir::Ty> {
+    match &e.kind {
+        ast::ExprKind::Int(_) => Some(ir::Ty::Int),
+        ast::ExprKind::Float(_) => Some(ir::Ty::Float),
+        ast::ExprKind::Bool(_) => Some(ir::Ty::Bool),
+        ast::ExprKind::Str(_) => Some(ir::Ty::Str),
+        _ => None,
+    }
+}
+
+fn record_simple_assign(stmt: &ast::Stmt, tys: &mut HashMap<String, ir::Ty>) {
+    let ast::StmtKind::Assign {
+        targets,
+        value,
+        annotation,
+        ..
+    } = &stmt.kind
+    else {
+        return;
+    };
+    let Some(name) = single_assign_name(targets) else {
+        return;
+    };
+    if let Some(ann) = annotation {
+        if let Ok(ty) = resolve_type_checked(*ann, stmt.span) {
+            tys.insert(name, ty);
+        }
+        return;
+    }
+    if let Some(ty) = literal_expr_ty(value) {
+        tys.insert(name, ty);
+    }
+}
+
+/// Whether this statement causes `child` (fully-qualified) to be loaded when
+/// executed in package `parent`.
+fn stmt_loads_child(stmt: &ast::Stmt, parent: &str, child: &str) -> bool {
+    match &stmt.kind {
+        ast::StmtKind::Import { module: m, .. } => {
+            m == child || is_strict_package_prefix(child, m) || is_strict_package_prefix(m, child)
+        }
+        ast::StmtKind::FromImport {
+            module: src, names, ..
+        } => {
+            if src == child || is_strict_package_prefix(child, src) {
+                return true;
+            }
+            // `from parent import child_tail` / `from . import mod`
+            for (name, _, _) in names {
+                let full = if src.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{src}.{name}")
+                };
+                if full == child || is_strict_package_prefix(child, &full) {
+                    return true;
+                }
+                // short name under parent
+                if src == parent {
+                    let under = format!("{parent}.{name}");
+                    if under == child || is_strict_package_prefix(child, &under) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// For each parent package P and child module C under P: simple assignment
+/// types in P **before** the first statement that loads C (CPython partial
+/// init: later names are not visible to the child).
+/// Map: parent → child → (name → ty).
+fn build_partial_prelim(
+    modules: &[ModuleInput],
+) -> HashMap<String, HashMap<String, HashMap<String, ir::Ty>>> {
+    let by_name: HashMap<&str, &ast::Module> =
+        modules.iter().map(|m| (m.name.as_str(), m.ast)).collect();
+    let mut out: HashMap<String, HashMap<String, HashMap<String, ir::Ty>>> = HashMap::new();
+    for m in modules {
+        let Some(parent) = m.name.rsplit_once('.').map(|(p, _)| p) else {
+            continue;
+        };
+        // Walk each ancestor package
+        let parts: Vec<&str> = m.name.split('.').collect();
+        for i in 1..parts.len() {
+            let parent_name = parts[..i].join(".");
+            let Some(parent_ast) = by_name.get(parent_name.as_str()) else {
+                continue;
+            };
+            let mut tys = HashMap::new();
+            for stmt in &parent_ast.body {
+                if stmt_loads_child(stmt, &parent_name, &m.name) {
+                    break;
+                }
+                record_simple_assign(stmt, &mut tys);
+            }
+            out.entry(parent_name)
+                .or_default()
+                .insert(m.name.clone(), tys);
+        }
+        let _ = parent;
+    }
+    out
+}
+
+/// Last top-level export kind for each name in each module (source order).
+#[derive(Debug, Clone)]
+enum LastExport {
+    /// Submodule binding (`from . import mod` / package attribute is a module).
+    Module(String),
+    /// Value or function (assignment, def, or value re-export).
+    Symbol,
+}
+
+/// Walk each module body in order; last binding of each name wins
+/// (Module vs Symbol re-exports).
+fn compute_last_exports(
+    modules: &[ModuleInput],
+    submodules: &HashMap<String, HashMap<String, String>>,
+    export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+    export_values: &HashMap<String, std::collections::HashSet<String>>,
+) -> HashMap<String, HashMap<String, LastExport>> {
+    // Process in given order (dependencies first) so sources are ready.
+    let mut all: HashMap<String, HashMap<String, LastExport>> = HashMap::new();
+    for m in modules {
+        let mut last: HashMap<String, LastExport> = HashMap::new();
+        for stmt in &m.ast.body {
+            match &stmt.kind {
+                ast::StmtKind::FuncDef(f) => {
+                    last.insert(f.name.clone(), LastExport::Symbol);
+                }
+                ast::StmtKind::Assign { targets, .. } => {
+                    let mut names = std::collections::HashSet::new();
+                    for t in targets {
+                        collect_assign_names(t, &mut names);
+                    }
+                    for n in names {
+                        last.insert(n, LastExport::Symbol);
+                    }
+                }
+                ast::StmtKind::AugAssign {
+                    target: ast::AssignTarget::Name { name, .. },
+                    ..
+                } => {
+                    last.insert(name.clone(), LastExport::Symbol);
+                }
+                ast::StmtKind::FromImport {
+                    module: src, names, ..
+                } => {
+                    for (name, alias, _) in names {
+                        let local = alias.as_ref().unwrap_or(name);
+                        let kind = resolve_from_export(
+                            src,
+                            name,
+                            &all,
+                            &last,
+                            m.name.as_str(),
+                            submodules,
+                            export_funcs,
+                            export_values,
+                        );
+                        if let Some(k) = kind {
+                            last.insert(local.clone(), k);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        all.insert(m.name.clone(), last);
+    }
+    all
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_from_export(
+    src: &str,
+    name: &str,
+    completed: &HashMap<String, HashMap<String, LastExport>>,
+    self_so_far: &HashMap<String, LastExport>,
+    self_name: &str,
+    submodules: &HashMap<String, HashMap<String, String>>,
+    export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+    export_values: &HashMap<String, std::collections::HashSet<String>>,
+) -> Option<LastExport> {
+    let sub_full = submodules.get(src).and_then(|s| s.get(name)).cloned();
+    // What does `src` export under `name`?
+    let src_export = if src == self_name {
+        self_so_far.get(name).cloned()
+    } else {
+        completed.get(src).and_then(|e| e.get(name)).cloned()
+    };
+    match src_export {
+        Some(LastExport::Symbol) => Some(LastExport::Symbol),
+        Some(LastExport::Module(full)) => Some(LastExport::Module(full)),
+        None => {
+            // Fall back to structural info when source has no explicit last map yet.
+            if let Some(full) = sub_full {
+                // Prefer value/func on source over bare submodule if present.
+                if export_funcs.get(src).is_some_and(|f| f.contains_key(name))
+                    || export_values.get(src).is_some_and(|v| v.contains(name))
+                {
+                    // Only if those come from assignment/def/reexport on src —
+                    // for a pure submodule package, export_values won't have it.
+                    // Submodule name alone: Module. If also a value export name
+                    // from expand, Symbol wins when it's a real re-export.
+                    // expand_export_values skips submodules, so values won't
+                    // include pure submodule names. Funcs are own defs.
+                    if export_funcs.get(src).is_some_and(|f| f.contains_key(name)) {
+                        Some(LastExport::Symbol)
+                    } else {
+                        Some(LastExport::Module(full))
+                    }
+                } else {
+                    Some(LastExport::Module(full))
+                }
+            } else if export_funcs.get(src).is_some_and(|f| f.contains_key(name))
+                || export_values.get(src).is_some_and(|v| v.contains(name))
+            {
+                Some(LastExport::Symbol)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Whether the last top-level binding of `local` is a `from … import`
+/// (CPython: last binding wins for package exports).
+fn last_binding_is_from_import(module: &ast::Module, local: &str) -> bool {
+    let mut last_import = false;
+    for stmt in &module.body {
+        match &stmt.kind {
+            ast::StmtKind::Assign { targets, .. } => {
+                let mut names = std::collections::HashSet::new();
+                for t in targets {
+                    collect_assign_names(t, &mut names);
+                }
+                if names.contains(local) {
+                    last_import = false;
+                }
+            }
+            ast::StmtKind::AugAssign {
+                target: ast::AssignTarget::Name { name, .. },
+                ..
+            } if name == local => {
+                last_import = false;
+            }
+            ast::StmtKind::FuncDef(f) if f.name == local => {
+                last_import = false;
+            }
+            ast::StmtKind::FromImport { names, .. } => {
+                for (name, alias, _) in names {
+                    let bound = alias.as_ref().unwrap_or(name);
+                    if bound == local {
+                        last_import = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    last_import
+}
+
+/// Build each module's **export** function table: own `def`s plus
+/// `from … import` re-exports (fixpoint). Used only for import validation
+/// and `ModuleData`; per-module lowering still uses own `def`s only so a
+/// re-exported name is not mistaken for a local function IR symbol.
+fn expand_export_funcs(
+    modules: &[ModuleInput],
+    own_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+) -> HashMap<String, HashMap<String, FuncSig>> {
+    let mut export = own_funcs.clone();
+    loop {
+        let mut changed = false;
+        for m in modules {
+            for stmt in &m.ast.body {
+                let ast::StmtKind::FromImport {
+                    module: src, names, ..
+                } = &stmt.kind
+                else {
+                    continue;
+                };
+                for (name, alias, _) in names {
+                    let local = alias.as_ref().unwrap_or(name);
+                    let Some(sig) = export
+                        .get(src.as_str())
+                        .and_then(|f| f.get(name.as_str()))
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let slot = export.entry(m.name.clone()).or_default();
+                    if let std::collections::hash_map::Entry::Vacant(e) = slot.entry(local.clone())
+                    {
+                        e.insert(sig);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    export
+}
+
+/// Origin `(module, name)` for a symbol exported by `module` under `name`,
+/// following re-export aliases recorded on finished modules.
+fn origin_of(mods: &HashMap<String, ModuleData>, module: &str, name: &str) -> (String, String) {
+    let mut m = module.to_string();
+    let mut n = name.to_string();
+    for _ in 0..32 {
+        let Some(data) = mods.get(&m) else {
+            break;
+        };
+        let Some((om, on)) = data.reexports.get(&n) else {
+            break;
+        };
+        m = om.clone();
+        n = on.clone();
+    }
+    (m, n)
+}
+
+/// Attach `from … import` re-exports to a finished module. **Last top-level
+/// binding wins** (CPython): an assignment/`def` after the import keeps the
+/// local binding; an import after an assignment re-exports instead.
+fn apply_reexports(
+    data: &mut ModuleData,
+    own_func_names: &std::collections::HashSet<String>,
+    imports: &HashMap<String, ImportBinding>,
+    mods: &HashMap<String, ModuleData>,
+    module_ast: &ast::Module,
+) {
+    for (local, binding) in imports {
+        let ImportBinding::Symbol {
+            module: src,
+            name: src_name,
+        } = binding
+        else {
+            continue;
+        };
+        let import_last = last_binding_is_from_import(module_ast, local);
+        // Own assignment/`def` wins only when it is the last binding.
+        if !import_last && (data.globals.contains_key(local) || own_func_names.contains(local)) {
+            continue;
+        }
+        let (om, on) = origin_of(mods, src, src_name);
+        let Some(src_data) = mods.get(&om) else {
+            continue;
+        };
+
+        if let Some(ty) = src_data.globals.get(&on) {
+            data.funcs.remove(local);
+            data.globals.insert(local.clone(), *ty);
+            data.reexports
+                .insert(local.clone(), (om.clone(), on.clone()));
+        } else if let Some(sig) = src_data.funcs.get(&on) {
+            data.globals.remove(local);
+            data.funcs.insert(local.clone(), sig.clone());
+            data.reexports
+                .insert(local.clone(), (om.clone(), on.clone()));
+        }
+    }
+}
+
 fn collect_assign_names(target: &ast::AssignTarget, names: &mut std::collections::HashSet<String>) {
     match target {
         ast::AssignTarget::Name { name, .. } => {
@@ -314,12 +846,16 @@ fn collect_assign_names(target: &ast::AssignTarget, names: &mut std::collections
 }
 
 /// Build a module's import bindings (local name → target), validating that
-/// imported modules and symbols exist.
+/// imported modules and symbols exist. Uses each source module's **last
+/// top-level export** (Module vs Symbol) so re-exports and same-named
+/// submodules follow source order.
 fn collect_imports(
     module: &ast::Module,
     self_name: &str,
-    all_funcs: &HashMap<String, HashMap<String, FuncSig>>,
-    all_globals: &HashMap<String, std::collections::HashSet<String>>,
+    last_exports: &HashMap<String, HashMap<String, LastExport>>,
+    export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+    export_values: &HashMap<String, std::collections::HashSet<String>>,
+    submodules: &HashMap<String, HashMap<String, String>>,
 ) -> SResult<HashMap<String, ImportBinding>> {
     let mut imports: HashMap<String, ImportBinding> = HashMap::new();
     for stmt in &module.body {
@@ -329,14 +865,14 @@ fn collect_imports(
                 alias,
                 span,
             } => {
-                let local = alias.clone().unwrap_or_else(|| m.clone());
+                let local = import_bind_name(m, alias);
                 let binding = if m == "sys" {
                     ImportBinding::Sys
                 } else {
                     if m == self_name {
                         return Err(err(format!("module '{m}' cannot import itself"), *span));
                     }
-                    ImportBinding::Module(m.clone())
+                    ImportBinding::Module(import_bound_module(m, alias))
                 };
                 imports.insert(local, binding);
             }
@@ -344,6 +880,7 @@ fn collect_imports(
                 module: m,
                 names,
                 span,
+                ..
             } => {
                 if m == "sys" {
                     return Err(err(
@@ -352,31 +889,52 @@ fn collect_imports(
                         *span,
                     ));
                 }
-                if m == self_name {
-                    return Err(err(
-                        format!("module '{m}' cannot import from itself"),
-                        *span,
-                    ));
-                }
-                let mfuncs = all_funcs.get(m);
-                let mglobals = all_globals.get(m);
                 for (name, alias, nspan) in names {
-                    let is_func = mfuncs.is_some_and(|f| f.contains_key(name));
-                    let is_global = mglobals.is_some_and(|g| g.contains(name));
-                    if !is_func && !is_global {
-                        return Err(err(
-                            format!("cannot import name '{name}' from '{m}'"),
-                            *nspan,
-                        ));
-                    }
                     let local = alias.clone().unwrap_or_else(|| name.clone());
-                    imports.insert(
-                        local,
-                        ImportBinding::Symbol {
-                            module: m.clone(),
-                            name: name.clone(),
-                        },
-                    );
+                    let export = last_exports.get(m).and_then(|e| e.get(name)).cloned();
+                    let sub_full = submodules.get(m).and_then(|s| s.get(name)).cloned();
+                    let is_func = export_funcs.get(m).is_some_and(|f| f.contains_key(name));
+                    let is_value = export_values.get(m).is_some_and(|g| g.contains(name));
+                    match export {
+                        Some(LastExport::Module(full)) => {
+                            imports.insert(local, ImportBinding::Module(full));
+                        }
+                        Some(LastExport::Symbol) => {
+                            if !is_func && !is_value && sub_full.is_none() {
+                                return Err(err(
+                                    format!("cannot import name '{name}' from '{m}'"),
+                                    *nspan,
+                                ));
+                            }
+                            imports.insert(
+                                local,
+                                ImportBinding::Symbol {
+                                    module: m.clone(),
+                                    name: name.clone(),
+                                },
+                            );
+                        }
+                        None => {
+                            // Source has no last-export entry (e.g. empty package
+                            // exporting only a not-yet-mapped name).
+                            if let Some(full) = sub_full {
+                                imports.insert(local, ImportBinding::Module(full));
+                            } else if is_func || is_value {
+                                imports.insert(
+                                    local,
+                                    ImportBinding::Symbol {
+                                        module: m.clone(),
+                                        name: name.clone(),
+                                    },
+                                );
+                            } else {
+                                return Err(err(
+                                    format!("cannot import name '{name}' from '{m}'"),
+                                    *nspan,
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -392,22 +950,36 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
     assert!(!modules.is_empty(), "a program needs at least one module");
     let root_idx = modules.len() - 1;
 
-    // pass 1: every module's signatures and global-name surface
-    let mut all_funcs: HashMap<String, HashMap<String, FuncSig>> = HashMap::new();
+    // pass 1: every module's own signatures and assignment-name surface
+    let mut own_funcs: HashMap<String, HashMap<String, FuncSig>> = HashMap::new();
     let mut all_orders: Vec<Vec<&ast::FuncDef>> = Vec::new();
-    let mut all_global_names: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut assigned_names: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let module_names: Vec<String> = modules.iter().map(|m| m.name.clone()).collect();
+    let submodules = build_submodule_map(&module_names);
     for (i, m) in modules.iter().enumerate() {
         let (funcs, order) = collect_sigs(m.ast).map_err(|d| d.with_file(i))?;
-        all_funcs.insert(m.name.clone(), funcs);
+        own_funcs.insert(m.name.clone(), funcs);
         all_orders.push(order);
-        all_global_names.insert(m.name.clone(), collect_global_names(m.ast));
+        assigned_names.insert(m.name.clone(), collect_assigned_names(m.ast));
     }
+    // pass 1b: export surface includes package re-exports; last-binding map
+    let export_funcs = expand_export_funcs(modules, &own_funcs);
+    let export_values = expand_export_values(modules, &assigned_names, &export_funcs, &submodules);
+    let last_exports = compute_last_exports(modules, &submodules, &export_funcs, &export_values);
+    let partial_prelim = build_partial_prelim(modules);
 
-    // pass 2: import bindings (validated against the collected surface)
+    // pass 2: import bindings (validated against the export surface)
     let mut all_imports: Vec<HashMap<String, ImportBinding>> = Vec::new();
     for (i, m) in modules.iter().enumerate() {
-        let imports = collect_imports(m.ast, &m.name, &all_funcs, &all_global_names)
-            .map_err(|d| d.with_file(i))?;
+        let imports = collect_imports(
+            m.ast,
+            &m.name,
+            &last_exports,
+            &export_funcs,
+            &export_values,
+            &submodules,
+        )
+        .map_err(|d| d.with_file(i))?;
         all_imports.push(imports);
     }
 
@@ -418,13 +990,15 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
 
     for (i, m) in modules.iter().enumerate() {
         let is_root = i == root_idx;
-        let funcs = &all_funcs[&m.name];
+        let funcs = &own_funcs[&m.name];
         let mctx = ModuleCtx {
             module: &m.name,
             is_root,
             funcs,
             imports: &all_imports[i],
             mods: &mods,
+            submodules: &submodules,
+            partial_prelim: &partial_prelim,
         };
 
         let mut globals: HashMap<String, ir::Ty> = HashMap::new();
@@ -509,13 +1083,17 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
         }
 
         out_globals.extend(globals_order.iter().cloned());
-        mods.insert(
-            m.name.clone(),
-            ModuleData {
-                funcs: funcs.clone(),
-                globals,
-            },
-        );
+        let own_func_names: std::collections::HashSet<String> = funcs.keys().cloned().collect();
+        let mut data = ModuleData {
+            funcs: funcs.clone(),
+            globals,
+            reexports: HashMap::new(),
+        };
+        // Dependencies are already in `mods` (topo order), so re-exports can
+        // resolve origin types/sigs. Parent packages that import children are
+        // lowered after those children.
+        apply_reexports(&mut data, &own_func_names, &all_imports[i], &mods, m.ast);
+        mods.insert(m.name.clone(), data);
     }
 
     Ok(ir::Module {
@@ -558,6 +1136,9 @@ struct FnCtx<'a> {
     globals_order: &'a mut Vec<(String, ir::Ty)>,
     /// This function is a module init: its top-level bindings are globals.
     is_entry: bool,
+    /// Direct module-body statements only (not inside `if`/`for`/…). Imports
+    /// are allowed solely when this is true (matches loader top-level scan).
+    allow_import: bool,
     /// Names this function declared with `global`.
     declared_globals: std::collections::HashSet<String>,
     fn_name: String,
@@ -629,6 +1210,7 @@ fn lower_function(
         globals,
         globals_order,
         is_entry,
+        allow_import: is_entry,
         declared_globals: std::collections::HashSet::new(),
         fn_name: f.name.clone(),
         ret: match f.ret {
@@ -689,6 +1271,15 @@ fn lower_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::Stmt>> {
     Ok(out)
 }
 
+/// Nested suite (if/for/try/…): imports are not allowed here.
+fn lower_nested_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::Stmt>> {
+    let prev = ctx.allow_import;
+    ctx.allow_import = false;
+    let result = lower_block(stmts, ctx);
+    ctx.allow_import = prev;
+    result
+}
+
 fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SResult<()> {
     match &stmt.kind {
         ast::StmtKind::FuncDef(f) => Err(err(
@@ -700,27 +1291,68 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
         )),
         ast::StmtKind::Pass => Ok(()),
         ast::StmtKind::Import { module, span, .. } => {
-            if !ctx.is_entry {
+            if !ctx.allow_import {
                 return Err(err(
-                    "imports are only supported at the top level of the program",
+                    "imports are only supported at module top level \
+                     (not inside functions, if/for/try, or other blocks)",
                     *span,
                 ));
             }
             // `import sys` needs no init; any other module runs its body
-            // (once, guarded) at this point
+            // (once, guarded) at this point — parent packages first
             if module != "sys" {
-                out.push(init_call(module));
+                out.extend(init_calls_for(module));
             }
             Ok(())
         }
-        ast::StmtKind::FromImport { module, span, .. } => {
-            if !ctx.is_entry {
+        ast::StmtKind::FromImport {
+            module,
+            names,
+            span,
+            ..
+        } => {
+            if !ctx.allow_import {
                 return Err(err(
-                    "imports are only supported at the top level of the program",
+                    "imports are only supported at module top level \
+                     (not inside functions, if/for/try, or other blocks)",
                     *span,
                 ));
             }
-            out.push(init_call(module));
+            // package / module body, then any submodules pulled in by name
+            if !module.is_empty() && module != "sys" {
+                out.extend(init_calls_for(module));
+            }
+            for (name, _, nspan) in names {
+                if let Some(full) = ctx
+                    .mctx
+                    .submodules
+                    .get(module)
+                    .and_then(|kids| kids.get(name))
+                {
+                    out.extend(init_calls_for(full));
+                    continue;
+                }
+                // Partial package init: value names must already be assigned
+                // on the parent before this child was loaded.
+                if !module.is_empty()
+                    && !ctx.mctx.mods.contains_key(module.as_str())
+                    && is_strict_package_prefix(module, ctx.mctx.module)
+                {
+                    let visible = ctx
+                        .mctx
+                        .partial_parent_globals(module)
+                        .is_some_and(|g| g.contains_key(name));
+                    if !visible {
+                        return Err(err(
+                            format!(
+                                "cannot import name '{name}' from partially initialized \
+                                 package '{module}' (most likely due to a circular import)"
+                            ),
+                            *nspan,
+                        ));
+                    }
+                }
+            }
             Ok(())
         }
         ast::StmtKind::With { item, target, body } => {
@@ -864,7 +1496,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             handlers,
             finally,
         } => {
-            let body_ir = lower_block(body, ctx)?;
+            let body_ir = lower_nested_block(body, ctx)?;
             let mut handlers_ir = Vec::new();
             for h in handlers {
                 let name = if let Some((n, span)) = &h.bind {
@@ -888,10 +1520,10 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 } else {
                     None
                 };
-                let body_h = lower_block(&h.body, ctx)?;
+                let body_h = lower_nested_block(&h.body, ctx)?;
                 handlers_ir.push((h.exc.map(ast_exc_to_ir), name, body_h));
             }
-            let finally_ir = lower_block(finally, ctx)?;
+            let finally_ir = lower_nested_block(finally, ctx)?;
             out.push(ir::Stmt::Try {
                 body: body_ir,
                 handlers: handlers_ir,
@@ -935,10 +1567,8 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 keywords,
             } = &e.kind
             {
-                // `module.func(args)` as a statement discards the result
-                if let ast::ExprKind::Name(alias) = &base.kind
-                    && let Some(real) = ctx.module_alias(alias)
-                {
+                // `module.func(args)` / `pkg.mod.func(args)` as a statement
+                if let Some(real) = resolve_module_path(base, ctx) {
                     let call = lower_module_call(&real, method, *method_span, args, keywords, ctx)?;
                     out.push(ir::Stmt::ExprStmt(call));
                     return Ok(());
@@ -961,10 +1591,10 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             let mut lowered_branches = Vec::new();
             for (cond, body) in branches {
                 let c = lower_condition(cond, ctx)?;
-                let b = lower_block(body, ctx)?;
+                let b = lower_nested_block(body, ctx)?;
                 lowered_branches.push((c, b));
             }
-            let lowered_orelse = lower_block(orelse, ctx)?;
+            let lowered_orelse = lower_nested_block(orelse, ctx)?;
             out.push(ir::Stmt::If {
                 branches: lowered_branches,
                 orelse: lowered_orelse,
@@ -974,7 +1604,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
         ast::StmtKind::While { cond, body, orelse } => {
             let c = lower_condition(cond, ctx)?;
             ctx.loop_depth += 1;
-            let b = lower_block(body, ctx)?;
+            let b = lower_nested_block(body, ctx)?;
             ctx.loop_depth -= 1;
             push_loop_with_else(c, b, vec![], orelse, ctx, out)
         }
@@ -1054,7 +1684,7 @@ fn lower_with(
     };
 
     // Lower as try/finally so catchable raise/die still closes the file.
-    let body_ir = lower_block(body, ctx)?;
+    let body_ir = lower_nested_block(body, ctx)?;
     out.push(ir::Stmt::Try {
         body: body_ir,
         handlers: vec![],
@@ -2160,7 +2790,7 @@ fn push_loop_with_else(
             }),
         },
     };
-    let else_body = lower_block(orelse, ctx)?;
+    let else_body = lower_nested_block(orelse, ctx)?;
     out.push(ir::Stmt::If {
         branches: vec![(not_broke, else_body)],
         orelse: vec![],
@@ -2280,7 +2910,7 @@ fn lower_for_file(
     };
 
     ctx.loop_depth += 1;
-    let user_body = lower_block(body, ctx)?;
+    let user_body = lower_nested_block(body, ctx)?;
     ctx.loop_depth -= 1;
 
     let stop = ir::Stmt::Assign {
@@ -2385,7 +3015,7 @@ fn lower_for_indexed(
     let bind = bind_name(var, var_span, None, element, var_span, ctx)?;
 
     ctx.loop_depth += 1;
-    let user_body = lower_block(body, ctx);
+    let user_body = lower_nested_block(body, ctx);
     ctx.loop_depth -= 1;
     let mut loop_body = vec![bind];
     loop_body.extend(user_body?);
@@ -2544,7 +3174,7 @@ fn lower_for_range(
     let bind = bind_name(var, var_span, None, it_local.clone(), var_span, ctx)?;
 
     ctx.loop_depth += 1;
-    let user_body = lower_block(body, ctx);
+    let user_body = lower_nested_block(body, ctx);
     ctx.loop_depth -= 1;
     let mut loop_body = vec![bind];
     loop_body.extend(user_body?);
@@ -2710,20 +3340,56 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 // a name brought in by `from other import ...`
                 match binding {
                     ImportBinding::Symbol { module, name: real } => {
-                        if let Some(ty) = ctx.mctx.mods[module].globals.get(real) {
-                            Ok(ir::Expr {
-                                ty: *ty,
-                                kind: ir::ExprKind::GlobalLoad(qual(module, real)),
-                            })
-                        } else {
-                            Err(err(
+                        if let Some(data) = ctx.mctx.mods.get(module) {
+                            let (om, on) = data
+                                .reexports
+                                .get(real)
+                                .cloned()
+                                .unwrap_or_else(|| (module.clone(), real.clone()));
+                            if let Some(ty) = data.globals.get(real).copied().or_else(|| {
+                                ctx.mctx
+                                    .mods
+                                    .get(&om)
+                                    .and_then(|d| d.globals.get(&on).copied())
+                            }) {
+                                return Ok(ir::Expr {
+                                    ty,
+                                    kind: ir::ExprKind::GlobalLoad(qual(&om, &on)),
+                                });
+                            }
+                            return Err(err(
                                 format!(
                                     "'{name}' is a function imported from '{module}'; \
                                      call it with parentheses: '{name}(...)'"
                                 ),
                                 expr.span,
-                            ))
+                            ));
                         }
+                        // Parent package not yet fully lowered (partial init).
+                        if let Some(ty) = ctx
+                            .mctx
+                            .partial_parent_globals(module)
+                            .and_then(|g| g.get(real))
+                            .copied()
+                        {
+                            return Ok(ir::Expr {
+                                ty,
+                                kind: ir::ExprKind::GlobalLoad(qual(module, real)),
+                            });
+                        }
+                        if is_strict_package_prefix(module, ctx.mctx.module) {
+                            return Err(err(
+                                format!(
+                                    "cannot import name '{real}' from partially initialized \
+                                     package '{module}' (most likely due to a circular import)"
+                                ),
+                                expr.span,
+                            ));
+                        }
+                        Err(err(
+                            format!("module '{module}' has no attribute '{real}'"),
+                            expr.span,
+                        ))
                     }
                     ImportBinding::Module(_) | ImportBinding::Sys => Err(err(
                         format!("module '{name}' is not a value; use '{name}.<name>'"),
@@ -2850,19 +3516,47 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         *attr_span,
                     ));
                 }
-                // `module.global` from an imported module
-                if let Some(real) = ctx.module_alias(alias) {
-                    let data = &ctx.mctx.mods[&real];
+                if alias == "sys" && ctx.module_alias(alias).is_none() {
+                    return Err(err(
+                        "name 'sys' is not defined; add 'import sys' at the top \
+                         of the program",
+                        base.span,
+                    ));
+                }
+            }
+            // `module.global` / `pkg.mod.global` from an imported module path.
+            // Last-binding wins: value/function re-exports are checked before
+            // treating `attr` as a submodule (same as `from pkg import attr`).
+            if let Some(real) = resolve_module_path(base, ctx) {
+                if let Some(data) = ctx.mctx.mods.get(&real) {
                     if let Some(ty) = data.globals.get(attr) {
+                        let (om, on) = data
+                            .reexports
+                            .get(attr)
+                            .cloned()
+                            .unwrap_or_else(|| (real.clone(), attr.clone()));
                         return Ok(ir::Expr {
                             ty: *ty,
-                            kind: ir::ExprKind::GlobalLoad(qual(&real, attr)),
+                            kind: ir::ExprKind::GlobalLoad(qual(&om, &on)),
                         });
                     }
                     if data.funcs.contains_key(attr) {
                         return Err(err(
+                            format!("'{real}.{attr}' is a function; call it: '{real}.{attr}(...)'"),
+                            *attr_span,
+                        ));
+                    }
+                    // Pure submodule: not a first-class value in this surface.
+                    if ctx
+                        .mctx
+                        .submodules
+                        .get(&real)
+                        .is_some_and(|kids| kids.contains_key(attr))
+                    {
+                        return Err(err(
                             format!(
-                                "'{real}.{attr}' is a function; call it: '{alias}.{attr}(...)'"
+                                "module '{real}.{attr}' is not a value; use \
+                                 '{real}.{attr}.<name>' or call a function on it"
                             ),
                             *attr_span,
                         ));
@@ -2872,13 +3566,45 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         *attr_span,
                     ));
                 }
-                if alias == "sys" {
+                // Partial package init: parent not fully lowered yet.
+                if let Some(ty) = ctx
+                    .mctx
+                    .partial_parent_globals(&real)
+                    .and_then(|g| g.get(attr))
+                    .copied()
+                {
+                    return Ok(ir::Expr {
+                        ty,
+                        kind: ir::ExprKind::GlobalLoad(qual(&real, attr)),
+                    });
+                }
+                if ctx
+                    .mctx
+                    .submodules
+                    .get(&real)
+                    .is_some_and(|kids| kids.contains_key(attr))
+                {
                     return Err(err(
-                        "name 'sys' is not defined; add 'import sys' at the top \
-                         of the program",
-                        base.span,
+                        format!(
+                            "module '{real}.{attr}' is not a value; use \
+                             '{real}.{attr}.<name>' or call a function on it"
+                        ),
+                        *attr_span,
                     ));
                 }
+                if is_strict_package_prefix(&real, ctx.mctx.module) {
+                    return Err(err(
+                        format!(
+                            "cannot import name '{attr}' from partially initialized \
+                             package '{real}' (most likely due to a circular import)"
+                        ),
+                        *attr_span,
+                    ));
+                }
+                return Err(err(
+                    format!("module '{real}' has no attribute '{attr}'"),
+                    *attr_span,
+                ));
             }
             Err(err(
                 "attribute access is only supported for 'sys.argv', imported \
@@ -2893,11 +3619,8 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             args,
             keywords,
         } => {
-            // `module.func(args)` — a cross-module call, resolved before we
-            // try to treat `base` as a value
-            if let ast::ExprKind::Name(alias) = &base.kind
-                && let Some(real) = ctx.module_alias(alias)
-            {
+            // `module.func(args)` / `pkg.mod.func(args)` — cross-module call
+            if let Some(real) = resolve_module_path(base, ctx) {
                 return lower_module_call(&real, method, *method_span, args, keywords, ctx);
             }
             if !keywords.is_empty() {
@@ -3851,7 +4574,7 @@ fn lower_call_with_sig(
     })
 }
 
-/// `module.func(args)` — a call into another module.
+/// `module.func(args)` — a call into another module (including re-exports).
 fn lower_module_call(
     real: &str,
     method: &str,
@@ -3860,11 +4583,36 @@ fn lower_module_call(
     keywords: &[ast::Keyword],
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    let data = &ctx.mctx.mods[real];
-    if let Some(sig) = data.funcs.get(method).cloned() {
+    let Some(data) = ctx.mctx.mods.get(real) else {
+        // Never panic: parent package mid-init has no ModuleData yet.
+        if is_strict_package_prefix(real, ctx.mctx.module) {
+            return Err(err(
+                format!(
+                    "cannot import name '{method}' from partially initialized \
+                     package '{real}' (most likely due to a circular import)"
+                ),
+                method_span,
+            ));
+        }
+        return Err(err(
+            format!("module '{real}' has no attribute '{method}'"),
+            method_span,
+        ));
+    };
+    let (om, on) = data
+        .reexports
+        .get(method)
+        .cloned()
+        .unwrap_or_else(|| (real.to_string(), method.to_string()));
+    if let Some(sig) = data.funcs.get(method).cloned().or_else(|| {
+        ctx.mctx
+            .mods
+            .get(&om)
+            .and_then(|d| d.funcs.get(&on).cloned())
+    }) {
         return lower_call_with_sig(
             method,
-            qual(real, method),
+            qual(&om, &on),
             &sig,
             args,
             keywords,
@@ -3897,18 +4645,35 @@ fn lower_call(
         let sig = ctx.funcs().get(func).cloned().unwrap();
         return lower_call_with_sig(func, ctx.own_func(func), &sig, args, keywords, span, ctx);
     }
-    // a function pulled in by `from other import func`
+    // a function pulled in by `from other import func` (incl. re-exports)
     if let Some(ImportBinding::Symbol { module, name }) = ctx.mctx.imports.get(func).cloned() {
-        if let Some(sig) = ctx.mctx.mods[&module].funcs.get(&name).cloned() {
-            return lower_call_with_sig(
-                func,
-                qual(&module, &name),
-                &sig,
-                args,
-                keywords,
-                span,
-                ctx,
-            );
+        if let Some(data) = ctx.mctx.mods.get(&module) {
+            let (om, on) = data
+                .reexports
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| (module.clone(), name.clone()));
+            if let Some(sig) = data.funcs.get(&name).cloned().or_else(|| {
+                ctx.mctx
+                    .mods
+                    .get(&om)
+                    .and_then(|d| d.funcs.get(&on).cloned())
+            }) {
+                return lower_call_with_sig(func, qual(&om, &on), &sig, args, keywords, span, ctx);
+            }
+            return Err(err(
+                format!("'{func}' is a value imported from '{module}', not a function"),
+                func_span,
+            ));
+        }
+        if is_strict_package_prefix(&module, ctx.mctx.module) {
+            return Err(err(
+                format!(
+                    "cannot import name '{name}' from partially initialized \
+                     package '{module}' (most likely due to a circular import)"
+                ),
+                func_span,
+            ));
         }
         return Err(err(
             format!("'{func}' is a value imported from '{module}', not a function"),
@@ -5808,5 +6573,79 @@ print(f())
     fn tuple_membership_not_supported_yet() {
         let e = analyze_err("print(1 in (1, 2))\n");
         assert!(e.message.contains("not supported yet"), "{}", e.message);
+    }
+
+    #[test]
+    fn import_bind_helpers() {
+        assert_eq!(import_bind_name("pkg.mod", &None), "pkg");
+        assert_eq!(import_bind_name("pkg.mod", &Some("m".into())), "m");
+        assert_eq!(import_bound_module("pkg.mod", &None), "pkg");
+        assert_eq!(import_bound_module("pkg.mod", &Some("m".into())), "pkg.mod");
+    }
+
+    #[test]
+    fn submodule_map_links_parents() {
+        let names = vec![
+            "pkg".into(),
+            "pkg.mod".into(),
+            "pkg.sub".into(),
+            "pkg.sub.m".into(),
+        ];
+        let map = build_submodule_map(&names);
+        assert_eq!(map["pkg"]["mod"], "pkg.mod");
+        assert_eq!(map["pkg"]["sub"], "pkg.sub");
+        assert_eq!(map["pkg.sub"]["m"], "pkg.sub.m");
+    }
+
+    #[test]
+    fn multi_module_reexport_analyze() {
+        let mod_ast = parser::parse("VAL = 3\ndef f() -> int:\n    return VAL\n").unwrap();
+        let pkg_ast = parser::parse("from pkg.mod import f, VAL\n").unwrap();
+        let main_ast = parser::parse(
+            "import pkg\nprint(pkg.VAL, pkg.f())\nfrom pkg import f as g\nprint(g())\n",
+        )
+        .unwrap();
+        let m = analyze_program(&[
+            ModuleInput {
+                name: "pkg.mod".into(),
+                ast: &mod_ast,
+            },
+            ModuleInput {
+                name: "pkg".into(),
+                ast: &pkg_ast,
+            },
+            ModuleInput {
+                name: ENTRY_NAME.into(),
+                ast: &main_ast,
+            },
+        ])
+        .expect("reexport program should analyze");
+        // Re-exported call should target origin IR name pkg.mod.f
+        let entry = find_func(&m, ENTRY_NAME);
+        let has_origin_call = entry.body.iter().any(|s| match s {
+            ir::Stmt::Print(args) => args.iter().any(|a| {
+                matches!(
+                    &a.kind,
+                    ir::ExprKind::Call { func, .. } if func == "pkg.mod.f"
+                )
+            }),
+            ir::Stmt::ExprStmt(e) => matches!(
+                &e.kind,
+                ir::ExprKind::Call { func, .. } if func == "pkg.mod.f" || func == "pkg.__init__" || func == "pkg.mod.__init__"
+            ),
+            _ => false,
+        });
+        assert!(
+            has_origin_call
+                || entry.body.iter().any(|s| matches!(
+                    s,
+                    ir::Stmt::Print(args) if args.iter().any(|a| matches!(
+                        &a.kind,
+                        ir::ExprKind::Call { func, .. } if func.contains("f")
+                    ))
+                )),
+            "expected call through re-export; body={:?}",
+            entry.body
+        );
     }
 }
