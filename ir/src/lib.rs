@@ -249,11 +249,13 @@ pub enum Stmt {
         exc: ExcType,
         message: Expr,
     },
-    /// try / except / finally. Handlers: (type filter or catch-all, optional
-    /// local name bound to the message str, body).
+    /// try / except / else / finally. Handlers: (type filter or catch-all,
+    /// optional local name bound to the message str, body). `orelse` runs
+    /// only on normal completion of `body` (not after a handled exception).
     Try {
         body: Vec<Stmt>,
         handlers: Vec<(Option<ExcType>, Option<String>, Vec<Stmt>)>,
+        orelse: Vec<Stmt>,
         finally: Vec<Stmt>,
     },
     Break,
@@ -365,7 +367,8 @@ pub enum ExprKind {
     SetLit(Vec<Expr>),
     /// Empty set with known element type.
     SetNew,
-    /// `d.get(key, default)` — default is required (no first-class None).
+    /// `d.get(key, default)`. Bare `get(key)` is lowered as indexing
+    /// (KeyError on miss) until Optional/None returns exist.
     DictGet {
         dict: Box<Expr>,
         key: Box<Expr>,
@@ -406,8 +409,26 @@ pub enum ExprKind {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// `min(xs)` for `list[int|float|bool]`; empty list traps ValueError.
+    MinList(Box<Expr>),
+    /// `max(xs)` for `list[int|float|bool]`; empty list traps ValueError.
+    MaxList(Box<Expr>),
     /// `sum(xs)` for `list[int]` or `list[float]`; empty lists yield 0 / 0.0.
     Sum(Box<Expr>),
+    /// `math.<op>(x)` — float unary from the `math` stdlib module.
+    MathCall {
+        op: MathOp,
+        arg: Box<Expr>,
+    },
+    /// `os.getcwd()` → str (POSIX getcwd via runtime).
+    OsGetcwd,
+    /// `json.dumps(x)` for a json-able value (type on the arg).
+    JsonDumps(Box<Expr>),
+    /// Scalar / container `json.loads_*` helpers (type is the result).
+    JsonLoads {
+        kind: JsonLoadsKind,
+        arg: Box<Expr>,
+    },
     /// int → float (sitofp)
     IntToFloat(Box<Expr>),
     /// float → int, truncating toward zero (Python's `int()`)
@@ -427,8 +448,81 @@ pub enum ExprKind {
     ToBool(Box<Expr>),
 }
 
+/// Unary ops from the pure-PyRs `math` module (bodies replaced at lower).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathOp {
+    Sqrt,
+    Sin,
+    Cos,
+    Tan,
+    Log,
+    Log10,
+    Exp,
+    /// Toward −∞, result type `Int` (CPython `math.floor`).
+    Floor,
+    /// Toward +∞, result type `Int` (CPython `math.ceil`).
+    Ceil,
+    Fabs,
+}
+
+impl MathOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MathOp::Sqrt => "sqrt",
+            MathOp::Sin => "sin",
+            MathOp::Cos => "cos",
+            MathOp::Tan => "tan",
+            MathOp::Log => "log",
+            MathOp::Log10 => "log10",
+            MathOp::Exp => "exp",
+            MathOp::Floor => "floor",
+            MathOp::Ceil => "ceil",
+            MathOp::Fabs => "fabs",
+        }
+    }
+}
+
+/// Typed `json.loads_*` forms (full dynamic `json.loads` is not supported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonLoadsKind {
+    Int,
+    Float,
+    Bool,
+    Str,
+    ListInt,
+    ListFloat,
+    ListStr,
+    ListBool,
+    DictStrInt,
+    DictStrFloat,
+    DictStrStr,
+    DictStrBool,
+}
+
+impl JsonLoadsKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JsonLoadsKind::Int => "loads_int",
+            JsonLoadsKind::Float => "loads_float",
+            JsonLoadsKind::Bool => "loads_bool",
+            JsonLoadsKind::Str => "loads_str",
+            JsonLoadsKind::ListInt => "loads_list_int",
+            JsonLoadsKind::ListFloat => "loads_list_float",
+            JsonLoadsKind::ListStr => "loads_list_str",
+            JsonLoadsKind::ListBool => "loads_list_bool",
+            JsonLoadsKind::DictStrInt => "loads_dict_str_int",
+            JsonLoadsKind::DictStrFloat => "loads_dict_str_float",
+            JsonLoadsKind::DictStrStr => "loads_dict_str_str",
+            JsonLoadsKind::DictStrBool => "loads_dict_str_bool",
+        }
+    }
+}
+
 /// Binary operations. Operand types are encoded in the operand `Expr`s and
 /// are always equal on both sides; comparison results are `Bool`.
+///
+/// `And`/`Or` short-circuit and yield an operand (not always `Bool`); both
+/// sides share the result type after numeric unify when needed.
 ///
 /// On `Str`/`List` operands: `Add` is concatenation, `Mul` is repetition
 /// (the int count is always the right operand). Str comparisons are

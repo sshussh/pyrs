@@ -112,11 +112,22 @@ pub struct Keyword {
 pub struct FuncDef {
     pub name: String,
     pub params: Vec<Param>,
+    /// `*args: T` — remaining positionals as `list[T]`.
+    pub vararg: Option<Param>,
+    /// `**kwargs: T` — remaining keywords as `dict[str, T]`.
+    pub kwarg: Option<Param>,
     /// Annotated return type; `None` means no annotation (returns nothing).
     pub ret: Option<TypeName>,
     pub body: Vec<Stmt>,
     /// Span of the `def name(...)` header, for diagnostics.
     pub span: Span,
+}
+
+/// One positional slot in a call: a value or `*iterable` unpack.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PosArg {
+    Pos(Expr),
+    Star(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,11 +197,10 @@ pub enum StmtKind {
     /// `global name, ...` — declares that assignments in this function
     /// target module-level variables.
     Global(Vec<(String, Span)>),
-    /// `import module [as alias]` — `module` may be dotted (`pkg.mod`).
+    /// `import module [as alias], ...` — each module may be dotted (`pkg.mod`).
+    /// `names` is `(module, optional alias, span of the module name)`.
     Import {
-        module: String,
-        alias: Option<String>,
-        span: Span,
+        names: Vec<(String, Option<String>, Span)>,
     },
     /// `from module import name [as alias], ...` and relative forms
     /// (`from . import x`, `from ..pkg import y`). `level` is the number of
@@ -216,10 +226,12 @@ pub enum StmtKind {
         exc: ExcType,
         message: Expr,
     },
-    /// `try` / `except` / `finally`.
+    /// `try` / `except` / `else` / `finally`.
+    /// `orelse` is only valid when there is at least one `except` (CPython).
     Try {
         body: Vec<Stmt>,
         handlers: Vec<ExceptHandler>,
+        orelse: Vec<Stmt>,
         finally: Vec<Stmt>,
     },
     Pass,
@@ -330,8 +342,10 @@ pub enum ExprKind {
     Call {
         func: String,
         func_span: Span,
-        args: Vec<Expr>,
+        args: Vec<PosArg>,
         keywords: Vec<Keyword>,
+        /// `**mapping` at the end of the call (at most one).
+        kwargs: Option<Box<Expr>>,
     },
     /// `obj.attr` without a call — currently only `sys.argv`.
     Attribute {
@@ -344,8 +358,9 @@ pub enum ExprKind {
         base: Box<Expr>,
         method: String,
         method_span: Span,
-        args: Vec<Expr>,
+        args: Vec<PosArg>,
         keywords: Vec<Keyword>,
+        kwargs: Option<Box<Expr>>,
     },
     /// `base[index]`
     Index {

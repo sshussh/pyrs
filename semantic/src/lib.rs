@@ -132,8 +132,23 @@ struct ParamSig {
 #[derive(Debug, Clone)]
 struct FuncSig {
     params: Vec<ParamSig>,
+    /// `*args: T` — element type `T`; IR param is `list[T]`.
+    vararg: Option<ParamSig>,
+    /// `**kwargs: T` — value type `T`; IR param is `dict[str, T]`.
+    kwarg: Option<ParamSig>,
     ret: ir::Ty,
     span: Span,
+}
+
+/// Nested function visible only inside its enclosing function.
+#[derive(Debug, Clone)]
+struct NestedFnInfo {
+    /// Fully-qualified IR name (`outer.inner` or `mod.outer.inner`).
+    ir_name: String,
+    /// Signature of the nested function **without** capture parameters.
+    sig: FuncSig,
+    /// Outer locals/params captured by value, in parameter order (leading IR params).
+    captures: Vec<(String, ir::Ty)>,
 }
 
 /// One parsed module handed to [`analyze_program`]. The driver supplies
@@ -381,6 +396,50 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                     default: p.default.clone(),
                 });
             }
+            let vararg = if let Some(p) = &f.vararg {
+                let ty = resolve_type_checked(p.ty, p.span)?;
+                if ty == ir::Ty::None {
+                    return Err(err(
+                        format!("*{} cannot have element type None", p.name),
+                        p.span,
+                    ));
+                }
+                if !seen_names.insert(p.name.clone()) {
+                    return Err(err(
+                        format!("duplicate parameter name '{}'", p.name),
+                        p.span,
+                    ));
+                }
+                Some(ParamSig {
+                    name: p.name.clone(),
+                    ty,
+                    default: None,
+                })
+            } else {
+                None
+            };
+            let kwarg = if let Some(p) = &f.kwarg {
+                let ty = resolve_type_checked(p.ty, p.span)?;
+                if ty == ir::Ty::None {
+                    return Err(err(
+                        format!("**{} cannot have value type None", p.name),
+                        p.span,
+                    ));
+                }
+                if !seen_names.insert(p.name.clone()) {
+                    return Err(err(
+                        format!("duplicate parameter name '{}'", p.name),
+                        p.span,
+                    ));
+                }
+                Some(ParamSig {
+                    name: p.name.clone(),
+                    ty,
+                    default: None,
+                })
+            } else {
+                None
+            };
             let ret = match f.ret {
                 Some(t) => resolve_type_checked(t, f.span)?,
                 Option::None => ir::Ty::None,
@@ -389,6 +448,8 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                 f.name.clone(),
                 FuncSig {
                     params,
+                    vararg,
+                    kwarg,
                     ret,
                     span: f.span,
                 },
@@ -529,9 +590,9 @@ fn record_simple_assign(stmt: &ast::Stmt, tys: &mut HashMap<String, ir::Ty>) {
 /// executed in package `parent`.
 fn stmt_loads_child(stmt: &ast::Stmt, parent: &str, child: &str) -> bool {
     match &stmt.kind {
-        ast::StmtKind::Import { module: m, .. } => {
+        ast::StmtKind::Import { names } => names.iter().any(|(m, _, _)| {
             m == child || is_strict_package_prefix(child, m) || is_strict_package_prefix(m, child)
-        }
+        }),
         ast::StmtKind::FromImport {
             module: src, names, ..
         } => {
@@ -1030,21 +1091,19 @@ fn collect_imports(
             } => {
                 self_value_bound.insert(name.clone());
             }
-            ast::StmtKind::Import {
-                module: m,
-                alias,
-                span,
-            } => {
-                let local = import_bind_name(m, alias);
-                let binding = if m == "sys" {
-                    ImportBinding::Sys
-                } else {
-                    if m == self_name {
-                        return Err(err(format!("module '{m}' cannot import itself"), *span));
-                    }
-                    ImportBinding::Module(import_bound_module(m, alias))
-                };
-                imports.insert(local, binding);
+            ast::StmtKind::Import { names } => {
+                for (m, alias, span) in names {
+                    let local = import_bind_name(m, alias);
+                    let binding = if m == "sys" {
+                        ImportBinding::Sys
+                    } else {
+                        if m == self_name {
+                            return Err(err(format!("module '{m}' cannot import itself"), *span));
+                        }
+                        ImportBinding::Module(import_bound_module(m, alias))
+                    };
+                    imports.insert(local, binding);
+                }
             }
             ast::StmtKind::FromImport {
                 module: m,
@@ -1225,7 +1284,7 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
         let init = if is_root && script.is_empty() {
             // PyRs convenience: a root that is only definitions calls main()
             if let Some(sig) = funcs.get("main") {
-                if !sig.params.is_empty() {
+                if !sig.params.is_empty() || sig.vararg.is_some() || sig.kwarg.is_some() {
                     return Err(err(
                         "main() is used as the entry point and cannot take parameters",
                         sig.span,
@@ -1252,12 +1311,16 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
             let init_def = ast::FuncDef {
                 name: init_name.clone(),
                 params: vec![],
+                vararg: None,
+                kwarg: None,
                 ret: None,
                 body: script,
                 span: Span::default(),
             };
-            let mut f = lower_function(&init_def, &mctx, &mut globals, &mut globals_order, true)
-                .map_err(|d| d.with_file(i))?;
+            let (mut f, nested) =
+                lower_function(&init_def, &mctx, &mut globals, &mut globals_order, true)
+                    .map_err(|d| d.with_file(i))?;
+            out_funcs.extend(nested);
             if !is_root {
                 add_init_guard(&mut f, &m.name, &mut globals_order);
             }
@@ -1266,9 +1329,10 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
 
         // functions, with the module's globals now typed
         for fd in &all_orders[i] {
-            let f = lower_function(fd, &mctx, &mut globals, &mut globals_order, false)
+            let (f, nested) = lower_function(fd, &mctx, &mut globals, &mut globals_order, false)
                 .map_err(|d| d.with_file(i))?;
             out_funcs.push(f);
+            out_funcs.extend(nested);
         }
 
         match init {
@@ -1353,6 +1417,10 @@ struct FnCtx<'a> {
     /// Innermost last. Comprehension variables shadow but never leak
     /// (Python 3 scoping).
     comp_renames: Vec<(String, String, ir::Ty)>,
+    /// Nested functions defined in this function (name → info).
+    nested_funcs: HashMap<String, NestedFnInfo>,
+    /// IR functions produced for nested defs (and their nested defs).
+    nested_ir: Vec<ir::Function>,
 }
 
 impl FnCtx<'_> {
@@ -1405,7 +1473,29 @@ fn lower_function(
     globals: &mut HashMap<String, ir::Ty>,
     globals_order: &mut Vec<(String, ir::Ty)>,
     is_entry: bool,
-) -> SResult<ir::Function> {
+) -> SResult<(ir::Function, Vec<ir::Function>)> {
+    lower_function_inner(
+        f,
+        mctx,
+        globals,
+        globals_order,
+        is_entry,
+        None,
+        HashMap::new(),
+    )
+}
+
+/// `capture_params`: leading params for nested functions (free vars), already typed.
+/// `seed_nested`: sibling (and self) nested functions visible for calls.
+fn lower_function_inner(
+    f: &ast::FuncDef,
+    mctx: &ModuleCtx,
+    globals: &mut HashMap<String, ir::Ty>,
+    globals_order: &mut Vec<(String, ir::Ty)>,
+    is_entry: bool,
+    capture_params: Option<Vec<(String, ir::Ty)>>,
+    seed_nested: HashMap<String, NestedFnInfo>,
+) -> SResult<(ir::Function, Vec<ir::Function>)> {
     let mut params = Vec::new();
     let mut ctx = FnCtx {
         mctx,
@@ -1424,7 +1514,18 @@ fn lower_function(
         loop_depth: 0,
         temp_counter: 0,
         comp_renames: Vec::new(),
+        nested_funcs: seed_nested,
+        nested_ir: Vec::new(),
     };
+
+    if let Some(caps) = &capture_params {
+        for (name, ty) in caps {
+            if ctx.locals.insert(name.clone(), *ty).is_some() {
+                return Err(err(format!("duplicate parameter '{name}'"), f.span));
+            }
+            params.push((name.clone(), *ty));
+        }
+    }
 
     for p in &f.params {
         let ty = resolve_type_checked(p.ty, p.span)?;
@@ -1433,8 +1534,157 @@ fn lower_function(
         }
         params.push((p.name.clone(), ty));
     }
+    if let Some(p) = &f.vararg {
+        let elem = resolve_type_checked(p.ty, p.span)?;
+        let ty = ir::list_of(elem);
+        if ctx.locals.insert(p.name.clone(), ty).is_some() {
+            return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
+        }
+        params.push((p.name.clone(), ty));
+    }
+    if let Some(p) = &f.kwarg {
+        let val = resolve_type_checked(p.ty, p.span)?;
+        let ty = ir::dict_of(ir::Ty::Str, val);
+        if ctx.locals.insert(p.name.clone(), ty).is_some() {
+            return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
+        }
+        params.push((p.name.clone(), ty));
+    }
 
-    let body = lower_block(&f.body, &mut ctx)?;
+    // `math` module: replace stub bodies with MathCall intrinsics.
+    let body = if mctx.module == "math"
+        && let Some(op) = math_intrinsic(&f.name)
+    {
+        if params.len() != 1 {
+            return Err(err(
+                format!(
+                    "math.{} must take exactly one parameter (found {})",
+                    f.name,
+                    params.len()
+                ),
+                f.span,
+            ));
+        }
+        let (pname, pty) = &params[0];
+        let arg = ir::Expr {
+            ty: *pty,
+            kind: ir::ExprKind::Local(pname.clone()),
+        };
+        // Accept int/float/bool param; coerce to float for libm.
+        let arg = match arg.ty {
+            ir::Ty::Float => arg,
+            ir::Ty::Int => ir::Expr {
+                ty: ir::Ty::Float,
+                kind: ir::ExprKind::IntToFloat(Box::new(arg)),
+            },
+            ir::Ty::Bool => {
+                let as_int = ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::BoolToInt(Box::new(arg)),
+                };
+                ir::Expr {
+                    ty: ir::Ty::Float,
+                    kind: ir::ExprKind::IntToFloat(Box::new(as_int)),
+                }
+            }
+            other => {
+                return Err(err(
+                    format!("math.{} expects a numeric parameter, found {other}", f.name),
+                    f.span,
+                ));
+            }
+        };
+        let ret_ty = match op {
+            ir::MathOp::Floor | ir::MathOp::Ceil => ir::Ty::Int,
+            _ => ir::Ty::Float,
+        };
+        if ctx.ret != ret_ty {
+            return Err(err(
+                format!(
+                    "math.{} must be declared to return {ret_ty} (found {})",
+                    f.name, ctx.ret
+                ),
+                f.span,
+            ));
+        }
+        vec![ir::Stmt::Return(Some(ir::Expr {
+            ty: ret_ty,
+            kind: ir::ExprKind::MathCall {
+                op,
+                arg: Box::new(arg),
+            },
+        }))]
+    } else if mctx.module == "os" && f.name == "getcwd" {
+        if !params.is_empty() {
+            return Err(err("os.getcwd must take no parameters".to_string(), f.span));
+        }
+        if ctx.ret != ir::Ty::Str {
+            return Err(err(
+                format!("os.getcwd must return str (found {})", ctx.ret),
+                f.span,
+            ));
+        }
+        vec![ir::Stmt::Return(Some(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::OsGetcwd,
+        }))]
+    } else if mctx.module == "json"
+        && let Some(kind) = json_loads_kind(&f.name)
+    {
+        if params.len() != 1 || params[0].1 != ir::Ty::Str {
+            return Err(err(
+                format!("json.{} must take a single str parameter", f.name),
+                f.span,
+            ));
+        }
+        let expected_ret = json_loads_ret(kind);
+        if ctx.ret != expected_ret {
+            return Err(err(
+                format!(
+                    "json.{} must be declared to return {expected_ret} (found {})",
+                    f.name, ctx.ret
+                ),
+                f.span,
+            ));
+        }
+        let arg = ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::Local(params[0].0.clone()),
+        };
+        vec![ir::Stmt::Return(Some(ir::Expr {
+            ty: expected_ret,
+            kind: ir::ExprKind::JsonLoads {
+                kind,
+                arg: Box::new(arg),
+            },
+        }))]
+    } else if mctx.module == "json" && f.name == "dumps" {
+        // Polymorphic: body never used; calls are special-cased. Keep a
+        // trivial body so the function still exists for signature lookup.
+        if params.len() != 1 {
+            return Err(err(
+                "json.dumps must take exactly one parameter".to_string(),
+                f.span,
+            ));
+        }
+        if ctx.ret != ir::Ty::Str {
+            return Err(err(
+                format!("json.dumps must return str (found {})", ctx.ret),
+                f.span,
+            ));
+        }
+        // Return dumps of the parameter (typed as str in the stub).
+        let arg = ir::Expr {
+            ty: params[0].1,
+            kind: ir::ExprKind::Local(params[0].0.clone()),
+        };
+        vec![ir::Stmt::Return(Some(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::JsonDumps(Box::new(arg)),
+        }))]
+    } else {
+        lower_block(&f.body, &mut ctx)?
+    };
 
     // every path through a value-returning function must return
     if ctx.ret != ir::Ty::None && !block_returns(&body) {
@@ -1456,13 +1706,52 @@ fn lower_function(
         ctx.own_func(&f.name)
     };
 
-    Ok(ir::Function {
-        name: ir_name,
-        params,
-        ret: ctx.ret,
-        locals: ctx.locals_order,
-        body,
+    let nested = ctx.nested_ir;
+    Ok((
+        ir::Function {
+            name: ir_name,
+            params,
+            ret: ctx.ret,
+            locals: ctx.locals_order,
+            body,
+        },
+        nested,
+    ))
+}
+
+fn json_loads_kind(name: &str) -> Option<ir::JsonLoadsKind> {
+    Some(match name {
+        "loads_int" => ir::JsonLoadsKind::Int,
+        "loads_float" => ir::JsonLoadsKind::Float,
+        "loads_bool" => ir::JsonLoadsKind::Bool,
+        "loads_str" => ir::JsonLoadsKind::Str,
+        "loads_list_int" => ir::JsonLoadsKind::ListInt,
+        "loads_list_float" => ir::JsonLoadsKind::ListFloat,
+        "loads_list_str" => ir::JsonLoadsKind::ListStr,
+        "loads_list_bool" => ir::JsonLoadsKind::ListBool,
+        "loads_dict_str_int" => ir::JsonLoadsKind::DictStrInt,
+        "loads_dict_str_float" => ir::JsonLoadsKind::DictStrFloat,
+        "loads_dict_str_str" => ir::JsonLoadsKind::DictStrStr,
+        "loads_dict_str_bool" => ir::JsonLoadsKind::DictStrBool,
+        _ => return None,
     })
+}
+
+fn json_loads_ret(kind: ir::JsonLoadsKind) -> ir::Ty {
+    match kind {
+        ir::JsonLoadsKind::Int => ir::Ty::Int,
+        ir::JsonLoadsKind::Float => ir::Ty::Float,
+        ir::JsonLoadsKind::Bool => ir::Ty::Bool,
+        ir::JsonLoadsKind::Str => ir::Ty::Str,
+        ir::JsonLoadsKind::ListInt => ir::list_of(ir::Ty::Int),
+        ir::JsonLoadsKind::ListFloat => ir::list_of(ir::Ty::Float),
+        ir::JsonLoadsKind::ListStr => ir::list_of(ir::Ty::Str),
+        ir::JsonLoadsKind::ListBool => ir::list_of(ir::Ty::Bool),
+        ir::JsonLoadsKind::DictStrInt => ir::dict_of(ir::Ty::Str, ir::Ty::Int),
+        ir::JsonLoadsKind::DictStrFloat => ir::dict_of(ir::Ty::Str, ir::Ty::Float),
+        ir::JsonLoadsKind::DictStrStr => ir::dict_of(ir::Ty::Str, ir::Ty::Str),
+        ir::JsonLoadsKind::DictStrBool => ir::dict_of(ir::Ty::Str, ir::Ty::Bool),
+    }
 }
 
 fn lower_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::Stmt>> {
@@ -1471,6 +1760,488 @@ fn lower_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::Stmt>> {
         lower_stmt(stmt, ctx, &mut out)?;
     }
     Ok(out)
+}
+
+/// Lower a nested `def` inside a function: capture free vars by value as
+/// leading parameters; register the name for local calls.
+fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
+    if ctx.nested_funcs.contains_key(&f.name) || ctx.locals.contains_key(&f.name) {
+        return Err(err(
+            format!(
+                "function '{}' is defined more than once in this scope",
+                f.name
+            ),
+            f.span,
+        ));
+    }
+    if BUILTINS.contains(&f.name.as_str()) {
+        return Err(err(
+            format!("cannot redefine the builtin '{}'", f.name),
+            f.span,
+        ));
+    }
+
+    // Build nested signature (params / *args / **kwargs).
+    let mut params = Vec::new();
+    let mut seen = HashSet::new();
+    for p in &f.params {
+        let ty = resolve_type_checked(p.ty, p.span)?;
+        if ty == ir::Ty::None {
+            return Err(err(
+                format!("parameter '{}' cannot have type None", p.name),
+                p.span,
+            ));
+        }
+        if !seen.insert(p.name.clone()) {
+            return Err(err(
+                format!("duplicate parameter name '{}'", p.name),
+                p.span,
+            ));
+        }
+        params.push(ParamSig {
+            name: p.name.clone(),
+            ty,
+            default: p.default.clone(),
+        });
+    }
+    let vararg = if let Some(p) = &f.vararg {
+        let ty = resolve_type_checked(p.ty, p.span)?;
+        if !seen.insert(p.name.clone()) {
+            return Err(err(
+                format!("duplicate parameter name '{}'", p.name),
+                p.span,
+            ));
+        }
+        Some(ParamSig {
+            name: p.name.clone(),
+            ty,
+            default: None,
+        })
+    } else {
+        None
+    };
+    let kwarg = if let Some(p) = &f.kwarg {
+        let ty = resolve_type_checked(p.ty, p.span)?;
+        if !seen.insert(p.name.clone()) {
+            return Err(err(
+                format!("duplicate parameter name '{}'", p.name),
+                p.span,
+            ));
+        }
+        Some(ParamSig {
+            name: p.name.clone(),
+            ty,
+            default: None,
+        })
+    } else {
+        None
+    };
+    let ret = match f.ret {
+        Some(t) => resolve_type_checked(t, f.span)?,
+        Option::None => ir::Ty::None,
+    };
+    let sig = FuncSig {
+        params,
+        vararg,
+        kwarg,
+        ret,
+        span: f.span,
+    };
+
+    // Free vars: names loaded in nested body that resolve to outer locals
+    // (including this function's params) and are not assigned in the nested body.
+    let assigned = assigned_names_in_stmts(&f.body);
+    let mut used = HashSet::new();
+    collect_used_names_in_stmts(&f.body, &mut used);
+    // also scan defaults on nested params
+    for p in &f.params {
+        if let Some(d) = &p.default {
+            collect_used_names_in_expr(d, &mut used);
+        }
+    }
+
+    let mut captures: Vec<(String, ir::Ty)> = Vec::new();
+    let mut capture_set = HashSet::new();
+    // Deterministic order: outer locals_order first, then any other used names.
+    let mut candidate_names: Vec<String> = Vec::new();
+    for (n, _) in &ctx.locals_order {
+        if used.contains(n) {
+            candidate_names.push(n.clone());
+        }
+    }
+    for n in &used {
+        if !candidate_names.iter().any(|x| x == n) {
+            candidate_names.push(n.clone());
+        }
+    }
+    for name in &candidate_names {
+        if seen.contains(name) || assigned.contains(name) {
+            continue;
+        }
+        if let Some(ty) = ctx.locals.get(name) {
+            if capture_set.insert(name.clone()) {
+                captures.push((name.clone(), *ty));
+            }
+        } else if ctx.nested_funcs.contains_key(name) {
+            return Err(err(
+                format!(
+                    "nested function '{name}' cannot be captured by '{}'; \
+                     call it directly in the outer scope",
+                    f.name
+                ),
+                f.span,
+            ));
+        }
+        // else: global / function / import — resolved normally inside nested
+    }
+
+    // Disallow assigning to a name that is only an outer local (would need nonlocal).
+    for name in &assigned {
+        if !seen.contains(name)
+            && ctx.locals.contains_key(name)
+            && !ctx.declared_globals.contains(name)
+        {
+            // In Python this creates a new local; we allow that. No error.
+            // Nonlocal writes are rejected at parse time.
+            let _ = name;
+        }
+    }
+
+    let ir_name = format!("{}.{}", ctx.fn_name, f.name);
+    // qualify with module for non-root
+    let ir_name = if ctx.mctx.is_root {
+        ir_name
+    } else {
+        format!("{}.{}", ctx.mctx.module, ir_name)
+    };
+
+    // Build a FuncDef with a fully-qualified name for IR.
+    let nested_def = ast::FuncDef {
+        name: ir_name.clone(),
+        params: f.params.clone(),
+        vararg: f.vararg.clone(),
+        kwarg: f.kwarg.clone(),
+        ret: f.ret,
+        body: f.body.clone(),
+        span: f.span,
+    };
+
+    let info = NestedFnInfo {
+        ir_name: ir_name.clone(),
+        sig: sig.clone(),
+        captures: captures.clone(),
+    };
+    // Seed: already-defined siblings + self (for recursion).
+    let mut seed = ctx.nested_funcs.clone();
+    seed.insert(f.name.clone(), info.clone());
+
+    let (func, more) = lower_function_inner(
+        &nested_def,
+        ctx.mctx,
+        ctx.globals,
+        ctx.globals_order,
+        false,
+        Some(captures),
+        seed,
+    )?;
+    ctx.nested_ir.push(func);
+    ctx.nested_ir.extend(more);
+
+    ctx.nested_funcs.insert(f.name.clone(), info);
+    Ok(())
+}
+
+fn assigned_names_in_stmts(stmts: &[ast::Stmt]) -> HashSet<String> {
+    let mut s = HashSet::new();
+    for st in stmts {
+        assigned_names_in_stmt(st, &mut s);
+    }
+    s
+}
+
+fn assigned_names_in_stmt(st: &ast::Stmt, out: &mut HashSet<String>) {
+    match &st.kind {
+        ast::StmtKind::Assign { targets, .. } => {
+            for t in targets {
+                assigned_names_in_target(t, out);
+            }
+        }
+        ast::StmtKind::AugAssign { target, .. } => assigned_names_in_target(target, out),
+        ast::StmtKind::For {
+            var, body, orelse, ..
+        } => {
+            out.insert(var.clone());
+            for s in body {
+                assigned_names_in_stmt(s, out);
+            }
+            for s in orelse {
+                assigned_names_in_stmt(s, out);
+            }
+        }
+        ast::StmtKind::If { branches, orelse } => {
+            for (_, body) in branches {
+                for s in body {
+                    assigned_names_in_stmt(s, out);
+                }
+            }
+            for s in orelse {
+                assigned_names_in_stmt(s, out);
+            }
+        }
+        ast::StmtKind::While { body, orelse, .. } => {
+            for s in body {
+                assigned_names_in_stmt(s, out);
+            }
+            for s in orelse {
+                assigned_names_in_stmt(s, out);
+            }
+        }
+        ast::StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finally,
+        } => {
+            for s in body {
+                assigned_names_in_stmt(s, out);
+            }
+            for h in handlers {
+                if let Some((name, _)) = &h.bind {
+                    out.insert(name.clone());
+                }
+                for s in &h.body {
+                    assigned_names_in_stmt(s, out);
+                }
+            }
+            for s in orelse {
+                assigned_names_in_stmt(s, out);
+            }
+            for s in finally {
+                assigned_names_in_stmt(s, out);
+            }
+        }
+        ast::StmtKind::FuncDef(f) => {
+            // nested nested: its name is local binding in the enclosing nested fn
+            out.insert(f.name.clone());
+        }
+        _ => {}
+    }
+}
+
+fn assigned_names_in_target(t: &ast::AssignTarget, out: &mut HashSet<String>) {
+    match t {
+        ast::AssignTarget::Name { name, .. } => {
+            out.insert(name.clone());
+        }
+        ast::AssignTarget::Index { .. } => {}
+        ast::AssignTarget::Tuple(ts) => {
+            for t in ts {
+                assigned_names_in_target(t, out);
+            }
+        }
+    }
+}
+
+fn collect_used_names_in_stmts(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for st in stmts {
+        collect_used_names_in_stmt(st, out);
+    }
+}
+
+fn collect_used_names_in_stmt(st: &ast::Stmt, out: &mut HashSet<String>) {
+    match &st.kind {
+        ast::StmtKind::Assign { targets, value, .. } => {
+            collect_used_names_in_expr(value, out);
+            for t in targets {
+                collect_used_names_in_target_read(t, out);
+            }
+        }
+        ast::StmtKind::AugAssign { target, value, .. } => {
+            collect_used_names_in_expr(value, out);
+            collect_used_names_in_target_read(target, out);
+            // augassign also reads the target name
+            if let ast::AssignTarget::Name { name, .. } = target {
+                out.insert(name.clone());
+            }
+        }
+        ast::StmtKind::ExprStmt(e) | ast::StmtKind::Return(Some(e)) => {
+            collect_used_names_in_expr(e, out);
+        }
+        ast::StmtKind::If { branches, orelse } => {
+            for (c, body) in branches {
+                collect_used_names_in_expr(c, out);
+                collect_used_names_in_stmts(body, out);
+            }
+            collect_used_names_in_stmts(orelse, out);
+        }
+        ast::StmtKind::While { cond, body, orelse } => {
+            collect_used_names_in_expr(cond, out);
+            collect_used_names_in_stmts(body, out);
+            collect_used_names_in_stmts(orelse, out);
+        }
+        ast::StmtKind::For {
+            iter, body, orelse, ..
+        } => {
+            collect_used_names_in_expr(iter, out);
+            collect_used_names_in_stmts(body, out);
+            collect_used_names_in_stmts(orelse, out);
+        }
+        ast::StmtKind::Raise { message, .. } => {
+            collect_used_names_in_expr(message, out);
+        }
+        ast::StmtKind::Delete { target } => collect_used_names_in_target_read(target, out),
+        ast::StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finally,
+        } => {
+            collect_used_names_in_stmts(body, out);
+            for h in handlers {
+                collect_used_names_in_stmts(&h.body, out);
+            }
+            collect_used_names_in_stmts(orelse, out);
+            collect_used_names_in_stmts(finally, out);
+        }
+        ast::StmtKind::FuncDef(f) => {
+            for p in &f.params {
+                if let Some(d) = &p.default {
+                    collect_used_names_in_expr(d, out);
+                }
+            }
+            collect_used_names_in_stmts(&f.body, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_used_names_in_target_read(t: &ast::AssignTarget, out: &mut HashSet<String>) {
+    match t {
+        ast::AssignTarget::Name { .. } => {}
+        ast::AssignTarget::Index { base, index } => {
+            collect_used_names_in_expr(base, out);
+            collect_used_names_in_expr(index, out);
+        }
+        ast::AssignTarget::Tuple(ts) => {
+            for t in ts {
+                collect_used_names_in_target_read(t, out);
+            }
+        }
+    }
+}
+
+fn collect_used_names_in_expr(e: &ast::Expr, out: &mut HashSet<String>) {
+    match &e.kind {
+        ast::ExprKind::Name(n) => {
+            out.insert(n.clone());
+        }
+        ast::ExprKind::Call {
+            args,
+            keywords,
+            kwargs,
+            ..
+        } => {
+            for a in args {
+                match a {
+                    ast::PosArg::Pos(x) | ast::PosArg::Star(x) => {
+                        collect_used_names_in_expr(x, out);
+                    }
+                }
+            }
+            for kw in keywords {
+                collect_used_names_in_expr(&kw.value, out);
+            }
+            if let Some(k) = kwargs {
+                collect_used_names_in_expr(k, out);
+            }
+        }
+        ast::ExprKind::MethodCall {
+            base,
+            args,
+            keywords,
+            kwargs,
+            ..
+        } => {
+            collect_used_names_in_expr(base, out);
+            for a in args {
+                match a {
+                    ast::PosArg::Pos(x) | ast::PosArg::Star(x) => {
+                        collect_used_names_in_expr(x, out);
+                    }
+                }
+            }
+            for kw in keywords {
+                collect_used_names_in_expr(&kw.value, out);
+            }
+            if let Some(k) = kwargs {
+                collect_used_names_in_expr(k, out);
+            }
+        }
+        ast::ExprKind::Attribute { base, .. } => collect_used_names_in_expr(base, out),
+        ast::ExprKind::Index { base, index } => {
+            collect_used_names_in_expr(base, out);
+            collect_used_names_in_expr(index, out);
+        }
+        ast::ExprKind::Slice {
+            base, lo, hi, step, ..
+        } => {
+            collect_used_names_in_expr(base, out);
+            if let Some(x) = lo {
+                collect_used_names_in_expr(x, out);
+            }
+            if let Some(x) = hi {
+                collect_used_names_in_expr(x, out);
+            }
+            if let Some(x) = step {
+                collect_used_names_in_expr(x, out);
+            }
+        }
+        ast::ExprKind::Binary { left, right, .. } => {
+            collect_used_names_in_expr(left, out);
+            collect_used_names_in_expr(right, out);
+        }
+        ast::ExprKind::Compare { first, rest } => {
+            collect_used_names_in_expr(first, out);
+            for (_, e) in rest {
+                collect_used_names_in_expr(e, out);
+            }
+        }
+        ast::ExprKind::Unary { operand, .. } => collect_used_names_in_expr(operand, out),
+        ast::ExprKind::ListLit(items) | ast::ExprKind::TupleLit(items) => {
+            for i in items {
+                collect_used_names_in_expr(i, out);
+            }
+        }
+        ast::ExprKind::DictLit(pairs) => {
+            for (k, v) in pairs {
+                collect_used_names_in_expr(k, out);
+                collect_used_names_in_expr(v, out);
+            }
+        }
+        ast::ExprKind::SetLit(items) => {
+            for i in items {
+                collect_used_names_in_expr(i, out);
+            }
+        }
+        ast::ExprKind::Cast { arg, .. } => collect_used_names_in_expr(arg, out),
+        ast::ExprKind::ListComp {
+            elem, iter, cond, ..
+        } => {
+            collect_used_names_in_expr(elem, out);
+            collect_used_names_in_expr(iter, out);
+            if let Some(c) = cond {
+                collect_used_names_in_expr(c, out);
+            }
+        }
+        ast::ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                if let ast::FStringPart::Expr { expr, .. } = p {
+                    collect_used_names_in_expr(expr, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Nested suite (if/for/try/…): imports are not allowed here.
@@ -1484,26 +2255,35 @@ fn lower_nested_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::S
 
 fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SResult<()> {
     match &stmt.kind {
-        ast::StmtKind::FuncDef(f) => Err(err(
-            format!(
-                "nested function definitions are not supported yet ('{}')",
-                f.name
-            ),
-            f.span,
-        )),
-        ast::StmtKind::Pass => Ok(()),
-        ast::StmtKind::Import { module, span, .. } => {
-            if !ctx.allow_import {
+        ast::StmtKind::FuncDef(f) => {
+            if ctx.is_entry {
                 return Err(err(
-                    "imports are only supported at module top level \
-                     (not inside functions, if/for/try, or other blocks)",
-                    *span,
+                    format!(
+                        "nested function definitions are only supported inside \
+                         functions, not at module top level ('{}')",
+                        f.name
+                    ),
+                    f.span,
                 ));
             }
-            // `import sys` needs no init; any other module runs its body
-            // (once, guarded) at this point — parent packages first
-            if module != "sys" {
-                out.extend(init_calls_for(module));
+            lower_nested_func_def(f, ctx)?;
+            Ok(())
+        }
+        ast::StmtKind::Pass => Ok(()),
+        ast::StmtKind::Import { names } => {
+            for (module, _, span) in names {
+                if !ctx.allow_import {
+                    return Err(err(
+                        "imports are only supported at module top level \
+                         (not inside functions, if/for/try, or other blocks)",
+                        *span,
+                    ));
+                }
+                // `import sys` needs no init; any other module runs its body
+                // (once, guarded) at this point — parent packages first
+                if module != "sys" {
+                    out.extend(init_calls_for(module));
+                }
             }
             Ok(())
         }
@@ -1731,6 +2511,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
         ast::StmtKind::Try {
             body,
             handlers,
+            orelse,
             finally,
         } => {
             let body_ir = lower_nested_block(body, ctx)?;
@@ -1760,10 +2541,12 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 let body_h = lower_nested_block(&h.body, ctx)?;
                 handlers_ir.push((h.exc.map(ast_exc_to_ir), name, body_h));
             }
+            let orelse_ir = lower_nested_block(orelse, ctx)?;
             let finally_ir = lower_nested_block(finally, ctx)?;
             out.push(ir::Stmt::Try {
                 body: body_ir,
                 handlers: handlers_ir,
+                orelse: orelse_ir,
                 finally: finally_ir,
             });
             Ok(())
@@ -1773,12 +2556,28 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
         }
         ast::StmtKind::ExprStmt(e) => {
             // print is a statement-level builtin
-            if let ast::ExprKind::Call { func, args, .. } = &e.kind
+            if let ast::ExprKind::Call {
+                func,
+                args,
+                keywords,
+                kwargs,
+                ..
+            } = &e.kind
                 && func == "print"
                 && !ctx.funcs().contains_key("print")
             {
+                if !keywords.is_empty() {
+                    return Err(err(
+                        "print() keyword arguments are not supported yet",
+                        keywords[0].name_span,
+                    ));
+                }
+                if kwargs.is_some() {
+                    return Err(err("print() does not take **kwargs", e.span));
+                }
+                let plain = require_plain_args(args, "print", e.span)?;
                 let mut lowered_args = Vec::new();
-                for (i, arg) in args.iter().enumerate() {
+                for (i, arg) in plain.iter().enumerate() {
                     let a = lower_expr(arg, ctx)?;
                     if a.ty == ir::Ty::None {
                         return Err(err(
@@ -1802,11 +2601,20 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 method_span,
                 args,
                 keywords,
+                kwargs,
             } = &e.kind
             {
                 // `module.func(args)` / `pkg.mod.func(args)` as a statement
                 if let Some(real) = resolve_module_path(base, ctx) {
-                    let call = lower_module_call(&real, method, *method_span, args, keywords, ctx)?;
+                    let call = lower_module_call(
+                        &real,
+                        method,
+                        *method_span,
+                        args,
+                        keywords,
+                        kwargs.as_deref(),
+                        ctx,
+                    )?;
                     out.push(ir::Stmt::ExprStmt(call));
                     return Ok(());
                 }
@@ -1816,7 +2624,15 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                         keywords[0].name_span,
                     ));
                 }
-                let stmt = lower_method_stmt(base, method, *method_span, args, ctx)?;
+                if kwargs.is_some() {
+                    return Err(err(
+                        "** unpacking is not supported for this method call",
+                        *method_span,
+                    ));
+                }
+                let plain = require_plain_args(args, method, *method_span)?;
+                let plain_owned: Vec<ast::Expr> = plain.iter().map(|e| (*e).clone()).collect();
+                let stmt = lower_method_stmt(base, method, *method_span, &plain_owned, ctx)?;
                 out.push(stmt);
                 return Ok(());
             }
@@ -1925,6 +2741,7 @@ fn lower_with(
     out.push(ir::Stmt::Try {
         body: body_ir,
         handlers: vec![],
+        orelse: vec![],
         finally: vec![close_stmt()],
     });
     Ok(())
@@ -2163,21 +2980,26 @@ fn lower_dict_method(
 ) -> SResult<ir::Expr> {
     match method {
         "get" => {
-            // Default is required: no first-class None return for missing keys.
-            if args.len() != 2 {
+            // Bare get(key): KeyError on miss (no Optional/None return yet).
+            // get(key, default) is CPython-identical.
+            if args.is_empty() || args.len() > 2 {
                 return Err(err(
-                    if args.len() == 1 {
-                        "dict.get(key) without a default is not supported yet \
-                         (None is not a first-class value); use get(key, default)"
-                            .to_string()
-                    } else {
-                        format!("get() takes 2 arguments ({} given)", args.len())
-                    },
+                    format!("get() takes 1 or 2 arguments ({} given)", args.len()),
                     method_span,
                 ));
             }
             let key = lower_expr(&args[0], ctx)?;
             let key = coerce(key, key_ty, args[0].span, "dict.get() key")?;
+            if args.len() == 1 {
+                // Same trap as d[key] until Optional returns exist.
+                return Ok(ir::Expr {
+                    ty: val_ty,
+                    kind: ir::ExprKind::Index {
+                        base: Box::new(base_ir),
+                        index: Box::new(key),
+                    },
+                });
+            }
             let d = lower_expr(&args[1], ctx)?;
             let default = coerce(d, val_ty, args[1].span, "dict.get() default")?;
             Ok(ir::Expr {
@@ -2555,12 +3377,14 @@ fn lower_assign(
                 func,
                 args,
                 keywords,
+                kwargs,
                 ..
             },
             Some(ir::Ty::Set(elem)),
         ) if func == "set"
             && args.is_empty()
             && keywords.is_empty()
+            && kwargs.is_none()
             && !ctx.funcs().contains_key("set") =>
         {
             check_hashable_key(*elem, value.span, "set")?;
@@ -2965,7 +3789,9 @@ fn lower_for(
         && func == "range"
         && !ctx.funcs().contains_key("range")
     {
-        return lower_for_range(var, var_span, args, iter.span, body, orelse, ctx, out);
+        let plain = require_plain_args(args, "range", iter.span)?;
+        let plain: Vec<ast::Expr> = plain.iter().map(|e| (*e).clone()).collect();
+        return lower_for_range(var, var_span, &plain, iter.span, body, orelse, ctx, out);
     }
 
     // general case: list/string by index, or file via readline until ""
@@ -3061,6 +3887,7 @@ fn rewrite_breaks_set_flag(stmts: Vec<ir::Stmt>, broke: &str) -> Vec<ir::Stmt> {
             ir::Stmt::Try {
                 body,
                 handlers,
+                orelse,
                 finally,
             } => {
                 out.push(ir::Stmt::Try {
@@ -3069,6 +3896,7 @@ fn rewrite_breaks_set_flag(stmts: Vec<ir::Stmt>, broke: &str) -> Vec<ir::Stmt> {
                         .into_iter()
                         .map(|(e, n, h)| (e, n, rewrite_breaks_set_flag(h, broke)))
                         .collect(),
+                    orelse: rewrite_breaks_set_flag(orelse, broke),
                     finally: rewrite_breaks_set_flag(finally, broke),
                 });
             }
@@ -3562,6 +4390,15 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     kind: ir::ExprKind::Local(storage.clone()),
                 });
             }
+            if ctx.nested_funcs.contains_key(name) {
+                return Err(err(
+                    format!(
+                        "local function '{name}' is not a value (returning nested \
+                         functions is not supported yet); call it with '{name}(...)'"
+                    ),
+                    expr.span,
+                ));
+            }
             if let Some(ty) = ctx.locals.get(name) {
                 Ok(ir::Expr {
                     ty: *ty,
@@ -3877,10 +4714,19 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             method_span,
             args,
             keywords,
+            kwargs,
         } => {
             // `module.func(args)` / `pkg.mod.func(args)` — cross-module call
             if let Some(real) = resolve_module_path(base, ctx) {
-                return lower_module_call(&real, method, *method_span, args, keywords, ctx);
+                return lower_module_call(
+                    &real,
+                    method,
+                    *method_span,
+                    args,
+                    keywords,
+                    kwargs.as_deref(),
+                    ctx,
+                );
             }
             if !keywords.is_empty() {
                 return Err(err(
@@ -3888,12 +4734,20 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     keywords[0].name_span,
                 ));
             }
+            if kwargs.is_some() {
+                return Err(err(
+                    "** unpacking is not supported for this method call",
+                    *method_span,
+                ));
+            }
+            let plain = require_plain_args(args, method, *method_span)?;
+            let args: Vec<ast::Expr> = plain.iter().map(|e| (*e).clone()).collect();
             let base_ir = lower_expr(base, ctx)?;
             match base_ir.ty {
                 ir::Ty::List(elem) => match method.as_str() {
                     // pop returns the removed element
-                    "pop" => lower_list_pop(base_ir, *elem, args, *method_span, ctx),
-                    "index" => lower_list_index_of(base_ir, *elem, args, *method_span, ctx),
+                    "pop" => lower_list_pop(base_ir, *elem, &args, *method_span, ctx),
+                    "index" => lower_list_index_of(base_ir, *elem, &args, *method_span, ctx),
                     "append" | "insert" | "remove" | "clear" | "sort" => Err(err(
                         format!(
                             "list.{method}(...) returns None and cannot be used \
@@ -3906,7 +4760,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         *method_span,
                     )),
                 },
-                ir::Ty::Str => lower_str_method(base_ir, method, *method_span, args, ctx),
+                ir::Ty::Str => lower_str_method(base_ir, method, *method_span, &args, ctx),
                 ir::Ty::File => {
                     if method == "close" {
                         return Err(err(
@@ -3915,10 +4769,10 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                             *method_span,
                         ));
                     }
-                    lower_file_method(base_ir, method, *method_span, args, ctx)
+                    lower_file_method(base_ir, method, *method_span, &args, ctx)
                 }
                 ir::Ty::Dict { key, value } => {
-                    lower_dict_method(base_ir, *key, *value, method, *method_span, args, ctx)
+                    lower_dict_method(base_ir, *key, *value, method, *method_span, &args, ctx)
                 }
                 ir::Ty::Set(_) => match method.as_str() {
                     "add" | "remove" | "discard" | "clear" => Err(err(
@@ -4028,7 +4882,16 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             func_span,
             args,
             keywords,
-        } => lower_call(func, *func_span, args, keywords, expr.span, ctx),
+            kwargs,
+        } => lower_call(
+            func,
+            *func_span,
+            args,
+            keywords,
+            kwargs.as_deref(),
+            expr.span,
+            ctx,
+        ),
         ast::ExprKind::Cast { ty, arg } => {
             let value = lower_expr(arg, ctx)?;
             lower_cast(*ty, value, arg.span)
@@ -4076,17 +4939,18 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             lower_compare_chain(first_ir, rest, expr.span, ctx)
         }
         ast::ExprKind::Binary { op, left, right } => {
-            // and/or take truthiness operands and short-circuit
+            // and/or yield an operand (not always bool), with short-circuit
             if matches!(op, ast::BinOp::And | ast::BinOp::Or) {
-                let l = lower_condition(left, ctx)?;
-                let r = lower_condition(right, ctx)?;
+                let l = lower_expr(left, ctx)?;
+                let r = lower_expr(right, ctx)?;
+                let (l, r, ty) = unify_and_or(l, r, expr.span)?;
                 let ir_op = if *op == ast::BinOp::And {
                     ir::BinOp::And
                 } else {
                     ir::BinOp::Or
                 };
                 return Ok(ir::Expr {
-                    ty: ir::Ty::Bool,
+                    ty,
                     kind: ir::ExprKind::Binary {
                         op: ir_op,
                         left: Box::new(l),
@@ -4166,14 +5030,15 @@ fn lower_list_comp(
         && func == "range"
         && !ctx.funcs().contains_key("range")
     {
-        if args.is_empty() || args.len() > 3 {
+        let plain = require_plain_args(args, "range", iter.span)?;
+        if plain.is_empty() || plain.len() > 3 {
             return Err(err(
-                format!("range() takes 1 to 3 arguments ({} given)", args.len()),
+                format!("range() takes 1 to 3 arguments ({} given)", plain.len()),
                 iter.span,
             ));
         }
         let mut lowered: Vec<ir::Expr> = Vec::new();
-        for a in args {
+        for a in &plain {
             let v = lower_expr(a, ctx)?;
             lowered.push(coerce(v, ir::Ty::Int, a.span, "range() argument")?);
         }
@@ -4712,50 +5577,313 @@ fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
     }
 }
 
+/// Require plain (non-`*`) positional args — used by builtins and methods.
+fn require_plain_args<'a>(
+    args: &'a [ast::PosArg],
+    what: &str,
+    span: Span,
+) -> SResult<Vec<&'a ast::Expr>> {
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        match a {
+            ast::PosArg::Pos(e) => out.push(e),
+            ast::PosArg::Star(_) => {
+                return Err(err(
+                    format!("*{what} unpacking is not supported here"),
+                    span,
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn lower_arg_expr(
+    arg: &ast::Expr,
+    expected: ir::Ty,
+    what: &str,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected) {
+        lower_list_lit(items, Some(*elem), arg.span, ctx)?
+    } else {
+        lower_expr(arg, ctx)?
+    };
+    coerce(a, expected, arg.span, what)
+}
+
 /// Type-check and lower a call to a function with a known signature.
+/// `extra_leading`: capture values for nested functions (prepended to IR args).
+#[allow(clippy::too_many_arguments)]
 fn lower_call_with_sig(
     display: &str,
     ir_name: String,
     sig: &FuncSig,
-    args: &[ast::Expr],
+    args: &[ast::PosArg],
     keywords: &[ast::Keyword],
+    kwargs: Option<&ast::Expr>,
     span: Span,
     ctx: &mut FnCtx,
+    extra_leading: &[ir::Expr],
 ) -> SResult<ir::Expr> {
     let n = sig.params.len();
-    if args.len() > n {
-        return Err(err(
-            format!(
-                "function '{display}' takes {} argument(s) but {} were given",
-                n,
-                args.len()
-            ),
-            span,
-        ));
-    }
+    let has_vararg = sig.vararg.is_some();
+    let has_kwarg = sig.kwarg.is_some();
 
-    let mut slots: Vec<Option<ir::Expr>> = (0..n).map(|_| None).collect();
+    // Expand positionals and *unpacks into a sequence of IR exprs for fixed
+    // params, plus a list of IR exprs that feed *args.
+    let mut fixed_slots: Vec<Option<ir::Expr>> = (0..n).map(|_| None).collect();
     let mut filled = vec![false; n];
+    let mut vararg_items: Vec<ir::Expr> = Vec::new();
+    let mut positional_count = 0usize; // how many fixed slots filled by position
+    let mut star_prelude: Vec<ir::Stmt> = Vec::new();
 
-    for (i, arg) in args.iter().enumerate() {
-        let expected = sig.params[i].ty;
-        let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected) {
-            lower_list_lit(items, Some(*elem), arg.span, ctx)?
-        } else {
-            lower_expr(arg, ctx)?
-        };
-        let a = coerce(
-            a,
-            expected,
-            arg.span,
-            &format!("argument {} of '{display}'", i + 1),
-        )?;
-        slots[i] = Some(a);
-        filled[i] = true;
+    for arg in args {
+        match arg {
+            ast::PosArg::Pos(e) => {
+                if positional_count < n {
+                    let expected = sig.params[positional_count].ty;
+                    let a = lower_arg_expr(
+                        e,
+                        expected,
+                        &format!("argument {} of '{display}'", positional_count + 1),
+                        ctx,
+                    )?;
+                    fixed_slots[positional_count] = Some(a);
+                    filled[positional_count] = true;
+                    positional_count += 1;
+                } else if has_vararg {
+                    let elem = sig.vararg.as_ref().unwrap().ty;
+                    let a = lower_arg_expr(
+                        e,
+                        elem,
+                        &format!(
+                            "*{} element of '{display}'",
+                            sig.vararg.as_ref().unwrap().name
+                        ),
+                        ctx,
+                    )?;
+                    vararg_items.push(a);
+                } else {
+                    return Err(err(
+                        format!(
+                            "function '{display}' takes {} argument(s) but more were given",
+                            n
+                        ),
+                        e.span,
+                    ));
+                }
+            }
+            ast::PosArg::Star(e) => {
+                let seq = lower_expr(e, ctx)?;
+                let elem = match seq.ty {
+                    ir::Ty::List(el) => *el,
+                    other => {
+                        return Err(err(
+                            format!("* unpacking expects a list, found {other}"),
+                            e.span,
+                        ));
+                    }
+                };
+                let remaining_fixed = n.saturating_sub(positional_count);
+                let seq_t = ctx.fresh_temp("star", seq.ty);
+                star_prelude.push(ir::Stmt::Assign {
+                    name: seq_t.clone(),
+                    value: seq,
+                });
+                let len_e = ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                        ty: ir::list_of(elem),
+                        kind: ir::ExprKind::Local(seq_t.clone()),
+                    })),
+                };
+                if remaining_fixed == 0 {
+                    if !has_vararg {
+                        return Err(err(
+                            format!(
+                                "function '{display}' takes {} argument(s); \
+                                 cannot *unpack extra values",
+                                n
+                            ),
+                            e.span,
+                        ));
+                    }
+                    let want = sig.vararg.as_ref().unwrap().ty;
+                    if elem != want {
+                        return Err(err(
+                            format!(
+                                "* unpacking element type {elem} does not match \
+                                 *{}: {want}",
+                                sig.vararg.as_ref().unwrap().name
+                            ),
+                            e.span,
+                        ));
+                    }
+                    // entire list goes to *args
+                    vararg_items.push(ir::Expr {
+                        ty: ir::list_of(elem),
+                        kind: ir::ExprKind::Local(seq_t),
+                    });
+                } else {
+                    let min_needed = remaining_fixed as i64;
+                    let check = if has_vararg {
+                        ir::Stmt::If {
+                            branches: vec![(
+                                ir::Expr {
+                                    ty: ir::Ty::Bool,
+                                    kind: ir::ExprKind::Binary {
+                                        op: ir::BinOp::Lt,
+                                        left: Box::new(len_e.clone()),
+                                        right: Box::new(int_const(min_needed)),
+                                    },
+                                },
+                                vec![ir::Stmt::Die(format!(
+                                    "TypeError: {display}() missing arguments after * unpack"
+                                ))],
+                            )],
+                            orelse: vec![],
+                        }
+                    } else {
+                        ir::Stmt::If {
+                            branches: vec![(
+                                ir::Expr {
+                                    ty: ir::Ty::Bool,
+                                    kind: ir::ExprKind::Binary {
+                                        op: ir::BinOp::Ne,
+                                        left: Box::new(len_e.clone()),
+                                        right: Box::new(int_const(min_needed)),
+                                    },
+                                },
+                                vec![ir::Stmt::Die(format!(
+                                    "TypeError: {display}() argument count after * unpack mismatch"
+                                ))],
+                            )],
+                            orelse: vec![],
+                        }
+                    };
+                    star_prelude.push(check);
+                    for i in 0..remaining_fixed {
+                        let expected = sig.params[positional_count].ty;
+                        if elem != expected
+                            && !(expected == ir::Ty::Float
+                                && matches!(elem, ir::Ty::Int | ir::Ty::Bool))
+                            && !(expected == ir::Ty::Int && elem == ir::Ty::Bool)
+                        {
+                            return Err(err(
+                                format!(
+                                    "* unpacking element type {elem} does not match \
+                                     parameter type {expected}"
+                                ),
+                                e.span,
+                            ));
+                        }
+                        let item = ir::Expr {
+                            ty: elem,
+                            kind: ir::ExprKind::Index {
+                                base: Box::new(ir::Expr {
+                                    ty: ir::list_of(elem),
+                                    kind: ir::ExprKind::Local(seq_t.clone()),
+                                }),
+                                index: Box::new(int_const(i as i64)),
+                            },
+                        };
+                        let item = coerce(
+                            item,
+                            expected,
+                            e.span,
+                            &format!("argument {} of '{display}'", positional_count + 1),
+                        )?;
+                        let tmp = ctx.fresh_temp("sarg", expected);
+                        star_prelude.push(ir::Stmt::Assign {
+                            name: tmp.clone(),
+                            value: item,
+                        });
+                        fixed_slots[positional_count] = Some(ir::Expr {
+                            ty: expected,
+                            kind: ir::ExprKind::Local(tmp),
+                        });
+                        filled[positional_count] = true;
+                        positional_count += 1;
+                    }
+                    if has_vararg {
+                        let want = sig.vararg.as_ref().unwrap().ty;
+                        if elem != want {
+                            return Err(err(
+                                format!(
+                                    "* unpacking element type {elem} does not match \
+                                     *{}: {want}",
+                                    sig.vararg.as_ref().unwrap().name
+                                ),
+                                e.span,
+                            ));
+                        }
+                        let rest = ir::Expr {
+                            ty: ir::list_of(elem),
+                            kind: ir::ExprKind::Slice {
+                                base: Box::new(ir::Expr {
+                                    ty: ir::list_of(elem),
+                                    kind: ir::ExprKind::Local(seq_t.clone()),
+                                }),
+                                lo: Box::new(int_const(remaining_fixed as i64)),
+                                hi: Box::new(int_const(i64::MIN)),
+                                step: Box::new(int_const(1)),
+                            },
+                        };
+                        let rest_t = ctx.fresh_temp("srest", rest.ty);
+                        star_prelude.push(ir::Stmt::Assign {
+                            name: rest_t.clone(),
+                            value: rest,
+                        });
+                        vararg_items.push(ir::Expr {
+                            ty: ir::list_of(elem),
+                            kind: ir::ExprKind::Local(rest_t),
+                        });
+                    }
+                }
+            }
+        }
     }
 
+    // Keywords for fixed params; extras go to **kwargs.
+    let mut kwarg_pairs: Vec<(ir::Expr, ir::Expr)> = Vec::new();
     for kw in keywords {
-        let Some(idx) = sig.params.iter().position(|p| p.name == kw.name) else {
+        if let Some(idx) = sig.params.iter().position(|p| p.name == kw.name) {
+            if filled[idx] {
+                return Err(err(
+                    format!(
+                        "function '{display}' got multiple values for argument '{name}'",
+                        name = kw.name
+                    ),
+                    kw.name_span,
+                ));
+            }
+            let expected = sig.params[idx].ty;
+            let a = lower_arg_expr(
+                &kw.value,
+                expected,
+                &format!("argument '{name}' of '{display}'", name = kw.name),
+                ctx,
+            )?;
+            fixed_slots[idx] = Some(a);
+            filled[idx] = true;
+        } else if has_kwarg {
+            let val_ty = sig.kwarg.as_ref().unwrap().ty;
+            let v = lower_arg_expr(
+                &kw.value,
+                val_ty,
+                &format!(
+                    "**{} value of '{display}'",
+                    sig.kwarg.as_ref().unwrap().name
+                ),
+                ctx,
+            )?;
+            let k = ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::ConstStr(kw.name.clone()),
+            };
+            kwarg_pairs.push((k, v));
+        } else {
             return Err(err(
                 format!(
                     "function '{display}' got an unexpected keyword argument '{name}'",
@@ -4763,54 +5891,147 @@ fn lower_call_with_sig(
                 ),
                 kw.name_span,
             ));
-        };
-        if filled[idx] {
-            return Err(err(
-                format!(
-                    "function '{display}' got multiple values for argument '{name}'",
-                    name = kw.name
-                ),
-                kw.name_span,
-            ));
         }
-        let expected = sig.params[idx].ty;
-        let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) =
-            (&kw.value.kind, expected)
-        {
-            lower_list_lit(items, Some(*elem), kw.value.span, ctx)?
-        } else {
-            lower_expr(&kw.value, ctx)?
-        };
-        let a = coerce(
-            a,
-            expected,
-            kw.value.span,
-            &format!("argument '{name}' of '{display}'", name = kw.name),
-        )?;
-        slots[idx] = Some(a);
-        filled[idx] = true;
     }
 
-    let mut lowered_args = Vec::with_capacity(n);
+    // **kwargs mapping unpack
+    let mut kwarg_dict_extra: Option<ir::Expr> = None;
+    if let Some(kd) = kwargs {
+        let d = lower_expr(kd, ctx)?;
+        match d.ty {
+            ir::Ty::Dict { key, value } if *key == ir::Ty::Str => {
+                if has_kwarg {
+                    let want = sig.kwarg.as_ref().unwrap().ty;
+                    if *value != want {
+                        return Err(err(
+                            format!(
+                                "** unpacking value type {value} does not match **{}: {want}",
+                                sig.kwarg.as_ref().unwrap().name
+                            ),
+                            kd.span,
+                        ));
+                    }
+                    // Merge: for each still-unfilled fixed param, try dict get.
+                    // Then remaining keys must only go to kwargs — without full
+                    // dynamic key scan, we only support **d when no fixed params
+                    // remain unfilled OR all unfilled fixed have defaults and
+                    // **d feeds kwargs only (no overlap). Simpler rule:
+                    // **d only fills kwargs dict; fixed params must already be filled.
+                    for (i, p) in sig.params.iter().enumerate() {
+                        if !filled[i] {
+                            // try to pull from d via ConstStr key — runtime KeyError if missing and no default
+                            // Use DictGet with a sentinel? Better: DictPop / index.
+                            // If has default, use DictGet(key, default); else Index.
+                            let key_e = ir::Expr {
+                                ty: ir::Ty::Str,
+                                kind: ir::ExprKind::ConstStr(p.name.clone()),
+                            };
+                            if let Some(def) = &p.default {
+                                let def_v = lower_arg_expr(
+                                    def,
+                                    p.ty,
+                                    &format!("default for parameter '{}' of '{display}'", p.name),
+                                    ctx,
+                                )?;
+                                let got = ir::Expr {
+                                    ty: p.ty,
+                                    kind: ir::ExprKind::DictGet {
+                                        dict: Box::new(d.clone()),
+                                        key: Box::new(key_e),
+                                        default: Box::new(def_v),
+                                    },
+                                };
+                                fixed_slots[i] = Some(got);
+                                filled[i] = true;
+                            } else {
+                                let got = ir::Expr {
+                                    ty: p.ty,
+                                    kind: ir::ExprKind::Index {
+                                        base: Box::new(d.clone()),
+                                        index: Box::new(key_e),
+                                    },
+                                };
+                                // coerce if needed - type already matches want
+                                fixed_slots[i] = Some(got);
+                                filled[i] = true;
+                            }
+                        }
+                    }
+                    kwarg_dict_extra = Some(d);
+                } else {
+                    // No **param: **d must supply remaining fixed params by name only.
+                    for (i, p) in sig.params.iter().enumerate() {
+                        if filled[i] {
+                            continue;
+                        }
+                        if *value != p.ty {
+                            return Err(err(
+                                format!(
+                                    "** unpacking value type {value} does not match \
+                                     parameter '{}': {}",
+                                    p.name, p.ty
+                                ),
+                                kd.span,
+                            ));
+                        }
+                        let key_e = ir::Expr {
+                            ty: ir::Ty::Str,
+                            kind: ir::ExprKind::ConstStr(p.name.clone()),
+                        };
+                        if let Some(def) = &p.default {
+                            let def_v = lower_arg_expr(
+                                def,
+                                p.ty,
+                                &format!("default for parameter '{}' of '{display}'", p.name),
+                                ctx,
+                            )?;
+                            fixed_slots[i] = Some(ir::Expr {
+                                ty: p.ty,
+                                kind: ir::ExprKind::DictGet {
+                                    dict: Box::new(d.clone()),
+                                    key: Box::new(key_e),
+                                    default: Box::new(def_v),
+                                },
+                            });
+                        } else {
+                            fixed_slots[i] = Some(ir::Expr {
+                                ty: p.ty,
+                                kind: ir::ExprKind::Index {
+                                    base: Box::new(d.clone()),
+                                    index: Box::new(key_e),
+                                },
+                            });
+                        }
+                        filled[i] = true;
+                    }
+                }
+            }
+            other => {
+                return Err(err(
+                    format!("** unpacking expects dict[str, T], found {other}"),
+                    kd.span,
+                ));
+            }
+        }
+    } else if kwargs.is_some() {
+        // handled
+    }
+
+    let mut lowered_args: Vec<ir::Expr> = extra_leading.to_vec();
     for (i, p) in sig.params.iter().enumerate() {
-        if let Some(a) = slots[i].take() {
+        if let Some(a) = fixed_slots[i].take() {
             lowered_args.push(a);
             continue;
         }
         if let Some(def) = &p.default {
-            let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&def.kind, p.ty) {
-                lower_list_lit(items, Some(*elem), def.span, ctx)?
-            } else {
-                lower_expr(def, ctx)?
-            };
-            let a = coerce(
-                a,
+            let a = lower_arg_expr(
+                def,
                 p.ty,
-                def.span,
                 &format!(
                     "default for parameter '{name}' of '{display}'",
                     name = p.name
                 ),
+                ctx,
             )?;
             lowered_args.push(a);
         } else {
@@ -4824,13 +6045,112 @@ fn lower_call_with_sig(
         }
     }
 
-    Ok(ir::Expr {
+    if let Some(va) = &sig.vararg {
+        let list_ty = ir::list_of(va.ty);
+        // Pack vararg_items: mix of scalar elems and whole lists (from *unpack).
+        let packed = if vararg_items.is_empty() {
+            ir::Expr {
+                ty: list_ty,
+                kind: ir::ExprKind::ListLit(vec![]),
+            }
+        } else {
+            // Start with empty or first list, concat/append rest.
+            let mut acc: Option<ir::Expr> = None;
+            for item in vararg_items {
+                if item.ty == list_ty {
+                    acc = Some(match acc {
+                        None => item,
+                        Some(a) => ir::Expr {
+                            ty: list_ty,
+                            kind: ir::ExprKind::Binary {
+                                op: ir::BinOp::Add,
+                                left: Box::new(a),
+                                right: Box::new(item),
+                            },
+                        },
+                    });
+                } else {
+                    // scalar: append via list + [item]
+                    let one = ir::Expr {
+                        ty: list_ty,
+                        kind: ir::ExprKind::ListLit(vec![item]),
+                    };
+                    acc = Some(match acc {
+                        None => one,
+                        Some(a) => ir::Expr {
+                            ty: list_ty,
+                            kind: ir::ExprKind::Binary {
+                                op: ir::BinOp::Add,
+                                left: Box::new(a),
+                                right: Box::new(one),
+                            },
+                        },
+                    });
+                }
+            }
+            acc.unwrap()
+        };
+        lowered_args.push(packed);
+    }
+
+    if let Some(kw) = &sig.kwarg {
+        let dict_ty = ir::dict_of(ir::Ty::Str, kw.ty);
+        let base = if kwarg_pairs.is_empty() {
+            ir::Expr {
+                ty: dict_ty,
+                kind: ir::ExprKind::DictNew,
+            }
+        } else {
+            ir::Expr {
+                ty: dict_ty,
+                kind: ir::ExprKind::DictLit(kwarg_pairs),
+            }
+        };
+        let dict_expr = if let Some(extra) = kwarg_dict_extra {
+            // Merge explicit kwargs over **d: start from **d, then set pairs.
+            // Without a dict-merge primitive, if both present and pairs non-empty,
+            // build from pairs only when extra is empty-keys case; else error if both.
+            if matches!(base.kind, ir::ExprKind::DictNew) {
+                extra
+            } else if matches!(&extra.kind, ir::ExprKind::DictNew)
+                || matches!(&extra.kind, ir::ExprKind::DictLit(p) if p.is_empty())
+            {
+                base
+            } else {
+                // Prefer explicit keyword pairs; ignore overlapping ** keys (CPython
+                // errors on duplicates). Documented subset: **d alone or keywords alone.
+                return Err(err(
+                    format!(
+                        "function '{display}': combining keyword arguments with ** unpacking \
+                         is not supported yet; use one or the other"
+                    ),
+                    span,
+                ));
+            }
+        } else {
+            base
+        };
+        lowered_args.push(dict_expr);
+    }
+
+    let call = ir::Expr {
         ty: sig.ret,
         kind: ir::ExprKind::Call {
             func: ir_name,
             args: lowered_args,
         },
-    })
+    };
+    if star_prelude.is_empty() {
+        Ok(call)
+    } else {
+        Ok(ir::Expr {
+            ty: sig.ret,
+            kind: ir::ExprKind::Block {
+                stmts: star_prelude,
+                result: Box::new(call),
+            },
+        })
+    }
 }
 
 /// Resolve a value attribute on a parent package that is not yet in `mods`.
@@ -5029,10 +6349,35 @@ fn lower_module_call(
     real: &str,
     method: &str,
     method_span: Span,
-    args: &[ast::Expr],
+    args: &[ast::PosArg],
     keywords: &[ast::Keyword],
+    kwargs: Option<&ast::Expr>,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
+    // json.dumps is polymorphic: special-case before signature matching.
+    if real == "json" && method == "dumps" {
+        if kwargs.is_some() {
+            return Err(err("json.dumps() does not take **kwargs", method_span));
+        }
+        if !keywords.is_empty() {
+            return Err(err(
+                "json.dumps() does not take keyword arguments",
+                keywords[0].name_span,
+            ));
+        }
+        let plain = require_plain_args(args, "json.dumps", method_span)?;
+        if plain.len() != 1 {
+            return Err(err(
+                format!(
+                    "json.dumps() takes exactly one argument ({} given)",
+                    plain.len()
+                ),
+                method_span,
+            ));
+        }
+        return lower_json_dumps(plain[0], ctx);
+    }
+
     let Some(data) = ctx.mctx.mods.get(real) else {
         // Parent package mid-init has no ModuleData yet.
         if is_strict_package_prefix(real, ctx.mctx.module) {
@@ -5045,8 +6390,10 @@ fn lower_module_call(
                     &sig,
                     args,
                     keywords,
+                    kwargs,
                     method_span,
                     ctx,
+                    &[],
                 );
             }
             return Err(err(
@@ -5079,8 +6426,10 @@ fn lower_module_call(
             &sig,
             args,
             keywords,
+            kwargs,
             method_span,
             ctx,
+            &[],
         );
     }
     if data.globals.contains_key(method) {
@@ -5095,21 +6444,117 @@ fn lower_module_call(
     ))
 }
 
+fn lower_json_dumps(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    let v = lower_expr(arg, ctx)?;
+    if !json_dumps_supported(v.ty) {
+        return Err(err(
+            format!(
+                "json.dumps() does not support type {} (supported: int, float, bool, str, \
+                 list/dict of those with str keys)",
+                v.ty
+            ),
+            arg.span,
+        ));
+    }
+    Ok(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::JsonDumps(Box::new(v)),
+    })
+}
+
+fn json_dumps_supported(ty: ir::Ty) -> bool {
+    match ty {
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => true,
+        ir::Ty::List(e) => json_dumps_supported(*e),
+        ir::Ty::Dict { key, value } => *key == ir::Ty::Str && json_dumps_supported(*value),
+        _ => false,
+    }
+}
+
 fn lower_call(
     func: &str,
     func_span: Span,
-    args: &[ast::Expr],
+    args: &[ast::PosArg],
     keywords: &[ast::Keyword],
+    kwargs: Option<&ast::Expr>,
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
+    // nested function in this function
+    if let Some(info) = ctx.nested_funcs.get(func).cloned() {
+        let mut leading = Vec::new();
+        for (name, ty) in &info.captures {
+            let Some(local_ty) = ctx.locals.get(name).copied() else {
+                return Err(err(
+                    format!(
+                        "cannot call nested function '{func}': free variable '{name}' \
+                         is not in scope here"
+                    ),
+                    span,
+                ));
+            };
+            if local_ty != *ty {
+                return Err(err(
+                    format!("capture type mismatch for '{name}': expected {ty}, found {local_ty}"),
+                    span,
+                ));
+            }
+            leading.push(ir::Expr {
+                ty: *ty,
+                kind: ir::ExprKind::Local(name.clone()),
+            });
+        }
+        return lower_call_with_sig(
+            func,
+            info.ir_name,
+            &info.sig,
+            args,
+            keywords,
+            kwargs,
+            span,
+            ctx,
+            &leading,
+        );
+    }
     // a function defined in this module
     if ctx.funcs().contains_key(func) {
         let sig = ctx.funcs().get(func).cloned().unwrap();
-        return lower_call_with_sig(func, ctx.own_func(func), &sig, args, keywords, span, ctx);
+        return lower_call_with_sig(
+            func,
+            ctx.own_func(func),
+            &sig,
+            args,
+            keywords,
+            kwargs,
+            span,
+            ctx,
+            &[],
+        );
     }
     // a function pulled in by `from other import func` (incl. re-exports)
     if let Some(ImportBinding::Symbol { module, name }) = ctx.mctx.imports.get(func).cloned() {
+        if module == "json" && name == "dumps" {
+            if kwargs.is_some() {
+                return Err(err("json.dumps() does not take **kwargs", span));
+            }
+            if !keywords.is_empty() {
+                return Err(err(
+                    "json.dumps() does not take keyword arguments",
+                    keywords[0].name_span,
+                ));
+            }
+            let plain = require_plain_args(args, "json.dumps", span)?;
+            if plain.len() != 1 {
+                return Err(err(
+                    format!(
+                        "json.dumps() takes exactly one argument ({} given)",
+                        plain.len()
+                    ),
+                    span,
+                ));
+            }
+            return lower_json_dumps(plain[0], ctx);
+        }
         if let Some(data) = ctx.mctx.mods.get(&module) {
             let (om, on) = data
                 .reexports
@@ -5122,7 +6567,17 @@ fn lower_call(
                     .get(&om)
                     .and_then(|d| d.funcs.get(&on).cloned())
             }) {
-                return lower_call_with_sig(func, qual(&om, &on), &sig, args, keywords, span, ctx);
+                return lower_call_with_sig(
+                    func,
+                    qual(&om, &on),
+                    &sig,
+                    args,
+                    keywords,
+                    kwargs,
+                    span,
+                    ctx,
+                    &[],
+                );
             }
             return Err(err(
                 format!("'{func}' is a value imported from '{module}', not a function"),
@@ -5133,7 +6588,17 @@ fn lower_call(
             if let Some((ir_name, sig)) =
                 resolve_parent_func(ctx, &module, &name, /*for_module_body*/ ctx.is_entry)
             {
-                return lower_call_with_sig(func, ir_name, &sig, args, keywords, span, ctx);
+                return lower_call_with_sig(
+                    func,
+                    ir_name,
+                    &sig,
+                    args,
+                    keywords,
+                    kwargs,
+                    span,
+                    ctx,
+                    &[],
+                );
             }
             return Err(err(
                 format!(
@@ -5161,6 +6626,11 @@ fn lower_call(
             kw.name_span,
         ));
     }
+    if kwargs.is_some() {
+        return Err(err(format!("'{func}()' does not take **kwargs"), span));
+    }
+    let plain = require_plain_args(args, func, span)?;
+    let args = plain;
     {
         match func {
             "print" => Err(err(
@@ -5180,7 +6650,7 @@ fn lower_call(
                         span,
                     ));
                 }
-                let arg = lower_expr(&args[0], ctx)?;
+                let arg = lower_expr(args[0], ctx)?;
                 if !matches!(
                     arg.ty,
                     ir::Ty::Str
@@ -5206,7 +6676,7 @@ fn lower_call(
                         span,
                     ));
                 }
-                let arg = lower_expr(&args[0], ctx)?;
+                let arg = lower_expr(args[0], ctx)?;
                 // bool → int (abs(True) is 1); int/float keep their type
                 let arg = match arg.ty {
                     ir::Ty::Bool => ir::Expr {
@@ -5227,30 +6697,63 @@ fn lower_call(
                 })
             }
             "min" | "max" => {
-                if args.len() != 2 {
-                    return Err(err(
+                if args.len() == 1 {
+                    // Iterable form: list of numbers (int/float/bool).
+                    let arg = lower_expr(args[0], ctx)?;
+                    let elem = match arg.ty {
+                        ir::Ty::List(e) => *e,
+                        other => {
+                            return Err(err(
+                                format!(
+                                    "{func}() iterable form expects a list of numbers, found {other}"
+                                ),
+                                args[0].span,
+                            ));
+                        }
+                    };
+                    match elem {
+                        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool => {
+                            let kind = if func == "min" {
+                                ir::ExprKind::MinList(Box::new(arg))
+                            } else {
+                                ir::ExprKind::MaxList(Box::new(arg))
+                            };
+                            Ok(ir::Expr { ty: elem, kind })
+                        }
+                        other => Err(err(
+                            format!(
+                                "{func}() is only supported for list[int], list[float], \
+                                 and list[bool], found list[{other}]"
+                            ),
+                            args[0].span,
+                        )),
+                    }
+                } else if args.len() == 2 {
+                    let left = lower_expr(args[0], ctx)?;
+                    let right = lower_expr(args[1], ctx)?;
+                    let (left, right, ty) = unify_numeric(left, right, span, &format!("{func}()"))?;
+                    let kind = if func == "min" {
+                        ir::ExprKind::Min {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        }
+                    } else {
+                        ir::ExprKind::Max {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        }
+                    };
+                    Ok(ir::Expr { ty, kind })
+                } else {
+                    Err(err(
                         format!(
-                            "{func}() takes exactly 2 arguments ({} given);                              iterable form is not supported yet",
+                            "{func}() takes 1 or 2 arguments ({} given); \
+                             key=/default= are not supported yet",
                             args.len()
                         ),
                         span,
-                    ));
+                    ))
                 }
-                let left = lower_expr(&args[0], ctx)?;
-                let right = lower_expr(&args[1], ctx)?;
-                let (left, right, ty) = unify_numeric(left, right, span, &format!("{func}()"))?;
-                let kind = if func == "min" {
-                    ir::ExprKind::Min {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }
-                } else {
-                    ir::ExprKind::Max {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }
-                };
-                Ok(ir::Expr { ty, kind })
             }
             "sum" => {
                 if args.len() != 1 {
@@ -5263,7 +6766,7 @@ fn lower_call(
                         span,
                     ));
                 }
-                let arg = lower_expr(&args[0], ctx)?;
+                let arg = lower_expr(args[0], ctx)?;
                 let elem = match arg.ty {
                     ir::Ty::List(e) => *e,
                     other => {
@@ -5298,7 +6801,7 @@ fn lower_call(
                         span,
                     ));
                 }
-                let arg = lower_expr(&args[0], ctx)?;
+                let arg = lower_expr(args[0], ctx)?;
                 let elem = match arg.ty {
                     ir::Ty::List(e) => *e,
                     other => {
@@ -5345,7 +6848,7 @@ fn lower_call(
                 span,
             )),
             "input" => {
-                let prompt = match args {
+                let prompt = match args.as_slice() {
                     [] => Option::None,
                     [p] => {
                         let v = lower_expr(p, ctx)?;
@@ -5380,7 +6883,7 @@ fn lower_call(
                         span,
                     ));
                 }
-                let path = lower_expr(&args[0], ctx)?;
+                let path = lower_expr(args[0], ctx)?;
                 if path.ty != ir::Ty::Str {
                     return Err(err(
                         format!("open() path must be a str, found {}", path.ty),
@@ -5587,6 +7090,47 @@ fn unify_numeric(
         }
         _ => unreachable!("promote_numeric only returns int/float"),
     }
+}
+
+/// Unify operand types for `and`/`or`: same type, or numeric promote
+/// (`bool`→`int`→`float`). Result type is the shared operand type.
+fn unify_and_or(l: ir::Expr, r: ir::Expr, span: Span) -> SResult<(ir::Expr, ir::Expr, ir::Ty)> {
+    if l.ty == r.ty {
+        let ty = l.ty;
+        return Ok((l, r, ty));
+    }
+    // Numeric sides: bool/int/float promote like other operators.
+    let l_num = matches!(l.ty, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
+    let r_num = matches!(r.ty, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
+    if l_num && r_num {
+        return unify_numeric(l, r, span, "'and'/'or'");
+    }
+    Err(err(
+        format!(
+            "'and'/'or' operands must share a type (or both be numeric); \
+             found {} and {}",
+            l.ty, r.ty
+        ),
+        span,
+    ))
+}
+
+/// Math stdlib unary intrinsic name → IR op (bodies replaced when lowering
+/// functions in the `math` module).
+fn math_intrinsic(name: &str) -> Option<ir::MathOp> {
+    Some(match name {
+        "sqrt" => ir::MathOp::Sqrt,
+        "sin" => ir::MathOp::Sin,
+        "cos" => ir::MathOp::Cos,
+        "tan" => ir::MathOp::Tan,
+        "log" => ir::MathOp::Log,
+        "log10" => ir::MathOp::Log10,
+        "exp" => ir::MathOp::Exp,
+        "floor" => ir::MathOp::Floor,
+        "ceil" => ir::MathOp::Ceil,
+        "fabs" => ir::MathOp::Fabs,
+        _ => return None,
+    })
 }
 
 fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
@@ -5955,12 +7499,21 @@ fn stmt_returns(stmt: &ir::Stmt) -> bool {
         ir::Stmt::Try {
             body,
             handlers,
+            orelse,
             finally,
         } => {
             if block_returns(finally) {
                 return true;
             }
-            if !block_returns(body) {
+            // Normal completion runs orelse; return from body skips it.
+            if block_returns(body) {
+                if !block_may_raise(body) {
+                    return true;
+                }
+                return handlers.iter().all(|(_, _, h)| block_returns(h));
+            }
+            // Body can fall through → else must return on that path.
+            if !block_returns(orelse) {
                 return false;
             }
             if !block_may_raise(body) {
@@ -5983,10 +7536,12 @@ fn block_may_raise(stmts: &[ir::Stmt]) -> bool {
         ir::Stmt::Try {
             body,
             handlers,
+            orelse,
             finally,
         } => {
             block_may_raise(body)
                 || handlers.iter().any(|(_, _, h)| block_may_raise(h))
+                || block_may_raise(orelse)
                 || block_may_raise(finally)
         }
         _ => false,
@@ -6005,10 +7560,12 @@ fn loop_breaks(stmts: &[ir::Stmt]) -> bool {
         ir::Stmt::Try {
             body,
             handlers,
+            orelse,
             finally,
         } => {
             loop_breaks(body)
                 || handlers.iter().any(|(_, _, h)| loop_breaks(h))
+                || loop_breaks(orelse)
                 || loop_breaks(finally)
         }
         _ => false,
@@ -6327,8 +7884,28 @@ print(f())
 
     #[test]
     fn min_arity() {
-        let e = analyze_err("x = min(1)\n");
-        assert!(e.message.contains("exactly 2 arguments"), "{}", e.message);
+        let e = analyze_err("x = min()\n");
+        assert!(
+            e.message.contains("1 or 2 arguments") || e.message.contains("takes"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn min_list_form() {
+        let m = analyze_ok("a = min([3, 1, 4])\nb = max([1.5, -2.0])\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::MinList(_)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+        assert!(matches!(value.kind, ir::ExprKind::MaxList(_)));
     }
 
     #[test]
@@ -7015,9 +8592,15 @@ print(count([]))
     }
 
     #[test]
-    fn dict_get_requires_default() {
-        let e = analyze_err("d: dict[str, int] = {\"a\": 1}\nx = d.get(\"a\")\n");
-        assert!(e.message.contains("default"), "{}", e.message);
+    fn dict_bare_get_lowers_to_index() {
+        // Bare get(key) → Index (KeyError on miss until Optional returns).
+        let m = analyze_ok("d: dict[str, int] = {\"a\": 1}\nx = d.get(\"a\")\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Index { .. }));
     }
 
     #[test]

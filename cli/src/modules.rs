@@ -548,16 +548,16 @@ fn collect_deps(
             } => {
                 bound.insert(name.clone());
             }
-            ast::StmtKind::Import {
-                module: m,
-                alias,
-                span,
-            } if m != "sys" => {
-                push(m.clone(), *span);
-                let local = alias
-                    .clone()
-                    .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
-                bound.insert(local);
+            ast::StmtKind::Import { names } => {
+                for (m, alias, span) in names {
+                    if m != "sys" {
+                        push(m.clone(), *span);
+                    }
+                    let local = alias
+                        .clone()
+                        .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
+                    bound.insert(local);
+                }
             }
             ast::StmtKind::FromImport {
                 module: m,
@@ -646,13 +646,13 @@ fn package_bound_names(roots: &[PathBuf], package: &str) -> Option<HashSet<Strin
             } => {
                 bound.insert(n.clone());
             }
-            ast::StmtKind::Import {
-                module: m, alias, ..
-            } => {
-                let local = alias
-                    .clone()
-                    .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
-                bound.insert(local);
+            ast::StmtKind::Import { names } => {
+                for (m, alias, _) in names {
+                    let local = alias
+                        .clone()
+                        .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
+                    bound.insert(local);
+                }
             }
             ast::StmtKind::FromImport { names, .. } => {
                 for (import_name, alias, _) in names {

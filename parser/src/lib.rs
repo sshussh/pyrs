@@ -588,6 +588,19 @@ impl Parser {
                 body: handler_body,
             });
         }
+        // `else` only after at least one `except` (CPython: try/finally alone
+        // cannot have else; SyntaxError).
+        let orelse = if self.peek() == &Token::Else {
+            if handlers.is_empty() {
+                return Err(
+                    self.error("'else' clause on 'try' requires at least one 'except' clause")
+                );
+            }
+            self.advance();
+            self.parse_block("'else' body")?
+        } else {
+            vec![]
+        };
         let finally = if self.peek() == &Token::Finally {
             self.advance();
             self.parse_block("'finally' body")?
@@ -612,6 +625,7 @@ impl Parser {
             kind: StmtKind::Try {
                 body,
                 handlers,
+                orelse,
                 finally,
             },
             span: start.to(end),
@@ -624,8 +638,79 @@ impl Parser {
         self.expect(Token::LParen, "after function name")?;
 
         let mut params: Vec<Param> = Vec::new();
+        let mut vararg: Option<Param> = None;
+        let mut kwarg: Option<Param> = None;
         if self.peek() != &Token::RParen {
             loop {
+                if self.peek() == &Token::DoubleStar {
+                    if kwarg.is_some() {
+                        return Err(self.error("duplicate **kwargs parameter"));
+                    }
+                    self.advance();
+                    let (pname, pspan) = self.expect_ident("after '**'")?;
+                    if !self.eat(&Token::Colon) {
+                        return Err(Diagnostic::new(
+                            Phase::Parse,
+                            format!(
+                                "parameter '{pname}' is missing a type annotation \
+                                 (e.g. '**{pname}: int')"
+                            ),
+                            pspan,
+                        ));
+                    }
+                    let ty = self.parse_type_name("in **kwargs annotation")?;
+                    kwarg = Some(Param {
+                        name: pname,
+                        ty,
+                        span: pspan,
+                        default: None,
+                    });
+                    // **kwargs must be last (optional trailing comma)
+                    if self.eat(&Token::Comma) && self.peek() != &Token::RParen {
+                        return Err(self.error("**kwargs must be the last parameter"));
+                    }
+                    break;
+                }
+                if self.peek() == &Token::Star {
+                    if vararg.is_some() {
+                        return Err(self.error("duplicate *args parameter"));
+                    }
+                    if kwarg.is_some() {
+                        return Err(self.error("*args cannot follow **kwargs"));
+                    }
+                    self.advance();
+                    let (pname, pspan) = self.expect_ident("after '*'")?;
+                    if !self.eat(&Token::Colon) {
+                        return Err(Diagnostic::new(
+                            Phase::Parse,
+                            format!(
+                                "parameter '{pname}' is missing a type annotation \
+                                 (e.g. '*{pname}: int')"
+                            ),
+                            pspan,
+                        ));
+                    }
+                    let ty = self.parse_type_name("in *args annotation")?;
+                    vararg = Some(Param {
+                        name: pname,
+                        ty,
+                        span: pspan,
+                        default: None,
+                    });
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                    if self.peek() == &Token::RParen {
+                        break;
+                    }
+                    // only **kwargs may follow *args
+                    continue;
+                }
+
+                if vararg.is_some() || kwarg.is_some() {
+                    return Err(self.error("positional parameter cannot follow *args or **kwargs"));
+                }
+
                 let (pname, pspan) = self.expect_ident("in parameter list")?;
                 if !self.eat(&Token::Colon) {
                     return Err(Diagnostic::new(
@@ -680,6 +765,8 @@ impl Parser {
             kind: StmtKind::FuncDef(FuncDef {
                 name,
                 params,
+                vararg,
+                kwarg,
                 ret,
                 body,
                 span: header_span,
@@ -780,25 +867,23 @@ impl Parser {
 
     fn parse_import(&mut self) -> PResult<Stmt> {
         let start = self.expect(Token::Import, "")?;
-        let (module, mspan) = self.parse_dotted_name("after 'import'")?;
-        let alias = if self.eat(&Token::As) {
-            Some(self.expect_ident("after 'as'")?.0)
-        } else {
-            None
-        };
-        if self.peek() == &Token::Comma {
-            return Err(self.error(
-                "importing several modules in one statement is not supported yet; \
-                 use one 'import' per line",
-            ));
+        let mut names = Vec::new();
+        loop {
+            let (module, mspan) = self.parse_dotted_name("after 'import'")?;
+            let alias = if self.eat(&Token::As) {
+                Some(self.expect_ident("after 'as'")?.0)
+            } else {
+                None
+            };
+            names.push((module, alias, mspan));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
         }
+        let end = names.last().map(|(_, _, s)| *s).unwrap_or(start);
         let stmt = Stmt {
-            kind: StmtKind::Import {
-                module,
-                alias,
-                span: mspan,
-            },
-            span: start.to(mspan),
+            kind: StmtKind::Import { names },
+            span: start.to(end),
         };
         self.expect_stmt_end()?;
         Ok(stmt)
@@ -1181,7 +1266,7 @@ impl Parser {
                         continue;
                     }
                     self.advance();
-                    let (args, keywords) = self.parse_call_args()?;
+                    let (args, keywords, kwargs) = self.parse_call_args()?;
                     let close = self.expect(Token::RParen, "after method arguments")?;
                     let span = expr.span.to(close);
                     expr = Expr {
@@ -1191,6 +1276,7 @@ impl Parser {
                             method_span,
                             args,
                             keywords,
+                            kwargs: kwargs.map(Box::new),
                         },
                         span,
                     };
@@ -1201,17 +1287,33 @@ impl Parser {
         Ok(expr)
     }
 
-    /// Positional args then `name=value` keywords (no positionals after keywords).
-    fn parse_call_args(&mut self) -> PResult<(Vec<Expr>, Vec<Keyword>)> {
+    /// Positionals / `*x`, then `name=value` keywords, optional trailing `**d`.
+    fn parse_call_args(&mut self) -> PResult<(Vec<PosArg>, Vec<Keyword>, Option<Expr>)> {
         let mut args = Vec::new();
         let mut keywords = Vec::new();
+        let mut kwargs: Option<Expr> = None;
         let mut seen_kw = false;
         if self.peek() != &Token::RParen {
             loop {
+                if self.peek() == &Token::DoubleStar {
+                    if kwargs.is_some() {
+                        return Err(self.error("multiple ** unpackings in call"));
+                    }
+                    self.advance();
+                    kwargs = Some(self.parse_expr()?);
+                    // ** must be last (optional trailing comma)
+                    if self.eat(&Token::Comma) && self.peek() != &Token::RParen {
+                        return Err(self.error("** unpacking must be the last argument"));
+                    }
+                    break;
+                }
                 // keyword: IDENT '=' expr (not `==`)
                 if let Token::Ident(name) = self.peek().clone()
                     && *self.peek2() == Token::Eq
                 {
+                    if kwargs.is_some() {
+                        return Err(self.error("arguments cannot follow ** unpacking"));
+                    }
                     let name_span = self.peek_span();
                     self.advance(); // name
                     self.advance(); // =
@@ -1222,11 +1324,23 @@ impl Parser {
                         value,
                     });
                     seen_kw = true;
+                } else if self.peek() == &Token::Star {
+                    if seen_kw {
+                        return Err(self.error("positional argument follows keyword argument"));
+                    }
+                    if kwargs.is_some() {
+                        return Err(self.error("arguments cannot follow ** unpacking"));
+                    }
+                    self.advance();
+                    args.push(PosArg::Star(self.parse_expr()?));
                 } else {
                     if seen_kw {
                         return Err(self.error("positional argument follows keyword argument"));
                     }
-                    args.push(self.parse_expr()?);
+                    if kwargs.is_some() {
+                        return Err(self.error("arguments cannot follow ** unpacking"));
+                    }
+                    args.push(PosArg::Pos(self.parse_expr()?));
                 }
                 if !self.eat(&Token::Comma) {
                     break;
@@ -1236,7 +1350,7 @@ impl Parser {
                 }
             }
         }
-        Ok((args, keywords))
+        Ok((args, keywords, kwargs))
     }
 
     fn parse_primary(&mut self) -> PResult<Expr> {
@@ -1317,6 +1431,7 @@ impl Parser {
                         func_span: span,
                         args: vec![],
                         keywords: vec![],
+                        kwargs: None,
                     },
                     span: span.to(close),
                 })
@@ -1325,7 +1440,7 @@ impl Parser {
                 self.advance();
                 if self.peek() == &Token::LParen {
                     self.advance();
-                    let (args, keywords) = self.parse_call_args()?;
+                    let (args, keywords, kwargs) = self.parse_call_args()?;
                     let close = self.expect(Token::RParen, "after call arguments")?;
                     return Ok(Expr {
                         kind: ExprKind::Call {
@@ -1333,6 +1448,7 @@ impl Parser {
                             func_span: span,
                             args,
                             keywords,
+                            kwargs: kwargs.map(Box::new),
                         },
                         span: span.to(close),
                     });
@@ -1675,11 +1791,23 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
         | ExprKind::NoneLit
         | ExprKind::Name(_) => {}
         ExprKind::Call {
-            func_span, args, ..
+            func_span,
+            args,
+            keywords,
+            kwargs,
+            ..
         } => {
             *func_span = span;
             for a in args {
-                rebase_spans(a, span);
+                match a {
+                    PosArg::Pos(e) | PosArg::Star(e) => rebase_spans(e, span),
+                }
+            }
+            for kw in keywords {
+                rebase_spans(&mut kw.value, span);
+            }
+            if let Some(k) = kwargs {
+                rebase_spans(k, span);
             }
         }
         ExprKind::Attribute {
@@ -1692,12 +1820,22 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
             base,
             method_span,
             args,
+            keywords,
+            kwargs,
             ..
         } => {
             *method_span = span;
             rebase_spans(base, span);
             for a in args {
-                rebase_spans(a, span);
+                match a {
+                    PosArg::Pos(e) | PosArg::Star(e) => rebase_spans(e, span),
+                }
+            }
+            for kw in keywords {
+                rebase_spans(&mut kw.value, span);
+            }
+            if let Some(k) = kwargs {
+                rebase_spans(k, span);
             }
         }
         ExprKind::Index { base, index } => {
@@ -2472,7 +2610,7 @@ def f(n: int) -> int:
         let m = parse_ok("import sys\nprint(len(sys.argv))\n");
         assert!(matches!(
             &m.body[0].kind,
-            StmtKind::Import { module, .. } if module == "sys"
+            StmtKind::Import { names } if names.len() == 1 && names[0].0 == "sys"
         ));
     }
 
@@ -2481,12 +2619,24 @@ def f(n: int) -> int:
         let m = parse_ok("import pkg.mod as m\n");
         assert!(matches!(
             &m.body[0].kind,
-            StmtKind::Import {
-                module,
-                alias: Some(a),
-                ..
-            } if module == "pkg.mod" && a == "m"
+            StmtKind::Import { names }
+                if names.len() == 1
+                    && names[0].0 == "pkg.mod"
+                    && names[0].1.as_deref() == Some("m")
         ));
+    }
+
+    #[test]
+    fn parses_multi_name_import() {
+        let m = parse_ok("import a, b as c\n");
+        let StmtKind::Import { names } = &m.body[0].kind else {
+            panic!("expected import");
+        };
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].0, "a");
+        assert!(names[0].1.is_none());
+        assert_eq!(names[1].0, "b");
+        assert_eq!(names[1].1.as_deref(), Some("c"));
     }
 
     #[test]
@@ -2531,13 +2681,41 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn multi_name_import_statement_is_rejected() {
-        let e = parse_err("import a, b\n");
+    fn try_else_without_except_is_rejected() {
+        let e = parse_err("try:\n    pass\nelse:\n    pass\n");
         assert!(
-            e.message.contains("several modules") && e.message.contains("not supported"),
+            e.message.contains("else") && e.message.contains("except"),
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn parses_try_except_else_finally() {
+        let m = parse_ok(
+            "\
+try:
+    x = 1
+except ValueError:
+    x = 2
+else:
+    x = 3
+finally:
+    x = 4
+",
+        );
+        let StmtKind::Try {
+            handlers,
+            orelse,
+            finally,
+            ..
+        } = &m.body[0].kind
+        else {
+            panic!("expected try");
+        };
+        assert_eq!(handlers.len(), 1);
+        assert!(!orelse.is_empty());
+        assert!(!finally.is_empty());
     }
 
     #[test]
@@ -2619,12 +2797,16 @@ finally:
         );
         assert!(matches!(m.body[0].kind, StmtKind::Raise { .. }));
         let StmtKind::Try {
-            handlers, finally, ..
+            handlers,
+            orelse,
+            finally,
+            ..
         } = &m.body[1].kind
         else {
             panic!("expected try");
         };
         assert!(handlers[0].bind.is_some());
+        assert!(orelse.is_empty());
         assert!(!finally.is_empty());
     }
 

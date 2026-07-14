@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /* exception type tags — keep in sync with ir::ExcType; OTHER is catchable
  * only by bare `except:` (not by `except RuntimeError`). */
@@ -2154,5 +2155,522 @@ PyrsList *pyrs_set_elements(const PyrsSet *s) {
             pyrs_list_push(r, e->key);
         }
     }
+    return r;
+}
+
+/* ---- os ---- */
+
+
+PyrsStr *pyrs_os_getcwd(void) {
+    char buf[PATH_MAX];
+    if (getcwd(buf, sizeof(buf)) == NULL) {
+        pyrs_die("OSError: getcwd failed");
+    }
+    return str_from_cstr(buf);
+}
+
+/* ---- json (subset) ---- */
+
+static void json_skip_ws(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') {
+        (*p)++;
+    }
+}
+
+static int json_match(const char **p, const char *lit) {
+    size_t n = strlen(lit);
+    if (strncmp(*p, lit, n) != 0) {
+        return 0;
+    }
+    *p += n;
+    return 1;
+}
+
+static void json_expect_end(const char *p) {
+    json_skip_ws(&p);
+    if (*p != '\0') {
+        pyrs_die("ValueError: Extra data");
+    }
+}
+
+static PyrsStr *json_parse_string(const char **p) {
+    if (**p != '"') {
+        pyrs_die("ValueError: Expecting value");
+    }
+    (*p)++;
+    /* first pass: compute length with escapes */
+    const char *s = *p;
+    long long n = 0;
+    while (*s && *s != '"') {
+        if (*s == '\\') {
+            s++;
+            if (!*s) {
+                pyrs_die("ValueError: Unterminated string");
+            }
+            s++;
+            n++;
+        } else {
+            s++;
+            n++;
+        }
+    }
+    if (*s != '"') {
+        pyrs_die("ValueError: Unterminated string");
+    }
+    PyrsStr *r = str_alloc(n);
+    char *out = r->data;
+    while (**p && **p != '"') {
+        if (**p == '\\') {
+            (*p)++;
+            char c = **p;
+            if (!c) {
+                pyrs_die("ValueError: Unterminated string");
+            }
+            switch (c) {
+            case '"':
+            case '\\':
+            case '/':
+                *out++ = c;
+                break;
+            case 'b':
+                *out++ = '\b';
+                break;
+            case 'f':
+                *out++ = '\f';
+                break;
+            case 'n':
+                *out++ = '\n';
+                break;
+            case 'r':
+                *out++ = '\r';
+                break;
+            case 't':
+                *out++ = '\t';
+                break;
+            case 'u':
+                /* minimal: only \u00XX latin-1 */
+                if (!(*p)[1] || !(*p)[2] || !(*p)[3] || !(*p)[4]) {
+                    pyrs_die("ValueError: Invalid \\u escape");
+                }
+                {
+                    unsigned v = 0;
+                    for (int i = 1; i <= 4; i++) {
+                        char h = (*p)[i];
+                        v <<= 4;
+                        if (h >= '0' && h <= '9')
+                            v |= (unsigned)(h - '0');
+                        else if (h >= 'a' && h <= 'f')
+                            v |= (unsigned)(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F')
+                            v |= (unsigned)(h - 'A' + 10);
+                        else
+                            pyrs_die("ValueError: Invalid \\u escape");
+                    }
+                    if (v > 0xff) {
+                        pyrs_die("ValueError: \\u escape out of range (ASCII/latin-1 only)");
+                    }
+                    *out++ = (char)v;
+                    *p += 4;
+                }
+                break;
+            default:
+                pyrs_die("ValueError: Invalid escape");
+            }
+            (*p)++;
+        } else {
+            *out++ = **p;
+            (*p)++;
+        }
+    }
+    (*p)++; /* closing quote */
+    return r;
+}
+
+static long long json_parse_int(const char **p) {
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(*p, &end, 10);
+    if (end == *p || errno == ERANGE) {
+        pyrs_die("ValueError: Expecting value");
+    }
+    *p = end;
+    return v;
+}
+
+static double json_parse_float(const char **p) {
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(*p, &end);
+    if (end == *p || errno == ERANGE) {
+        pyrs_die("ValueError: Expecting value");
+    }
+    *p = end;
+    return v;
+}
+
+static int json_parse_bool(const char **p) {
+    if (json_match(p, "true")) {
+        return 1;
+    }
+    if (json_match(p, "false")) {
+        return 0;
+    }
+    pyrs_die("ValueError: Expecting value");
+    return 0;
+}
+
+long long pyrs_json_loads_int(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    long long v = json_parse_int(&p);
+    json_expect_end(p);
+    return v;
+}
+
+double pyrs_json_loads_float(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    double v = json_parse_float(&p);
+    json_expect_end(p);
+    return v;
+}
+
+int pyrs_json_loads_bool(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    int v = json_parse_bool(&p);
+    json_expect_end(p);
+    return v;
+}
+
+PyrsStr *pyrs_json_loads_str(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsStr *v = json_parse_string(&p);
+    json_expect_end(p);
+    return v;
+}
+
+static PyrsList *json_parse_list_of(const char **p, int elem_tag) {
+    if (**p != '[') {
+        pyrs_die("ValueError: Expecting value");
+    }
+    (*p)++;
+    json_skip_ws(p);
+    PyrsList *list = pyrs_list_new(4);
+    if (**p == ']') {
+        (*p)++;
+        return list;
+    }
+    for (;;) {
+        json_skip_ws(p);
+        long long slot;
+        if (elem_tag == TAG_INT) {
+            slot = json_parse_int(p);
+        } else if (elem_tag == TAG_FLOAT) {
+            double d = json_parse_float(p);
+            memcpy(&slot, &d, sizeof(double));
+        } else if (elem_tag == TAG_BOOL) {
+            slot = json_parse_bool(p) ? 1 : 0;
+        } else if (elem_tag == TAG_STR) {
+            slot = (long long)(uintptr_t)json_parse_string(p);
+        } else {
+            pyrs_die("ValueError: unsupported list element");
+            slot = 0;
+        }
+        pyrs_list_push(list, slot);
+        json_skip_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            continue;
+        }
+        if (**p == ']') {
+            (*p)++;
+            break;
+        }
+        pyrs_die("ValueError: Expecting ',' delimiter");
+    }
+    return list;
+}
+
+PyrsList *pyrs_json_loads_list_int(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsList *v = json_parse_list_of(&p, TAG_INT);
+    json_expect_end(p);
+    return v;
+}
+
+PyrsList *pyrs_json_loads_list_float(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsList *v = json_parse_list_of(&p, TAG_FLOAT);
+    json_expect_end(p);
+    return v;
+}
+
+PyrsList *pyrs_json_loads_list_str(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsList *v = json_parse_list_of(&p, TAG_STR);
+    json_expect_end(p);
+    return v;
+}
+
+PyrsList *pyrs_json_loads_list_bool(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsList *v = json_parse_list_of(&p, TAG_BOOL);
+    json_expect_end(p);
+    return v;
+}
+
+static PyrsDict *json_parse_dict_str_val(const char **p, int val_tag) {
+    if (**p != '{') {
+        pyrs_die("ValueError: Expecting value");
+    }
+    (*p)++;
+    json_skip_ws(p);
+    PyrsDict *d = pyrs_dict_new();
+    if (**p == '}') {
+        (*p)++;
+        return d;
+    }
+    for (;;) {
+        json_skip_ws(p);
+        PyrsStr *key = json_parse_string(p);
+        json_skip_ws(p);
+        if (**p != ':') {
+            pyrs_die("ValueError: Expecting ':' delimiter");
+        }
+        (*p)++;
+        json_skip_ws(p);
+        long long val;
+        if (val_tag == TAG_INT) {
+            val = json_parse_int(p);
+        } else if (val_tag == TAG_FLOAT) {
+            double dv = json_parse_float(p);
+            memcpy(&val, &dv, sizeof(double));
+        } else if (val_tag == TAG_BOOL) {
+            val = json_parse_bool(p) ? 1 : 0;
+        } else if (val_tag == TAG_STR) {
+            val = (long long)(uintptr_t)json_parse_string(p);
+        } else {
+            pyrs_die("ValueError: unsupported dict value");
+            val = 0;
+        }
+        pyrs_dict_set(d, (long long)(uintptr_t)key, TAG_STR, val, val_tag);
+        json_skip_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            continue;
+        }
+        if (**p == '}') {
+            (*p)++;
+            break;
+        }
+        pyrs_die("ValueError: Expecting ',' delimiter");
+    }
+    return d;
+}
+
+PyrsDict *pyrs_json_loads_dict_str_int(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsDict *v = json_parse_dict_str_val(&p, TAG_INT);
+    json_expect_end(p);
+    return v;
+}
+
+PyrsDict *pyrs_json_loads_dict_str_float(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsDict *v = json_parse_dict_str_val(&p, TAG_FLOAT);
+    json_expect_end(p);
+    return v;
+}
+
+PyrsDict *pyrs_json_loads_dict_str_str(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsDict *v = json_parse_dict_str_val(&p, TAG_STR);
+    json_expect_end(p);
+    return v;
+}
+
+PyrsDict *pyrs_json_loads_dict_str_bool(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    json_skip_ws(&p);
+    PyrsDict *v = json_parse_dict_str_val(&p, TAG_BOOL);
+    json_expect_end(p);
+    return v;
+}
+
+/* growable byte buffer for dumps */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} JsonBuf;
+
+static void jbuf_init(JsonBuf *b) {
+    b->cap = 64;
+    b->len = 0;
+    b->data = (char *)xmalloc(b->cap);
+    b->data[0] = '\0';
+}
+
+static void jbuf_ensure(JsonBuf *b, size_t extra) {
+    if (b->len + extra + 1 > b->cap) {
+        size_t nc = b->cap * 2;
+        while (nc < b->len + extra + 1) {
+            nc *= 2;
+        }
+        char *nd = (char *)xmalloc(nc);
+        memcpy(nd, b->data, b->len + 1);
+        free(b->data);
+        b->data = nd;
+        b->cap = nc;
+    }
+}
+
+static void jbuf_putc(JsonBuf *b, char c) {
+    jbuf_ensure(b, 1);
+    b->data[b->len++] = c;
+    b->data[b->len] = '\0';
+}
+
+static void jbuf_puts(JsonBuf *b, const char *s) {
+    size_t n = strlen(s);
+    jbuf_ensure(b, n);
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+}
+
+static void jbuf_put_str_escaped(JsonBuf *b, const PyrsStr *s) {
+    jbuf_putc(b, '"');
+    for (long long i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        switch (c) {
+        case '"':
+            jbuf_puts(b, "\\\"");
+            break;
+        case '\\':
+            jbuf_puts(b, "\\\\");
+            break;
+        case '\b':
+            jbuf_puts(b, "\\b");
+            break;
+        case '\f':
+            jbuf_puts(b, "\\f");
+            break;
+        case '\n':
+            jbuf_puts(b, "\\n");
+            break;
+        case '\r':
+            jbuf_puts(b, "\\r");
+            break;
+        case '\t':
+            jbuf_puts(b, "\\t");
+            break;
+        default:
+            if (c < 0x20) {
+                char tmp[8];
+                snprintf(tmp, sizeof(tmp), "\\u%04x", c);
+                jbuf_puts(b, tmp);
+            } else {
+                jbuf_putc(b, (char)c);
+            }
+        }
+    }
+    jbuf_putc(b, '"');
+}
+
+static void jbuf_put_int(JsonBuf *b, long long v) {
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "%lld", v);
+    jbuf_puts(b, tmp);
+}
+
+static void jbuf_put_float(JsonBuf *b, double v) {
+    /* Match CPython json: use repr-like shortest that round-trips; whole floats keep .0 */
+    char tmp[64];
+    if (isnan(v) || isinf(v)) {
+        pyrs_die("ValueError: Out of range float values are not JSON compliant");
+    }
+    /* Use the same idea as print: enough digits, then strip trailing zeros carefully */
+    snprintf(tmp, sizeof(tmp), "%.17g", v);
+    /* Ensure a decimal point or exponent for whole numbers (json allows "1" for 1.0) */
+    jbuf_puts(b, tmp);
+}
+
+static void json_dumps_into(JsonBuf *b, long long slot, int tag) {
+    if (tag == TAG_INT) {
+        jbuf_put_int(b, slot);
+    } else if (tag == TAG_FLOAT) {
+        double d;
+        memcpy(&d, &slot, sizeof(double));
+        jbuf_put_float(b, d);
+    } else if (tag == TAG_BOOL) {
+        jbuf_puts(b, slot ? "true" : "false");
+    } else if (tag == TAG_STR) {
+        jbuf_put_str_escaped(b, (const PyrsStr *)(uintptr_t)slot);
+    } else if (tag == TAG_DICT) {
+        const PyrsDict *d = (const PyrsDict *)(uintptr_t)slot;
+        check_ref(d);
+        jbuf_putc(b, '{');
+        int first = 1;
+        PyrsList *items = pyrs_dict_items(d);
+        for (long long i = 0; i < items->len; i++) {
+            PyrsTuple *t = (PyrsTuple *)(uintptr_t)items->data[i];
+            if (!first) {
+                jbuf_puts(b, ", ");
+            }
+            first = 0;
+            long long kslot = t->data[0];
+            long long vslot = t->data[1];
+            int vtag = t->tags[1];
+            jbuf_put_str_escaped(b, (const PyrsStr *)(uintptr_t)kslot);
+            jbuf_puts(b, ": ");
+            json_dumps_into(b, vslot, vtag);
+        }
+        jbuf_putc(b, '}');
+    } else if (tag >= 4 && ((tag - 4) % 8) == 0) {
+        /* list: tag = 4 + 8 * elem_tag */
+        const PyrsList *l = (const PyrsList *)(uintptr_t)slot;
+        check_ref(l);
+        int elem_tag = (tag - 4) / 8;
+        jbuf_putc(b, '[');
+        for (long long i = 0; i < l->len; i++) {
+            if (i > 0) {
+                jbuf_puts(b, ", ");
+            }
+            json_dumps_into(b, l->data[i], elem_tag);
+        }
+        jbuf_putc(b, ']');
+    } else {
+        pyrs_die("TypeError: Object of this type is not JSON serializable");
+    }
+}
+
+PyrsStr *pyrs_json_dumps(long long slot, int tag) {
+    JsonBuf b;
+    jbuf_init(&b);
+    json_dumps_into(&b, slot, tag);
+    PyrsStr *r = str_from_cstr(b.data);
+    free(b.data);
     return r;
 }

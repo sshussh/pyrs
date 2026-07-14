@@ -1,16 +1,19 @@
 # POSIX path helpers (subset of CPython `posixpath`).
-# `join` takes exactly two arguments (no *args).
+# `join` accepts a first segment plus optional further segments (`*parts`).
 
 
-def join(a: str, b: str) -> str:
-    # Join two pathname components, inserting '/' as needed.
-    # If `b` is absolute, it replaces `a`. An empty `a` yields `b`.
-    # An empty `b` with non-empty `a` yields a path ending with '/'.
-    if b.startswith("/") or a == "":
-        return b
-    if a.endswith("/"):
-        return a + b
-    return a + "/" + b
+def join(a: str, *parts: str) -> str:
+    # Join pathname components, inserting '/' as needed (POSIX).
+    # An absolute later segment replaces earlier ones.
+    result: str = a
+    for b in parts:
+        if b.startswith("/") or result == "":
+            result = b
+        elif result.endswith("/"):
+            result = result + b
+        else:
+            result = result + "/" + b
+    return result
 
 
 def dirname(p: str) -> str:

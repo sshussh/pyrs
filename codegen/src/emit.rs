@@ -21,7 +21,9 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use ir::{BinOp, Expr, ExprKind, FileFn, Function, Module, Stmt, StrFn, Ty, UnOp};
+use ir::{
+    BinOp, Expr, ExprKind, FileFn, Function, JsonLoadsKind, MathOp, Module, Stmt, StrFn, Ty, UnOp,
+};
 
 pub fn emit_llvm_ir(module: &Module) -> String {
     let mut e = Emitter::default();
@@ -256,9 +258,32 @@ impl Emitter {
         out.push_str("declare double @pyrs_fmod_floored(double, double)\n");
         out.push_str("declare double @llvm.fabs.f64(double)\n");
         out.push_str("declare double @llvm.floor.f64(double)\n");
+        out.push_str("declare double @llvm.ceil.f64(double)\n");
+        out.push_str("declare double @llvm.sqrt.f64(double)\n");
+        out.push_str("declare double @llvm.sin.f64(double)\n");
+        out.push_str("declare double @llvm.cos.f64(double)\n");
+        out.push_str("declare double @llvm.exp.f64(double)\n");
+        out.push_str("declare double @llvm.log.f64(double)\n");
+        out.push_str("declare double @llvm.log10.f64(double)\n");
         out.push_str("declare double @llvm.pow.f64(double, double)\n");
+        // libm (linked with -lm); no reliable LLVM intrinsic for tan
+        out.push_str("declare double @tan(double)\n");
         out.push_str("declare i64 @llvm.abs.i64(i64, i1)\n");
-        out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n\n");
+        out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n");
+        out.push_str("declare ptr @pyrs_os_getcwd()\n");
+        out.push_str("declare ptr @pyrs_json_dumps(i64, i32)\n");
+        out.push_str("declare i64 @pyrs_json_loads_int(ptr)\n");
+        out.push_str("declare double @pyrs_json_loads_float(ptr)\n");
+        out.push_str("declare i32 @pyrs_json_loads_bool(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_str(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_list_int(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_list_float(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_list_str(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_list_bool(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_dict_str_int(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_dict_str_float(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_dict_str_str(ptr)\n");
+        out.push_str("declare ptr @pyrs_json_loads_dict_str_bool(ptr)\n\n");
         out.push_str(&self.global_defs);
         out.push_str(&self.string_defs);
         out.push('\n');
@@ -453,6 +478,156 @@ impl Emitter {
 
         self.start_block(&end_l);
         acc
+    }
+
+    /// `min(xs)` / `max(xs)` over a numeric list; empty → ValueError.
+    fn emit_min_max_list(&mut self, is_max: bool, list: &Expr) -> String {
+        let Ty::List(elem) = list.ty else {
+            unreachable!("min/max list of non-list");
+        };
+        let hdr = self.emit_expr(list);
+        let len = self.emit_len(&hdr);
+        // empty sequence trap (CPython wording)
+        let empty = self.tmp();
+        self.line(format!("{empty} = icmp eq i64 {len}, 0"));
+        let trap_l = self.fresh_block("mml.trap");
+        let ok_l = self.fresh_block("mml.ok");
+        self.line(format!("br i1 {empty}, label %{trap_l}, label %{ok_l}"));
+        self.start_block(&trap_l);
+        let msg = if is_max {
+            "ValueError: max() iterable argument is empty"
+        } else {
+            "ValueError: min() iterable argument is empty"
+        };
+        self.emit_die(msg);
+        self.start_block(&ok_l);
+
+        let data_pp = self.tmp();
+        self.line(format!(
+            "{data_pp} = getelementptr inbounds i8, ptr {hdr}, i64 16"
+        ));
+        let data_p = self.tmp();
+        self.line(format!("{data_p} = load ptr, ptr {data_pp}"));
+
+        // first element as initial best
+        let addr0 = self.tmp();
+        self.line(format!(
+            "{addr0} = getelementptr inbounds i64, ptr {data_p}, i64 0"
+        ));
+        let slot0 = self.tmp();
+        self.line(format!("{slot0} = load i64, ptr {addr0}"));
+        let init = self.value_from_slot(&slot0, *elem);
+
+        self.tmp += 1;
+        let i = format!("%t{}", self.tmp);
+        self.tmp += 1;
+        let best = format!("%t{}", self.tmp);
+        self.tmp += 1;
+        let i_next = format!("%t{}", self.tmp);
+        self.tmp += 1;
+        let best_next = format!("%t{}", self.tmp);
+
+        let elty = lty(*elem);
+        let pred = self.cur_block.clone();
+        let loop_l = self.fresh_block("mml.loop");
+        let body_l = self.fresh_block("mml.body");
+        let end_l = self.fresh_block("mml.end");
+        self.line(format!("br label %{loop_l}"));
+
+        self.start_block(&loop_l);
+        self.line(format!(
+            "{i} = phi i64 [ 1, %{pred} ], [ {i_next}, %{body_l} ]"
+        ));
+        self.line(format!(
+            "{best} = phi {elty} [ {init}, %{pred} ], [ {best_next}, %{body_l} ]"
+        ));
+        let done = self.tmp();
+        self.line(format!("{done} = icmp sge i64 {i}, {len}"));
+        self.line(format!("br i1 {done}, label %{end_l}, label %{body_l}"));
+
+        self.start_block(&body_l);
+        let addr = self.tmp();
+        self.line(format!(
+            "{addr} = getelementptr inbounds i64, ptr {data_p}, i64 {i}"
+        ));
+        let slot = self.tmp();
+        self.line(format!("{slot} = load i64, ptr {addr}"));
+        let cur = self.value_from_slot(&slot, *elem);
+        // pick cur when strictly better (ties keep best = left/first)
+        let pick = self.tmp();
+        match *elem {
+            Ty::Int => {
+                let pred = if is_max { "sgt" } else { "slt" };
+                self.line(format!("{pick} = icmp {pred} i64 {cur}, {best}"));
+            }
+            Ty::Float => {
+                let pred = if is_max { "ogt" } else { "olt" };
+                self.line(format!("{pick} = fcmp {pred} double {cur}, {best}"));
+            }
+            Ty::Bool => {
+                // bool stored as i1; treat as unsigned 0/1
+                let pred = if is_max { "ugt" } else { "ult" };
+                self.line(format!("{pick} = icmp {pred} i1 {cur}, {best}"));
+            }
+            other => unreachable!("min/max list element {other:?}"),
+        }
+        self.line(format!(
+            "{best_next} = select i1 {pick}, {elty} {cur}, {elty} {best}"
+        ));
+        self.line(format!("{i_next} = add i64 {i}, 1"));
+        self.line(format!("br label %{loop_l}"));
+
+        self.start_block(&end_l);
+        best
+    }
+
+    fn emit_math_call(&mut self, op: MathOp, arg: &Expr) -> String {
+        let v = self.emit_expr(arg);
+        let t = self.tmp();
+        match op {
+            MathOp::Sqrt => {
+                self.line(format!("{t} = call double @llvm.sqrt.f64(double {v})"));
+            }
+            MathOp::Sin => {
+                self.line(format!("{t} = call double @llvm.sin.f64(double {v})"));
+            }
+            MathOp::Cos => {
+                self.line(format!("{t} = call double @llvm.cos.f64(double {v})"));
+            }
+            MathOp::Tan => {
+                self.line(format!("{t} = call double @tan(double {v})"));
+            }
+            MathOp::Log => {
+                self.line(format!("{t} = call double @llvm.log.f64(double {v})"));
+            }
+            MathOp::Log10 => {
+                self.line(format!("{t} = call double @llvm.log10.f64(double {v})"));
+            }
+            MathOp::Exp => {
+                self.line(format!("{t} = call double @llvm.exp.f64(double {v})"));
+            }
+            MathOp::Fabs => {
+                self.line(format!("{t} = call double @llvm.fabs.f64(double {v})"));
+            }
+            MathOp::Floor => {
+                let floored = self.tmp();
+                self.line(format!(
+                    "{floored} = call double @llvm.floor.f64(double {v})"
+                ));
+                // CPython math.floor → int
+                self.line(format!(
+                    "{t} = call i64 @llvm.fptosi.sat.i64.f64(double {floored})"
+                ));
+            }
+            MathOp::Ceil => {
+                let ceiled = self.tmp();
+                self.line(format!("{ceiled} = call double @llvm.ceil.f64(double {v})"));
+                self.line(format!(
+                    "{t} = call i64 @llvm.fptosi.sat.i64.f64(double {ceiled})"
+                ));
+            }
+        }
+        t
     }
 
     /// Inline list element addressing: negative-index adjustment, bounds
@@ -731,9 +906,10 @@ impl Emitter {
             Stmt::Try {
                 body,
                 handlers,
+                orelse,
                 finally,
             } => {
-                self.emit_try(body, handlers, finally);
+                self.emit_try(body, handlers, orelse, finally);
             }
             Stmt::ListAppend { list, value } => {
                 let l = self.emit_expr(list);
@@ -1235,7 +1411,82 @@ impl Emitter {
             // otherwise left (ties and NaN comparisons keep the left operand).
             ExprKind::Min { left, right } => self.emit_min_max(false, left, right),
             ExprKind::Max { left, right } => self.emit_min_max(true, left, right),
+            ExprKind::MinList(list) => self.emit_min_max_list(false, list),
+            ExprKind::MaxList(list) => self.emit_min_max_list(true, list),
             ExprKind::Sum(list) => self.emit_sum(list),
+            ExprKind::MathCall { op, arg } => self.emit_math_call(*op, arg),
+            ExprKind::OsGetcwd => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_os_getcwd()"));
+                t
+            }
+            ExprKind::JsonDumps(arg) => {
+                let v = self.emit_expr(arg);
+                let slot = self.slot_from_value(&v, arg.ty);
+                let tag = elem_tag(&arg.ty);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_json_dumps(i64 {slot}, i32 {tag})"
+                ));
+                t
+            }
+            ExprKind::JsonLoads { kind, arg } => {
+                let s = self.emit_expr(arg);
+                let t = self.tmp();
+                match kind {
+                    JsonLoadsKind::Int => {
+                        self.line(format!("{t} = call i64 @pyrs_json_loads_int(ptr {s})"));
+                    }
+                    JsonLoadsKind::Float => {
+                        self.line(format!("{t} = call double @pyrs_json_loads_float(ptr {s})"));
+                    }
+                    JsonLoadsKind::Bool => {
+                        let i = self.tmp();
+                        self.line(format!("{i} = call i32 @pyrs_json_loads_bool(ptr {s})"));
+                        self.line(format!("{t} = trunc i32 {i} to i1"));
+                    }
+                    JsonLoadsKind::Str => {
+                        self.line(format!("{t} = call ptr @pyrs_json_loads_str(ptr {s})"));
+                    }
+                    JsonLoadsKind::ListInt => {
+                        self.line(format!("{t} = call ptr @pyrs_json_loads_list_int(ptr {s})"));
+                    }
+                    JsonLoadsKind::ListFloat => {
+                        self.line(format!(
+                            "{t} = call ptr @pyrs_json_loads_list_float(ptr {s})"
+                        ));
+                    }
+                    JsonLoadsKind::ListStr => {
+                        self.line(format!("{t} = call ptr @pyrs_json_loads_list_str(ptr {s})"));
+                    }
+                    JsonLoadsKind::ListBool => {
+                        self.line(format!(
+                            "{t} = call ptr @pyrs_json_loads_list_bool(ptr {s})"
+                        ));
+                    }
+                    JsonLoadsKind::DictStrInt => {
+                        self.line(format!(
+                            "{t} = call ptr @pyrs_json_loads_dict_str_int(ptr {s})"
+                        ));
+                    }
+                    JsonLoadsKind::DictStrFloat => {
+                        self.line(format!(
+                            "{t} = call ptr @pyrs_json_loads_dict_str_float(ptr {s})"
+                        ));
+                    }
+                    JsonLoadsKind::DictStrStr => {
+                        self.line(format!(
+                            "{t} = call ptr @pyrs_json_loads_dict_str_str(ptr {s})"
+                        ));
+                    }
+                    JsonLoadsKind::DictStrBool => {
+                        self.line(format!(
+                            "{t} = call ptr @pyrs_json_loads_dict_str_bool(ptr {s})"
+                        ));
+                    }
+                }
+                t
+            }
             ExprKind::IntToFloat(inner) => {
                 let v = self.emit_expr(inner);
                 let t = self.tmp();
@@ -1654,6 +1905,7 @@ impl Emitter {
         &mut self,
         body: &[Stmt],
         handlers: &[(Option<ir::ExcType>, Option<String>, Vec<Stmt>)],
+        orelse: &[Stmt],
         finally: &[Stmt],
     ) {
         let exit_ptr = self.tmp();
@@ -1662,7 +1914,8 @@ impl Emitter {
         let live_ptr = self.tmp();
         self.line(format!("{live_ptr} = alloca i32, align 4"));
         self.line(format!("store i32 1, ptr {live_ptr}"));
-        // 0 = try body, 1 = except handler (second longjmp → finally/reraise)
+        // 0 = try body, 1 = except handler, 2 = else
+        // phase != 0 on longjmp → finally/reraise (skip re-dispatch to handlers)
         let phase_ptr = self.tmp();
         self.line(format!("{phase_ptr} = alloca i32, align 4"));
         self.line(format!("store i32 0, ptr {phase_ptr}"));
@@ -1692,7 +1945,20 @@ impl Emitter {
         self.start_block(&body_l);
         self.emit_block(body);
         if !self.terminated {
-            self.emit_try_exit(TRY_EXIT_NORMAL, None);
+            if orelse.is_empty() {
+                self.emit_try_exit(TRY_EXIT_NORMAL, None);
+            } else {
+                // Normal completion: run else before finally. phase=2 so
+                // exceptions in else skip this try's handlers (CPython).
+                self.line(format!("store i32 2, ptr {phase_ptr}"));
+                let else_l = self.fresh_block("try.else");
+                self.line(format!("br label %{else_l}"));
+                self.start_block(&else_l);
+                self.emit_block(orelse);
+                if !self.terminated {
+                    self.emit_try_exit(TRY_EXIT_NORMAL, None);
+                }
+            }
         }
 
         // ---- exception path (frame still live until structured exit) ----
@@ -1707,7 +1973,7 @@ impl Emitter {
             "br i1 {in_handler}, label %{hraise_l}, label %{dispatch_l}"
         ));
 
-        // Second longjmp: raise/trap while running a handler → finally then reraise
+        // Second longjmp: raise/trap while running a handler or else → finally/reraise
         self.start_block(&hraise_l);
         self.emit_try_exit(TRY_EXIT_RERAISE, None);
 
@@ -2034,15 +2300,19 @@ impl Emitter {
         let end_l = self.fresh_block("sc.end");
 
         let l = self.emit_expr(left);
+        // Branch on truthiness; yield the left or right value (Python and/or).
+        // Truthiness may insert null-check blocks — record the predecessor
+        // for the phi *after* that, immediately before the branch.
+        let cond = self.emit_truthiness(&l, left.ty);
         let lhs_block = self.cur_block.clone();
-        let (skip_value, on_true, on_false) = match op {
-            // a and b: if a is false, skip rhs and produce false
-            BinOp::And => ("false", rhs_l.clone(), end_l.clone()),
-            // a or b: if a is true, skip rhs and produce true
-            BinOp::Or => ("true", end_l.clone(), rhs_l.clone()),
+        let (on_true, on_false) = match op {
+            // a and b: if a is false, skip rhs and produce a
+            BinOp::And => (rhs_l.clone(), end_l.clone()),
+            // a or b: if a is true, skip rhs and produce a
+            BinOp::Or => (end_l.clone(), rhs_l.clone()),
             _ => unreachable!(),
         };
-        self.line(format!("br i1 {l}, label %{on_true}, label %{on_false}"));
+        self.line(format!("br i1 {cond}, label %{on_true}, label %{on_false}"));
 
         self.start_block(&rhs_l);
         let r = self.emit_expr(right);
@@ -2051,10 +2321,36 @@ impl Emitter {
 
         self.start_block(&end_l);
         let t = self.tmp();
+        let rty = lty(left.ty);
         self.line(format!(
-            "{t} = phi i1 [ {skip_value}, %{lhs_block} ], [ {r}, %{rhs_block} ]"
+            "{t} = phi {rty} [ {l}, %{lhs_block} ], [ {r}, %{rhs_block} ]"
         ));
         t
+    }
+
+    /// Truthiness test for short-circuit `and`/`or` (same rules as ToBool).
+    fn emit_truthiness(&mut self, v: &str, ty: Ty) -> String {
+        match ty {
+            Ty::Bool => v.to_string(),
+            Ty::Int => {
+                let t = self.tmp();
+                self.line(format!("{t} = icmp ne i64 {v}, 0"));
+                t
+            }
+            Ty::Float => {
+                let t = self.tmp();
+                // une: NaN is truthy, like Python
+                self.line(format!("{t} = fcmp une double {v}, {}", fconst(0.0)));
+                t
+            }
+            Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) => {
+                let len = self.emit_len(v);
+                let t = self.tmp();
+                self.line(format!("{t} = icmp ne i64 {len}, 0"));
+                t
+            }
+            other => unreachable!("truthiness on {other:?}"),
+        }
     }
 
     /// Trap with a ZeroDivisionError when the divisor is zero.
