@@ -106,12 +106,16 @@ A statically-typed Python subset:
   `import utils`, `import pkg.mod` / `import pkg.mod as m`,
   `from pkg.mod import name`, `from pkg import mod`, package re-exports
   in `__init__.py` (`from .mod import f` / `from . import mod`; last
-  top-level binding wins), relative forms inside packages, and partial
-  package init (child may read simple parent assigns set before the
-  child import); a directory with `__init__.py` is a package; module
-  bodies run once at the import site (like Python); absolute imports
-  resolve relative to the entry script's directory. Cycles and missing
-  modules/names are compile errors that point at the offending file
+  top-level binding wins, with CPython fromlist hasattr short-circuit so
+  assign/`def` then `from . import same_name` keeps the value and does
+  not run the submodule), relative forms inside packages, and partial
+  package init (child module top level may read simple parent assigns
+  set before the child import; child function bodies may use deferred
+  parent attrs/calls after full init); a directory with `__init__.py` is
+  a package; module bodies run once at the import site (like Python);
+  absolute imports resolve relative to the entry script's directory.
+  Cycles and missing modules/names are compile errors that point at the
+  offending file
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
 
@@ -144,8 +148,9 @@ case/whitespace rules, heap memory is never freed, files support text
 modes "r"/"w"/"a" only (`with`, `for line in f`, and `file` params/
 returns work; no `list[file]` or printing files), no `from m import *`,
 namespace packages without `__init__.py`, multi-name `import a, b`,
-imports only at module top level (not inside `if`/functions), or
-treating modules as first-class values beyond attribute/call chains;
+imports only at module top level (not inside `if`/functions), a package
+importing itself by name, or treating modules as first-class values
+beyond attribute/call chains;
 full f-string format specs (beyond `{x:.Nf}`) are unsupported, dict/set
 keys are only `int`/`str`,
 `dict.get` requires a default (no bare `None` return),

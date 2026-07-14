@@ -676,19 +676,34 @@ from ..other import x      # parent package (when nested)
 - **Package re-exports:** a package `__init__.py` may
   `from .mod import name` (or `from . import mod`). Those names are then
   available as `pkg.name` and `from pkg import name`.
-- **Last top-level binding wins** for a name on a package (assign vs
-  `from` value re-export vs `from . import submodule`): whichever appears
-  last in the package body is what `from pkg import name` / `pkg.name`
-  sees.
-- **Partial package init:** while a package `__init__` imports a child,
-  the child may read **simple** parent assignments (literals / annotated
-  assigns) that appear **before** that import — e.g. `VERSION = 1` then
-  `from .mod import f` allows the child `from . import VERSION`. Names
-  bound only after the child-loading import are not visible (compile
-  error, CPython-like). Attribute access `pkg.VERSION` under partial
-  init uses the same rule; calling a parent function via `pkg.g()` while
-  the parent is mid-init is rejected with a clear diagnostic (not a
-  crash). Only simple assignments are typed for partial init today.
+- **Last top-level binding (package exports):** for `from pkg import name`
+  / `pkg.name`, PyRs uses the last **top-level** binding of `name` in the
+  package body, with CPython’s `hasattr` short-circuit on fromlist:
+  - `name = …` / `def name` / `from other import name` bind a **value or
+    function** export.
+  - `from . import name` (or `from pkg import name` inside the package)
+    binds a **submodule** only when `name` is **not** already bound as a
+    value/function on the package. If it is already bound, the prior
+    export is kept and the submodule file is **not** loaded or run.
+  - Later assign/`def` after a submodule import overwrites the export
+    with a value/function (last binding wins).
+  - Tested orders: assign-then-`from . import`, `def`-then-`from . import`,
+    value re-export-then-`from . import`, `from . import` then assign,
+    and pure submodule `from . import mod`.
+- **Partial package init:** while a package `__init__` imports a child:
+  - At the child **module top level**, only **simple** parent assignments
+    (literals / annotated assigns) and `def`s that appear **before** the
+    child-loading import are visible — e.g. `VERSION = 1` then
+    `from .mod import f` allows the child `from . import VERSION`. Names
+    bound only after that import are a compile error at module top level
+    (`cannot import name '…' from partially initialized package`).
+  - Inside child **function bodies**, parent attributes and calls resolve
+    with **deferred** lookup (CPython parity): names assigned or defined
+    later in the parent body are OK when the function runs after the
+    parent finishes initializing (`utilpkg.AFTER`, `utilpkg.g()`).
+  - Only simple assignments are typed on the partial/deferred value
+    surface today (e.g. `VERSION = make()` before the child import is not
+    visible as a partial value).
 - A module's top-level code runs **once**, at the point its first
   `import` is reached (depth-first, like Python).
 - To mutate another module's global, call a function in that module
@@ -706,8 +721,10 @@ go above the top-level package.
 Still unsupported: `from M import *`, namespace packages (no
 `__init__.py`), multi-name `import a, b` on one line, imports inside
 functions or other blocks (only **module top-level** statements),
-modules as first-class values beyond attribute/call chains, and
-re-assigning another module's attributes from outside.
+modules as first-class values beyond attribute/call chains,
+re-assigning another module's attributes from outside, and a package
+**importing itself** by name (`import utilpkg` inside
+`utilpkg/__init__.py` is a compile error).
 
 ## 6. Runtime errors
 

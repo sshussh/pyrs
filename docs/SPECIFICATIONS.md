@@ -280,8 +280,12 @@ programs** link only the object file from the shim plus `runtime.c`.
 - Package `__init__.py` may import its own submodules (partial package
   init; not treated as a cycle). Re-exports are visible as package
   attributes and via `from pkg import name`. **Last top-level binding**
-  decides Module vs value for a name. Partial init exposes only simple
-  parent assignments that appear before the child-loading import.
+  decides Module vs value for a name; a `from . import name` does **not**
+  load or bind a submodule when `name` is already a value/function on the
+  package (CPython fromlist `hasattr` short-circuit). Partial init: child
+  **module top level** sees only simple parent assigns/`def`s before the
+  child-loading import; child **function bodies** may use deferred parent
+  attributes/calls after full parent init.
 - Still unsupported: `from m import *`, namespace packages (no
   `__init__.py`), multi-name `import a, b`, imports nested in blocks,
   dynamic import. Load-time diagnostics use phase tag `load`.
