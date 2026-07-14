@@ -297,8 +297,13 @@ non-empty strings and lists are truthy) and short-circuit. They return
 
 ### Strings
 
-Immutable, with literals in single or double quotes. Escapes: `\n` `\t`
-`\r` `\0` `\\` `\'` `\"` (unknown escapes are kept verbatim).
+Immutable, with literals in single or double quotes, and triple-quoted
+forms (`"""…"""` or `'''…'''`) that may span lines. Escapes: `\n` `\t`
+`\r` `\0` `\\` `\'` `\"` (unknown escapes are kept verbatim). The same
+escape set applies inside triples. Physical source newlines inside
+triples are normalized like CPython (`\r\n` / `\r` → `\n`); a backslash
+immediately before a physical newline is a line continuation and is
+elided (so `"""a\<newline>b"""` is `"ab"`).
 
 ```python
 s = "hello" + " " + "world"    # concatenation
@@ -310,6 +315,23 @@ print(len(s))                  # length
 for c in s:                    # iterate characters (each is a 1-char str)
     print(c)
 label = str(42)                # str() converts int/float/bool
+
+block = """line one
+line two"""                    # multi-line; value contains a real newline
+msg = '''quotes "ok" here'''
+```
+
+A string-literal expression statement is allowed (including as a
+module- or function-level **docstring**). At runtime it is a no-op for
+program output; PyRs does **not** yet expose `__doc__` on functions or
+modules.
+
+```python
+"""module documentation"""
+
+def answer() -> int:
+    """function documentation"""
+    return 42
 ```
 
 Slicing takes `[lo:hi:step]` with any part omitted, exactly like Python:
@@ -349,11 +371,39 @@ print(f"hello {name}, n={n}, next={n + 1}")
 print(f"{{literal braces}} and {f'nested {n}'}")
 print(f"pi={pi:.2f}")          # fixed-point: "pi=3.14"
 print(f"{n:.2f}")              # int/bool promoted: "2.00"
+
+msg = f"""hello {name}
+line two {n}"""                # multi-line; same rules as single-line
+print(f'''{{x}} is {n}''')     # f'''…''' also works
 ```
 
-Any expression can appear inside `{...}`, including slices, calls, and
-nested f-strings. Interpolated values are converted with the `str()`
-rules (int/float/bool/str). `{{` and `}}` produce literal braces.
+Expressions inside `{...}` may include slices, calls, nested f-strings,
+and the usual operators. Interpolated values are converted with the
+`str()` rules (int/float/bool/str). `{{` and `}}` produce literal braces.
+Triple-quoted forms (`f"""…"""` / `f'''…'''`) allow multi-line *literal*
+content with the same escape and newline rules as plain triple strings.
+
+**Multi-line expressions:** physical newlines *inside* `{...}` without
+parentheses are not supported yet (the fragment is re-lexed as a
+standalone expression and rejects `NEWLINE`/`INDENT`). Use parentheses so
+implicit line joining applies:
+
+```python
+print(f"""{(x +
+1)}""")                    # ok
+# print(f"""{x +
+# 1}""")                   # compile error today
+```
+
+**Nested quotes in expressions:** use a *different* quote style than the
+outer f-string. Same-delimiter triples inside `{...}` are not supported
+(the lexer closes the outer string at the first unescaped `"""` / `'''`):
+
+```python
+print(f"""{'''nested'''}""")   # ok
+print(f'''{"""nested"""}''')   # ok
+# print(f"""{"""nested"""}""") # not supported
+```
 
 **Format specs:** `{x:.Nf}` (fixed-point with `N` digits after the
 decimal) is supported for `int`/`float`/`bool`. Other format codes
@@ -889,8 +939,11 @@ object. Other traps (`EOFError`, `FileNotFoundError`, …) match bare
 Not implemented yet (clear compile errors): classes, `from M import *`,
 namespace packages, `match`, generators/`yield`, `lambda`, nested
 functions, closures, `nonlocal`, full f-string format specs beyond
-`{x:.Nf}`, `*args`/`**kwargs`, starred unpack, and most remaining
-methods on tuple/dict/set.
+`{x:.Nf}`, unparenthesized multi-line expressions inside f-string
+`{...}` (parenthesize instead), same-delimiter triple quotes nested
+inside an f-string expression, `__doc__` attribute access,
+`*args`/`**kwargs`, starred unpack, and most remaining methods on
+tuple/dict/set.
 
 ## 9. Performance
 

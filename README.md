@@ -67,14 +67,20 @@ A statically-typed Python subset:
   (two arguments), `sum()` on `list[int]`/`list[float]`, indexing with
   negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
   `print(...)` with any mix of values (including tuples/dicts/sets)
-- **f-strings:** `f"x={x}, next={x + 1}"` with `{{`/`}}` escapes,
-  nesting, and fixed-point `{x:.Nf}` (other format codes / `!r` still
-  unsupported)
-- **Strings:** immutable; `+` concat, `*` repeat, lexicographic
-  comparisons, indexing, slicing, `in`, iteration, `len()`, `str(x)`
-  conversions, and methods: `upper` `lower` `strip` `lstrip` `rstrip`
-  `startswith` `endswith` `find` `rfind` `rindex` `count` `replace`
-  `split` `join` `isdigit` `isalpha` `isspace` `isupper` `islower`
+- **f-strings:** `f"x={x}, next={x + 1}"` and multi-line `f"""…"""` /
+  `f'''…'''` with `{{`/`}}` escapes, nesting, and fixed-point `{x:.Nf}`
+  (other format codes / `!r` still unsupported; multi-line *expressions*
+  inside `{...}` need parentheses; same-delimiter triples inside `{...}`
+  unsupported — use the other quote style)
+- **Strings:** immutable; single/double and triple-quoted literals
+  (`"""…"""` / `'''…'''`, multi-line; escapes as for single-line);
+  module/function first-statement string docstrings are accepted as
+  no-op expression statements (no `__doc__` attribute yet); `+` concat,
+  `*` repeat, lexicographic comparisons, indexing, slicing, `in`,
+  iteration, `len()`, `str(x)` conversions, and methods: `upper` `lower`
+  `strip` `lstrip` `rstrip` `startswith` `endswith` `find` `rfind`
+  `rindex` `count` `replace` `split` `join` `isdigit` `isalpha`
+  `isspace` `isupper` `islower`
 - **Lists:** homogeneous, growable; literals, comprehensions
   (`[x * x for x in xs if x > 0]`, with Python 3 scoping — and faster
   than the equivalent loop: results are pre-sized and appends inlined),
@@ -162,8 +168,10 @@ importing itself by name, or treating modules as first-class values
 beyond attribute/call chains; `os.path.join` is two-argument and POSIX
 only (no `*`args, no Windows paths); no full `os` / `math` / other
 stdlib yet;
-full f-string format specs (beyond `{x:.Nf}`) are unsupported, dict/set
-keys are only `int`/`str`,
+full f-string format specs (beyond `{x:.Nf}`) are unsupported,
+unparenthesized multi-line f-string expressions and same-delimiter
+nested triples inside `{...}` are unsupported, no `__doc__` attribute
+on functions/modules, dict/set keys are only `int`/`str`,
 `dict.get` requires a default (no bare `None` return),
 `keys`/`values`/`items` return lists (not view objects), no starred
 unpack `*a`, no tuple methods, dynamic indexing of heterogeneous tuples
