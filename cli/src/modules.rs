@@ -509,13 +509,13 @@ fn parse_source(
 }
 
 /// Absolute module dependencies from a (relative-rewritten) AST.
-/// Only **top-level** import statements are collected (same as semantic).
+/// Collects top-level **and** nested imports (function/if bodies), matching
+/// CPython load behavior for deferred imports.
 ///
 /// CPython `fromlist` uses `hasattr` on the source package: if a name is
 /// already bound (assign/`def`/prior import), a same-named submodule is **not**
-/// loaded. Self-imports use a bound-so-far walk; external `from pkg import name`
-/// consults the package's final top-level bindings (parse package file) so a
-/// value/`def`/re-export on the package does not pull in a same-named submodule.
+/// loaded. Self-imports use a bound-so-far walk at top level; nested imports
+/// always load the named module (simple rule for this subset).
 fn collect_deps(
     module: &ast::Module,
     self_name: &str,
@@ -524,39 +524,70 @@ fn collect_deps(
     let mut deps = Vec::new();
     let mut seen = HashSet::new();
     let mut bound: HashSet<String> = HashSet::new();
-    // Cache final top-level bindings per external package for fromlist checks.
     let mut package_binds_cache: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut push = |mod_name: String, span: common::Span| {
-        if mod_name != "sys" && mod_name != self_name && seen.insert(mod_name.clone()) {
-            deps.push((mod_name, span));
-        }
-    };
+    collect_deps_in_stmts(
+        &module.body,
+        self_name,
+        roots,
+        &mut deps,
+        &mut seen,
+        &mut bound,
+        &mut package_binds_cache,
+        true,
+    );
+    deps
+}
 
-    for stmt in &module.body {
+#[allow(clippy::too_many_arguments)]
+fn collect_deps_in_stmts(
+    stmts: &[ast::Stmt],
+    self_name: &str,
+    roots: &[PathBuf],
+    deps: &mut Vec<(String, common::Span)>,
+    seen: &mut HashSet<String>,
+    bound: &mut HashSet<String>,
+    package_binds_cache: &mut HashMap<String, HashSet<String>>,
+    track_bound: bool,
+) {
+    for stmt in stmts {
         match &stmt.kind {
             ast::StmtKind::FuncDef(f) => {
-                bound.insert(f.name.clone());
+                if track_bound {
+                    bound.insert(f.name.clone());
+                }
+                collect_deps_in_stmts(
+                    &f.body,
+                    self_name,
+                    roots,
+                    deps,
+                    seen,
+                    bound,
+                    package_binds_cache,
+                    false,
+                );
             }
-            ast::StmtKind::Assign { targets, .. } => {
+            ast::StmtKind::Assign { targets, .. } if track_bound => {
                 for t in targets {
-                    collect_bound_names(t, &mut bound);
+                    collect_bound_names(t, bound);
                 }
             }
             ast::StmtKind::AugAssign {
                 target: ast::AssignTarget::Name { name, .. },
                 ..
-            } => {
+            } if track_bound => {
                 bound.insert(name.clone());
             }
             ast::StmtKind::Import { names } => {
                 for (m, alias, span) in names {
-                    if m != "sys" {
-                        push(m.clone(), *span);
+                    if m != "sys" && m != self_name && seen.insert(m.clone()) {
+                        deps.push((m.clone(), *span));
                     }
-                    let local = alias
-                        .clone()
-                        .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
-                    bound.insert(local);
+                    if track_bound {
+                        let local = alias
+                            .clone()
+                            .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
+                        bound.insert(local);
+                    }
                 }
             }
             ast::StmtKind::FromImport {
@@ -565,10 +596,9 @@ fn collect_deps(
                 span,
                 ..
             } => {
-                if m != "sys" && !m.is_empty() && m != self_name {
-                    push(m.clone(), *span);
+                if m != "sys" && !m.is_empty() && m != self_name && seen.insert(m.clone()) {
+                    deps.push((m.clone(), *span));
                 }
-                // `from pkg import mod` may refer to a submodule (fromlist).
                 for (import_name, alias, nspan) in names {
                     let sub = if m.is_empty() {
                         import_name.clone()
@@ -577,30 +607,145 @@ fn collect_deps(
                     };
                     if module_exists(roots, &sub) {
                         let from_self = m == self_name || m.is_empty();
-                        if from_self {
-                            // hasattr(self, name) mid-init
-                            if !bound.contains(import_name) {
-                                push(sub, *nspan);
-                            }
-                        } else if !package_binds_name_cached(
-                            roots,
-                            m,
-                            import_name,
-                            &mut package_binds_cache,
-                        ) {
-                            // External fromlist: load submodule only if package
-                            // does not already bind the name after full init.
-                            push(sub, *nspan);
+                        let should_push = if from_self {
+                            !track_bound || !bound.contains(import_name)
+                        } else {
+                            !package_binds_name_cached(roots, m, import_name, package_binds_cache)
+                        };
+                        if should_push && sub != self_name && seen.insert(sub.clone()) {
+                            deps.push((sub, *nspan));
                         }
                     }
-                    let local = alias.clone().unwrap_or_else(|| import_name.clone());
-                    bound.insert(local);
+                    if track_bound {
+                        let local = alias.clone().unwrap_or_else(|| import_name.clone());
+                        bound.insert(local);
+                    }
+                }
+            }
+            ast::StmtKind::If { branches, orelse } => {
+                for (_, b) in branches {
+                    collect_deps_in_stmts(
+                        b,
+                        self_name,
+                        roots,
+                        deps,
+                        seen,
+                        bound,
+                        package_binds_cache,
+                        false,
+                    );
+                }
+                collect_deps_in_stmts(
+                    orelse,
+                    self_name,
+                    roots,
+                    deps,
+                    seen,
+                    bound,
+                    package_binds_cache,
+                    false,
+                );
+            }
+            ast::StmtKind::While { body, orelse, .. } | ast::StmtKind::For { body, orelse, .. } => {
+                collect_deps_in_stmts(
+                    body,
+                    self_name,
+                    roots,
+                    deps,
+                    seen,
+                    bound,
+                    package_binds_cache,
+                    false,
+                );
+                collect_deps_in_stmts(
+                    orelse,
+                    self_name,
+                    roots,
+                    deps,
+                    seen,
+                    bound,
+                    package_binds_cache,
+                    false,
+                );
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                collect_deps_in_stmts(
+                    body,
+                    self_name,
+                    roots,
+                    deps,
+                    seen,
+                    bound,
+                    package_binds_cache,
+                    false,
+                );
+                for h in handlers {
+                    collect_deps_in_stmts(
+                        &h.body,
+                        self_name,
+                        roots,
+                        deps,
+                        seen,
+                        bound,
+                        package_binds_cache,
+                        false,
+                    );
+                }
+                collect_deps_in_stmts(
+                    orelse,
+                    self_name,
+                    roots,
+                    deps,
+                    seen,
+                    bound,
+                    package_binds_cache,
+                    false,
+                );
+                collect_deps_in_stmts(
+                    finally,
+                    self_name,
+                    roots,
+                    deps,
+                    seen,
+                    bound,
+                    package_binds_cache,
+                    false,
+                );
+            }
+            ast::StmtKind::With { body, .. } => {
+                collect_deps_in_stmts(
+                    body,
+                    self_name,
+                    roots,
+                    deps,
+                    seen,
+                    bound,
+                    package_binds_cache,
+                    false,
+                );
+            }
+            ast::StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    collect_deps_in_stmts(
+                        &c.body,
+                        self_name,
+                        roots,
+                        deps,
+                        seen,
+                        bound,
+                        package_binds_cache,
+                        false,
+                    );
                 }
             }
             _ => {}
         }
     }
-    deps
 }
 
 /// Whether `package` binds `name` at the end of its top-level body (any
@@ -677,34 +822,79 @@ fn collect_bound_names(target: &ast::AssignTarget, names: &mut HashSet<String>) 
                 collect_bound_names(t, names);
             }
         }
+        ast::AssignTarget::Starred { target, .. } => collect_bound_names(target, names),
     }
 }
 
-/// Turn relative `from` imports into absolute (`level = 0`) in place.
-/// Only top-level statements (nested imports are rejected in semantic).
+/// Turn relative `from` imports into absolute (`level = 0`) in place,
+/// including imports nested in functions / control-flow blocks.
 fn rewrite_relative_imports(
     module: &mut ast::Module,
     package: Option<&str>,
     display: &str,
     source: &str,
 ) -> Result<(), LoadError> {
-    for stmt in &mut module.body {
-        if let ast::StmtKind::FromImport {
-            module: m,
-            level,
-            span,
-            ..
-        } = &mut stmt.kind
-        {
-            if *level == 0 {
-                continue;
+    rewrite_relative_in_stmts(&mut module.body, package, display, source)
+}
+
+fn rewrite_relative_in_stmts(
+    stmts: &mut [ast::Stmt],
+    package: Option<&str>,
+    display: &str,
+    source: &str,
+) -> Result<(), LoadError> {
+    for stmt in stmts {
+        match &mut stmt.kind {
+            ast::StmtKind::FromImport {
+                module: m,
+                level,
+                span,
+                ..
+            } => {
+                if *level != 0 {
+                    let abs = resolve_relative(*level, m, package).map_err(|msg| {
+                        let d = Diagnostic::new(common::Phase::Load, msg, *span);
+                        LoadError(render(&d, display, source))
+                    })?;
+                    *m = abs;
+                    *level = 0;
+                }
             }
-            let abs = resolve_relative(*level, m, package).map_err(|msg| {
-                let d = Diagnostic::new(common::Phase::Load, msg, *span);
-                LoadError(render(&d, display, source))
-            })?;
-            *m = abs;
-            *level = 0;
+            ast::StmtKind::FuncDef(f) => {
+                rewrite_relative_in_stmts(&mut f.body, package, display, source)?;
+            }
+            ast::StmtKind::If { branches, orelse } => {
+                for (_, b) in branches {
+                    rewrite_relative_in_stmts(b, package, display, source)?;
+                }
+                rewrite_relative_in_stmts(orelse, package, display, source)?;
+            }
+            ast::StmtKind::While { body, orelse, .. } | ast::StmtKind::For { body, orelse, .. } => {
+                rewrite_relative_in_stmts(body, package, display, source)?;
+                rewrite_relative_in_stmts(orelse, package, display, source)?;
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                rewrite_relative_in_stmts(body, package, display, source)?;
+                for h in handlers {
+                    rewrite_relative_in_stmts(&mut h.body, package, display, source)?;
+                }
+                rewrite_relative_in_stmts(orelse, package, display, source)?;
+                rewrite_relative_in_stmts(finally, package, display, source)?;
+            }
+            ast::StmtKind::With { body, .. } => {
+                rewrite_relative_in_stmts(body, package, display, source)?;
+            }
+            ast::StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    rewrite_relative_in_stmts(&mut c.body, package, display, source)?;
+                }
+            }
+            _ => {}
         }
     }
     Ok(())

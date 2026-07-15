@@ -1583,6 +1583,16 @@ void pyrs_unpack_check(long long got, long long expected) {
     }
 }
 
+void pyrs_unpack_check_min(long long got, long long minimum) {
+    if (got < minimum) {
+        char buf[160];
+        snprintf(buf, sizeof buf,
+                 "ValueError: not enough values to unpack (expected at least %lld, got %lld)",
+                 minimum, got);
+        pyrs_die(buf);
+    }
+}
+
 /* ---- dicts (open addressing + insertion order; keys: int/str) ---- */
 
 typedef struct {
@@ -2691,4 +2701,134 @@ PyrsStr *pyrs_json_dumps(long long slot, int tag) {
     PyrsStr *r = str_from_cstr(b.data);
     free(b.data);
     return r;
+}
+
+/* ---- cells (nonlocal / mutable free vars) ---- */
+typedef struct {
+    long long slot;
+} PyrsCell;
+
+PyrsCell *pyrs_cell_new(long long slot) {
+    PyrsCell *c = (PyrsCell *)xmalloc(sizeof(PyrsCell));
+    c->slot = slot;
+    return c;
+}
+
+long long pyrs_cell_load(PyrsCell *c) {
+    check_ref(c);
+    return c->slot;
+}
+
+void pyrs_cell_store(PyrsCell *c, long long slot) {
+    check_ref(c);
+    c->slot = slot;
+}
+
+/* ---- closures ---- */
+typedef struct {
+    void *code;
+    long long ncap;
+    long long caps[];
+} PyrsClosure;
+
+PyrsClosure *pyrs_closure_new(void *code, long long ncap) {
+    size_t sz = sizeof(PyrsClosure) + (size_t)ncap * sizeof(long long);
+    PyrsClosure *c = (PyrsClosure *)xmalloc(sz);
+    c->code = code;
+    c->ncap = ncap;
+    for (long long i = 0; i < ncap; i++) {
+        c->caps[i] = 0;
+    }
+    return c;
+}
+
+void pyrs_closure_set(PyrsClosure *c, long long i, long long slot) {
+    check_ref(c);
+    if (i < 0 || i >= c->ncap) {
+        pyrs_die("RuntimeError: closure capture index out of range");
+    }
+    c->caps[i] = slot;
+}
+
+void *pyrs_closure_code(PyrsClosure *c) {
+    check_ref(c);
+    return c->code;
+}
+
+long long pyrs_closure_get(PyrsClosure *c, long long i) {
+    check_ref(c);
+    if (i < 0 || i >= c->ncap) {
+        pyrs_die("RuntimeError: closure capture index out of range");
+    }
+    return c->caps[i];
+}
+
+/* ---- generators ---- */
+typedef struct {
+    void *code;          /* resume function: i32 (PyrsGen*) */
+    long long state;     /* program counter */
+    long long done;      /* non-zero when exhausted */
+    long long yield_slot;/* last yielded value as slot */
+    long long nlocals;
+    long long locals[];  /* frame */
+} PyrsGen;
+
+PyrsGen *pyrs_gen_new(void *code, long long nlocals) {
+    size_t sz = sizeof(PyrsGen) + (size_t)nlocals * sizeof(long long);
+    PyrsGen *g = (PyrsGen *)xmalloc(sz);
+    g->code = code;
+    g->state = 0;
+    g->done = 0;
+    g->yield_slot = 0;
+    g->nlocals = nlocals;
+    for (long long i = 0; i < nlocals; i++) {
+        g->locals[i] = 0;
+    }
+    return g;
+}
+
+long long pyrs_gen_get_local(PyrsGen *g, long long i) {
+    check_ref(g);
+    if (i < 0 || i >= g->nlocals) {
+        pyrs_die("RuntimeError: generator local index out of range");
+    }
+    return g->locals[i];
+}
+
+void pyrs_gen_set_local(PyrsGen *g, long long i, long long slot) {
+    check_ref(g);
+    if (i < 0 || i >= g->nlocals) {
+        pyrs_die("RuntimeError: generator local index out of range");
+    }
+    g->locals[i] = slot;
+}
+
+long long pyrs_gen_state(PyrsGen *g) {
+    check_ref(g);
+    return g->state;
+}
+
+void pyrs_gen_set_state(PyrsGen *g, long long state) {
+    check_ref(g);
+    g->state = state;
+}
+
+void pyrs_gen_set_yield(PyrsGen *g, long long slot) {
+    check_ref(g);
+    g->yield_slot = slot;
+}
+
+long long pyrs_gen_yield_value(PyrsGen *g) {
+    check_ref(g);
+    return g->yield_slot;
+}
+
+int pyrs_gen_done(PyrsGen *g) {
+    check_ref(g);
+    return g->done ? 1 : 0;
+}
+
+void pyrs_gen_set_done(PyrsGen *g) {
+    check_ref(g);
+    g->done = 1;
 }

@@ -106,7 +106,8 @@ pub struct Module {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
-    pub ty: TypeName,
+    /// Parameter type annotation; `None` means omitted (inferred in semantic).
+    pub ty: Option<TypeName>,
     pub span: Span,
     /// Default value after `=`; if present, later params must also have defaults.
     pub default: Option<Expr>,
@@ -162,6 +163,11 @@ pub enum AssignTarget {
     },
     /// `a, b = ...` / nested unpacking targets.
     Tuple(Vec<AssignTarget>),
+    /// `*rest` in unpacking (`a, *rest, b = xs`). At most one per tuple level.
+    Starred {
+        target: Box<AssignTarget>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,9 +252,48 @@ pub enum StmtKind {
         orelse: Vec<Stmt>,
         finally: Vec<Stmt>,
     },
+    /// `nonlocal name, ...` — assignments target an enclosing function local.
+    Nonlocal(Vec<(String, Span)>),
+    /// `match subject:` with `case` arms (structural pattern matching subset).
+    Match {
+        subject: Expr,
+        cases: Vec<MatchCase>,
+    },
     Pass,
     Break,
     Continue,
+}
+
+/// One `case pattern [if guard]:` arm under `match`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchCase {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// Structural patterns for `match`/`case` (subset of PEP 634).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// `_`
+    Wildcard,
+    /// Capture name `x` (also value pattern when name is a constant — treated as capture).
+    Capture(String),
+    /// Integer literal.
+    Int(i64),
+    /// String literal.
+    Str(String),
+    /// `True` / `False`.
+    Bool(bool),
+    /// `None`
+    None,
+    /// `p1 | p2 | ...`
+    Or(Vec<Pattern>),
+    /// Fixed-length sequence `[a, b]` / `(a, b)`.
+    Sequence(Vec<Pattern>),
+    /// Mapping `{ "k": v, ... }` — string keys only in this subset.
+    Mapping(Vec<(String, Pattern)>),
 }
 
 /// One `except` clause under a `try`.
@@ -290,6 +335,16 @@ pub enum BinOp {
     IsNot,
     And,
     Or,
+    /// Bitwise AND `&` (ints / bools).
+    BitAnd,
+    /// Bitwise OR `|` (ints / bools). Distinct from type-union `|` by context.
+    BitOr,
+    /// Bitwise XOR `^`.
+    BitXor,
+    /// Left shift `<<`.
+    LShift,
+    /// Right shift `>>` (arithmetic on signed i64).
+    RShift,
 }
 
 impl std::fmt::Display for BinOp {
@@ -314,6 +369,11 @@ impl std::fmt::Display for BinOp {
             BinOp::IsNot => "is not",
             BinOp::And => "and",
             BinOp::Or => "or",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::LShift => "<<",
+            BinOp::RShift => ">>",
         };
         write!(f, "{s}")
     }
@@ -325,6 +385,8 @@ pub enum UnaryOp {
     Neg,
     /// `not x`
     Not,
+    /// `~x` bitwise invert (ints / bools as int).
+    Invert,
 }
 
 /// Supported f-string format specs (minimal subset of PEP 3101).
@@ -394,14 +456,26 @@ pub enum ExprKind {
     },
     /// `f"..."`: literal chunks interleaved with interpolated expressions.
     JoinedStr(Vec<FStringPart>),
-    /// `[a, b, c]`
-    ListLit(Vec<Expr>),
+    /// `[a, b, c]` — elements may include `*starred` (see [`ListElem`]).
+    ListLit(Vec<ListElem>),
     /// `(a, b)`, `(a,)`, `()` — also bare `a, b` in assign/return contexts.
     TupleLit(Vec<Expr>),
-    /// `{k: v, ...}`
+    /// `{k: v, ...}` — values may include `**` unpack later; keys plain for now.
     DictLit(Vec<(Expr, Expr)>),
     /// `{a, b, ...}` — nonempty; empty set is `set()`.
     SetLit(Vec<Expr>),
+    /// `lambda params: expr` — expression body only.
+    Lambda {
+        params: Vec<Param>,
+        body: Box<Expr>,
+    },
+    /// `yield value` / bare `yield` (None). Only valid inside functions.
+    Yield(Option<Box<Expr>>),
+    /// `yield from iterable`.
+    YieldFrom(Box<Expr>),
+    /// `*expr` — only legal inside list displays and unpack targets (validated
+    /// in semantic / when converting to assign targets).
+    Starred(Box<Expr>),
     /// `[elem for var in iter if cond]`
     ListComp {
         elem: Box<Expr>,
@@ -430,4 +504,11 @@ pub enum ExprKind {
         op: UnaryOp,
         operand: Box<Expr>,
     },
+}
+
+/// One element of a list display: a value or `*iterable` unpack.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListElem {
+    Item(Expr),
+    Star(Expr),
 }

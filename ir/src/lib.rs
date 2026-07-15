@@ -43,6 +43,26 @@ pub enum Ty {
     /// Tagged union of at least two distinct members (flattened, sorted,
     /// interned). Lowers to LLVM `{ i32, i64 }` (tag + payload slot).
     Union(&'static [Ty]),
+    /// First-class nested function / lambda. Points at a heap closure
+    /// `{ code_ptr, env }`. `params` are the user-facing parameters
+    /// (captures live in the env as leading IR params); `ret` is the return
+    /// type. `capture_tys` / `func` identify the nested IR function so
+    /// CallClosure can unpack the env and invoke it with the right types.
+    Closure {
+        params: &'static [Ty],
+        ret: &'static Ty,
+        capture_tys: &'static [Ty],
+        /// Fully-qualified IR function name (empty for unknown).
+        func: &'static str,
+    },
+    /// Heap cell (box) holding a single value of `inner` for `nonlocal` /
+    /// mutable free-variable capture. Represented as `ptr` in LLVM.
+    Cell(&'static Ty),
+    /// Generator / iterator object produced by calling a generator function.
+    /// Yields values of type `yield_ty`. Represented as `ptr` in LLVM.
+    Generator {
+        yield_ty: &'static Ty,
+    },
 }
 
 /// Intern a list type: `list_of(Ty::Int)` is `list[int]`.
@@ -69,8 +89,8 @@ pub fn set_of(elem: Ty) -> Ty {
 }
 
 /// Total order for union members: None < Bool < Int < Float < Str < List <
-/// Tuple < Dict < Set < File. Nested containers compare recursively.
-/// Unions should not nest (flatten first).
+/// Tuple < Dict < Set < File < Closure < Cell < Generator. Nested containers
+/// compare recursively. Unions should not nest (flatten first).
 pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     fn rank(t: &Ty) -> u8 {
@@ -86,11 +106,15 @@ pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
             Ty::Set(_) => 8,
             Ty::File => 9,
             Ty::Union(_) => 10,
+            Ty::Closure { .. } => 11,
+            Ty::Cell(_) => 12,
+            Ty::Generator { .. } => 13,
         }
     }
     match (a, b) {
         (Ty::List(x), Ty::List(y)) => ty_cmp(x, y),
         (Ty::Set(x), Ty::Set(y)) => ty_cmp(x, y),
+        (Ty::Cell(x), Ty::Cell(y)) => ty_cmp(x, y),
         (Ty::Dict { key: k1, value: v1 }, Ty::Dict { key: k2, value: v2 }) => {
             ty_cmp(k1, k2).then_with(|| ty_cmp(v1, v2))
         }
@@ -112,7 +136,75 @@ pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
             }
             x.len().cmp(&y.len())
         }
+        (
+            Ty::Closure {
+                params: p1,
+                ret: r1,
+                capture_tys: c1,
+                func: f1,
+            },
+            Ty::Closure {
+                params: p2,
+                ret: r2,
+                capture_tys: c2,
+                func: f2,
+            },
+        ) => {
+            let c = p1.len().cmp(&p2.len());
+            if c != Ordering::Equal {
+                return c;
+            }
+            for (a, b) in p1.iter().zip(p2.iter()) {
+                let c = ty_cmp(a, b);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            let c = ty_cmp(r1, r2);
+            if c != Ordering::Equal {
+                return c;
+            }
+            let c = c1.len().cmp(&c2.len());
+            if c != Ordering::Equal {
+                return c;
+            }
+            for (a, b) in c1.iter().zip(c2.iter()) {
+                let c = ty_cmp(a, b);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            f1.cmp(f2)
+        }
+        (Ty::Generator { yield_ty: a }, Ty::Generator { yield_ty: b }) => ty_cmp(a, b),
         _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// Intern a closure type.
+pub fn closure_of(params: &[Ty], ret: Ty) -> Ty {
+    closure_of_full(params, ret, &[], "")
+}
+
+/// Intern a closure type with capture metadata for CallClosure.
+pub fn closure_of_full(params: &[Ty], ret: Ty, capture_tys: &[Ty], func: &str) -> Ty {
+    Ty::Closure {
+        params: Box::leak(params.to_vec().into_boxed_slice()),
+        ret: Box::leak(Box::new(ret)),
+        capture_tys: Box::leak(capture_tys.to_vec().into_boxed_slice()),
+        func: Box::leak(func.to_string().into_boxed_str()),
+    }
+}
+
+/// Intern a cell type.
+pub fn cell_of(inner: Ty) -> Ty {
+    Ty::Cell(Box::leak(Box::new(inner)))
+}
+
+/// Intern a generator type.
+pub fn generator_of(yield_ty: Ty) -> Ty {
+    Ty::Generator {
+        yield_ty: Box::leak(Box::new(yield_ty)),
     }
 }
 
@@ -209,6 +301,18 @@ impl std::fmt::Display for Ty {
                 }
                 Ok(())
             }
+            Ty::Closure { params, ret, .. } => {
+                write!(f, "closure[(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{p}")?;
+                }
+                write!(f, ") -> {ret}]")
+            }
+            Ty::Cell(inner) => write!(f, "cell[{inner}]"),
+            Ty::Generator { yield_ty } => write!(f, "generator[{yield_ty}]"),
         }
     }
 }
@@ -261,6 +365,14 @@ pub struct Function {
     /// compiler-synthesized temporaries (names starting with '.').
     pub locals: Vec<(String, Ty)>,
     pub body: Vec<Stmt>,
+    /// When set, this is a generator resume function: first param is the
+    /// generator frame pointer (`ptr`), and `Yield` stmts suspend into it.
+    /// The function returns `i1` done-flag via a side channel is not used;
+    /// instead yield stores into the frame and returns a special sentinel.
+    /// `None` for ordinary functions.
+    pub is_generator: bool,
+    /// Yield element type when `is_generator` (otherwise ignored).
+    pub yield_ty: Option<Ty>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -364,6 +476,11 @@ pub enum Stmt {
         len: Expr,
         expected: i64,
     },
+    /// Runtime length check for starred unpack: require `len >= minimum`.
+    UnpackCheckMin {
+        len: Expr,
+        minimum: i64,
+    },
     /// `raise ExcType(msg)` — msg is a str.
     Raise {
         exc: ExcType,
@@ -378,6 +495,13 @@ pub enum Stmt {
         orelse: Vec<Stmt>,
         finally: Vec<Stmt>,
     },
+    /// Store `value` into a heap cell (nonlocal / mutable capture).
+    CellStore {
+        cell: Expr,
+        value: Expr,
+    },
+    /// `yield value` inside a generator function — suspend and produce value.
+    Yield(Expr),
     Break,
     Continue,
 }
@@ -399,6 +523,12 @@ pub enum ExprKind {
     /// Wrap a concrete value (or sub-union) into a union type.
     /// `expr.ty` is the target union; `value.ty` is a member or sub-union.
     ToUnion {
+        value: Box<Expr>,
+    },
+    /// Extract a concrete member from a union (after narrowing). `expr.ty` is
+    /// the member type; `value.ty` is the union. No runtime tag check (semantic
+    /// proves the refinement).
+    FromUnion {
         value: Box<Expr>,
     },
     /// `value is None` / `value is not None`. Result is Bool.
@@ -580,6 +710,40 @@ pub enum ExprKind {
     },
     /// truthiness test → bool: numerics `!= 0`, containers `len != 0`
     ToBool(Box<Expr>),
+    /// Build a heap closure for nested function / lambda `func`.
+    /// `captures` are env slots (values or cell pointers) in declaration order.
+    MakeClosure {
+        /// Fully-qualified IR function name (mangled with module/outer).
+        func: String,
+        captures: Vec<Expr>,
+        /// Capture is a cell pointer (true) vs by-value payload (false), parallel to captures.
+        capture_is_cell: Vec<bool>,
+    },
+    /// Call a first-class closure value.
+    CallClosure {
+        closure: Box<Expr>,
+        args: Vec<Expr>,
+        /// Types of the leading capture parameters (env slots), in order.
+        capture_tys: Vec<Ty>,
+        /// Fully-qualified IR function name to call (captures + user args).
+        func: String,
+    },
+    /// Allocate a cell and store the initial value.
+    CellNew(Box<Expr>),
+    /// Load the value from a cell.
+    CellLoad(Box<Expr>),
+    /// Create a generator object by calling a generator function's constructor.
+    /// `func` is the resume IR function; `args` are the original call args
+    /// (stored as generator locals). Yield type is on `expr.ty`.
+    MakeGenerator {
+        func: String,
+        args: Vec<Expr>,
+        /// Total frame slots (params + locals + temps). Over-estimate is fine.
+        nlocals: i64,
+    },
+    /// Advance a generator: returns a union `yield_ty | None` where None means
+    /// StopIteration (exhausted). Used by `for` desugaring.
+    GeneratorNext(Box<Expr>),
 }
 
 /// Unary ops from the pure-PyRs `math` module (bodies replaced at lower).
@@ -683,12 +847,20 @@ pub enum BinOp {
     /// Short-circuit; operands are Bool.
     And,
     Or,
+    /// Bitwise ops — both operands Int (bools promoted in semantic).
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
     Not,
+    /// Bitwise invert `~` on Int.
+    Invert,
 }
 
 /// File methods implemented by the C runtime. Errors (closed file,

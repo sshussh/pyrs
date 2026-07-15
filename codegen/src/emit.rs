@@ -39,7 +39,14 @@ fn lty(ty: Ty) -> &'static str {
         Ty::Float => "double",
         Ty::Bool => "i1",
         Ty::Str => "ptr",
-        Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) | Ty::File => "ptr",
+        Ty::List(_)
+        | Ty::Tuple(_)
+        | Ty::Dict { .. }
+        | Ty::Set(_)
+        | Ty::File
+        | Ty::Closure { .. }
+        | Ty::Cell(_)
+        | Ty::Generator { .. } => "ptr",
         // Value-level None (expression); not the void function return.
         Ty::None => "i8",
         Ty::Union(_) => "{ i32, i64 }",
@@ -78,7 +85,9 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Dict { .. } => 6,
         Ty::Set(_) => 7,
         Ty::Union(_) => 8,
-        Ty::File | Ty::None => unreachable!("no print tag for {ty:?}"),
+        Ty::File | Ty::None | Ty::Closure { .. } | Ty::Cell(_) | Ty::Generator { .. } => {
+            unreachable!("no print tag for {ty:?}")
+        }
     }
 }
 
@@ -151,6 +160,13 @@ struct Emitter {
     fn_ret: Ty,
     /// Shared alloca for a pending return value while unwinding through finally.
     try_ret_ptr: Option<String>,
+    /// When emitting a generator resume: frame pointer name.
+    gen_frame: Option<String>,
+    /// Local name → frame slot index.
+    gen_local_index: HashMap<String, i64>,
+    /// Next yield resume state id.
+    gen_next_state: i64,
+    gen_yield_ty: Ty,
 }
 
 impl Default for Emitter {
@@ -169,7 +185,60 @@ impl Default for Emitter {
             tries: Vec::new(),
             fn_ret: Ty::None,
             try_ret_ptr: None,
+            gen_frame: None,
+            gen_local_index: HashMap::new(),
+            gen_next_state: 1,
+            gen_yield_ty: Ty::Int,
         }
+    }
+}
+
+fn count_yields_in_stmts(stmts: &[Stmt]) -> i64 {
+    let mut n = 0i64;
+    for s in stmts {
+        n += count_yields_in_stmt(s);
+    }
+    n
+}
+
+fn count_yields_in_stmt(s: &Stmt) -> i64 {
+    match s {
+        Stmt::Yield(_) => 1,
+        Stmt::If { branches, orelse } => {
+            branches
+                .iter()
+                .map(|(_, b)| count_yields_in_stmts(b))
+                .sum::<i64>()
+                + count_yields_in_stmts(orelse)
+        }
+        Stmt::While { body, step, .. } => count_yields_in_stmts(body) + count_yields_in_stmts(step),
+        Stmt::Try {
+            body,
+            handlers,
+            orelse,
+            finally,
+        } => {
+            count_yields_in_stmts(body)
+                + handlers
+                    .iter()
+                    .map(|(_, _, b)| count_yields_in_stmts(b))
+                    .sum::<i64>()
+                + count_yields_in_stmts(orelse)
+                + count_yields_in_stmts(finally)
+        }
+        Stmt::ExprStmt(e) | Stmt::Assign { value: e, .. } | Stmt::GlobalAssign { value: e, .. } => {
+            count_yields_in_expr(e)
+        }
+        _ => 0,
+    }
+}
+
+fn count_yields_in_expr(e: &Expr) -> i64 {
+    match &e.kind {
+        ExprKind::Block { stmts, result } => {
+            count_yields_in_stmts(stmts) + count_yields_in_expr(result)
+        }
+        _ => 0,
     }
 }
 
@@ -206,6 +275,23 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_tuple_get(ptr, i64)\n");
         out.push_str("declare i32 @pyrs_tuple_eq(ptr, ptr)\n");
         out.push_str("declare void @pyrs_unpack_check(i64, i64)\n");
+        out.push_str("declare void @pyrs_unpack_check_min(i64, i64)\n");
+        out.push_str("declare ptr @pyrs_cell_new(i64)\n");
+        out.push_str("declare i64 @pyrs_cell_load(ptr)\n");
+        out.push_str("declare void @pyrs_cell_store(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_closure_new(ptr, i64)\n");
+        out.push_str("declare void @pyrs_closure_set(ptr, i64, i64)\n");
+        out.push_str("declare ptr @pyrs_closure_code(ptr)\n");
+        out.push_str("declare i64 @pyrs_closure_get(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_gen_new(ptr, i64)\n");
+        out.push_str("declare i64 @pyrs_gen_get_local(ptr, i64)\n");
+        out.push_str("declare void @pyrs_gen_set_local(ptr, i64, i64)\n");
+        out.push_str("declare i64 @pyrs_gen_state(ptr)\n");
+        out.push_str("declare void @pyrs_gen_set_state(ptr, i64)\n");
+        out.push_str("declare void @pyrs_gen_set_yield(ptr, i64)\n");
+        out.push_str("declare i64 @pyrs_gen_yield_value(ptr)\n");
+        out.push_str("declare i32 @pyrs_gen_done(ptr)\n");
+        out.push_str("declare void @pyrs_gen_set_done(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_new()\n");
         out.push_str("declare void @pyrs_dict_set(ptr, i64, i32, i64, i32)\n");
         out.push_str("declare i64 @pyrs_dict_get(ptr, i64, i32)\n");
@@ -322,9 +408,15 @@ impl Emitter {
             let init = match ty {
                 Ty::Float => fconst(0.0),
                 Ty::Bool => "false".to_string(),
-                Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) | Ty::File => {
-                    "null".to_string()
-                }
+                Ty::Str
+                | Ty::List(_)
+                | Ty::Tuple(_)
+                | Ty::Dict { .. }
+                | Ty::Set(_)
+                | Ty::File
+                | Ty::Closure { .. }
+                | Ty::Cell(_)
+                | Ty::Generator { .. } => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
                 _ => "0".to_string(),
             };
@@ -722,7 +814,15 @@ impl Emitter {
                 // payload unused for None
                 "0".to_string()
             }
-            Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) | Ty::File => {
+            Ty::Str
+            | Ty::List(_)
+            | Ty::Tuple(_)
+            | Ty::Dict { .. }
+            | Ty::Set(_)
+            | Ty::File
+            | Ty::Closure { .. }
+            | Ty::Cell(_)
+            | Ty::Generator { .. } => {
                 let t = self.tmp();
                 self.line(format!("{t} = ptrtoint ptr {value} to i64"));
                 t
@@ -771,7 +871,15 @@ impl Emitter {
                 t
             }
             Ty::None => "0".to_string(),
-            Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) | Ty::File => {
+            Ty::Str
+            | Ty::List(_)
+            | Ty::Tuple(_)
+            | Ty::Dict { .. }
+            | Ty::Set(_)
+            | Ty::File
+            | Ty::Closure { .. }
+            | Ty::Cell(_)
+            | Ty::Generator { .. } => {
                 let t = self.tmp();
                 self.line(format!("{t} = inttoptr i64 {slot} to ptr"));
                 t
@@ -966,6 +1074,14 @@ impl Emitter {
             Ty::Tuple(_) => self.line(format!("call void @pyrs_print_tuple(ptr {v})")),
             Ty::Dict { .. } => self.line(format!("call void @pyrs_print_dict(ptr {v})")),
             Ty::Set(_) => self.line(format!("call void @pyrs_print_set(ptr {v})")),
+            Ty::Closure { .. } => {
+                let s = self.intern_string("<function>");
+                self.line(format!("call void @pyrs_print_str(ptr {s})"));
+            }
+            Ty::Cell(_) | Ty::Generator { .. } => {
+                let s = self.intern_string("<object>");
+                self.line(format!("call void @pyrs_print_str(ptr {s})"));
+            }
             Ty::None => {
                 let s = self.intern_string("None");
                 self.line(format!("call void @pyrs_print_str(ptr {s})"));
@@ -1002,6 +1118,10 @@ impl Emitter {
     // ---- functions ----
 
     fn emit_function(&mut self, func: &Function) {
+        if func.is_generator {
+            self.emit_generator_function(func);
+            return;
+        }
         self.body.clear();
         self.tmp = 0;
         self.blk = 0;
@@ -1023,9 +1143,15 @@ impl Emitter {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
             let zero = match ty {
                 Ty::Float => fconst(0.0),
-                Ty::Str | Ty::List(_) | Ty::Tuple(_) | Ty::Dict { .. } | Ty::Set(_) | Ty::File => {
-                    "null".to_string()
-                }
+                Ty::Str
+                | Ty::List(_)
+                | Ty::Tuple(_)
+                | Ty::Dict { .. }
+                | Ty::Set(_)
+                | Ty::File
+                | Ty::Closure { .. }
+                | Ty::Cell(_)
+                | Ty::Generator { .. } => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
                 _ => "0".to_string(),
             };
@@ -1063,6 +1189,75 @@ impl Emitter {
         ));
     }
 
+    /// Emit a generator resume function: `i32 @name(ptr %gen)`.
+    /// Locals live in the gen frame; Yield stores value+state and returns 0;
+    /// falling off the end returns 1 (done).
+    fn emit_generator_function(&mut self, func: &Function) {
+        self.body.clear();
+        self.tmp = 0;
+        self.blk = 0;
+        self.loops.clear();
+        self.tries.clear();
+        self.fn_ret = Ty::Int;
+        self.try_ret_ptr = None;
+        self.gen_frame = Some("%gen".to_string());
+        self.gen_local_index.clear();
+        self.gen_yield_ty = func.yield_ty.unwrap_or(Ty::Int);
+
+        // Frame layout: params first, then locals
+        let mut idx = 0i64;
+        for (name, _) in &func.params {
+            self.gen_local_index.insert(name.clone(), idx);
+            idx += 1;
+        }
+        for (name, _) in &func.locals {
+            self.gen_local_index.insert(name.clone(), idx);
+            idx += 1;
+        }
+        // Count yields for switch
+        let yield_count = count_yields_in_stmts(&func.body);
+        self.start_block("entry");
+        // switch on state
+        let st = self.tmp();
+        self.line(format!("{st} = call i64 @pyrs_gen_state(ptr %gen)"));
+        let mut cases = String::new();
+        for i in 0..=yield_count {
+            let lab = format!("gstate{i}");
+            cases.push_str(&format!(" i64 {i}, label %{lab}"));
+        }
+        let bad = self.fresh_block("gbad");
+        self.line(format!("switch i64 {st}, label %{bad} [{cases} ]"));
+        self.start_block(&bad);
+        self.line("ret i32 1");
+        // state 0 = start
+        self.start_block("gstate0");
+        self.gen_next_state = 1;
+        self.emit_block(&func.body);
+        if !self.terminated {
+            self.line("call void @pyrs_gen_set_done(ptr %gen)");
+            self.line("ret i32 1");
+            self.terminated = true;
+        }
+        // Ensure all gstateN labels exist (empty ones fall through to done)
+        for i in 1..=yield_count {
+            let lab = format!("gstate{i}");
+            // if never started (no yield reached this state as resume), still define
+            if !self.body.contains(&format!("\n{lab}:\n"))
+                && !self.body.starts_with(&format!("{lab}:\n"))
+            {
+                self.start_block(&lab);
+                self.line("call void @pyrs_gen_set_done(ptr %gen)");
+                self.line("ret i32 1");
+            }
+        }
+        self.gen_frame = None;
+        self.funcs.push_str(&format!(
+            "define i32 @{}(ptr %gen) {{\n{}}}\n\n",
+            mangle(&func.name),
+            self.body
+        ));
+    }
+
     fn emit_block(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
             if self.terminated {
@@ -1077,7 +1272,17 @@ impl Emitter {
         match stmt {
             Stmt::Assign { name, value } => {
                 let v = self.emit_expr(value);
-                self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
+                if let (Some(frame), Some(idx)) = (
+                    self.gen_frame.clone(),
+                    self.gen_local_index.get(name).copied(),
+                ) {
+                    let slot = self.slot_from_value(&v, value.ty);
+                    self.line(format!(
+                        "call void @pyrs_gen_set_local(ptr {frame}, i64 {idx}, i64 {slot})"
+                    ));
+                } else {
+                    self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
+                }
             }
             Stmt::GlobalAssign { name, value } => {
                 let v = self.emit_expr(value);
@@ -1161,6 +1366,38 @@ impl Emitter {
                 self.line(format!(
                     "call void @pyrs_unpack_check(i64 {n}, i64 {expected})"
                 ));
+            }
+            Stmt::UnpackCheckMin { len, minimum } => {
+                let n = self.emit_expr(len);
+                self.line(format!(
+                    "call void @pyrs_unpack_check_min(i64 {n}, i64 {minimum})"
+                ));
+            }
+            Stmt::CellStore { cell, value } => {
+                let c = self.emit_expr(cell);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                self.line(format!("call void @pyrs_cell_store(ptr {c}, i64 {slot})"));
+            }
+            Stmt::Yield(value) => {
+                let Some(frame) = self.gen_frame.clone() else {
+                    panic!("Yield outside generator function");
+                };
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                self.line(format!(
+                    "call void @pyrs_gen_set_yield(ptr {frame}, i64 {slot})"
+                ));
+                let next = self.gen_next_state;
+                self.gen_next_state += 1;
+                self.line(format!(
+                    "call void @pyrs_gen_set_state(ptr {frame}, i64 {next})"
+                ));
+                self.line("ret i32 0");
+                self.terminated = true;
+                // Resume label for this yield
+                let lab = format!("gstate{next}");
+                self.start_block(&lab);
             }
             Stmt::Raise { exc, message } => {
                 let m = self.emit_expr(message);
@@ -1381,15 +1618,32 @@ impl Emitter {
             ExprKind::ConstBool(v) => v.to_string(),
             ExprKind::ConstStr(s) => self.intern_string(s),
             ExprKind::ConstNone => "0".to_string(),
+            ExprKind::FromUnion { value } => {
+                let v = self.emit_expr(value);
+                let payload = self.tmp();
+                self.line(format!("{payload} = extractvalue {{ i32, i64 }} {v}, 1"));
+                self.value_from_slot(&payload, expr.ty)
+            }
             ExprKind::ToUnion { value } => {
                 let v = self.emit_expr(value);
                 self.emit_to_union(&v, value.ty, expr.ty)
             }
             ExprKind::IsNone { value, not } => self.emit_is_none(value, *not),
             ExprKind::Local(name) => {
-                let t = self.tmp();
-                self.line(format!("{t} = load {}, ptr %v.{name}", lty(expr.ty)));
-                t
+                if let (Some(frame), Some(idx)) = (
+                    self.gen_frame.clone(),
+                    self.gen_local_index.get(name).copied(),
+                ) {
+                    let slot = self.tmp();
+                    self.line(format!(
+                        "{slot} = call i64 @pyrs_gen_get_local(ptr {frame}, i64 {idx})"
+                    ));
+                    self.value_from_slot(&slot, expr.ty)
+                } else {
+                    let t = self.tmp();
+                    self.line(format!("{t} = load {}, ptr %v.{name}", lty(expr.ty)));
+                    t
+                }
             }
             ExprKind::GlobalLoad(name) => {
                 let t = self.tmp();
@@ -1834,8 +2088,154 @@ impl Emitter {
                     (UnOp::Neg, Ty::Int) => self.line(format!("{t} = sub i64 0, {v}")),
                     (UnOp::Neg, Ty::Float) => self.line(format!("{t} = fneg double {v}")),
                     (UnOp::Not, Ty::Bool) => self.line(format!("{t} = xor i1 {v}, true")),
+                    (UnOp::Invert, Ty::Int) => {
+                        // ~x == xor with all-ones
+                        self.line(format!("{t} = xor i64 {v}, -1"));
+                    }
                     other => unreachable!("bad unary op {other:?}"),
                 }
+                t
+            }
+            ExprKind::MakeClosure {
+                func,
+                captures,
+                capture_is_cell,
+            } => {
+                let n = captures.len() as i64;
+                // code pointer: bitcast of the nested function
+                let code = format!("@{}", mangle(func));
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_closure_new(ptr {code}, i64 {n})"
+                ));
+                for (i, (cap, is_cell)) in captures.iter().zip(capture_is_cell.iter()).enumerate() {
+                    let v = self.emit_expr(cap);
+                    let slot = if *is_cell || matches!(cap.ty, Ty::Cell(_)) {
+                        // cell pointer as i64
+                        let s = self.tmp();
+                        self.line(format!("{s} = ptrtoint ptr {v} to i64"));
+                        s
+                    } else {
+                        self.slot_from_value(&v, cap.ty)
+                    };
+                    self.line(format!(
+                        "call void @pyrs_closure_set(ptr {t}, i64 {i}, i64 {slot})"
+                    ));
+                }
+                t
+            }
+            ExprKind::CallClosure {
+                closure,
+                args,
+                capture_tys,
+                func,
+            } => {
+                let c = self.emit_expr(closure);
+                let mut arg_parts: Vec<String> = Vec::new();
+                for (i, cty) in capture_tys.iter().enumerate() {
+                    let slot = self.tmp();
+                    self.line(format!(
+                        "{slot} = call i64 @pyrs_closure_get(ptr {c}, i64 {i})"
+                    ));
+                    let v = self.value_from_slot(&slot, *cty);
+                    arg_parts.push(format!("{} {v}", lty(*cty)));
+                }
+                for a in args {
+                    let v = self.emit_expr(a);
+                    arg_parts.push(format!("{} {v}", lty(a.ty)));
+                }
+                let args_s = arg_parts.join(", ");
+                let Ty::Closure { ret, .. } = closure.ty else {
+                    unreachable!("CallClosure on non-closure");
+                };
+                let ret_ty = *ret;
+                let callee = if func.is_empty() {
+                    let code = self.tmp();
+                    self.line(format!("{code} = call ptr @pyrs_closure_code(ptr {c})"));
+                    code
+                } else {
+                    format!("@{}", mangle(func))
+                };
+                if ret_ty == Ty::None {
+                    self.line(format!("call void {callee}({args_s})"));
+                    "0".to_string()
+                } else {
+                    let t = self.tmp();
+                    self.line(format!("{t} = call {} {callee}({args_s})", lty(ret_ty)));
+                    t
+                }
+            }
+            ExprKind::CellNew(inner) => {
+                let v = self.emit_expr(inner);
+                let slot = self.slot_from_value(&v, inner.ty);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_cell_new(i64 {slot})"));
+                t
+            }
+            ExprKind::CellLoad(cell) => {
+                let c = self.emit_expr(cell);
+                let slot = self.tmp();
+                self.line(format!("{slot} = call i64 @pyrs_cell_load(ptr {c})"));
+                let inner_ty = match cell.ty {
+                    Ty::Cell(inner) => *inner,
+                    _ => expr.ty,
+                };
+                self.value_from_slot(&slot, inner_ty)
+            }
+            ExprKind::MakeGenerator {
+                func,
+                args,
+                nlocals,
+            } => {
+                let code = format!("@{}", mangle(func));
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_gen_new(ptr {code}, i64 {nlocals})"
+                ));
+                for (i, a) in args.iter().enumerate() {
+                    let v = self.emit_expr(a);
+                    let slot = self.slot_from_value(&v, a.ty);
+                    self.line(format!(
+                        "call void @pyrs_gen_set_local(ptr {t}, i64 {i}, i64 {slot})"
+                    ));
+                }
+                t
+            }
+            ExprKind::GeneratorNext(gexpr) => {
+                let g = self.emit_expr(gexpr);
+                let Ty::Generator { yield_ty } = gexpr.ty else {
+                    unreachable!("GeneratorNext on non-generator");
+                };
+                let yty = *yield_ty;
+                let code = self.tmp();
+                // PyrsGen and PyrsClosure both start with void* code
+                self.line(format!("{code} = call ptr @pyrs_closure_code(ptr {g})"));
+                let done = self.tmp();
+                self.line(format!("{done} = call i32 {code}(ptr {g})"));
+                let is_done = self.tmp();
+                self.line(format!("{is_done} = icmp ne i32 {done}, 0"));
+                let done_l = self.fresh_block("gdone");
+                let yield_l = self.fresh_block("gyield");
+                let end_l = self.fresh_block("gend");
+                self.line(format!(
+                    "br i1 {is_done}, label %{done_l}, label %{yield_l}"
+                ));
+                self.start_block(&yield_l);
+                let yslot = self.tmp();
+                self.line(format!("{yslot} = call i64 @pyrs_gen_yield_value(ptr {g})"));
+                let yval = self.value_from_slot(&yslot, yty);
+                let yunion = self.emit_to_union(&yval, yty, expr.ty);
+                let yblk = self.cur_block.clone();
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&done_l);
+                let none_u = self.emit_to_union("0", Ty::None, expr.ty);
+                let dblk = self.cur_block.clone();
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&end_l);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = phi {{ i32, i64 }} [ {yunion}, %{yblk} ], [ {none_u}, %{dblk} ]"
+                ));
                 t
             }
             ExprKind::Binary { op, left, right } => self.emit_binary(*op, left, right),
@@ -2425,6 +2825,19 @@ impl Emitter {
                         };
                         self.line(format!("{t} = icmp {cc} i64 {l}, {r}"));
                     }
+                    // Bool is i1; used by match `case True`/`case False` and bool == bool.
+                    Ty::Bool => {
+                        let cc = match op {
+                            BinOp::Eq => "eq",
+                            BinOp::Ne => "ne",
+                            BinOp::Lt => "ult",
+                            BinOp::Le => "ule",
+                            BinOp::Gt => "ugt",
+                            BinOp::Ge => "uge",
+                            _ => unreachable!(),
+                        };
+                        self.line(format!("{t} = icmp {cc} i1 {l}, {r}"));
+                    }
                     Ty::Float => {
                         // ordered except Ne: Python nan != x is True
                         let cc = match op {
@@ -2443,6 +2856,50 @@ impl Emitter {
                 t
             }
             BinOp::And | BinOp::Or => unreachable!("handled above"),
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                let instr = match op {
+                    BinOp::BitAnd => "and",
+                    BinOp::BitOr => "or",
+                    BinOp::BitXor => "xor",
+                    _ => unreachable!(),
+                };
+                let t = self.tmp();
+                self.line(format!("{t} = {instr} i64 {l}, {r}"));
+                t
+            }
+            BinOp::LShift | BinOp::RShift => {
+                // Python: negative shift count → ValueError
+                let neg = self.tmp();
+                self.line(format!("{neg} = icmp slt i64 {r}, 0"));
+                let trap_l = self.fresh_block("shift.trap");
+                let ok_l = self.fresh_block("shift.ok");
+                self.line(format!("br i1 {neg}, label %{trap_l}, label %{ok_l}"));
+                self.start_block(&trap_l);
+                self.emit_die("ValueError: negative shift count");
+                self.start_block(&ok_l);
+                // clamp shift amount to 0..63 for defined LLVM behavior matching wrapping
+                let big = self.tmp();
+                self.line(format!("{big} = icmp uge i64 {r}, 64"));
+                let shamt = self.tmp();
+                self.line(format!("{shamt} = select i1 {big}, i64 63, i64 {r}"));
+                let t = self.tmp();
+                if matches!(op, BinOp::LShift) {
+                    // if r >= 64 → 0
+                    let shifted = self.tmp();
+                    self.line(format!("{shifted} = shl i64 {l}, {shamt}"));
+                    self.line(format!("{t} = select i1 {big}, i64 0, i64 {shifted}"));
+                } else {
+                    // arithmetic shift; if r >= 64 → 0 or -1 by sign
+                    let shifted = self.tmp();
+                    self.line(format!("{shifted} = ashr i64 {l}, {shamt}"));
+                    let neg_l = self.tmp();
+                    self.line(format!("{neg_l} = icmp slt i64 {l}, 0"));
+                    let fill = self.tmp();
+                    self.line(format!("{fill} = select i1 {neg_l}, i64 -1, i64 0"));
+                    self.line(format!("{t} = select i1 {big}, i64 {fill}, i64 {shifted}"));
+                }
+                t
+            }
         }
     }
 

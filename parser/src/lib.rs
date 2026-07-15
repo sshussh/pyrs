@@ -175,7 +175,7 @@ impl Parser {
             Token::Import => self.parse_import(),
             Token::From => self.parse_from_import(),
             Token::Try => self.parse_try(),
-            Token::Match => Err(self.error("'match' statements are not supported yet")),
+            Token::Match => self.parse_match(),
             Token::With => self.parse_with(),
             Token::Indent => Err(self.error("unexpected indent")),
             _ => {
@@ -248,7 +248,29 @@ impl Parser {
                     span: start.to(end),
                 })
             }
-            Token::Nonlocal => Err(self.error("'nonlocal' is not supported yet")),
+            Token::Nonlocal => {
+                self.advance();
+                let mut names = Vec::new();
+                loop {
+                    names.push(self.expect_ident("after 'nonlocal'")?);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                let end = names.last().map(|(_, s)| *s).unwrap_or(start);
+                Ok(Stmt {
+                    kind: StmtKind::Nonlocal(names),
+                    span: start.to(end),
+                })
+            }
+            Token::Yield => {
+                // `yield` / `yield from` as a statement (expression statement)
+                let expr = self.parse_yield_expr()?;
+                Ok(Stmt {
+                    kind: StmtKind::ExprStmt(expr),
+                    span: start.to(self.peek_span()),
+                })
+            }
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -266,6 +288,11 @@ impl Parser {
             Token::DoubleSlashEq => Some(BinOp::FloorDiv),
             Token::PercentEq => Some(BinOp::Mod),
             Token::DoubleStarEq => Some(BinOp::Pow),
+            Token::AmpEq => Some(BinOp::BitAnd),
+            Token::PipeEq => Some(BinOp::BitOr),
+            Token::CaretEq => Some(BinOp::BitXor),
+            Token::LShiftEq => Some(BinOp::LShift),
+            Token::RShiftEq => Some(BinOp::RShift),
             _ => None,
         };
 
@@ -344,9 +371,10 @@ impl Parser {
     }
 
     /// `expr (',' expr)* [',']` — a single expression, or a tuple when a
-    /// comma appears (including trailing comma for 1-tuples).
+    /// comma appears (including trailing comma for 1-tuples). Allows
+    /// `*starred` elements for unpack targets / displays.
     fn parse_tuple_or_expr(&mut self) -> PResult<Expr> {
-        let first = self.parse_expr()?;
+        let first = self.parse_star_or_expr()?;
         if self.peek() != &Token::Comma {
             return Ok(first);
         }
@@ -355,13 +383,29 @@ impl Parser {
             if self.tuple_list_ends() {
                 break;
             }
-            items.push(self.parse_expr()?);
+            items.push(self.parse_star_or_expr()?);
         }
         let span = items[0].span.to(items.last().unwrap().span);
         Ok(Expr {
             kind: ExprKind::TupleLit(items),
             span,
         })
+    }
+
+    /// Expression or `*expr` (starred).
+    fn parse_star_or_expr(&mut self) -> PResult<Expr> {
+        if self.peek() == &Token::Star {
+            let start = self.peek_span();
+            self.advance();
+            let inner = self.parse_expr()?;
+            let span = start.to(inner.span);
+            Ok(Expr {
+                kind: ExprKind::Starred(Box::new(inner)),
+                span,
+            })
+        } else {
+            self.parse_expr()
+        }
     }
 
     fn tuple_list_ends(&self) -> bool {
@@ -404,10 +448,40 @@ impl Parser {
                     ));
                 }
                 let mut targets = Vec::with_capacity(items.len());
+                let mut starred = 0usize;
                 for item in items {
-                    targets.push(self.expr_to_target(item)?);
+                    let t = self.expr_to_target(item)?;
+                    if matches!(t, AssignTarget::Starred { .. }) {
+                        starred += 1;
+                        if starred > 1 {
+                            return Err(Diagnostic::new(
+                                Phase::Parse,
+                                "multiple starred expressions in assignment",
+                                expr.span,
+                            ));
+                        }
+                    }
+                    targets.push(t);
                 }
                 Ok(AssignTarget::Tuple(targets))
+            }
+            ExprKind::Starred(inner) => {
+                let span = expr.span;
+                let target = self.expr_to_target(*inner)?;
+                if matches!(
+                    target,
+                    AssignTarget::Starred { .. } | AssignTarget::Tuple(_)
+                ) {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        "starred assignment target must be a name or subscript",
+                        span,
+                    ));
+                }
+                Ok(AssignTarget::Starred {
+                    target: Box::new(target),
+                    span,
+                })
             }
             _ => Err(Diagnostic::new(
                 Phase::Parse,
@@ -715,17 +789,11 @@ impl Parser {
                     }
                     self.advance();
                     let (pname, pspan) = self.expect_ident("after '**'")?;
-                    if !self.eat(&Token::Colon) {
-                        return Err(Diagnostic::new(
-                            Phase::Parse,
-                            format!(
-                                "parameter '{pname}' is missing a type annotation \
-                                 (e.g. '**{pname}: int')"
-                            ),
-                            pspan,
-                        ));
-                    }
-                    let ty = self.parse_type_name("in **kwargs annotation")?;
+                    let ty = if self.eat(&Token::Colon) {
+                        Some(self.parse_type_name("in **kwargs annotation")?)
+                    } else {
+                        None
+                    };
                     kwarg = Some(Param {
                         name: pname,
                         ty,
@@ -747,17 +815,11 @@ impl Parser {
                     }
                     self.advance();
                     let (pname, pspan) = self.expect_ident("after '*'")?;
-                    if !self.eat(&Token::Colon) {
-                        return Err(Diagnostic::new(
-                            Phase::Parse,
-                            format!(
-                                "parameter '{pname}' is missing a type annotation \
-                                 (e.g. '*{pname}: int')"
-                            ),
-                            pspan,
-                        ));
-                    }
-                    let ty = self.parse_type_name("in *args annotation")?;
+                    let ty = if self.eat(&Token::Colon) {
+                        Some(self.parse_type_name("in *args annotation")?)
+                    } else {
+                        None
+                    };
                     vararg = Some(Param {
                         name: pname,
                         ty,
@@ -779,17 +841,11 @@ impl Parser {
                 }
 
                 let (pname, pspan) = self.expect_ident("in parameter list")?;
-                if !self.eat(&Token::Colon) {
-                    return Err(Diagnostic::new(
-                        Phase::Parse,
-                        format!(
-                            "parameter '{pname}' is missing a type annotation \
-                             (e.g. '{pname}: int')"
-                        ),
-                        pspan,
-                    ));
-                }
-                let ty = self.parse_type_name("in parameter annotation")?;
+                let ty = if self.eat(&Token::Colon) {
+                    Some(self.parse_type_name("in parameter annotation")?)
+                } else {
+                    None
+                };
                 let default = if self.eat(&Token::Eq) {
                     Some(self.parse_expr()?)
                 } else {
@@ -1134,11 +1190,11 @@ impl Parser {
     /// A comparison or a chain (`a < b <= c`); chains get their own node so
     /// semantic can evaluate the middle operands exactly once.
     fn parse_comparison(&mut self) -> PResult<Expr> {
-        let first = self.parse_arith()?;
+        let first = self.parse_bitor()?;
         let mut rest = Vec::new();
         while let Some((op, tokens)) = self.comparison_op() {
             self.pos += tokens;
-            let operand = self.parse_arith()?;
+            let operand = self.parse_bitor()?;
             rest.push((op, operand));
         }
         if rest.len() > 1
@@ -1173,6 +1229,85 @@ impl Parser {
                 })
             }
         }
+    }
+
+    /// Bitwise OR `|` (expression context; type unions use the same token
+    /// only inside annotations via `parse_type_name`).
+    fn parse_bitor(&mut self) -> PResult<Expr> {
+        let mut left = self.parse_bitxor()?;
+        while self.peek() == &Token::Pipe {
+            self.advance();
+            let right = self.parse_bitxor()?;
+            let span = left.span.to(right.span);
+            left = Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::BitOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_bitxor(&mut self) -> PResult<Expr> {
+        let mut left = self.parse_bitand()?;
+        while self.peek() == &Token::Caret {
+            self.advance();
+            let right = self.parse_bitand()?;
+            let span = left.span.to(right.span);
+            left = Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::BitXor,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_bitand(&mut self) -> PResult<Expr> {
+        let mut left = self.parse_shift()?;
+        while self.peek() == &Token::Amp {
+            self.advance();
+            let right = self.parse_shift()?;
+            let span = left.span.to(right.span);
+            left = Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::BitAnd,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_shift(&mut self) -> PResult<Expr> {
+        let mut left = self.parse_arith()?;
+        loop {
+            let op = match self.peek() {
+                Token::LShift => BinOp::LShift,
+                Token::RShift => BinOp::RShift,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_arith()?;
+            let span = left.span.to(right.span);
+            left = Expr {
+                kind: ExprKind::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            };
+        }
+        Ok(left)
     }
 
     fn parse_arith(&mut self) -> PResult<Expr> {
@@ -1242,6 +1377,19 @@ impl Parser {
             Token::Plus => {
                 self.advance();
                 self.parse_unary()
+            }
+            Token::Tilde => {
+                let start = self.peek_span();
+                self.advance();
+                let operand = self.parse_unary()?;
+                let span = start.to(operand.span);
+                Ok(Expr {
+                    kind: ExprKind::Unary {
+                        op: UnaryOp::Invert,
+                        operand: Box::new(operand),
+                    },
+                    span,
+                })
             }
             _ => self.parse_power(),
         }
@@ -1563,6 +1711,21 @@ impl Parser {
                         span: span.to(close),
                     });
                 }
+                // Starred first element cannot start a comprehension.
+                if self.peek() == &Token::Star {
+                    let mut items = vec![self.parse_list_elem()?];
+                    while self.eat(&Token::Comma) {
+                        if self.peek() == &Token::RBracket {
+                            break;
+                        }
+                        items.push(self.parse_list_elem()?);
+                    }
+                    let close = self.expect(Token::RBracket, "to close the list literal")?;
+                    return Ok(Expr {
+                        kind: ExprKind::ListLit(items),
+                        span: span.to(close),
+                    });
+                }
                 let first = self.parse_expr()?;
                 // `[elem for var in iter]` — a comprehension
                 if self.peek() == &Token::For {
@@ -1598,12 +1761,12 @@ impl Parser {
                         span: span.to(close),
                     });
                 }
-                let mut items = vec![first];
+                let mut items = vec![ListElem::Item(first)];
                 while self.eat(&Token::Comma) {
                     if self.peek() == &Token::RBracket {
                         break;
                     }
-                    items.push(self.parse_expr()?);
+                    items.push(self.parse_list_elem()?);
                 }
                 let close = self.expect(Token::RBracket, "to close the list literal")?;
                 Ok(Expr {
@@ -1655,9 +1818,262 @@ impl Parser {
                     })
                 }
             }
-            Token::Lambda => Err(self.error("'lambda' is not supported yet")),
+            Token::Lambda => self.parse_lambda(span),
+            Token::Yield => self.parse_yield_expr(),
             other => Err(self.error(format!(
                 "expected an expression, found {}",
+                other.describe()
+            ))),
+        }
+    }
+
+    fn parse_list_elem(&mut self) -> PResult<ListElem> {
+        if self.peek() == &Token::Star {
+            self.advance();
+            let e = self.parse_expr()?;
+            Ok(ListElem::Star(e))
+        } else {
+            Ok(ListElem::Item(self.parse_expr()?))
+        }
+    }
+
+    /// `lambda [params]: expr`
+    fn parse_lambda(&mut self, start: Span) -> PResult<Expr> {
+        self.expect(Token::Lambda, "")?;
+        let mut params: Vec<Param> = Vec::new();
+        if self.peek() != &Token::Colon {
+            loop {
+                let (pname, pspan) = self.expect_ident("in lambda parameter list")?;
+                let ty = if self.eat(&Token::Colon) {
+                    Some(self.parse_type_name("in lambda parameter annotation")?)
+                } else {
+                    None
+                };
+                let default = if self.eat(&Token::Eq) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                if default.is_none() && params.iter().any(|p| p.default.is_some()) {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        format!("non-default argument '{pname}' follows default argument"),
+                        pspan,
+                    ));
+                }
+                params.push(Param {
+                    name: pname,
+                    ty,
+                    span: pspan,
+                    default,
+                });
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+                if self.peek() == &Token::Colon {
+                    break;
+                }
+            }
+        }
+        self.expect(Token::Colon, "after lambda parameters")?;
+        let body = self.parse_expr()?;
+        let span = start.to(body.span);
+        Ok(Expr {
+            kind: ExprKind::Lambda {
+                params,
+                body: Box::new(body),
+            },
+            span,
+        })
+    }
+
+    /// `yield [from] [expr]`
+    fn parse_yield_expr(&mut self) -> PResult<Expr> {
+        let start = self.expect(Token::Yield, "")?;
+        if self.eat(&Token::From) {
+            let iter = self.parse_expr()?;
+            let span = start.to(iter.span);
+            return Ok(Expr {
+                kind: ExprKind::YieldFrom(Box::new(iter)),
+                span,
+            });
+        }
+        match self.peek() {
+            Token::Newline
+            | Token::Dedent
+            | Token::EOF
+            | Token::RParen
+            | Token::RBracket
+            | Token::RBrace
+            | Token::Comma
+            | Token::Colon => Ok(Expr {
+                kind: ExprKind::Yield(None),
+                span: start,
+            }),
+            _ => {
+                let value = self.parse_expr()?;
+                let span = start.to(value.span);
+                Ok(Expr {
+                    kind: ExprKind::Yield(Some(Box::new(value))),
+                    span,
+                })
+            }
+        }
+    }
+
+    /// `match subject:\n case ...`
+    fn parse_match(&mut self) -> PResult<Stmt> {
+        let start = self.expect(Token::Match, "")?;
+        let subject = self.parse_expr()?;
+        self.expect(Token::Colon, "after match subject")?;
+        self.expect(Token::Newline, "after match header")?;
+        self.expect(Token::Indent, "before match cases")?;
+        let mut cases = Vec::new();
+        while self.peek() == &Token::Case {
+            cases.push(self.parse_match_case()?);
+        }
+        if cases.is_empty() {
+            return Err(self.error("match statement must have at least one case"));
+        }
+        let end = cases.last().map(|c| c.span).unwrap_or(start);
+        self.expect(Token::Dedent, "to close match body")?;
+        Ok(Stmt {
+            kind: StmtKind::Match { subject, cases },
+            span: start.to(end),
+        })
+    }
+
+    fn parse_match_case(&mut self) -> PResult<MatchCase> {
+        let start = self.expect(Token::Case, "")?;
+        let pattern = self.parse_pattern()?;
+        let guard = if self.eat(&Token::If) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        // parse_block consumes the colon
+        let body = self.parse_block("case body")?;
+        let end = body.last().map(|s| s.span).unwrap_or(start);
+        Ok(MatchCase {
+            pattern,
+            guard,
+            body,
+            span: start.to(end),
+        })
+    }
+
+    /// Pattern grammar (subset): or-patterns of closed patterns.
+    fn parse_pattern(&mut self) -> PResult<Pattern> {
+        let first = self.parse_closed_pattern()?;
+        if self.peek() != &Token::Pipe {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.eat(&Token::Pipe) {
+            alts.push(self.parse_closed_pattern()?);
+        }
+        Ok(Pattern::Or(alts))
+    }
+
+    fn parse_closed_pattern(&mut self) -> PResult<Pattern> {
+        match self.peek().clone() {
+            Token::Ident(name) if name == "_" => {
+                self.advance();
+                Ok(Pattern::Wildcard)
+            }
+            Token::Ident(name) => {
+                self.advance();
+                Ok(Pattern::Capture(name))
+            }
+            Token::Intlit(v) => {
+                self.advance();
+                Ok(Pattern::Int(v))
+            }
+            Token::Strlit(s) => {
+                self.advance();
+                Ok(Pattern::Str(s))
+            }
+            Token::True => {
+                self.advance();
+                Ok(Pattern::Bool(true))
+            }
+            Token::False => {
+                self.advance();
+                Ok(Pattern::Bool(false))
+            }
+            Token::None => {
+                self.advance();
+                Ok(Pattern::None)
+            }
+            Token::LBracket => {
+                self.advance();
+                let mut items = Vec::new();
+                if self.peek() != &Token::RBracket {
+                    loop {
+                        items.push(self.parse_pattern()?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                        if self.peek() == &Token::RBracket {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Token::RBracket, "to close sequence pattern")?;
+                Ok(Pattern::Sequence(items))
+            }
+            Token::LParen => {
+                self.advance();
+                if self.peek() == &Token::RParen {
+                    self.advance();
+                    return Ok(Pattern::Sequence(vec![]));
+                }
+                let first = self.parse_pattern()?;
+                if self.peek() != &Token::Comma {
+                    self.expect(Token::RParen, "to close parenthesized pattern")?;
+                    return Ok(first);
+                }
+                let mut items = vec![first];
+                while self.eat(&Token::Comma) {
+                    if self.peek() == &Token::RParen {
+                        break;
+                    }
+                    items.push(self.parse_pattern()?);
+                }
+                self.expect(Token::RParen, "to close sequence pattern")?;
+                Ok(Pattern::Sequence(items))
+            }
+            Token::LBrace => {
+                self.advance();
+                let mut items = Vec::new();
+                if self.peek() != &Token::RBrace {
+                    loop {
+                        let key = match self.advance() {
+                            (Token::Strlit(s), _) => s,
+                            (_, span) => {
+                                return Err(Diagnostic::new(
+                                    Phase::Parse,
+                                    "mapping pattern keys must be string literals in this subset",
+                                    span,
+                                ));
+                            }
+                        };
+                        self.expect(Token::Colon, "after mapping pattern key")?;
+                        let val = self.parse_pattern()?;
+                        items.push((key, val));
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                        if self.peek() == &Token::RBrace {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Token::RBrace, "to close mapping pattern")?;
+                Ok(Pattern::Mapping(items))
+            }
+            other => Err(self.error(format!(
+                "unsupported match pattern starting with {}",
                 other.describe()
             ))),
         }
@@ -1668,6 +2084,7 @@ fn target_span(target: &AssignTarget) -> Span {
     match target {
         AssignTarget::Name { span, .. } => *span,
         AssignTarget::Index { base, index } => base.span.to(index.span),
+        AssignTarget::Starred { span, .. } => *span,
         AssignTarget::Tuple(items) => {
             let first = items
                 .first()
@@ -1923,11 +2340,32 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
                 rebase_spans(step, span);
             }
         }
-        ExprKind::ListLit(items) | ExprKind::TupleLit(items) | ExprKind::SetLit(items) => {
+        ExprKind::ListLit(items) => {
+            for item in items {
+                match item {
+                    ListElem::Item(e) | ListElem::Star(e) => rebase_spans(e, span),
+                }
+            }
+        }
+        ExprKind::TupleLit(items) | ExprKind::SetLit(items) => {
             for item in items {
                 rebase_spans(item, span);
             }
         }
+        ExprKind::Lambda { body, params, .. } => {
+            for p in params {
+                if let Some(d) = &mut p.default {
+                    rebase_spans(d, span);
+                }
+            }
+            rebase_spans(body, span);
+        }
+        ExprKind::Yield(v) => {
+            if let Some(v) = v {
+                rebase_spans(v, span);
+            }
+        }
+        ExprKind::YieldFrom(v) | ExprKind::Starred(v) => rebase_spans(v, span),
         ExprKind::DictLit(items) => {
             for (k, v) in items {
                 rebase_spans(k, span);
@@ -1994,7 +2432,7 @@ mod tests {
         };
         assert_eq!(f.name, "add");
         assert_eq!(f.params.len(), 2);
-        assert_eq!(f.params[0].ty, TypeName::Int);
+        assert_eq!(f.params[0].ty, Some(TypeName::Int));
         assert_eq!(f.ret, Some(TypeName::Int));
         assert_eq!(f.body.len(), 1);
         assert!(matches!(f.body[0].kind, StmtKind::Return(Some(_))));
@@ -2484,9 +2922,47 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn error_missing_param_annotation() {
-        let e = parse_err("def f(x):\n    return x\n");
-        assert!(e.message.contains("type annotation"), "{}", e.message);
+    fn parses_unannotated_param() {
+        // Annotations are optional at parse time; semantic may still require
+        // a type via inference or a diagnostic.
+        let m = parse_ok("def f(x):\n    return x\n");
+        let StmtKind::FuncDef(f) = &m.body[0].kind else {
+            panic!("expected FuncDef");
+        };
+        assert!(f.params[0].ty.is_none());
+    }
+
+    #[test]
+    fn parses_bitwise_and_shift() {
+        let m = parse_ok("x = 1 << 2 | 3 & 4 ^ ~5\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        assert!(matches!(
+            value.kind,
+            ExprKind::Binary {
+                op: BinOp::BitOr,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_lambda_and_match() {
+        let m = parse_ok(
+            "f = lambda x, y=1: x + y\nmatch f:\n    case 1:\n        pass\n    case _:\n        pass\n",
+        );
+        assert!(matches!(
+            m.body[0].kind,
+            StmtKind::Assign {
+                value: Expr {
+                    kind: ExprKind::Lambda { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(m.body[1].kind, StmtKind::Match { .. }));
     }
 
     #[test]

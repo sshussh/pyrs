@@ -298,6 +298,28 @@ pub enum Token {
     PercentEq,
     #[token("**=")]
     DoubleStarEq,
+    #[token("&=")]
+    AmpEq,
+    #[token("|=")]
+    PipeEq,
+    #[token("^=")]
+    CaretEq,
+    #[token("<<=")]
+    LShiftEq,
+    #[token(">>=")]
+    RShiftEq,
+
+    // bitwise operators (longer forms before shorter where needed)
+    #[token("<<")]
+    LShift,
+    #[token(">>")]
+    RShift,
+    #[token("&")]
+    Amp,
+    #[token("^")]
+    Caret,
+    #[token("~")]
+    Tilde,
 
     // symbols
     #[token("(")]
@@ -320,7 +342,7 @@ pub enum Token {
     Dot,
     #[token("->")]
     Arrow,
-    /// `|` — used only in type unions (`int | None`); not a bitwise-or expr.
+    /// `|` — type unions (`int | None`) and bitwise-or expressions.
     #[token("|")]
     Pipe,
 
@@ -420,6 +442,16 @@ fn token_text(token: &Token) -> &'static str {
         Token::DoubleSlashEq => "//=",
         Token::PercentEq => "%=",
         Token::DoubleStarEq => "**=",
+        Token::AmpEq => "&=",
+        Token::PipeEq => "|=",
+        Token::CaretEq => "^=",
+        Token::LShiftEq => "<<=",
+        Token::RShiftEq => ">>=",
+        Token::LShift => "<<",
+        Token::RShift => ">>",
+        Token::Amp => "&",
+        Token::Caret => "^",
+        Token::Tilde => "~",
         Token::LParen => "(",
         Token::RParen => ")",
         Token::LBracket => "[",
