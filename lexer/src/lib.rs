@@ -231,8 +231,9 @@ pub enum Token {
     // Literals
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
-    #[regex(r"[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<i64>().ok())]
-    Intlit(i64),
+    /// Decimal digits only (underscores stripped). May exceed i64.
+    #[regex(r"[0-9][0-9_]*", |lex| Some(lex.slice().replace('_', "")))]
+    Intlit(String),
     #[regex(r"([0-9][0-9_]*\.[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?", |lex| lex.slice().replace('_', "").parse::<f64>().ok())]
     #[regex(r"[0-9][0-9_]*[eE][+-]?[0-9]+", |lex| lex.slice().replace('_', "").parse::<f64>().ok())]
     Floatlit(f64),
@@ -361,6 +362,7 @@ impl Token {
         match self {
             Token::Ident(name) => format!("identifier '{name}'"),
             Token::Intlit(v) => format!("integer literal {v}"),
+            // v is String digits
             Token::Floatlit(v) => format!("float literal {v}"),
             Token::Strlit(_) => "string literal".to_string(),
             Token::FStrlit(_) => "f-string literal".to_string(),
@@ -672,7 +674,7 @@ mod test {
                 Token::Newline,
                 Token::Indent,
                 Token::Return,
-                Token::Intlit(5),
+                Token::Intlit("5".into()),
                 Token::Dedent,
                 Token::EOF
             ]
@@ -761,10 +763,10 @@ mod test {
         assert_eq!(
             kinds("0 42 1000 1_000_000"),
             vec![
-                Token::Intlit(0),
-                Token::Intlit(42),
-                Token::Intlit(1000),
-                Token::Intlit(1_000_000),
+                Token::Intlit("0".into()),
+                Token::Intlit("42".into()),
+                Token::Intlit("1000".into()),
+                Token::Intlit("1000000".into()),
                 Token::EOF,
             ]
         );
@@ -1117,7 +1119,7 @@ mod test {
                 Token::Newline,
                 Token::Indent,
                 Token::Return,
-                Token::Intlit(5),
+                Token::Intlit("5".into()),
                 Token::Dedent,
                 Token::EOF,
             ]
@@ -1173,7 +1175,7 @@ mod test {
                 Token::Newline,
                 Token::Indent,
                 Token::Return,
-                Token::Intlit(1),
+                Token::Intlit("1".into()),
                 Token::Newline,
                 Token::Dedent,
                 Token::Dedent,
@@ -1200,11 +1202,11 @@ mod test {
                 Token::Newline,
                 Token::Indent,
                 Token::Return,
-                Token::Intlit(1),
+                Token::Intlit("1".into()),
                 Token::Newline,
                 Token::Dedent,
                 Token::Return,
-                Token::Intlit(2),
+                Token::Intlit("2".into()),
                 Token::Newline,
                 Token::Dedent,
                 Token::EOF,
@@ -1225,7 +1227,7 @@ mod test {
                 Token::Newline,
                 Token::Indent,
                 Token::Return,
-                Token::Intlit(1),
+                Token::Intlit("1".into()),
                 Token::Dedent,
                 Token::EOF,
             ]
@@ -1245,7 +1247,7 @@ mod test {
                 Token::Newline,
                 Token::Indent,
                 Token::Return,
-                Token::Intlit(1),
+                Token::Intlit("1".into()),
                 Token::Dedent,
                 Token::EOF,
             ]
@@ -1278,11 +1280,11 @@ mod test {
                 Token::Indent,
                 Token::Ident("x".to_string()),
                 Token::Eq,
-                Token::Intlit(1),
+                Token::Intlit("1".into()),
                 Token::Newline,
                 Token::Ident("y".to_string()),
                 Token::Eq,
-                Token::Intlit(2),
+                Token::Intlit("2".into()),
                 Token::Newline,
                 Token::Dedent,
                 Token::EOF,
@@ -1297,11 +1299,11 @@ mod test {
             vec![
                 Token::Ident("x".to_string()),
                 Token::Eq,
-                Token::Intlit(1),
+                Token::Intlit("1".into()),
                 Token::Newline,
                 Token::Ident("y".to_string()),
                 Token::Eq,
-                Token::Intlit(2),
+                Token::Intlit("2".into()),
                 Token::Newline,
                 Token::EOF,
             ]
@@ -1315,7 +1317,7 @@ mod test {
             vec![
                 Token::Ident("x".to_string()),
                 Token::Eq,
-                Token::Intlit(1),
+                Token::Intlit("1".into()),
                 Token::Newline,
                 Token::EOF,
             ]
@@ -1329,9 +1331,9 @@ mod test {
             vec![
                 Token::Ident("foo".to_string()),
                 Token::LParen,
-                Token::Intlit(1),
+                Token::Intlit("1".into()),
                 Token::Comma,
-                Token::Intlit(2),
+                Token::Intlit("2".into()),
                 Token::RParen,
                 Token::Newline,
                 Token::EOF,
@@ -1362,7 +1364,7 @@ mod test {
         assert_eq!(*token, Token::Ident("abc".to_string()));
         assert_eq!(&code[span.start..span.end], "abc");
         let (token, span) = &tokens[2];
-        assert_eq!(*token, Token::Intlit(42));
+        assert_eq!(*token, Token::Intlit("42".into()));
         assert_eq!(&code[span.start..span.end], "42");
     }
 }

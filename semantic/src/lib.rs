@@ -110,7 +110,7 @@ fn resolve_param_ty(p: &ast::Param) -> SResult<ir::Ty> {
 /// Infer a type from a simple default expression (literals and short forms).
 fn infer_ty_from_default(expr: &ast::Expr) -> SResult<ir::Ty> {
     match &expr.kind {
-        ast::ExprKind::Int(_) => Ok(ir::Ty::Int),
+        ast::ExprKind::Int(_) | ast::ExprKind::IntDigits(_) => Ok(ir::Ty::Int),
         ast::ExprKind::Float(_) => Ok(ir::Ty::Float),
         ast::ExprKind::Bool(_) => Ok(ir::Ty::Bool),
         ast::ExprKind::Str(_) | ast::ExprKind::JoinedStr(_) => Ok(ir::Ty::Str),
@@ -642,6 +642,7 @@ fn freeze_nested_defaults(
 fn default_is_literal(e: &ast::Expr) -> bool {
     match &e.kind {
         ast::ExprKind::Int(_)
+        | ast::ExprKind::IntDigits(_)
         | ast::ExprKind::Float(_)
         | ast::ExprKind::Bool(_)
         | ast::ExprKind::Str(_)
@@ -1188,7 +1189,7 @@ fn try_type_ast_expr(
     known_rets: &HashMap<String, ir::Ty>,
 ) -> Option<ir::Ty> {
     match &e.kind {
-        ast::ExprKind::Int(_) => Some(ir::Ty::Int),
+        ast::ExprKind::Int(_) | ast::ExprKind::IntDigits(_) => Some(ir::Ty::Int),
         ast::ExprKind::Float(_) => Some(ir::Ty::Float),
         ast::ExprKind::Bool(_) => Some(ir::Ty::Bool),
         ast::ExprKind::Str(_) | ast::ExprKind::JoinedStr(_) => Some(ir::Ty::Str),
@@ -1258,6 +1259,136 @@ fn try_type_ast_expr(
     }
 }
 
+/// Static `__all__ = ["a", "b"]` / `("a", "b")` from a module body.
+/// `Some(Ok(names))` — static list/tuple of string literals (last assignment wins).
+/// `Some(Err(()))` — `__all__` assigned to something non-static.
+/// `None` — no `__all__` assignment.
+fn static_dunder_all(module: &ast::Module) -> Option<Result<Vec<String>, ()>> {
+    let mut found: Option<Result<Vec<String>, ()>> = None;
+    for stmt in &module.body {
+        let ast::StmtKind::Assign { targets, value, .. } = &stmt.kind else {
+            continue;
+        };
+        let is_all = targets
+            .iter()
+            .any(|t| matches!(t, ast::AssignTarget::Name { name, .. } if name == "__all__"));
+        if !is_all {
+            continue;
+        }
+        found = Some(string_lit_sequence(value));
+    }
+    found
+}
+
+fn string_lit_sequence(e: &ast::Expr) -> Result<Vec<String>, ()> {
+    match &e.kind {
+        ast::ExprKind::ListLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    ast::ListElem::Item(expr) => match &expr.kind {
+                        ast::ExprKind::Str(s) => out.push(s.clone()),
+                        _ => return Err(()),
+                    },
+                    ast::ListElem::Star(_) => return Err(()),
+                }
+            }
+            Ok(out)
+        }
+        ast::ExprKind::TupleLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match &it.kind {
+                    ast::ExprKind::Str(s) => out.push(s.clone()),
+                    _ => return Err(()),
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(()),
+    }
+}
+
+/// Build name → AST for modules in the program.
+fn module_ast_map<'a>(modules: &'a [ModuleInput<'a>]) -> HashMap<&'a str, &'a ast::Module> {
+    modules.iter().map(|m| (m.name.as_str(), m.ast)).collect()
+}
+
+/// Names that `from src import *` should bind, for a single expansion step.
+///
+/// - Static `__all__`: those names (including private).
+/// - Dynamic `__all__`: empty here; [`collect_imports`] reports the error.
+/// - No `__all__`: public names from the current export surface (funcs +
+///   values) plus any extra public names supplied by the caller (e.g.
+///   submodule short names from last-export / submodule maps).
+fn star_import_name_list(
+    src: &str,
+    src_ast: Option<&ast::Module>,
+    export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+    export_values: &HashMap<String, std::collections::HashSet<String>>,
+    extra_public: Option<&std::collections::HashSet<String>>,
+    span: Span,
+) -> Vec<(String, Option<String>, Span)> {
+    if let Some(ast) = src_ast {
+        match static_dunder_all(ast) {
+            Some(Ok(names)) => {
+                return names.into_iter().map(|n| (n, None, span)).collect();
+            }
+            Some(Err(())) => return Vec::new(),
+            None => {}
+        }
+    }
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(f) = export_funcs.get(src) {
+        for k in f.keys() {
+            if !k.starts_with('_') {
+                names.insert(k.clone());
+            }
+        }
+    }
+    if let Some(v) = export_values.get(src) {
+        for k in v {
+            if !k.starts_with('_') {
+                names.insert(k.clone());
+            }
+        }
+    }
+    if let Some(extra) = extra_public {
+        for k in extra {
+            if !k.starts_with('_') {
+                names.insert(k.clone());
+            }
+        }
+    }
+    names.into_iter().map(|n| (n, None, span)).collect()
+}
+
+/// Effective from-import name list: expand `*` when `star` is set.
+#[allow(clippy::too_many_arguments)]
+fn effective_from_names(
+    src: &str,
+    names: &[(String, Option<String>, Span)],
+    star: bool,
+    span: Span,
+    src_ast: Option<&ast::Module>,
+    export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+    export_values: &HashMap<String, std::collections::HashSet<String>>,
+    extra_public: Option<&std::collections::HashSet<String>>,
+) -> Vec<(String, Option<String>, Span)> {
+    if star {
+        star_import_name_list(
+            src,
+            src_ast,
+            export_funcs,
+            export_values,
+            extra_public,
+            span,
+        )
+    } else {
+        names.to_vec()
+    }
+}
+
 /// Names bound by top-level assignment / augassign only (not imports).
 /// Used so `from . import mod` is not mistaken for a scalar global that
 /// shadows the submodule.
@@ -1290,18 +1421,33 @@ fn expand_export_values(
     export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
     submodules: &HashMap<String, HashMap<String, String>>,
 ) -> HashMap<String, std::collections::HashSet<String>> {
+    let asts = module_ast_map(modules);
     let mut export = assigned.clone();
     loop {
         let mut changed = false;
         for m in modules {
             for stmt in &m.ast.body {
                 let ast::StmtKind::FromImport {
-                    module: src, names, ..
+                    module: src,
+                    names,
+                    star,
+                    span,
+                    ..
                 } = &stmt.kind
                 else {
                     continue;
                 };
-                for (name, alias, _) in names {
+                let eff = effective_from_names(
+                    src,
+                    names,
+                    *star,
+                    *span,
+                    asts.get(src.as_str()).copied(),
+                    export_funcs,
+                    &export,
+                    None,
+                );
+                for (name, alias, _) in &eff {
                     let local = alias.as_ref().unwrap_or(name);
                     // Submodule: not a value export.
                     if submodules
@@ -1352,7 +1498,7 @@ fn single_assign_name(targets: &[ast::AssignTarget]) -> Option<String> {
 
 fn literal_expr_ty(e: &ast::Expr) -> Option<ir::Ty> {
     match &e.kind {
-        ast::ExprKind::Int(_) => Some(ir::Ty::Int),
+        ast::ExprKind::Int(_) | ast::ExprKind::IntDigits(_) => Some(ir::Ty::Int),
         ast::ExprKind::Float(_) => Some(ir::Ty::Float),
         ast::ExprKind::Bool(_) => Some(ir::Ty::Bool),
         ast::ExprKind::Str(_) => Some(ir::Ty::Str),
@@ -1392,10 +1538,17 @@ fn stmt_loads_child(stmt: &ast::Stmt, parent: &str, child: &str) -> bool {
             m == child || is_strict_package_prefix(child, m) || is_strict_package_prefix(m, child)
         }),
         ast::StmtKind::FromImport {
-            module: src, names, ..
+            module: src,
+            names,
+            star,
+            ..
         } => {
             if src == child || is_strict_package_prefix(child, src) {
                 return true;
+            }
+            // `import *` does not force-load specific submodules.
+            if *star {
+                return false;
             }
             // `from parent import child_tail` / `from . import mod`
             for (name, _, _) in names {
@@ -1521,10 +1674,30 @@ fn build_partial_reexports(
                     break;
                 }
                 if let ast::StmtKind::FromImport {
-                    names: imported, ..
+                    module: src,
+                    names: imported,
+                    star,
+                    span,
+                    ..
                 } = &stmt.kind
                 {
-                    for (name, alias, _) in imported {
+                    // Partial reexport scan has no full export surface; for star,
+                    // use static __all__ or public names already scanned.
+                    let eff = if *star {
+                        match by_name.get(src.as_str()).copied() {
+                            Some(src_ast) => match static_dunder_all(src_ast) {
+                                Some(Ok(all)) => all
+                                    .into_iter()
+                                    .map(|n| (n, None, *span))
+                                    .collect::<Vec<_>>(),
+                                _ => Vec::new(),
+                            },
+                            None => Vec::new(),
+                        }
+                    } else {
+                        imported.clone()
+                    };
+                    for (name, alias, _) in &eff {
                         let local = alias.as_ref().unwrap_or(name);
                         names.insert(local.clone());
                     }
@@ -1589,6 +1762,7 @@ fn compute_last_exports(
     export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
     export_values: &HashMap<String, std::collections::HashSet<String>>,
 ) -> HashMap<String, HashMap<String, LastExport>> {
+    let asts = module_ast_map(modules);
     // Process in given order (dependencies first) so sources are ready.
     let mut all: HashMap<String, HashMap<String, LastExport>> = HashMap::new();
     for m in modules {
@@ -1614,9 +1788,34 @@ fn compute_last_exports(
                     last.insert(name.clone(), LastExport::Symbol);
                 }
                 ast::StmtKind::FromImport {
-                    module: src, names, ..
+                    module: src,
+                    names,
+                    star,
+                    span,
+                    ..
                 } => {
-                    for (name, alias, _) in names {
+                    // Public submodule short names available for star expansion.
+                    let sub_public: std::collections::HashSet<String> = submodules
+                        .get(src.as_str())
+                        .map(|s| s.keys().filter(|k| !k.starts_with('_')).cloned().collect())
+                        .unwrap_or_default();
+                    let src_last_public: std::collections::HashSet<String> = all
+                        .get(src.as_str())
+                        .map(|e| e.keys().filter(|k| !k.starts_with('_')).cloned().collect())
+                        .unwrap_or_default();
+                    let mut extra = sub_public;
+                    extra.extend(src_last_public);
+                    let eff = effective_from_names(
+                        src,
+                        names,
+                        *star,
+                        *span,
+                        asts.get(src.as_str()).copied(),
+                        export_funcs,
+                        export_values,
+                        Some(&extra),
+                    );
+                    for (name, alias, _) in &eff {
                         let local = alias.as_ref().unwrap_or(name);
                         let kind = resolve_from_export(
                             src,
@@ -1718,11 +1917,18 @@ fn last_binding_is_from_import(module: &ast::Module, local: &str) -> bool {
             ast::StmtKind::FuncDef(f) if f.name == local => {
                 last_import = false;
             }
-            ast::StmtKind::FromImport { names, .. } => {
-                for (name, alias, _) in names {
-                    let bound = alias.as_ref().unwrap_or(name);
-                    if bound == local {
-                        last_import = true;
+            ast::StmtKind::FromImport { names, star, .. } => {
+                if *star {
+                    // `collect_imports` only puts real star-expanded names into
+                    // the imports map; callers only query those locals, so a
+                    // star statement counts as an import binding of `local`.
+                    last_import = true;
+                } else {
+                    for (name, alias, _) in names {
+                        let bound = alias.as_ref().unwrap_or(name);
+                        if bound == local {
+                            last_import = true;
+                        }
                     }
                 }
             }
@@ -1740,18 +1946,35 @@ fn expand_export_funcs(
     modules: &[ModuleInput],
     own_funcs: &HashMap<String, HashMap<String, FuncSig>>,
 ) -> HashMap<String, HashMap<String, FuncSig>> {
+    let asts = module_ast_map(modules);
+    // Empty values map for star public-name filtering during func expansion.
+    let empty_values: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     let mut export = own_funcs.clone();
     loop {
         let mut changed = false;
         for m in modules {
             for stmt in &m.ast.body {
                 let ast::StmtKind::FromImport {
-                    module: src, names, ..
+                    module: src,
+                    names,
+                    star,
+                    span,
+                    ..
                 } = &stmt.kind
                 else {
                     continue;
                 };
-                for (name, alias, _) in names {
+                let eff = effective_from_names(
+                    src,
+                    names,
+                    *star,
+                    *span,
+                    asts.get(src.as_str()).copied(),
+                    &export,
+                    &empty_values,
+                    None,
+                );
+                for (name, alias, _) in &eff {
                     let local = alias.as_ref().unwrap_or(name);
                     let Some(sig) = export
                         .get(src.as_str())
@@ -1863,6 +2086,21 @@ fn collect_assign_names(target: &ast::AssignTarget, names: &mut std::collections
 ///
 /// Nested imports bind function-locally via [`FnCtx::local_imports`] at lower
 /// time; only top-level imports are recorded here.
+/// AST of `src` for star-import expansion. When importing from self, use the
+/// current module body; otherwise look up the program map.
+fn star_src_ast<'a>(
+    src: &str,
+    self_name: &str,
+    self_ast: &'a ast::Module,
+    asts: &HashMap<&str, &'a ast::Module>,
+) -> Option<&'a ast::Module> {
+    if src == self_name {
+        Some(self_ast)
+    } else {
+        asts.get(src).copied()
+    }
+}
+
 fn collect_imports(
     module: &ast::Module,
     self_name: &str,
@@ -1870,6 +2108,7 @@ fn collect_imports(
     export_funcs: &HashMap<String, HashMap<String, FuncSig>>,
     export_values: &HashMap<String, std::collections::HashSet<String>>,
     submodules: &HashMap<String, HashMap<String, String>>,
+    asts: &HashMap<&str, &ast::Module>,
 ) -> SResult<HashMap<String, ImportBinding>> {
     let mut imports: HashMap<String, ImportBinding> = HashMap::new();
     // Names already bound on this module as Symbol exports (assign/def/reexport)
@@ -1912,17 +2151,61 @@ fn collect_imports(
             ast::StmtKind::FromImport {
                 module: m,
                 names,
+                star,
                 span,
                 ..
             } => {
                 if m == "sys" {
                     return Err(err(
-                        "'from sys import ...' is not supported; use 'import sys' \
-                         and 'sys.argv'",
+                        if *star {
+                            "'from sys import *' is not supported; use 'import sys' \
+                             and 'sys.argv'"
+                        } else {
+                            "'from sys import ...' is not supported; use 'import sys' \
+                             and 'sys.argv'"
+                        },
                         *span,
                     ));
                 }
-                for (name, alias, nspan) in names {
+                if *star {
+                    // Validate static __all__ / expand public names.
+                    if let Some(src_ast) = star_src_ast(m, self_name, module, asts)
+                        && let Some(Err(())) = static_dunder_all(src_ast)
+                    {
+                        return Err(err(
+                            format!(
+                                "module '{m}' has a non-static __all__; \
+                                 star import requires a list or tuple of string literals"
+                            ),
+                            *span,
+                        ));
+                    }
+                }
+                let sub_public: std::collections::HashSet<String> = submodules
+                    .get(m.as_str())
+                    .map(|s| s.keys().filter(|k| !k.starts_with('_')).cloned().collect())
+                    .unwrap_or_default();
+                let last_public: std::collections::HashSet<String> = last_exports
+                    .get(m.as_str())
+                    .map(|e| e.keys().filter(|k| !k.starts_with('_')).cloned().collect())
+                    .unwrap_or_default();
+                let mut extra = sub_public;
+                extra.extend(last_public);
+                let src_ast = star_src_ast(m, self_name, module, asts);
+                let eff = effective_from_names(
+                    m,
+                    names,
+                    *star,
+                    *span,
+                    src_ast,
+                    export_funcs,
+                    export_values,
+                    Some(&extra),
+                );
+                if *star && eff.is_empty() {
+                    // Empty __all__ or empty public surface is fine.
+                }
+                for (name, alias, nspan) in &eff {
                     let local = alias.clone().unwrap_or_else(|| name.clone());
                     let export = last_exports.get(m).and_then(|e| e.get(name)).cloned();
                     let sub_full = submodules.get(m).and_then(|s| s.get(name)).cloned();
@@ -1998,6 +2281,7 @@ fn collect_imports(
                         export_values,
                         submodules,
                         &self_value_bound,
+                        asts,
                     )?;
                     imports.extend(nested);
                 }
@@ -2009,6 +2293,7 @@ fn collect_imports(
                     export_values,
                     submodules,
                     &self_value_bound,
+                    asts,
                 )?;
                 imports.extend(nested);
             }
@@ -2021,6 +2306,7 @@ fn collect_imports(
                     export_values,
                     submodules,
                     &self_value_bound,
+                    asts,
                 )?;
                 imports.extend(nested);
                 let nested = collect_imports_block(
@@ -2031,6 +2317,7 @@ fn collect_imports(
                     export_values,
                     submodules,
                     &self_value_bound,
+                    asts,
                 )?;
                 imports.extend(nested);
             }
@@ -2053,6 +2340,7 @@ fn collect_imports(
                         export_values,
                         submodules,
                         &self_value_bound,
+                        asts,
                     )?;
                     imports.extend(nested);
                 }
@@ -2066,6 +2354,7 @@ fn collect_imports(
                     export_values,
                     submodules,
                     &self_value_bound,
+                    asts,
                 )?;
                 imports.extend(nested);
             }
@@ -2079,6 +2368,7 @@ fn collect_imports(
                         export_values,
                         submodules,
                         &self_value_bound,
+                        asts,
                     )?;
                     imports.extend(nested);
                 }
@@ -2090,6 +2380,7 @@ fn collect_imports(
 }
 
 /// Collect imports from a block without entering nested function defs.
+#[allow(clippy::too_many_arguments)]
 fn collect_imports_block(
     stmts: &[ast::Stmt],
     self_name: &str,
@@ -2098,6 +2389,7 @@ fn collect_imports_block(
     export_values: &HashMap<String, std::collections::HashSet<String>>,
     submodules: &HashMap<String, HashMap<String, String>>,
     self_value_bound: &HashSet<String>,
+    asts: &HashMap<&str, &ast::Module>,
 ) -> SResult<HashMap<String, ImportBinding>> {
     // Reuse main collector by building a temporary module body that skips FuncDefs.
     let filtered: Vec<ast::Stmt> = stmts
@@ -2109,14 +2401,7 @@ fn collect_imports_block(
     // self_value_bound is only used for short-circuit; pass a synthetic module
     // walk. For simplicity, call collect_imports which re-walks (including
     // nested ifs) — FuncDefs already filtered out.
-    let _ = (
-        self_name,
-        last_exports,
-        export_funcs,
-        export_values,
-        submodules,
-        self_value_bound,
-    );
+    let _ = self_value_bound;
     collect_imports(
         &m,
         self_name,
@@ -2124,6 +2409,7 @@ fn collect_imports_block(
         export_funcs,
         export_values,
         submodules,
+        asts,
     )
 }
 
@@ -2157,6 +2443,7 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
     let package_final_values = build_package_final_values(modules);
 
     // pass 2: import bindings (validated against the export surface)
+    let asts = module_ast_map(modules);
     let mut all_imports: Vec<HashMap<String, ImportBinding>> = Vec::new();
     for (i, m) in modules.iter().enumerate() {
         let imports = collect_imports(
@@ -2166,6 +2453,7 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
             &export_funcs,
             &export_values,
             &submodules,
+            &asts,
         )
         .map_err(|d| d.with_file(i))?;
         all_imports.push(imports);
@@ -2414,7 +2702,7 @@ fn seed_globals_from_script(
 
 fn seed_ty_from_expr(e: &ast::Expr) -> Option<ir::Ty> {
     match &e.kind {
-        ast::ExprKind::Int(_) => Some(ir::Ty::Int),
+        ast::ExprKind::Int(_) | ast::ExprKind::IntDigits(_) => Some(ir::Ty::Int),
         ast::ExprKind::Float(_) => Some(ir::Ty::Float),
         ast::ExprKind::Bool(_) => Some(ir::Ty::Bool),
         ast::ExprKind::Str(_) | ast::ExprKind::JoinedStr(_) => Some(ir::Ty::Str),
@@ -2491,9 +2779,6 @@ struct FnCtx<'a> {
     pending_cell_inits: Vec<ir::Stmt>,
     /// Nesting depth of try/except/finally.
     try_depth: usize,
-    /// Nesting depth of `finally` blocks (yield in finally is rejected until
-    /// exit-state is persisted across suspend like try phase).
-    finally_depth: usize,
     /// Function-local import bindings (CPython: import in function is local).
     local_imports: HashMap<String, ImportBinding>,
     /// Names that some nested function declares `nonlocal` (pre-scanned).
@@ -2622,7 +2907,6 @@ fn lower_function_inner(
         type_refinements: HashMap::new(),
         pending_cell_inits: Vec::new(),
         try_depth: 0,
-        finally_depth: 0,
         local_imports: HashMap::new(),
         sibling_nonlocal_names: HashSet::new(),
         cell_candidates: HashSet::new(),
@@ -3409,7 +3693,7 @@ fn guess_expr_ty(
     known: &HashMap<String, ir::Ty>,
 ) -> Option<ir::Ty> {
     match &e.kind {
-        ast::ExprKind::Int(_) => Some(ir::Ty::Int),
+        ast::ExprKind::Int(_) | ast::ExprKind::IntDigits(_) => Some(ir::Ty::Int),
         ast::ExprKind::Float(_) => Some(ir::Ty::Float),
         ast::ExprKind::Bool(_) => Some(ir::Ty::Bool),
         ast::ExprKind::Str(_) => Some(ir::Ty::Str),
@@ -4123,19 +4407,25 @@ fn walk_expr_for_lambdas(e: &ast::Expr, out: &mut HashSet<String>) {
                 walk_expr_for_lambdas(r, out);
             }
         }
-        ast::ExprKind::ListComp {
-            elem, iter, cond, ..
-        } => {
+        ast::ExprKind::ListComp { elem, generators } => {
             walk_expr_for_lambdas(elem, out);
-            walk_expr_for_lambdas(iter, out);
-            if let Some(c) = cond {
-                walk_expr_for_lambdas(c, out);
+            for g in generators {
+                walk_expr_for_lambdas(&g.iter, out);
+                for c in &g.ifs {
+                    walk_expr_for_lambdas(c, out);
+                }
             }
         }
         ast::ExprKind::JoinedStr(parts) => {
             for p in parts {
-                if let ast::FStringPart::Expr { expr, .. } = p {
+                if let ast::FStringPart::Expr {
+                    expr, format_spec, ..
+                } = p
+                {
                     walk_expr_for_lambdas(expr, out);
+                    if let Some(spec) = format_spec {
+                        walk_expr_for_lambdas(spec, out);
+                    }
                 }
             }
         }
@@ -4222,9 +4512,12 @@ fn assigned_names_in_stmt(st: &ast::Stmt, out: &mut HashSet<String>) {
         }
         ast::StmtKind::AugAssign { target, .. } => assigned_names_in_target(target, out),
         ast::StmtKind::For {
-            var, body, orelse, ..
+            target,
+            body,
+            orelse,
+            ..
         } => {
-            out.insert(var.clone());
+            assigned_names_in_target(target, out);
             for s in body {
                 assigned_names_in_stmt(s, out);
             }
@@ -4493,20 +4786,26 @@ fn collect_called_func_names_in_expr(e: &ast::Expr, out: &mut HashSet<String>) {
                 collect_called_func_names_in_expr(v, out);
             }
         }
-        ast::ExprKind::ListComp {
-            elem, iter, cond, ..
-        } => {
+        ast::ExprKind::ListComp { elem, generators } => {
             collect_called_func_names_in_expr(elem, out);
-            collect_called_func_names_in_expr(iter, out);
-            if let Some(c) = cond {
-                collect_called_func_names_in_expr(c, out);
+            for g in generators {
+                collect_called_func_names_in_expr(&g.iter, out);
+                for c in &g.ifs {
+                    collect_called_func_names_in_expr(c, out);
+                }
             }
         }
         ast::ExprKind::Cast { arg, .. } => collect_called_func_names_in_expr(arg, out),
         ast::ExprKind::JoinedStr(parts) => {
             for p in parts {
-                if let ast::FStringPart::Expr { expr, .. } = p {
+                if let ast::FStringPart::Expr {
+                    expr, format_spec, ..
+                } = p
+                {
                     collect_called_func_names_in_expr(expr, out);
+                    if let Some(spec) = format_spec {
+                        collect_called_func_names_in_expr(spec, out);
+                    }
                 }
             }
         }
@@ -4550,8 +4849,12 @@ fn collect_used_names_in_stmt(st: &ast::Stmt, out: &mut HashSet<String>) {
             collect_used_names_in_stmts(orelse, out);
         }
         ast::StmtKind::For {
-            iter, body, orelse, ..
+            target,
+            iter,
+            body,
+            orelse,
         } => {
+            collect_used_names_in_target_read(target, out);
             collect_used_names_in_expr(iter, out);
             collect_used_names_in_stmts(body, out);
             collect_used_names_in_stmts(orelse, out);
@@ -4717,19 +5020,26 @@ fn collect_used_names_in_expr(e: &ast::Expr, out: &mut HashSet<String>) {
             }
         }
         ast::ExprKind::Cast { arg, .. } => collect_used_names_in_expr(arg, out),
-        ast::ExprKind::ListComp {
-            elem, iter, cond, ..
-        } => {
+        ast::ExprKind::ListComp { elem, generators } => {
             collect_used_names_in_expr(elem, out);
-            collect_used_names_in_expr(iter, out);
-            if let Some(c) = cond {
-                collect_used_names_in_expr(c, out);
+            for g in generators {
+                collect_used_names_in_target_read(&g.target, out);
+                collect_used_names_in_expr(&g.iter, out);
+                for c in &g.ifs {
+                    collect_used_names_in_expr(c, out);
+                }
             }
         }
         ast::ExprKind::JoinedStr(parts) => {
             for p in parts {
-                if let ast::FStringPart::Expr { expr, .. } = p {
+                if let ast::FStringPart::Expr {
+                    expr, format_spec, ..
+                } = p
+                {
                     collect_used_names_in_expr(expr, out);
+                    if let Some(spec) = format_spec {
+                        collect_used_names_in_expr(spec, out);
+                    }
                 }
             }
         }
@@ -4798,15 +5108,44 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
         ast::StmtKind::FromImport {
             module,
             names,
+            star,
             span,
             ..
         } => {
-            let _ = span;
+            if *star && !ctx.is_entry {
+                return Err(err("import * only allowed at module level", *span));
+            }
             // package / module body, then any submodules pulled in by name
             if !module.is_empty() && module != "sys" {
                 out.extend(init_calls_for(module));
             }
-            for (name, alias, nspan) in names {
+            // Star: bindings come from `collect_imports` + re-exports; still
+            // ensure any Module bindings from this source get their init run.
+            let eff: Vec<(String, Option<String>, Span)> = if *star {
+                let mut from_imports: Vec<(String, Option<String>, Span)> = Vec::new();
+                for (local, binding) in ctx.mctx.imports.iter() {
+                    match binding {
+                        ImportBinding::Symbol {
+                            module: src,
+                            name: src_name,
+                        } if src == module && local == src_name => {
+                            from_imports.push((src_name.clone(), None, *span));
+                        }
+                        ImportBinding::Module(full)
+                            if full.rsplit_once('.').is_some_and(|(p, c)| {
+                                p == module.as_str() && c == local.as_str()
+                            }) =>
+                        {
+                            from_imports.push((local.clone(), None, *span));
+                        }
+                        _ => {}
+                    }
+                }
+                from_imports
+            } else {
+                names.clone()
+            };
+            for (name, alias, nspan) in &eff {
                 // Function-local from-import binding (CPython local scope).
                 if !ctx.is_entry {
                     let local = alias.clone().unwrap_or_else(|| name.clone());
@@ -4942,7 +5281,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
         ast::StmtKind::Return(value) => {
             // Generator stop: bare `return` ends iteration; `return <expr>`
             // stores StopIteration.value for `yield from` consumers (and
-            // evaluates for side effects). Non-None send / throw still out.
+            // evaluates for side effects).
             if let Some(yty) = ctx.yield_ty {
                 if let Some(e) = value {
                     let v = lower_expr(e, ctx)?;
@@ -5071,9 +5410,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 handlers_ir.push((h.exc.map(ast_exc_to_ir), name, body_h));
             }
             let orelse_ir = lower_nested_block(orelse, ctx)?;
-            ctx.finally_depth += 1;
             let finally_ir = lower_nested_block(finally, ctx)?;
-            ctx.finally_depth -= 1;
             ctx.try_depth -= 1;
             out.push(ir::Stmt::Try {
                 body: body_ir,
@@ -5281,12 +5618,11 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             Ok(())
         }
         ast::StmtKind::For {
-            var,
-            var_span,
+            target,
             iter,
             body,
             orelse,
-        } => lower_for(var, *var_span, iter, body, orelse, ctx, out),
+        } => lower_for(target, iter, body, orelse, ctx, out),
         ast::StmtKind::Nonlocal(names) => {
             if ctx.is_entry {
                 return Err(err(
@@ -5580,6 +5916,21 @@ fn lower_pattern_match(
                     op: ir::BinOp::Eq,
                     left: Box::new(left),
                     right: Box::new(int_const(*v)),
+                },
+            })
+        }
+        ast::Pattern::IntDigits(s) => {
+            let left = subject.clone();
+            let left = coerce(left, ir::Ty::Int, span, "match subject")?;
+            Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Eq,
+                    left: Box::new(left),
+                    right: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::ConstIntDigits(s.clone()),
+                    }),
                 },
             })
         }
@@ -6319,33 +6670,155 @@ fn lower_generator_method_stmt(
             Ok(ir::Stmt::GenClose { generator: base_ir })
         }
         "send" => {
-            // send(None) ≡ next(g); non-None send is not supported yet.
             if args.len() != 1 {
                 return Err(err(
                     format!("send() takes exactly one argument ({} given)", args.len()),
                     method_span,
                 ));
             }
-            let v = lower_expr(&args[0], ctx)?;
-            if !matches!(v.kind, ir::ExprKind::ConstNone) && v.ty != ir::Ty::None {
-                return Err(err(
-                    "generator.send(value) only supports send(None) in this subset \
-                     (equivalent to next()); non-None send is not supported yet",
-                    args[0].span,
-                ));
-            }
-            // Discard the next value (statement form).
+            let send = lower_gen_send_arg(&args[0], yield_ty, ctx)?;
             let next = ir::Expr {
                 ty: ir::optional_of(yield_ty),
-                kind: ir::ExprKind::GeneratorNext(Box::new(base_ir)),
+                kind: ir::ExprKind::GeneratorNext {
+                    generator: Box::new(base_ir),
+                    send: Box::new(send),
+                },
             };
             Ok(ir::Stmt::ExprStmt(next))
         }
-        "throw" => Err(err("generator.throw() is not supported yet", method_span)),
+        "throw" => {
+            let (exc, message) = lower_gen_throw_args(args, method_span, ctx)?;
+            let thr = ir::Expr {
+                ty: ir::optional_of(yield_ty),
+                kind: ir::ExprKind::GeneratorThrow {
+                    generator: Box::new(base_ir),
+                    exc,
+                    message: Box::new(message),
+                },
+            };
+            Ok(ir::Stmt::ExprStmt(thr))
+        }
         _ => Err(err(
-            format!("generator method '{method}' is not supported yet (supported: close, send)"),
+            format!(
+                "generator method '{method}' is not supported yet (supported: close, send, throw)"
+            ),
             method_span,
         )),
+    }
+}
+
+/// `send` arg: `None` or a value coerced to the generator's yield type.
+fn lower_gen_send_arg(arg: &ast::Expr, yield_ty: ir::Ty, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    let v = lower_expr(arg, ctx)?;
+    if matches!(v.kind, ir::ExprKind::ConstNone) || v.ty == ir::Ty::None {
+        return Ok(const_none());
+    }
+    coerce(v, yield_ty, arg.span, "generator.send value")
+}
+
+/// Parse `throw(ExcType)`, `throw(ExcType("msg"))`, or `throw(ExcType, "msg")`.
+fn lower_gen_throw_args(
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<(ir::ExcType, ir::Expr)> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(err(
+            format!(
+                "throw() takes 1 or 2 arguments ({} given); use throw(ExcType) or \
+                 throw(ExcType(\"msg\"))",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+    if args.len() == 2 {
+        let exc = parse_exc_type_name(&args[0])?;
+        let msg = lower_expr(&args[1], ctx)?;
+        let msg = coerce(msg, ir::Ty::Str, args[1].span, "throw message")?;
+        return Ok((exc, msg));
+    }
+    // Single argument: ExcType or ExcType("msg")
+    match &args[0].kind {
+        ast::ExprKind::Name(n) => {
+            let exc = name_to_exc_type(n, args[0].span)?;
+            Ok((exc, empty_str_const()))
+        }
+        ast::ExprKind::Call {
+            func,
+            func_span,
+            args: call_args,
+            keywords,
+            kwargs,
+        } => {
+            if !keywords.is_empty() || kwargs.is_some() {
+                return Err(err(
+                    "throw() exception constructor does not accept keyword arguments",
+                    args[0].span,
+                ));
+            }
+            let exc = name_to_exc_type(func, *func_span)?;
+            let plain = require_plain_args(call_args, "throw exception", args[0].span)?;
+            if plain.len() > 1 {
+                return Err(err(
+                    format!(
+                        "exception constructor takes at most 1 argument ({} given)",
+                        plain.len()
+                    ),
+                    args[0].span,
+                ));
+            }
+            if plain.is_empty() {
+                Ok((exc, empty_str_const()))
+            } else {
+                let msg = lower_expr(plain[0], ctx)?;
+                let msg = coerce(msg, ir::Ty::Str, plain[0].span, "throw message")?;
+                Ok((exc, msg))
+            }
+        }
+        _ => Err(err(
+            "throw() expects ExcType or ExcType(\"msg\") (supported: ValueError, \
+             KeyError, IndexError, ZeroDivisionError, TypeError, RuntimeError, \
+             GeneratorExit)",
+            args[0].span,
+        )),
+    }
+}
+
+fn parse_exc_type_name(e: &ast::Expr) -> SResult<ir::ExcType> {
+    match &e.kind {
+        ast::ExprKind::Name(n) => name_to_exc_type(n, e.span),
+        _ => Err(err(
+            "throw() first argument must be an exception type name",
+            e.span,
+        )),
+    }
+}
+
+fn name_to_exc_type(name: &str, span: Span) -> SResult<ir::ExcType> {
+    match name {
+        "ValueError" => Ok(ir::ExcType::ValueError),
+        "KeyError" => Ok(ir::ExcType::KeyError),
+        "IndexError" => Ok(ir::ExcType::IndexError),
+        "ZeroDivisionError" => Ok(ir::ExcType::ZeroDivisionError),
+        "TypeError" => Ok(ir::ExcType::TypeError),
+        "RuntimeError" => Ok(ir::ExcType::RuntimeError),
+        "GeneratorExit" => Ok(ir::ExcType::GeneratorExit),
+        _ => Err(err(
+            format!(
+                "unsupported exception type '{name}' for throw() (supported: ValueError, \
+                 KeyError, IndexError, ZeroDivisionError, TypeError, RuntimeError, \
+                 GeneratorExit)"
+            ),
+            span,
+        )),
+    }
+}
+
+fn empty_str_const() -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::ConstStr(String::new()),
     }
 }
 
@@ -7494,9 +7967,36 @@ fn lower_aug_assign(
 
 // ---- for loops ----
 
+fn assign_target_span(target: &ast::AssignTarget) -> Span {
+    match target {
+        ast::AssignTarget::Name { span, .. } => *span,
+        ast::AssignTarget::Index { base, index } => base.span.to(index.span),
+        ast::AssignTarget::Starred { span, .. } => *span,
+        ast::AssignTarget::Tuple(items) => {
+            let first = items
+                .first()
+                .map(assign_target_span)
+                .unwrap_or_else(|| Span::new(0, 0));
+            let last = items.last().map(assign_target_span).unwrap_or(first);
+            first.to(last)
+        }
+    }
+}
+
+/// Bind a for-loop / comprehension element into an assignment target.
+fn bind_for_target(
+    target: &ast::AssignTarget,
+    value: ir::Expr,
+    ctx: &mut FnCtx,
+) -> SResult<Vec<ir::Stmt>> {
+    let mut stmts = Vec::new();
+    let span = assign_target_span(target);
+    lower_assign_ir(target, None, value, span, ctx, &mut stmts)?;
+    Ok(stmts)
+}
+
 fn lower_for(
-    var: &str,
-    var_span: Span,
+    target: &ast::AssignTarget,
     iter: &ast::Expr,
     body: &[ast::Stmt],
     orelse: &[ast::Stmt],
@@ -7510,15 +8010,15 @@ fn lower_for(
     {
         let plain = require_plain_args(args, "range", iter.span)?;
         let plain: Vec<ast::Expr> = plain.iter().map(|e| (*e).clone()).collect();
-        return lower_for_range(var, var_span, &plain, iter.span, body, orelse, ctx, out);
+        return lower_for_range(target, &plain, iter.span, body, orelse, ctx, out);
     }
 
     // general case: list/string by index, or file via readline until ""
     let seq = lower_expr(iter, ctx)?;
     match seq.ty {
-        ir::Ty::File => lower_for_file(var, var_span, seq, body, orelse, ctx, out),
+        ir::Ty::File => lower_for_file(target, seq, body, orelse, ctx, out),
         ir::Ty::List(_) | ir::Ty::Str | ir::Ty::Tuple(_) => {
-            lower_for_indexed(var, var_span, seq, body, orelse, ctx, out)
+            lower_for_indexed(target, seq, body, orelse, ctx, out)
         }
         ir::Ty::Dict { key, .. } => {
             // `for k in d` iterates keys (insertion order)
@@ -7526,27 +8026,25 @@ fn lower_for(
                 ty: ir::list_of(*key),
                 kind: ir::ExprKind::DictKeys(Box::new(seq)),
             };
-            lower_for_indexed(var, var_span, keys, body, orelse, ctx, out)
+            lower_for_indexed(target, keys, body, orelse, ctx, out)
         }
         ir::Ty::Set(elem) => {
             let els = ir::Expr {
                 ty: ir::list_of(*elem),
                 kind: ir::ExprKind::SetToList(Box::new(seq)),
             };
-            lower_for_indexed(var, var_span, els, body, orelse, ctx, out)
+            lower_for_indexed(target, els, body, orelse, ctx, out)
         }
         ir::Ty::Generator { yield_ty } => {
-            lower_for_generator(var, var_span, seq, *yield_ty, body, orelse, ctx, out)
+            lower_for_generator(target, seq, *yield_ty, body, orelse, ctx, out)
         }
         other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
     }
 }
 
 /// `for x in gen:` via GeneratorNext → optional yield|None until None.
-#[allow(clippy::too_many_arguments)]
 fn lower_for_generator(
-    var: &str,
-    var_span: Span,
+    target: &ast::AssignTarget,
     gen_expr: ir::Expr,
     yield_ty: ir::Ty,
     body: &[ast::Stmt],
@@ -7576,7 +8074,10 @@ fn lower_for_generator(
     // loop body: next = GeneratorNext(g); if next is None: more=False else: bind; user
     let next_e = ir::Expr {
         ty: opt_ty,
-        kind: ir::ExprKind::GeneratorNext(Box::new(gen_local)),
+        kind: ir::ExprKind::GeneratorNext {
+            generator: Box::new(gen_local),
+            send: Box::new(const_none()),
+        },
     };
     let is_none = ir::Expr {
         ty: ir::Ty::Bool,
@@ -7598,11 +8099,11 @@ fn lower_for_generator(
         },
     };
     let entry_ref = ctx.type_refinements.clone();
-    let bind = bind_name(var, var_span, None, extracted, var_span, ctx)?;
+    let bind = bind_for_target(target, extracted, ctx)?;
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx)?;
     ctx.loop_depth -= 1;
-    restore_refinements_after_for(ctx, entry_ref, var, body, orelse);
+    restore_refinements_after_for(ctx, entry_ref, target, body, orelse);
     let body_stmts = vec![
         ir::Stmt::Assign {
             name: nxt_t.clone(),
@@ -7620,7 +8121,7 @@ fn lower_for_generator(
                 }],
             )],
             orelse: {
-                let mut b = vec![bind];
+                let mut b = bind;
                 b.extend(user_body);
                 b
             },
@@ -7636,12 +8137,12 @@ fn lower_for_generator(
 }
 
 /// After lowering a `for` body, restore entry peels and drop peels for names
-/// the body (or loop variable) may rebind. Zero-trip loops must not keep
+/// the body (or loop target) may rebind. Zero-trip loops must not keep
 /// body-only peels (e.g. `for i in range(0): x = 5` must not leave `x` as int).
 fn restore_refinements_after_for(
     ctx: &mut FnCtx,
     entry: HashMap<String, ir::Ty>,
-    var: &str,
+    target: &ast::AssignTarget,
     body: &[ast::Stmt],
     orelse: &[ast::Stmt],
 ) {
@@ -7649,7 +8150,11 @@ fn restore_refinements_after_for(
     for name in assigned_names_in_stmts(body) {
         ctx.type_refinements.remove(&name);
     }
-    ctx.type_refinements.remove(var);
+    let mut names = HashSet::new();
+    assigned_names_in_target(target, &mut names);
+    for name in names {
+        ctx.type_refinements.remove(&name);
+    }
     // `orelse` is lowered next under these peels; clear its assigns after.
     let _ = orelse;
 }
@@ -7755,16 +8260,16 @@ fn rewrite_breaks_set_flag(stmts: Vec<ir::Stmt>, broke: &str) -> Vec<ir::Stmt> {
     out
 }
 
-/// `for line in f:` — while more: line = readline; if not line: more=False else: body
+/// `for line in f:` — while more: line = readline; if not line: more=False else: bind; body
 fn lower_for_file(
-    var: &str,
-    var_span: Span,
+    target: &ast::AssignTarget,
     file: ir::Expr,
     body: &[ast::Stmt],
     orelse: &[ast::Stmt],
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
+    let tspan = assign_target_span(target);
     let file_t = ctx.fresh_temp("for.file", ir::Ty::File);
     out.push(ir::Stmt::Assign {
         name: file_t.clone(),
@@ -7789,33 +8294,23 @@ fn lower_for_file(
         kind: ir::ExprKind::Local(more_t.clone()),
     };
 
-    let line = ir::Expr {
+    // Read into a temp so EOF (empty string) is checked before unpacking.
+    let line_t = ctx.fresh_temp("for.line", ir::Ty::Str);
+    let line_read = ir::Expr {
         ty: ir::Ty::Str,
         kind: ir::ExprKind::FileCall {
             func: ir::FileFn::ReadLine,
             args: vec![file_local],
         },
     };
-    let entry_ref = ctx.type_refinements.clone();
-    let bind = bind_name(var, var_span, None, line, var_span, ctx)?;
-
-    let line_local = if let ir::Stmt::Assign { name, .. } = &bind {
-        ir::Expr {
-            ty: ir::Ty::Str,
-            kind: ir::ExprKind::Local(name.clone()),
-        }
-    } else if let ir::Stmt::GlobalAssign { name, .. } = &bind {
-        ir::Expr {
-            ty: ir::Ty::Str,
-            kind: ir::ExprKind::GlobalLoad(name.clone()),
-        }
-    } else {
-        return Err(err(
-            "internal error: for-file loop variable binding",
-            var_span,
-        ));
+    let line_local = ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::Local(line_t.clone()),
     };
-    let truthy = to_bool(line_local, var_span)?;
+    let entry_ref = ctx.type_refinements.clone();
+    let bind = bind_for_target(target, line_local.clone(), ctx)?;
+
+    let truthy = to_bool(line_local, tspan)?;
     let not_line = ir::Expr {
         ty: ir::Ty::Bool,
         kind: ir::ExprKind::Unary {
@@ -7827,7 +8322,7 @@ fn lower_for_file(
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx)?;
     ctx.loop_depth -= 1;
-    restore_refinements_after_for(ctx, entry_ref, var, body, orelse);
+    restore_refinements_after_for(ctx, entry_ref, target, body, orelse);
 
     let stop = ir::Stmt::Assign {
         name: more_t,
@@ -7836,10 +8331,15 @@ fn lower_for_file(
             kind: ir::ExprKind::ConstBool(false),
         },
     };
+    let mut run = bind;
+    run.extend(user_body);
     let loop_body = vec![
-        bind,
+        ir::Stmt::Assign {
+            name: line_t,
+            value: line_read,
+        },
         ir::Stmt::If {
-            branches: vec![(not_line, vec![stop]), (truthy, user_body)],
+            branches: vec![(not_line, vec![stop]), (truthy, run)],
             orelse: vec![],
         },
     ];
@@ -7851,14 +8351,14 @@ fn lower_for_file(
 
 /// `for x in xs` / `for c in s` — index from 0 to len (re-read each iteration).
 fn lower_for_indexed(
-    var: &str,
-    var_span: Span,
+    target: &ast::AssignTarget,
     seq: ir::Expr,
     body: &[ast::Stmt],
     orelse: &[ast::Stmt],
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
+    let tspan = assign_target_span(target);
     let elem_ty = match seq.ty {
         ir::Ty::List(e) => *e,
         ir::Ty::Str => ir::Ty::Str,
@@ -7874,7 +8374,7 @@ fn lower_for_indexed(
                     return Err(err(
                         "iterating a heterogeneous tuple is not supported yet; \
                          unpack or index with constants",
-                        var_span,
+                        tspan,
                     ));
                 }
             }
@@ -7882,7 +8382,7 @@ fn lower_for_indexed(
         other => {
             return Err(err(
                 format!("internal error: lower_for_indexed on {other}"),
-                var_span,
+                tspan,
             ));
         }
     };
@@ -7922,7 +8422,7 @@ fn lower_for_indexed(
         },
     };
 
-    // var = seq[idx] as the first statement of the body
+    // target = seq[idx] as the first statement(s) of the body
     let element = ir::Expr {
         ty: elem_ty,
         kind: ir::ExprKind::Index {
@@ -7931,13 +8431,13 @@ fn lower_for_indexed(
         },
     };
     let entry_ref = ctx.type_refinements.clone();
-    let bind = bind_name(var, var_span, None, element, var_span, ctx)?;
+    let bind = bind_for_target(target, element, ctx)?;
 
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx);
     ctx.loop_depth -= 1;
-    restore_refinements_after_for(ctx, entry_ref, var, body, orelse);
-    let mut loop_body = vec![bind];
+    restore_refinements_after_for(ctx, entry_ref, target, body, orelse);
+    let mut loop_body = bind;
     loop_body.extend(user_body?);
 
     let step = vec![ir::Stmt::Assign {
@@ -7957,10 +8457,8 @@ fn lower_for_indexed(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lower_for_range(
-    var: &str,
-    var_span: Span,
+    target: &ast::AssignTarget,
     args: &[ast::Expr],
     range_span: Span,
     body: &[ast::Stmt],
@@ -7993,26 +8491,28 @@ fn lower_for_range(
         }
     };
 
-    // the loop variable must be an int (wherever it is bound)
-    let existing_var_ty = if ctx.binds_global(var) {
-        ctx.globals.get(var).copied()
-    } else {
-        ctx.locals.get(var).copied()
-    };
-    if let Some(existing) = existing_var_ty
-        && existing != ir::Ty::Int
-    {
-        return Err(err(
-            format!(
-                "loop variable '{var}' already has type {existing}, but \
-                 range() yields int"
-            ),
-            var_span,
-        ));
+    // Simple name targets: the loop variable must be an int.
+    if let ast::AssignTarget::Name { name, span } = target {
+        let existing_var_ty = if ctx.binds_global(name) {
+            ctx.globals.get(name).copied()
+        } else {
+            ctx.locals.get(name).copied()
+        };
+        if let Some(existing) = existing_var_ty
+            && existing != ir::Ty::Int
+        {
+            return Err(err(
+                format!(
+                    "loop variable '{name}' already has type {existing}, but \
+                     range() yields int"
+                ),
+                *span,
+            ));
+        }
     }
 
     // Python semantics: iterate a hidden counter and assign the user
-    // variable at the top of each iteration. After exhaustion the variable
+    // target at the top of each iteration. After exhaustion the variable
     // holds the last *yielded* value (not one past), an empty range never
     // assigns it, and mutating it inside the body cannot derail the loop.
     let stop_t = ctx.fresh_temp("range.stop", ir::Ty::Int);
@@ -8092,15 +8592,15 @@ fn lower_for_range(
         }
     };
 
-    // var = .it as the first statement of the body
+    // target = .it as the first statement(s) of the body
     let entry_ref = ctx.type_refinements.clone();
-    let bind = bind_name(var, var_span, None, it_local.clone(), var_span, ctx)?;
+    let bind = bind_for_target(target, it_local.clone(), ctx)?;
 
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx);
     ctx.loop_depth -= 1;
-    restore_refinements_after_for(ctx, entry_ref, var, body, orelse);
-    let mut loop_body = vec![bind];
+    restore_refinements_after_for(ctx, entry_ref, target, body, orelse);
+    let mut loop_body = bind;
     loop_body.extend(user_body?);
 
     let step_stmt = ir::Stmt::Assign {
@@ -8256,8 +8756,8 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
         ));
     }
 
-    // Closures with matching params/ret and empty captures: retype for
-    // homogeneous containers (call uses the object's code pointer).
+    // Closures with matching params/ret/capture env: retype for homogeneous
+    // containers (call uses the object's code pointer; captures from env).
     if let (
         ir::Ty::Closure {
             params: p1,
@@ -8274,8 +8774,7 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
     ) = (value.ty, target)
         && p1 == p2
         && r1 == r2
-        && c1.is_empty()
-        && c2.is_empty()
+        && c1 == c2
     {
         return Ok(ir::Expr {
             ty: target,
@@ -8359,6 +8858,10 @@ fn const_none() -> ir::Expr {
 fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     match &expr.kind {
         ast::ExprKind::Int(v) => Ok(int_const(*v)),
+        ast::ExprKind::IntDigits(s) => Ok(ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::ConstIntDigits(s.clone()),
+        }),
         ast::ExprKind::Float(v) => Ok(ir::Expr {
             ty: ir::Ty::Float,
             kind: ir::ExprKind::ConstFloat(*v),
@@ -8540,13 +9043,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         ast::ExprKind::TupleLit(items) => lower_tuple_lit(items, None, expr.span, ctx),
         ast::ExprKind::DictLit(items) => lower_dict_lit(items, None, expr.span, ctx),
         ast::ExprKind::SetLit(items) => lower_set_lit(items, None, expr.span, ctx),
-        ast::ExprKind::ListComp {
-            elem,
-            var,
-            var_span,
-            iter,
-            cond,
-        } => lower_list_comp(elem, var, *var_span, iter, cond.as_deref(), expr.span, ctx),
+        ast::ExprKind::ListComp { elem, generators } => {
+            lower_list_comp(elem, generators, expr.span, ctx)
+        }
         ast::ExprKind::Index { base, index } => {
             let base_ir = lower_expr(base, ctx)?;
             match base_ir.ty {
@@ -8859,24 +9358,30 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                                 *method_span,
                             ));
                         }
-                        let v = lower_expr(&args[0], ctx)?;
-                        if !matches!(v.kind, ir::ExprKind::ConstNone) && v.ty != ir::Ty::None {
-                            return Err(err(
-                                "generator.send(value) only supports send(None) in this subset",
-                                args[0].span,
-                            ));
-                        }
-                        // send(None) → yield_ty | None (like next)
+                        let send = lower_gen_send_arg(&args[0], *yield_ty, ctx)?;
                         Ok(ir::Expr {
                             ty: ir::optional_of(*yield_ty),
-                            kind: ir::ExprKind::GeneratorNext(Box::new(base_ir)),
+                            kind: ir::ExprKind::GeneratorNext {
+                                generator: Box::new(base_ir),
+                                send: Box::new(send),
+                            },
                         })
                     }
-                    "throw" => Err(err("generator.throw() is not supported yet", *method_span)),
+                    "throw" => {
+                        let (exc, message) = lower_gen_throw_args(&args, *method_span, ctx)?;
+                        Ok(ir::Expr {
+                            ty: ir::optional_of(*yield_ty),
+                            kind: ir::ExprKind::GeneratorThrow {
+                                generator: Box::new(base_ir),
+                                exc,
+                                message: Box::new(message),
+                            },
+                        })
+                    }
                     _ => Err(err(
                         format!(
                             "generator method '{method}' is not supported yet \
-                             (supported: close, send)"
+                             (supported: close, send, throw)"
                         ),
                         *method_span,
                     )),
@@ -8933,41 +9438,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 },
             })
         }
-        ast::ExprKind::JoinedStr(parts) => {
-            let mut result: Option<ir::Expr> = Option::None;
-            for part in parts {
-                let piece = match part {
-                    ast::FStringPart::Literal(s) => ir::Expr {
-                        ty: ir::Ty::Str,
-                        kind: ir::ExprKind::ConstStr(s.clone()),
-                    },
-                    ast::FStringPart::Expr { expr: e, format } => {
-                        let v = lower_expr(e, ctx)?;
-                        match format {
-                            None => lower_cast(ast::TypeName::Str, v, e.span)?,
-                            Some(ast::FStringFormat::DotNf { precision }) => {
-                                lower_float_format(v, *precision, e.span)?
-                            }
-                        }
-                    }
-                };
-                result = Some(match result {
-                    Option::None => piece,
-                    Some(acc) => ir::Expr {
-                        ty: ir::Ty::Str,
-                        kind: ir::ExprKind::Binary {
-                            op: ir::BinOp::Add,
-                            left: Box::new(acc),
-                            right: Box::new(piece),
-                        },
-                    },
-                });
-            }
-            Ok(result.unwrap_or(ir::Expr {
-                ty: ir::Ty::Str,
-                kind: ir::ExprKind::ConstStr(String::new()),
-            }))
-        }
+        ast::ExprKind::JoinedStr(parts) => lower_joined_str(parts, ctx),
         ast::ExprKind::Call {
             func,
             func_span,
@@ -9004,15 +9475,26 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     let value = promote_numeric(value, operand.span, "unary '-'")?;
                     // fold negated literals into constants so negative range
                     // steps and exponents are statically visible
-                    match value.kind {
-                        ir::ExprKind::ConstInt(v) => return Ok(int_const(v.wrapping_neg())),
-                        ir::ExprKind::ConstFloat(v) => {
-                            return Ok(ir::Expr {
-                                ty: ir::Ty::Float,
-                                kind: ir::ExprKind::ConstFloat(-v),
-                            });
+                    if let ir::ExprKind::ConstInt(v) = value.kind {
+                        if let Some(n) = v.checked_neg() {
+                            return Ok(int_const(n));
                         }
-                        _ => {}
+                        // i64::MIN negated needs a bigint; leave as Unary.
+                        let value = int_const(v);
+                        let ty = value.ty;
+                        return Ok(ir::Expr {
+                            ty,
+                            kind: ir::ExprKind::Unary {
+                                op: ir::UnOp::Neg,
+                                operand: Box::new(value),
+                            },
+                        });
+                    }
+                    if let ir::ExprKind::ConstFloat(v) = value.kind {
+                        return Ok(ir::Expr {
+                            ty: ir::Ty::Float,
+                            kind: ir::ExprKind::ConstFloat(-v),
+                        });
                     }
                     let ty = value.ty;
                     Ok(ir::Expr {
@@ -9096,9 +9578,6 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         }
         ast::ExprKind::Lambda { params, body } => lower_lambda(params, body, expr.span, ctx),
         ast::ExprKind::Yield(v) => {
-            if ctx.finally_depth > 0 {
-                return Err(err("yield in finally is not supported yet", expr.span));
-            }
             let val = match v {
                 Some(e) => lower_expr(e, ctx)?,
                 None => const_none(),
@@ -9110,22 +9589,21 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 ));
             };
             let val = coerce(val, yty, expr.span, "yield value")?;
-            // Represent as a Block that executes Yield stmt and produces None
-            // (yield expressions are not used as values in this subset except
-            // as expression statements).
+            // Yield suspends then resumes with send/next value as Optional[Y].
+            let sent_ty = ir::optional_of(yty);
             Ok(ir::Expr {
-                ty: ir::Ty::None,
+                ty: sent_ty,
                 kind: ir::ExprKind::Block {
                     stmts: vec![ir::Stmt::Yield(val)],
-                    result: Box::new(const_none()),
+                    result: Box::new(ir::Expr {
+                        ty: sent_ty,
+                        kind: ir::ExprKind::GenSentValue,
+                    }),
                 },
             })
         }
         ast::ExprKind::YieldFrom(iter) => {
             // Desugar to iteration + yield for any iterable supported by `for`.
-            if ctx.finally_depth > 0 {
-                return Err(err("yield from in finally is not supported yet", expr.span));
-            }
             let Some(yty) = ctx.yield_ty else {
                 return Err(err("'yield from' outside function", expr.span));
             };
@@ -9369,7 +9847,10 @@ fn lower_yield_from(
                     name: nxt_t.clone(),
                     value: ir::Expr {
                         ty: opt_ty,
-                        kind: ir::ExprKind::GeneratorNext(Box::new(gen_local.clone())),
+                        kind: ir::ExprKind::GeneratorNext {
+                            generator: Box::new(gen_local.clone()),
+                            send: Box::new(const_none()),
+                        },
                     },
                 },
                 ir::Stmt::If {
@@ -9518,33 +9999,29 @@ fn lower_compare_chain(
     })
 }
 
-/// `[elem for var in iter if cond]` desugars to a loop building a list
-/// inside an expression-level Block. The variable lives in a hidden
-/// storage slot (Python 3: it shadows but does not leak). Fast path:
-/// when the produced count is knowable (list/str sources always; range
-/// with a constant step of 1), the result is allocated at full capacity
-/// and appended without per-element capacity checks.
-fn lower_list_comp(
-    elem: &ast::Expr,
-    var: &str,
-    var_span: Span,
+/// One prepared `for` level inside a list comprehension.
+struct CompLevel {
+    /// Stmts that run before this level's while (at the appropriate nesting).
+    setup: Vec<ir::Stmt>,
+    cond: ir::Expr,
+    step: Vec<ir::Stmt>,
+    /// Bind the iteration element into the target.
+    bind: Vec<ir::Stmt>,
+    /// Filters for this generator (`if` clauses), already lowered.
+    ifs: Vec<ir::Expr>,
+    /// Exact capacity when knowable (only used for a single unfiltered gen).
+    cap: Option<ir::Expr>,
+}
+
+/// Build range/list/str loop setup for one comprehension generator.
+/// Appends setup into `setup`; returns (cond, step, element, optional cap).
+fn lower_comp_iter(
     iter: &ast::Expr,
-    cond: Option<&ast::Expr>,
-    span: Span,
+    want_cap: bool,
     ctx: &mut FnCtx,
-) -> SResult<ir::Expr> {
-    let mut stmts: Vec<ir::Stmt> = Vec::new();
-
-    // ---- source setup: yields (per-iteration element expr, loop parts) ----
-    struct Loop {
-        cond: ir::Expr,
-        step: Vec<ir::Stmt>,
-        element: ir::Expr,
-        /// exact or upper-bound capacity when knowable
-        cap: Option<ir::Expr>,
-    }
-
-    let looping: Loop = if let ast::ExprKind::Call { func, args, .. } = &iter.kind
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<(ir::Expr, Vec<ir::Stmt>, ir::Expr, Option<ir::Expr>)> {
+    if let ast::ExprKind::Call { func, args, .. } = &iter.kind
         && func == "range"
         && !ctx.funcs().contains_key("range")
     {
@@ -9573,7 +10050,7 @@ fn lower_list_comp(
             }
         };
         let stop_t = ctx.fresh_temp("comp.stop", ir::Ty::Int);
-        stmts.push(ir::Stmt::Assign {
+        setup.push(ir::Stmt::Assign {
             name: stop_t.clone(),
             value: stop,
         });
@@ -9582,7 +10059,7 @@ fn lower_list_comp(
             kind: ir::ExprKind::Local(stop_t),
         };
         let it_t = ctx.fresh_temp("comp.it", ir::Ty::Int);
-        stmts.push(ir::Stmt::Assign {
+        setup.push(ir::Stmt::Assign {
             name: it_t.clone(),
             value: start,
         });
@@ -9595,10 +10072,9 @@ fn lower_list_comp(
             ir::ExprKind::ConstInt(0) => {
                 return Err(err("range() arg 3 must not be zero", iter.span));
             }
-            ir::ExprKind::ConstInt(1) => {
-                // presize: cap = max(0, stop - it)
+            ir::ExprKind::ConstInt(1) if want_cap => {
                 let cap_t = ctx.fresh_temp("comp.cap", ir::Ty::Int);
-                stmts.push(ir::Stmt::Assign {
+                setup.push(ir::Stmt::Assign {
                     name: cap_t.clone(),
                     value: ir::Expr {
                         ty: ir::Ty::Int,
@@ -9613,7 +10089,7 @@ fn lower_list_comp(
                     ty: ir::Ty::Int,
                     kind: ir::ExprKind::Local(cap_t.clone()),
                 };
-                stmts.push(ir::Stmt::If {
+                setup.push(ir::Stmt::If {
                     branches: vec![(
                         int_cmp(ir::BinOp::Lt, cap_local.clone(), int_const(0)),
                         vec![ir::Stmt::Assign {
@@ -9639,7 +10115,7 @@ fn lower_list_comp(
             }
             _ => {
                 let step_t = ctx.fresh_temp("comp.step", ir::Ty::Int);
-                stmts.push(ir::Stmt::Assign {
+                setup.push(ir::Stmt::Assign {
                     name: step_t.clone(),
                     value: step,
                 });
@@ -9647,7 +10123,7 @@ fn lower_list_comp(
                     ty: ir::Ty::Int,
                     kind: ir::ExprKind::Local(step_t),
                 };
-                stmts.push(ir::Stmt::If {
+                setup.push(ir::Stmt::If {
                     branches: vec![(
                         int_cmp(ir::BinOp::Eq, step_local.clone(), int_const(0)),
                         vec![ir::Stmt::Die(
@@ -9686,103 +10162,179 @@ fn lower_list_comp(
                 },
             },
         };
-        Loop {
-            cond: loop_cond,
-            step: vec![step_stmt],
-            element: it_local,
-            cap,
+        return Ok((loop_cond, vec![step_stmt], it_local, cap));
+    }
+
+    // list or str: index loop; optional presize via len
+    let seq = lower_expr(iter, ctx)?;
+    let src_elem_ty = match seq.ty {
+        ir::Ty::List(e) => *e,
+        ir::Ty::Str => ir::Ty::Str,
+        other => {
+            return Err(err(format!("'{other}' object is not iterable"), iter.span));
         }
-    } else {
-        // list or str: index loop, exact/upper-bound presize via len
-        let seq = lower_expr(iter, ctx)?;
-        let src_elem_ty = match seq.ty {
-            ir::Ty::List(e) => *e,
-            ir::Ty::Str => ir::Ty::Str,
-            other => {
-                return Err(err(format!("'{other}' object is not iterable"), iter.span));
-            }
-        };
-        let seq_ty = seq.ty;
-        let seq_t = ctx.fresh_temp("comp.seq", seq_ty);
-        stmts.push(ir::Stmt::Assign {
-            name: seq_t.clone(),
-            value: seq,
-        });
-        let idx_t = ctx.fresh_temp("comp.idx", ir::Ty::Int);
-        stmts.push(ir::Stmt::Assign {
-            name: idx_t.clone(),
-            value: int_const(0),
-        });
-        let seq_local = ir::Expr {
-            ty: seq_ty,
-            kind: ir::ExprKind::Local(seq_t),
-        };
-        let idx_local = ir::Expr {
+    };
+    let seq_ty = seq.ty;
+    let seq_t = ctx.fresh_temp("comp.seq", seq_ty);
+    setup.push(ir::Stmt::Assign {
+        name: seq_t.clone(),
+        value: seq,
+    });
+    let idx_t = ctx.fresh_temp("comp.idx", ir::Ty::Int);
+    setup.push(ir::Stmt::Assign {
+        name: idx_t.clone(),
+        value: int_const(0),
+    });
+    let seq_local = ir::Expr {
+        ty: seq_ty,
+        kind: ir::ExprKind::Local(seq_t),
+    };
+    let idx_local = ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Local(idx_t.clone()),
+    };
+    let cond = int_cmp(
+        ir::BinOp::Lt,
+        idx_local.clone(),
+        ir::Expr {
             ty: ir::Ty::Int,
-            kind: ir::ExprKind::Local(idx_t.clone()),
-        };
-        let cond = int_cmp(
-            ir::BinOp::Lt,
-            idx_local.clone(),
-            ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Len(Box::new(seq_local.clone())),
+            kind: ir::ExprKind::Len(Box::new(seq_local.clone())),
+        },
+    );
+    let element = ir::Expr {
+        ty: src_elem_ty,
+        kind: ir::ExprKind::Index {
+            base: Box::new(seq_local.clone()),
+            index: Box::new(idx_local.clone()),
+        },
+    };
+    let step_stmt = ir::Stmt::Assign {
+        name: idx_t,
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(idx_local),
+                right: Box::new(int_const(1)),
             },
-        );
-        let element = ir::Expr {
-            ty: src_elem_ty,
-            kind: ir::ExprKind::Index {
-                base: Box::new(seq_local.clone()),
-                index: Box::new(idx_local.clone()),
-            },
-        };
-        let step_stmt = ir::Stmt::Assign {
-            name: idx_t,
-            value: ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Binary {
-                    op: ir::BinOp::Add,
-                    left: Box::new(idx_local),
-                    right: Box::new(int_const(1)),
-                },
-            },
-        };
-        // exact capacity without a filter, upper bound with one
-        let cap = ir::Expr {
+        },
+    };
+    let cap = if want_cap {
+        Some(ir::Expr {
             ty: ir::Ty::Int,
             kind: ir::ExprKind::Len(Box::new(seq_local)),
-        };
-        Loop {
-            cond,
-            step: vec![step_stmt],
-            element,
-            cap: Some(cap),
+        })
+    } else {
+        None
+    };
+    Ok((cond, vec![step_stmt], element, cap))
+}
+
+/// Bind a comprehension target: simple names use hidden storage (no leak);
+/// unpack / index targets bind real locals via `lower_assign_ir`.
+fn bind_comp_target(
+    target: &ast::AssignTarget,
+    element: ir::Expr,
+    ctx: &mut FnCtx,
+) -> SResult<(Vec<ir::Stmt>, usize)> {
+    match target {
+        ast::AssignTarget::Name { name, .. } => {
+            let src_elem_ty = element.ty;
+            ctx.temp_counter += 1;
+            let storage = format!(".comp{}.{name}", ctx.temp_counter);
+            ctx.locals_order.push((storage.clone(), src_elem_ty));
+            ctx.comp_renames
+                .push((name.clone(), storage.clone(), src_elem_ty));
+            let bind = vec![ir::Stmt::Assign {
+                name: storage,
+                value: element,
+            }];
+            Ok((bind, 1))
         }
-    };
+        _ => {
+            let bind = bind_for_target(target, element, ctx)?;
+            Ok((bind, 0))
+        }
+    }
+}
 
-    // ---- hidden storage for the loop variable ----
-    let src_elem_ty = looping.element.ty;
-    ctx.temp_counter += 1;
-    let storage = format!(".comp{}.{var}", ctx.temp_counter);
-    ctx.locals_order.push((storage.clone(), src_elem_ty));
+/// Nest `if` filters around an inner body (rightmost if is outermost? No —
+/// left-to-right: first if wraps the rest).
+fn wrap_comp_ifs(ifs: &[ir::Expr], inner: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
+    let mut body = inner;
+    for c in ifs.iter().rev() {
+        body = vec![ir::Stmt::If {
+            branches: vec![(c.clone(), body)],
+            orelse: vec![],
+        }];
+    }
+    body
+}
 
-    ctx.comp_renames
-        .push((var.to_string(), storage.clone(), src_elem_ty));
+/// `[elem for target in iter if cond ... for ...]` desugars to nested loops
+/// building a list inside an expression-level Block. Simple name targets live
+/// in hidden storage (Python 3: shadow, do not leak). Unpack targets bind real
+/// locals. Fast path: single generator, no filters, knowable length → presize
+/// + unchecked append.
+fn lower_list_comp(
+    elem: &ast::Expr,
+    generators: &[ast::CompFor],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if generators.is_empty() {
+        return Err(err(
+            "internal error: list comprehension has no generators",
+            span,
+        ));
+    }
+
+    let can_presize = generators.len() == 1 && generators[0].ifs.is_empty();
+    let mut levels: Vec<CompLevel> = Vec::with_capacity(generators.len());
+    let mut renames_pushed = 0usize;
+
+    for (i, clause) in generators.iter().enumerate() {
+        let want_cap = can_presize && i == 0;
+        let mut setup = Vec::new();
+        let (cond, step, element, cap) = lower_comp_iter(&clause.iter, want_cap, ctx, &mut setup)?;
+        let (bind, n_renames) = bind_comp_target(&clause.target, element, ctx)?;
+        renames_pushed += n_renames;
+        let mut ifs = Vec::with_capacity(clause.ifs.len());
+        for c in &clause.ifs {
+            ifs.push(lower_condition(c, ctx)?);
+        }
+        levels.push(CompLevel {
+            setup,
+            cond,
+            step,
+            bind,
+            ifs,
+            cap,
+        });
+    }
+
     let elem_ir = lower_expr(elem, ctx);
-    let cond_ir = match cond {
-        Some(c) => lower_condition(c, ctx).map(Some),
-        Option::None => Ok(Option::None),
-    };
-    ctx.comp_renames.pop();
+    for _ in 0..renames_pushed {
+        ctx.comp_renames.pop();
+    }
     let elem_ir = elem_ir?;
-    let cond_ir = cond_ir?;
-
     let elem_ty = elem_of(elem_ir.ty, elem.span)?;
-    let _ = var_span;
 
     // ---- result list ----
-    let presized = looping.cap.is_some();
-    let cap_expr = looping.cap.unwrap_or(int_const(4));
+    // Cap setup lives in the outermost generator's `setup`; emit that first
+    // so presized ListNew can read the capacity temp.
+    let presized = can_presize && levels[0].cap.is_some();
+    let cap_expr = if presized {
+        levels[0].cap.take().unwrap_or(int_const(4))
+    } else {
+        int_const(4)
+    };
+
+    let mut stmts: Vec<ir::Stmt> = Vec::new();
+    // Peel outermost setup so ListNew sits between setup0 and while0.
+    let outer_setup = std::mem::take(&mut levels[0].setup);
+
+    stmts.extend(outer_setup);
     let res_t = ctx.fresh_temp("comp.res", ir::list_of(elem_ty));
     stmts.push(ir::Stmt::Assign {
         name: res_t.clone(),
@@ -9798,35 +10350,34 @@ fn lower_list_comp(
         kind: ir::ExprKind::Local(res_t.clone()),
     };
 
-    // ---- loop body: var = element; [if cond:] append(elem) ----
     let append = if presized {
         ir::Stmt::ListAppendUnchecked {
-            list: res_local.clone(),
+            list: res_local,
             value: elem_ir,
         }
     } else {
         ir::Stmt::ListAppend {
-            list: res_local.clone(),
+            list: res_local,
             value: elem_ir,
         }
     };
-    let mut body = vec![ir::Stmt::Assign {
-        name: storage,
-        value: looping.element,
-    }];
-    match cond_ir {
-        Some(c) => body.push(ir::Stmt::If {
-            branches: vec![(c, vec![append])],
-            orelse: vec![],
-        }),
-        Option::None => body.push(append),
-    }
 
-    stmts.push(ir::Stmt::While {
-        cond: looping.cond,
-        body,
-        step: looping.step,
-    });
+    // Nest from innermost generator outward.
+    // Outermost setup already emitted; its while is built here with empty setup.
+    let mut inner_body = vec![append];
+    for level in levels.into_iter().rev() {
+        let mut body = level.bind;
+        body.extend(wrap_comp_ifs(&level.ifs, inner_body));
+        let while_stmt = ir::Stmt::While {
+            cond: level.cond,
+            body,
+            step: level.step,
+        };
+        let mut wrapped = level.setup;
+        wrapped.push(while_stmt);
+        inner_body = wrapped;
+    }
+    stmts.extend(inner_body);
 
     let _ = span;
     Ok(ir::Expr {
@@ -10189,8 +10740,9 @@ fn lower_set_lit(
 }
 
 fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
-    // Homogeneous closures: same params/ret. Erase capture/func identity so
-    // CallClosure uses the code pointer from the heap object.
+    // Homogeneous closures: same params/ret and same capture env shape.
+    // Erase func identity so CallClosure uses the code pointer from the heap
+    // object (capture slots are still typed for unpack).
     if let (
         ir::Ty::Closure {
             params: p1,
@@ -10206,11 +10758,9 @@ fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
         },
     ) = (a, b)
     {
-        if p1 == p2 && r1 == r2 && c1.is_empty() && c2.is_empty() {
-            return Some(ir::closure_of_full(p1, *r1, &[], ""));
+        if p1 == p2 && r1 == r2 && c1 == c2 {
+            return Some(ir::closure_of_full(p1, *r1, c1, ""));
         }
-        // Same captures shape (rare homogeneous list of identical nested) —
-        // only when both are capture-free for container storage.
         return None;
     }
     match (a, b) {
@@ -12000,38 +12550,127 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
     }
 }
 
-/// f-string `{x:.Nf}`: format int/float/bool as fixed-point (CPython-compatible).
-fn lower_float_format(value: ir::Expr, precision: u32, span: Span) -> SResult<ir::Expr> {
-    let as_float = match value.ty {
-        ir::Ty::Float => value,
-        ir::Ty::Int => ir::Expr {
-            ty: ir::Ty::Float,
-            kind: ir::ExprKind::IntToFloat(Box::new(value)),
-        },
-        ir::Ty::Bool => {
-            let as_int = ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::BoolToInt(Box::new(value)),
-            };
-            ir::Expr {
-                ty: ir::Ty::Float,
-                kind: ir::ExprKind::IntToFloat(Box::new(as_int)),
+/// Lower `f"…"` / nested format-spec joined strings to concat of pieces.
+fn lower_joined_str(parts: &[ast::FStringPart], ctx: &mut FnCtx<'_>) -> SResult<ir::Expr> {
+    let mut result: Option<ir::Expr> = Option::None;
+    for part in parts {
+        let piece = match part {
+            ast::FStringPart::Literal(s) => ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::ConstStr(s.clone()),
+            },
+            ast::FStringPart::Expr {
+                expr: e,
+                conversion,
+                format_spec,
+            } => {
+                let v = lower_expr(e, ctx)?;
+                let converted = lower_fstring_conversion(v, *conversion, e.span)?;
+                match format_spec {
+                    None => {
+                        // No `:` → `str(value)` (after optional conversion).
+                        if converted.ty == ir::Ty::Str {
+                            converted
+                        } else {
+                            lower_cast(ast::TypeName::Str, converted, e.span)?
+                        }
+                    }
+                    Some(spec) => {
+                        let spec_ir = lower_expr(spec, ctx)?;
+                        if spec_ir.ty != ir::Ty::Str {
+                            return Err(err(
+                                format!(
+                                    "f-string format specifier must be str, got {}",
+                                    spec_ir.ty
+                                ),
+                                e.span,
+                            ));
+                        }
+                        // Static check: only scalar types we can format.
+                        match converted.ty {
+                            ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => {}
+                            other => {
+                                return Err(err(
+                                    format!("format() cannot convert {other} yet"),
+                                    e.span,
+                                ));
+                            }
+                        }
+                        ir::Expr {
+                            ty: ir::Ty::Str,
+                            kind: ir::ExprKind::FormatValue {
+                                value: Box::new(converted),
+                                spec: Box::new(spec_ir),
+                            },
+                        }
+                    }
+                }
+            }
+        };
+        result = Some(match result {
+            Option::None => piece,
+            Some(acc) => ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(acc),
+                    right: Box::new(piece),
+                },
+            },
+        });
+    }
+    Ok(result.unwrap_or(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::ConstStr(String::new()),
+    }))
+}
+
+/// Apply f-string `!s` / `!r` / `!a` conversion (or leave value unchanged).
+fn lower_fstring_conversion(
+    value: ir::Expr,
+    conversion: Option<ast::FStringConversion>,
+    span: Span,
+) -> SResult<ir::Expr> {
+    let Some(conv) = conversion else {
+        return Ok(value);
+    };
+    match conv {
+        ast::FStringConversion::Str => {
+            if value.ty == ir::Ty::Str {
+                Ok(value)
+            } else {
+                lower_cast(ast::TypeName::Str, value, span)
             }
         }
-        other => {
-            return Err(err(
-                format!("Unknown format code 'f' for object of type '{other}'"),
-                span,
-            ));
+        ast::FStringConversion::Repr => lower_repr_like(value, false, span),
+        ast::FStringConversion::Ascii => lower_repr_like(value, true, span),
+    }
+}
+
+/// `repr` / `ascii` for supported scalars. For int/float/bool, both match
+/// `str()`. For str, emit [`ir::ExprKind::StrRepr`] / [`ir::ExprKind::StrAscii`].
+fn lower_repr_like(value: ir::Expr, ascii: bool, span: Span) -> SResult<ir::Expr> {
+    match value.ty {
+        ir::Ty::Str => Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: if ascii {
+                ir::ExprKind::StrAscii(Box::new(value))
+            } else {
+                ir::ExprKind::StrRepr(Box::new(value))
+            },
+        }),
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool => {
+            // CPython: repr(42) == '42', ascii same as repr for these.
+            lower_cast(ast::TypeName::Str, value, span)
         }
-    };
-    Ok(ir::Expr {
-        ty: ir::Ty::Str,
-        kind: ir::ExprKind::FloatFormat {
-            value: Box::new(as_float),
-            precision,
-        },
-    })
+        other => Err(err(
+            format!(
+                "{}() cannot convert {other} yet",
+                if ascii { "ascii" } else { "repr" }
+            ),
+            span,
+        )),
+    }
 }
 
 /// bool → int; int/float pass through; anything else is an error.
@@ -12391,42 +13030,54 @@ fn lower_bitwise(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
         ast::BinOp::RShift => ir::BinOp::RShift,
         _ => unreachable!(),
     };
-    // constant fold
+    // constant fold only when the result still fits in i64 (bigint shifts leave runtime)
     if let (ir::ExprKind::ConstInt(a), ir::ExprKind::ConstInt(b)) = (&l.kind, &r.kind) {
-        let v = match ir_op {
-            ir::BinOp::BitAnd => a & b,
-            ir::BinOp::BitOr => a | b,
-            ir::BinOp::BitXor => a ^ b,
+        let folded: Option<i64> = match ir_op {
+            ir::BinOp::BitAnd => Some(a & b),
+            ir::BinOp::BitOr => Some(a | b),
+            ir::BinOp::BitXor => Some(a ^ b),
             ir::BinOp::LShift => {
                 if *b < 0 {
                     return Err(err("negative shift count", span));
                 }
-                if *b >= 64 {
-                    0
+                if *b >= 63 {
+                    None // may need bigint (e.g. 1<<100)
+                } else if *b == 0 {
+                    Some(*a)
                 } else {
-                    a.wrapping_shl(*b as u32)
+                    // only fold when no overflow beyond i64
+                    let sh = *b as u32;
+                    if *a >= 0 {
+                        a.checked_shl(sh).filter(|&v| v >> sh == *a)
+                    } else if sh < 63 {
+                        // small negative << k that still fits in i64
+                        Some(a.wrapping_shl(sh))
+                    } else {
+                        None
+                    }
                 }
             }
             ir::BinOp::RShift => {
                 if *b < 0 {
                     return Err(err("negative shift count", span));
                 }
-                if *b >= 64 {
-                    if *a < 0 { -1 } else { 0 }
+                if *b >= 63 {
+                    Some(if *a < 0 { -1 } else { 0 })
                 } else {
-                    // Arithmetic right shift (CPython); wrapping_shr is logical.
-                    *a >> (*b as u32)
+                    Some(*a >> (*b as u32))
                 }
             }
             _ => unreachable!(),
         };
-        if keep_bool {
-            return Ok(ir::Expr {
-                ty: ir::Ty::Bool,
-                kind: ir::ExprKind::ConstBool(v != 0),
-            });
+        if let Some(v) = folded {
+            if keep_bool {
+                return Ok(ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::ConstBool(v != 0),
+                });
+            }
+            return Ok(int_const(v));
         }
-        return Ok(int_const(v));
     }
     let result = ir::Expr {
         ty: ir::Ty::Int,
@@ -13738,7 +14389,7 @@ print(count([]))
     }
 
     #[test]
-    fn fstring_dot_nf_lowers_to_float_format() {
+    fn fstring_format_spec_lowers_to_format_value() {
         let m = analyze_ok("x = 3.14159\ns = f\"{x:.2f}\"\n");
         let entry = find_func(&m, ENTRY_NAME);
         let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
@@ -13746,7 +14397,10 @@ print(count([]))
         };
         fn has_fmt(e: &ir::Expr) -> bool {
             match &e.kind {
-                ir::ExprKind::FloatFormat { precision: 2, .. } => true,
+                ir::ExprKind::FormatValue { value, spec } => {
+                    value.ty == ir::Ty::Float
+                        && matches!(&spec.kind, ir::ExprKind::ConstStr(s) if s == ".2f")
+                }
                 ir::ExprKind::Binary { left, right, .. } => has_fmt(left) || has_fmt(right),
                 _ => false,
             }
@@ -13755,39 +14409,43 @@ print(count([]))
     }
 
     #[test]
-    fn fstring_dot_nf_promotes_int() {
+    fn fstring_format_spec_on_int() {
         let m = analyze_ok("n = 2\ns = f\"{n:.2f}\"\n");
         let entry = find_func(&m, ENTRY_NAME);
         let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
-        fn has_int_to_float_fmt(e: &ir::Expr) -> bool {
+        fn has_int_fmt(e: &ir::Expr) -> bool {
             match &e.kind {
-                ir::ExprKind::FloatFormat {
-                    value,
-                    precision: 2,
-                } => {
-                    matches!(value.kind, ir::ExprKind::IntToFloat(_))
-                }
-                ir::ExprKind::Binary { left, right, .. } => {
-                    has_int_to_float_fmt(left) || has_int_to_float_fmt(right)
-                }
+                ir::ExprKind::FormatValue { value, .. } => value.ty == ir::Ty::Int,
+                ir::ExprKind::Binary { left, right, .. } => has_int_fmt(left) || has_int_fmt(right),
                 _ => false,
             }
         }
-        assert!(has_int_to_float_fmt(value), "{value:?}");
+        assert!(has_int_fmt(value), "{value:?}");
+    }
+
+    #[test]
+    fn fstring_repr_conversion_on_str() {
+        let m = analyze_ok("s = \"hi\"\nt = f\"{s!r}\"\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        fn has_repr(e: &ir::Expr) -> bool {
+            match &e.kind {
+                ir::ExprKind::StrRepr(_) => true,
+                ir::ExprKind::Binary { left, right, .. } => has_repr(left) || has_repr(right),
+                _ => false,
+            }
+        }
+        assert!(has_repr(value), "{value:?}");
     }
 
     #[test]
     fn error_fstring_of_list() {
         let e = analyze_err("xs = [1]\ns = f\"{xs}\"\nprint(s)\n");
         assert!(e.message.contains("convert"), "{}", e.message);
-    }
-
-    #[test]
-    fn error_fstring_dot_nf_on_str() {
-        let e = analyze_err("s = \"hi\"\nt = f\"{s:.2f}\"\n");
-        assert!(e.message.contains("format code"), "{}", e.message);
     }
 
     #[test]

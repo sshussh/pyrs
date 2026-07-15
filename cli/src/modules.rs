@@ -9,7 +9,9 @@
 //! 3. workspace **`stdlib/`** next to the `cli` crate when present (dev only)
 //! 4. **embedded** stdlib baked into the `pyrs` binary (always available)
 //!
-//! A directory with `__init__.py` is a package; relative imports are rewritten
+//! A directory with `__init__.py` is a regular package. A directory **without**
+//! `__init__.py` that exists on disk is a **namespace package** (PEP 420
+//! subset: single origin, no multi-path split). Relative imports are rewritten
 //! to absolute form before semantic analysis.
 //!
 //! **Partial package init:** a package `__init__.py` may import its own
@@ -50,8 +52,10 @@ pub struct LoadError(pub String);
 /// Where a module's source was found.
 #[derive(Debug, Clone)]
 enum ModuleLoc {
-    /// Real filesystem path.
+    /// Real filesystem path (`.py` module or package `__init__.py`).
     File(PathBuf),
+    /// Namespace package directory (no `__init__.py`; empty synthetic body).
+    Namespace { dir: PathBuf, display: String },
     /// Embedded stdlib (`display` is synthetic, e.g. `<stdlib>/os/path.py`).
     Embed {
         display: String,
@@ -318,7 +322,12 @@ fn resolve_module(roots: &[PathBuf], name: &str) -> Option<(ModuleLoc, bool)> {
     }
 
     match top_loc {
-        ModuleLoc::File(init_path) => resolve_children_under_dir(&init_path, &parts[1..]),
+        ModuleLoc::File(ref path) => {
+            // Regular package: children under the directory containing `__init__.py`.
+            let pkg_dir = path.parent()?;
+            resolve_children_under_dir(pkg_dir, &parts[1..])
+        }
+        ModuleLoc::Namespace { ref dir, .. } => resolve_children_under_dir(dir, &parts[1..]),
         ModuleLoc::Embed { .. } => resolve_children_in_embed(&parts),
     }
 }
@@ -326,41 +335,56 @@ fn resolve_module(roots: &[PathBuf], name: &str) -> Option<(ModuleLoc, bool)> {
 /// Top-level name only: first filesystem root, then embed.
 fn resolve_top_level(roots: &[PathBuf], name: &str) -> Option<(ModuleLoc, bool)> {
     for root in roots {
-        if let Some((path, is_package)) = resolve_under(root, name) {
-            return Some((ModuleLoc::File(path), is_package));
+        if let Some(hit) = resolve_under(root, name) {
+            return Some(hit);
         }
     }
     resolve_embedded(name)
 }
 
-/// Resolve nested components under a filesystem package directory.
-/// `init_path` is the parent package's `__init__.py`. Does not search other
-/// roots or embed.
-fn resolve_children_under_dir(init_path: &Path, child_parts: &[&str]) -> Option<(ModuleLoc, bool)> {
-    let mut pkg_dir = init_path.parent()?.to_path_buf();
-    let mut loc = ModuleLoc::File(init_path.to_path_buf());
+/// Resolve nested components under a filesystem package **directory**
+/// (regular package dir or namespace package dir). Prefer, per component:
+/// `__init__.py` package → `name.py` module → namespace subdirectory.
+/// Does not search other roots or embed.
+fn resolve_children_under_dir(pkg_dir: &Path, child_parts: &[&str]) -> Option<(ModuleLoc, bool)> {
+    let mut pkg_dir = pkg_dir.to_path_buf();
+    let mut loc: Option<(ModuleLoc, bool)> = None;
     let mut is_pkg = true;
     for &part in child_parts {
         if !is_pkg {
             return None;
         }
-        let child_init = pkg_dir.join(part).join("__init__.py");
+        let child_dir = pkg_dir.join(part);
+        let child_init = child_dir.join("__init__.py");
         if child_init.is_file() {
-            loc = ModuleLoc::File(child_init);
+            loc = Some((ModuleLoc::File(child_init), true));
             is_pkg = true;
-            pkg_dir = pkg_dir.join(part);
+            pkg_dir = child_dir;
             continue;
         }
         let mut child_py = pkg_dir.join(part);
         child_py.set_extension("py");
         if child_py.is_file() {
-            loc = ModuleLoc::File(child_py);
+            loc = Some((ModuleLoc::File(child_py), false));
             is_pkg = false;
+            continue;
+        }
+        if child_dir.is_dir() {
+            let display = child_dir.display().to_string();
+            loc = Some((
+                ModuleLoc::Namespace {
+                    dir: child_dir.clone(),
+                    display,
+                },
+                true,
+            ));
+            is_pkg = true;
+            pkg_dir = child_dir;
             continue;
         }
         return None;
     }
-    Some((loc, is_pkg))
+    loc
 }
 
 /// Resolve a dotted name entirely within the embed (parent packages must
@@ -379,43 +403,40 @@ fn resolve_children_in_embed(parts: &[&str]) -> Option<(ModuleLoc, bool)> {
 }
 
 /// Filesystem-only resolve with package confinement (no embed). Used by unit tests.
+/// Returns a filesystem path for `File` locs (`__init__.py` or `.py`); for
+/// namespace packages returns the package directory.
 #[cfg(test)]
 fn resolve_module_path(roots: &[PathBuf], name: &str) -> Option<(PathBuf, bool)> {
-    let parts: Vec<&str> = name.split('.').filter(|p| !p.is_empty()).collect();
-    if parts.is_empty() {
-        return None;
-    }
-    let mut found: Option<(PathBuf, bool)> = None;
-    for root in roots {
-        if let Some(hit) = resolve_under(root, parts[0]) {
-            found = Some(hit);
-            break;
-        }
-    }
-    let (top_path, top_is_pkg) = found?;
-    if parts.len() == 1 {
-        return Some((top_path, top_is_pkg));
-    }
-    if !top_is_pkg {
-        return None;
-    }
-    let (loc, is_pkg) = resolve_children_under_dir(&top_path, &parts[1..])?;
+    let (loc, is_pkg) = resolve_module(roots, name)?;
     match loc {
         ModuleLoc::File(p) => Some((p, is_pkg)),
+        ModuleLoc::Namespace { dir, .. } => Some((dir, is_pkg)),
         ModuleLoc::Embed { .. } => None,
     }
 }
 
-fn resolve_under(root: &Path, name: &str) -> Option<(PathBuf, bool)> {
+/// Prefer under `root`: `__init__.py` package → `name.py` module → namespace directory.
+fn resolve_under(root: &Path, name: &str) -> Option<(ModuleLoc, bool)> {
     let rel: PathBuf = name.split('.').collect();
-    let pkg_init = root.join(&rel).join("__init__.py");
+    let pkg_dir = root.join(&rel);
+    let pkg_init = pkg_dir.join("__init__.py");
     if pkg_init.is_file() {
-        return Some((pkg_init, true));
+        return Some((ModuleLoc::File(pkg_init), true));
     }
     let mut py = root.join(&rel);
     py.set_extension("py");
     if py.is_file() {
-        return Some((py, false));
+        return Some((ModuleLoc::File(py), false));
+    }
+    if pkg_dir.is_dir() {
+        let display = pkg_dir.display().to_string();
+        return Some((
+            ModuleLoc::Namespace {
+                dir: pkg_dir,
+                display,
+            },
+            true,
+        ));
     }
     None
 }
@@ -458,6 +479,10 @@ fn parse_loc(
 ) -> Result<Parsed, LoadError> {
     match loc {
         ModuleLoc::File(path) => parse_file(&path, name, package, roots),
+        ModuleLoc::Namespace { display, .. } => {
+            // Synthetic empty package body (PEP 420 namespace package).
+            parse_source(display, String::new(), name, package, true, roots)
+        }
         ModuleLoc::Embed { display, source } => {
             let is_package = display.ends_with("/__init__.py") || display.ends_with("__init__.py");
             parse_source(
@@ -593,32 +618,48 @@ fn collect_deps_in_stmts(
             ast::StmtKind::FromImport {
                 module: m,
                 names,
+                star,
                 span,
                 ..
             } => {
                 if m != "sys" && !m.is_empty() && m != self_name && seen.insert(m.clone()) {
                     deps.push((m.clone(), *span));
                 }
-                for (import_name, alias, nspan) in names {
-                    let sub = if m.is_empty() {
-                        import_name.clone()
-                    } else {
-                        format!("{m}.{import_name}")
-                    };
-                    if module_exists(roots, &sub) {
-                        let from_self = m == self_name || m.is_empty();
-                        let should_push = if from_self {
-                            !track_bound || !bound.contains(import_name)
-                        } else {
-                            !package_binds_name_cached(roots, m, import_name, package_binds_cache)
-                        };
-                        if should_push && sub != self_name && seen.insert(sub.clone()) {
-                            deps.push((sub, *nspan));
+                // `import *` does not force-load submodules (only names already
+                // on the source); expand bound names for hasattr short-circuit.
+                if *star {
+                    if track_bound {
+                        for name in star_public_bound_names(roots, m) {
+                            bound.insert(name);
                         }
                     }
-                    if track_bound {
-                        let local = alias.clone().unwrap_or_else(|| import_name.clone());
-                        bound.insert(local);
+                } else {
+                    for (import_name, alias, nspan) in names {
+                        let sub = if m.is_empty() {
+                            import_name.clone()
+                        } else {
+                            format!("{m}.{import_name}")
+                        };
+                        if module_exists(roots, &sub) {
+                            let from_self = m == self_name || m.is_empty();
+                            let should_push = if from_self {
+                                !track_bound || !bound.contains(import_name)
+                            } else {
+                                !package_binds_name_cached(
+                                    roots,
+                                    m,
+                                    import_name,
+                                    package_binds_cache,
+                                )
+                            };
+                            if should_push && sub != self_name && seen.insert(sub.clone()) {
+                                deps.push((sub, *nspan));
+                            }
+                        }
+                        if track_bound {
+                            let local = alias.clone().unwrap_or_else(|| import_name.clone());
+                            bound.insert(local);
+                        }
                     }
                 }
             }
@@ -771,6 +812,7 @@ fn package_bound_names(roots: &[PathBuf], package: &str) -> Option<HashSet<Strin
     let (loc, _) = resolve_module(roots, package)?;
     let source = match loc {
         ModuleLoc::File(path) => std::fs::read_to_string(path).ok()?,
+        ModuleLoc::Namespace { .. } => String::new(),
         ModuleLoc::Embed { source, .. } => source.to_string(),
     };
     let ast = parser::parse(&source).ok()?;
@@ -799,16 +841,153 @@ fn package_bound_names(roots: &[PathBuf], package: &str) -> Option<HashSet<Strin
                     bound.insert(local);
                 }
             }
-            ast::StmtKind::FromImport { names, .. } => {
-                for (import_name, alias, _) in names {
-                    let local = alias.clone().unwrap_or_else(|| import_name.clone());
-                    bound.insert(local);
+            ast::StmtKind::FromImport {
+                module: m,
+                names,
+                star,
+                ..
+            } => {
+                if *star {
+                    for name in star_public_bound_names(roots, m) {
+                        bound.insert(name);
+                    }
+                } else {
+                    for (import_name, alias, _) in names {
+                        let local = alias.clone().unwrap_or_else(|| import_name.clone());
+                        bound.insert(local);
+                    }
                 }
             }
             _ => {}
         }
     }
     Some(bound)
+}
+
+/// Names that `from package import *` would bind, for hasattr short-circuit
+/// during load. Uses static `__all__` when present; otherwise public names
+/// (not starting with `_`) from the source module body. Dynamic/`__all__`
+/// that is not a list/tuple of string lits is treated as binding nothing
+/// here (semantic reports the error).
+fn star_public_bound_names(roots: &[PathBuf], package: &str) -> HashSet<String> {
+    let Some((loc, _)) = resolve_module(roots, package) else {
+        return HashSet::new();
+    };
+    let source = match loc {
+        ModuleLoc::File(path) => match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        },
+        ModuleLoc::Namespace { .. } => return HashSet::new(),
+        ModuleLoc::Embed { source, .. } => source.to_string(),
+    };
+    let Ok(ast) = parser::parse(&source) else {
+        return HashSet::new();
+    };
+    match static_dunder_all(&ast) {
+        Some(Ok(names)) => names.into_iter().collect(),
+        Some(Err(())) => HashSet::new(),
+        None => {
+            let mut bound = HashSet::new();
+            for stmt in &ast.body {
+                match &stmt.kind {
+                    ast::StmtKind::FuncDef(f) if !f.name.starts_with('_') => {
+                        bound.insert(f.name.clone());
+                    }
+                    ast::StmtKind::Assign { targets, .. } => {
+                        let mut names = HashSet::new();
+                        for t in targets {
+                            collect_bound_names(t, &mut names);
+                        }
+                        for n in names {
+                            if !n.starts_with('_') {
+                                bound.insert(n);
+                            }
+                        }
+                    }
+                    ast::StmtKind::AugAssign {
+                        target: ast::AssignTarget::Name { name: n, .. },
+                        ..
+                    } if !n.starts_with('_') => {
+                        bound.insert(n.clone());
+                    }
+                    ast::StmtKind::Import { names } => {
+                        for (m, alias, _) in names {
+                            let local = alias
+                                .clone()
+                                .unwrap_or_else(|| m.split('.').next().unwrap_or(m).to_string());
+                            if !local.starts_with('_') {
+                                bound.insert(local);
+                            }
+                        }
+                    }
+                    ast::StmtKind::FromImport {
+                        names, star: false, ..
+                    } => {
+                        for (import_name, alias, _) in names {
+                            let local = alias.clone().unwrap_or_else(|| import_name.clone());
+                            if !local.starts_with('_') {
+                                bound.insert(local);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            bound
+        }
+    }
+}
+
+/// Static `__all__ = ["a", "b"]` / `("a", "b")` from a module body.
+/// `Some(Ok(names))` — static list/tuple of string literals (last assignment wins).
+/// `Some(Err(()))` — `__all__` assigned to something else (dynamic).
+/// `None` — no `__all__` assignment.
+fn static_dunder_all(module: &ast::Module) -> Option<Result<Vec<String>, ()>> {
+    let mut found: Option<Result<Vec<String>, ()>> = None;
+    for stmt in &module.body {
+        let ast::StmtKind::Assign { targets, value, .. } = &stmt.kind else {
+            continue;
+        };
+        let is_all = targets
+            .iter()
+            .any(|t| matches!(t, ast::AssignTarget::Name { name, .. } if name == "__all__"));
+        if !is_all {
+            continue;
+        }
+        found = Some(string_lit_sequence(value));
+    }
+    found
+}
+
+/// List or tuple of string literals → names; else error.
+fn string_lit_sequence(e: &ast::Expr) -> Result<Vec<String>, ()> {
+    match &e.kind {
+        ast::ExprKind::ListLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    ast::ListElem::Item(expr) => match &expr.kind {
+                        ast::ExprKind::Str(s) => out.push(s.clone()),
+                        _ => return Err(()),
+                    },
+                    ast::ListElem::Star(_) => return Err(()),
+                }
+            }
+            Ok(out)
+        }
+        ast::ExprKind::TupleLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match &it.kind {
+                    ast::ExprKind::Str(s) => out.push(s.clone()),
+                    _ => return Err(()),
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(()),
+    }
 }
 
 fn collect_bound_names(target: &ast::AssignTarget, names: &mut HashSet<String>) {
@@ -1008,6 +1187,80 @@ mod tests {
     }
 
     #[test]
+    fn resolve_namespace_package_without_init() {
+        let dir = std::env::temp_dir().join(format!("pyrs-ns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("utilpkg")).unwrap();
+        std::fs::write(dir.join("utilpkg/mod.py"), "X = 1\n").unwrap();
+        let roots = [dir.clone()];
+
+        let (p, is_pkg) = resolve_module_path(&roots, "utilpkg").unwrap();
+        assert!(is_pkg);
+        assert!(p.is_dir());
+        assert!(p.ends_with("utilpkg"));
+
+        let (p2, is_pkg2) = resolve_module_path(&roots, "utilpkg.mod").unwrap();
+        assert!(!is_pkg2);
+        assert!(p2.ends_with("mod.py"));
+
+        // Prefer __init__.py over bare directory.
+        std::fs::write(dir.join("utilpkg/__init__.py"), "MARK = 1\n").unwrap();
+        let (p3, is_pkg3) = resolve_module_path(&roots, "utilpkg").unwrap();
+        assert!(is_pkg3);
+        assert!(p3.ends_with("__init__.py"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_nested_namespace_packages() {
+        let dir = std::env::temp_dir().join(format!("pyrs-ns-nest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/c.py"), "Y = 2\n").unwrap();
+        let roots = [dir.clone()];
+
+        let (_, a_pkg) = resolve_module_path(&roots, "a").unwrap();
+        assert!(a_pkg);
+        let (_, b_pkg) = resolve_module_path(&roots, "a.b").unwrap();
+        assert!(b_pkg);
+        let (c, c_pkg) = resolve_module_path(&roots, "a.b.c").unwrap();
+        assert!(!c_pkg);
+        assert!(c.ends_with("c.py"));
+
+        let main = dir.join("main.py");
+        std::fs::write(&main, "import a.b.c\nprint(a.b.c.Y)\n").unwrap();
+        let loaded = load_program_with_roots(&main, &roots).unwrap();
+        let names: Vec<_> = loaded.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"a"), "names={names:?}");
+        assert!(names.contains(&"a.b"), "names={names:?}");
+        assert!(names.contains(&"a.b.c"), "names={names:?}");
+        let a_mod = loaded.iter().find(|m| m.name == "a").unwrap();
+        assert!(a_mod.source.is_empty(), "namespace package has empty body");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_prefers_module_py_over_namespace_dir() {
+        // CPython: foo.py wins over foo/ without __init__.py for `import foo`.
+        let dir = std::env::temp_dir().join(format!("pyrs-py-vs-ns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("foo")).unwrap();
+        std::fs::write(dir.join("foo/bar.py"), "Z = 3\n").unwrap();
+        std::fs::write(dir.join("foo.py"), "Z = 4\n").unwrap();
+        let roots = [dir.clone()];
+        let (p, is_pkg) = resolve_module_path(&roots, "foo").unwrap();
+        assert!(!is_pkg);
+        assert!(p.ends_with("foo.py"));
+        assert!(
+            resolve_module_path(&roots, "foo.bar").is_none(),
+            "foo is a module, not a package"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn resolve_searches_roots_in_order_user_wins() {
         let pid = std::process::id();
         let user = std::env::temp_dir().join(format!("pyrs-user-{pid}"));
@@ -1078,7 +1331,7 @@ mod tests {
                 // Re-exports `path` for `import os` → `os.path`.
                 assert!(source.contains("from . import path"), "source={source:?}");
             }
-            ModuleLoc::File(_) => panic!("expected embed"),
+            ModuleLoc::File(_) | ModuleLoc::Namespace { .. } => panic!("expected embed"),
         }
         let (loc, is_pkg) = resolve_embedded("os.path").expect("embedded os.path");
         assert!(!is_pkg);
@@ -1089,7 +1342,7 @@ mod tests {
                 assert!(source.contains("def dirname"), "source={source:?}");
                 assert!(source.contains("def basename"), "source={source:?}");
             }
-            ModuleLoc::File(_) => panic!("expected embed"),
+            ModuleLoc::File(_) | ModuleLoc::Namespace { .. } => panic!("expected embed"),
         }
         assert!(resolve_embedded("nope_missing").is_none());
     }
@@ -1234,7 +1487,9 @@ mod tests {
         assert!(is_pkg);
         match loc {
             ModuleLoc::File(p) => assert!(p.starts_with(&user)),
-            ModuleLoc::Embed { .. } => panic!("user package must win over embed"),
+            ModuleLoc::Namespace { .. } | ModuleLoc::Embed { .. } => {
+                panic!("user package must win over embed")
+            }
         }
         let loaded = load_program_with_roots(&main, &roots).unwrap();
         let os_mod = loaded.iter().find(|m| m.name == "os").unwrap();

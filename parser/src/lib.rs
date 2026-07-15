@@ -408,6 +408,44 @@ impl Parser {
         }
     }
 
+    /// Like [`parse_tuple_or_expr`], but stops before comparison operators so
+    /// `for x in xs` does not parse `x in xs` as a single comparison.
+    /// Targets are bitwise-or level (names, subscripts, calls, …).
+    fn parse_target_tuple_or_expr(&mut self) -> PResult<Expr> {
+        let first = self.parse_star_or_target_expr()?;
+        if self.peek() != &Token::Comma {
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while self.eat(&Token::Comma) {
+            if self.tuple_list_ends() {
+                break;
+            }
+            items.push(self.parse_star_or_target_expr()?);
+        }
+        let span = items[0].span.to(items.last().unwrap().span);
+        Ok(Expr {
+            kind: ExprKind::TupleLit(items),
+            span,
+        })
+    }
+
+    /// Starred or unstarred target atom (below comparison, so `in` is left alone).
+    fn parse_star_or_target_expr(&mut self) -> PResult<Expr> {
+        if self.peek() == &Token::Star {
+            let start = self.peek_span();
+            self.advance();
+            let inner = self.parse_bitor()?;
+            let span = start.to(inner.span);
+            Ok(Expr {
+                kind: ExprKind::Starred(Box::new(inner)),
+                span,
+            })
+        } else {
+            self.parse_bitor()
+        }
+    }
+
     fn tuple_list_ends(&self) -> bool {
         matches!(
             self.peek(),
@@ -419,6 +457,7 @@ impl Parser {
                 | Token::RBrace
                 | Token::Colon
                 | Token::Eq
+                | Token::In // `for a, in xs` / `for a, b in xs`
                 | Token::PlusEq
                 | Token::MinusEq
                 | Token::StarEq
@@ -945,19 +984,16 @@ impl Parser {
 
     fn parse_for(&mut self) -> PResult<Stmt> {
         let start = self.expect(Token::For, "")?;
-        let (var, var_span) = self.expect_ident("after 'for'")?;
-        if self.peek() == &Token::Comma {
-            return Err(self.error("unpacking multiple loop variables is not supported yet"));
-        }
-        self.expect(Token::In, "after the loop variable")?;
+        let target_expr = self.parse_target_tuple_or_expr()?;
+        let target = self.expr_to_target(target_expr)?;
+        self.expect(Token::In, "after the loop target")?;
         let iter = self.parse_expr()?;
         let body = self.parse_block("'for' body")?;
         let orelse = self.parse_loop_else()?;
         let end = self.peek_span();
         Ok(Stmt {
             kind: StmtKind::For {
-                var,
-                var_span,
+                target,
                 iter,
                 body,
                 orelse,
@@ -1029,20 +1065,35 @@ impl Parser {
             return Err(self.error("expected module name after 'from'"));
         };
         self.expect(Token::Import, "after the module name")?;
-        if self.peek() == &Token::Star {
-            return Err(self.error("'from module import *' is not supported yet"));
-        }
+        let star;
         let mut names = Vec::new();
-        loop {
-            let (name, name_span) = self.expect_ident("in the import list")?;
-            let alias = if self.eat(&Token::As) {
-                Some(self.expect_ident("after 'as'")?.0)
-            } else {
-                None
-            };
-            names.push((name, alias, name_span));
-            if !self.eat(&Token::Comma) {
-                break;
+        if self.peek() == &Token::Star {
+            let star_span = self.peek_span();
+            self.advance();
+            if self.eat(&Token::As) {
+                return Err(self.error("cannot use 'as' after '*' in 'from ... import *'"));
+            }
+            if self.eat(&Token::Comma) {
+                return Err(self.error(
+                    "cannot mix '*' with other names in 'from ... import'; \
+                     use only 'import *'",
+                ));
+            }
+            let _ = star_span;
+            star = true;
+        } else {
+            star = false;
+            loop {
+                let (name, name_span) = self.expect_ident("in the import list")?;
+                let alias = if self.eat(&Token::As) {
+                    Some(self.expect_ident("after 'as'")?.0)
+                } else {
+                    None
+                };
+                names.push((name, alias, name_span));
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
             }
         }
         let end = self.peek_span();
@@ -1051,6 +1102,7 @@ impl Parser {
                 module,
                 level,
                 names,
+                star,
                 span: start.to(end),
             },
             span: start.to(end),
@@ -1612,10 +1664,11 @@ impl Parser {
         match self.peek().clone() {
             Token::Intlit(v) => {
                 self.advance();
-                Ok(Expr {
-                    kind: ExprKind::Int(v),
-                    span,
-                })
+                let kind = match v.parse::<i64>() {
+                    Ok(n) => ExprKind::Int(n),
+                    Err(_) => ExprKind::IntDigits(v),
+                };
+                Ok(Expr { kind, span })
             }
             Token::Floatlit(v) => {
                 self.advance();
@@ -1764,36 +1817,30 @@ impl Parser {
                     });
                 }
                 let first = self.parse_expr()?;
-                // `[elem for var in iter]` — a comprehension
+                // `[elem for target in iter if ... for ...]` — a comprehension
                 if self.peek() == &Token::For {
                     self.advance();
-                    let (var, var_span) = self.expect_ident("after 'for'")?;
-                    if self.peek() == &Token::Comma {
-                        return Err(
-                            self.error("unpacking multiple loop variables is not supported yet")
-                        );
-                    }
-                    self.expect(Token::In, "after the comprehension variable")?;
-                    let iter = self.parse_expr()?;
-                    let cond = if self.eat(&Token::If) {
-                        Some(Box::new(self.parse_expr()?))
-                    } else {
-                        None
-                    };
-                    if matches!(self.peek(), Token::For | Token::If) {
-                        return Err(self.error(
-                            "multiple comprehension clauses are not supported \
-                             yet; nest comprehensions or use a loop",
-                        ));
+                    let mut generators = Vec::new();
+                    loop {
+                        let target_expr = self.parse_target_tuple_or_expr()?;
+                        let target = self.expr_to_target(target_expr)?;
+                        self.expect(Token::In, "after the comprehension target")?;
+                        let iter = self.parse_expr()?;
+                        let mut ifs = Vec::new();
+                        while self.eat(&Token::If) {
+                            ifs.push(self.parse_expr()?);
+                        }
+                        generators.push(CompFor { target, iter, ifs });
+                        if self.eat(&Token::For) {
+                            continue;
+                        }
+                        break;
                     }
                     let close = self.expect(Token::RBracket, "to close the comprehension")?;
                     return Ok(Expr {
                         kind: ExprKind::ListComp {
                             elem: Box::new(first),
-                            var,
-                            var_span,
-                            iter: Box::new(iter),
-                            cond,
+                            generators,
                         },
                         span: span.to(close),
                     });
@@ -2087,7 +2134,10 @@ impl Parser {
             }
             Token::Intlit(v) => {
                 self.advance();
-                Ok(Pattern::Int(v))
+                match v.parse::<i64>() {
+                    Ok(n) => Ok(Pattern::Int(n)),
+                    Err(_) => Ok(Pattern::IntDigits(v)),
+                }
             }
             Token::Strlit(s) => {
                 self.advance();
@@ -2235,6 +2285,25 @@ fn target_span(target: &AssignTarget) -> Span {
     }
 }
 
+fn rebase_target_spans(target: &mut AssignTarget, span: Span) {
+    match target {
+        AssignTarget::Name { span: s, .. } => *s = span,
+        AssignTarget::Index { base, index } => {
+            rebase_spans(base, span);
+            rebase_spans(index, span);
+        }
+        AssignTarget::Starred { target, span: s } => {
+            *s = span;
+            rebase_target_spans(target, span);
+        }
+        AssignTarget::Tuple(items) => {
+            for t in items {
+                rebase_target_spans(t, span);
+            }
+        }
+    }
+}
+
 // ---- f-strings ----
 
 /// Split f-string content into literal chunks and `{...}` expressions.
@@ -2274,7 +2343,7 @@ fn parse_fstring(raw: &str, span: Span) -> PResult<Expr> {
                         None => return Err(err("unterminated '{' in f-string")),
                     }
                 }
-                let (expr_src, format) = split_fstring_fragment(&frag, span)?;
+                let (expr_src, conversion, format_spec) = split_fstring_fragment(&frag, span)?;
                 if expr_src.trim().is_empty() {
                     return Err(err("empty expression in f-string"));
                 }
@@ -2283,7 +2352,8 @@ fn parse_fstring(raw: &str, span: Span) -> PResult<Expr> {
                 }
                 parts.push(FStringPart::Expr {
                     expr: parse_fragment(expr_src, span)?,
-                    format,
+                    conversion,
+                    format_spec,
                 });
             }
             '}' => {
@@ -2306,10 +2376,183 @@ fn parse_fstring(raw: &str, span: Span) -> PResult<Expr> {
     })
 }
 
-/// Split `{expr}` / `{expr:.Nf}` / reject unsupported `!` conversions and
-/// other format specs. A `:` inside brackets (e.g. a slice) is part of the
-/// expression, not a format delimiter.
-fn split_fstring_fragment(frag: &str, span: Span) -> PResult<(&str, Option<FStringFormat>)> {
+/// Split `{expr}`, `{expr!r}`, `{expr:spec}`, `{expr!s:spec}` fragments.
+/// A `:` / `!` / `=` inside brackets is part of the expression, not a delimiter.
+/// Debug self-documenting forms (`{x=}`) are rejected. Nested replacement
+/// fields in the format spec become a mini [`ExprKind::JoinedStr`].
+#[allow(clippy::type_complexity)]
+fn split_fstring_fragment(
+    frag: &str,
+    span: Span,
+) -> PResult<(&str, Option<FStringConversion>, Option<Box<Expr>>)> {
+    let mut depth = 0i32;
+    let bytes = frag.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] as char {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '=' if depth == 0 => {
+                // Part of `==`, `!=`, `<=`, `>=`, `:=` → expression; else debug form.
+                let prev = if i > 0 {
+                    Some(bytes[i - 1] as char)
+                } else {
+                    None
+                };
+                let next = bytes.get(i + 1).map(|&b| b as char);
+                let part_of_op =
+                    matches!(prev, Some('=' | '!' | '<' | '>' | ':')) || matches!(next, Some('='));
+                if !part_of_op {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        "self-documenting expressions (`f\"{x=}\"`) in f-strings are not supported yet",
+                        span,
+                    ));
+                }
+            }
+            '!' if depth == 0 => {
+                // `!=` is a comparison inside the expression.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    i += 1;
+                } else {
+                    let expr_src = &frag[..i];
+                    let rest = &frag[i + 1..];
+                    let (conversion, after) = parse_fstring_conversion(rest, span)?;
+                    let format_spec = parse_optional_format_spec(after, span)?;
+                    return Ok((expr_src, Some(conversion), format_spec));
+                }
+            }
+            ':' if depth == 0 => {
+                let expr_src = &frag[..i];
+                let spec = &frag[i + 1..];
+                let format_spec = Some(Box::new(parse_format_spec_joined(spec, span)?));
+                return Ok((expr_src, None, format_spec));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok((frag, None, None))
+}
+
+fn parse_fstring_conversion(rest: &str, span: Span) -> PResult<(FStringConversion, &str)> {
+    let mut chars = rest.chars();
+    let Some(c) = chars.next() else {
+        return Err(Diagnostic::new(
+            Phase::Parse,
+            "f-string: expecting conversion character after '!'",
+            span,
+        ));
+    };
+    let conversion = match c {
+        's' => FStringConversion::Str,
+        'r' => FStringConversion::Repr,
+        'a' => FStringConversion::Ascii,
+        other => {
+            return Err(Diagnostic::new(
+                Phase::Parse,
+                format!(
+                    "f-string: invalid conversion character '{other}': \
+                     expected 's', 'r', or 'a'"
+                ),
+                span,
+            ));
+        }
+    };
+    Ok((conversion, chars.as_str()))
+}
+
+/// After a conversion (or alone), optional `:format_spec`.
+fn parse_optional_format_spec(rest: &str, span: Span) -> PResult<Option<Box<Expr>>> {
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    if let Some(stripped) = rest.strip_prefix(':') {
+        return Ok(Some(Box::new(parse_format_spec_joined(stripped, span)?)));
+    }
+    Err(Diagnostic::new(
+        Phase::Parse,
+        format!("f-string: unexpected '{rest}' after conversion"),
+        span,
+    ))
+}
+
+/// Parse a format mini-language string into a [`ExprKind::JoinedStr`] of
+/// literal chunks and nested `{expr}` fields (no `!` or `:` inside nested
+/// fields).
+fn parse_format_spec_joined(spec: &str, span: Span) -> PResult<Expr> {
+    let err = |msg: &str| Diagnostic::new(Phase::Parse, msg, span);
+    let mut parts: Vec<FStringPart> = Vec::new();
+    let mut lit = String::new();
+    let mut chars = spec.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    lit.push('{');
+                    continue;
+                }
+                let mut depth = 1i32;
+                let mut frag = String::new();
+                loop {
+                    match chars.next() {
+                        Some('{') => {
+                            depth += 1;
+                            frag.push('{');
+                        }
+                        Some('}') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            frag.push('}');
+                        }
+                        Some(ch) => frag.push(ch),
+                        None => {
+                            return Err(err("unterminated '{' in f-string format specifier"));
+                        }
+                    }
+                }
+                if frag.trim().is_empty() {
+                    return Err(err("empty expression in f-string format specifier"));
+                }
+                // Nested fields: expression only — no conversion / format_spec.
+                reject_nested_field_decorators(&frag, span)?;
+                if !lit.is_empty() {
+                    parts.push(FStringPart::Literal(std::mem::take(&mut lit)));
+                }
+                parts.push(FStringPart::Expr {
+                    expr: parse_fragment(&frag, span)?,
+                    conversion: None,
+                    format_spec: None,
+                });
+            }
+            '}' => {
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                    lit.push('}');
+                } else {
+                    return Err(err(
+                        "single '}' is not allowed in an f-string format specifier; use '}}'",
+                    ));
+                }
+            }
+            _ => lit.push(c),
+        }
+    }
+    if !lit.is_empty() {
+        parts.push(FStringPart::Literal(lit));
+    }
+    Ok(Expr {
+        kind: ExprKind::JoinedStr(parts),
+        span,
+    })
+}
+
+/// Nested format fields may only contain an expression (no `!` / `:` / `=`).
+fn reject_nested_field_decorators(frag: &str, span: Span) -> PResult<()> {
     let mut depth = 0i32;
     let bytes = frag.as_bytes();
     let mut i = 0usize;
@@ -2318,65 +2561,45 @@ fn split_fstring_fragment(frag: &str, span: Span) -> PResult<(&str, Option<FStri
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
             '!' if depth == 0 => {
-                // allow `!=` comparison inside the expression
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     i += 1;
                 } else {
                     return Err(Diagnostic::new(
                         Phase::Parse,
-                        "conversions like '!r' in f-strings are not supported yet",
+                        "conversions are not allowed in nested f-string format fields",
                         span,
                     ));
                 }
             }
             ':' if depth == 0 => {
-                let expr_src = &frag[..i];
-                let spec = &frag[i + 1..];
-                let format = parse_fstring_format(spec, span)?;
-                return Ok((expr_src, Some(format)));
+                return Err(Diagnostic::new(
+                    Phase::Parse,
+                    "format specs are not allowed in nested f-string format fields",
+                    span,
+                ));
+            }
+            '=' if depth == 0 => {
+                let prev = if i > 0 {
+                    Some(bytes[i - 1] as char)
+                } else {
+                    None
+                };
+                let next = bytes.get(i + 1).map(|&b| b as char);
+                let part_of_op =
+                    matches!(prev, Some('=' | '!' | '<' | '>' | ':')) || matches!(next, Some('='));
+                if !part_of_op {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        "self-documenting expressions are not allowed in nested f-string format fields",
+                        span,
+                    ));
+                }
             }
             _ => {}
         }
         i += 1;
     }
-    Ok((frag, None))
-}
-
-/// Currently only `{x:.Nf}` (fixed-point, N digits).
-fn parse_fstring_format(spec: &str, span: Span) -> PResult<FStringFormat> {
-    let unsupported = || {
-        Diagnostic::new(
-            Phase::Parse,
-            format!(
-                "format specifier '{spec}' in f-strings is not supported yet \
-                 (only '.Nf' fixed-point is supported)"
-            ),
-            span,
-        )
-    };
-    let s = spec.trim();
-    if !s.starts_with('.') || !s.ends_with('f') || s.len() < 3 {
-        return Err(unsupported());
-    }
-    let digits = &s[1..s.len() - 1];
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(unsupported());
-    }
-    let precision: u32 = digits.parse().map_err(|_| {
-        Diagnostic::new(
-            Phase::Parse,
-            format!("format precision '{digits}' is out of range"),
-            span,
-        )
-    })?;
-    if precision > 1000 {
-        return Err(Diagnostic::new(
-            Phase::Parse,
-            "format precision must be at most 1000",
-            span,
-        ));
-    }
-    Ok(FStringFormat::DotNf { precision })
+    Ok(())
 }
 
 fn parse_fragment(frag: &str, span: Span) -> PResult<Expr> {
@@ -2410,6 +2633,7 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
     expr.span = span;
     match &mut expr.kind {
         ExprKind::Int(_)
+        | ExprKind::IntDigits(_)
         | ExprKind::Float(_)
         | ExprKind::Bool(_)
         | ExprKind::Str(_)
@@ -2511,18 +2735,14 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
                 rebase_spans(v, span);
             }
         }
-        ExprKind::ListComp {
-            elem,
-            var_span,
-            iter,
-            cond,
-            ..
-        } => {
-            *var_span = span;
+        ExprKind::ListComp { elem, generators } => {
             rebase_spans(elem, span);
-            rebase_spans(iter, span);
-            if let Some(c) = cond {
-                rebase_spans(c, span);
+            for g in generators {
+                rebase_target_spans(&mut g.target, span);
+                rebase_spans(&mut g.iter, span);
+                for c in &mut g.ifs {
+                    rebase_spans(c, span);
+                }
             }
         }
         ExprKind::Cast { arg, .. } => rebase_spans(arg, span),
@@ -2539,8 +2759,14 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
         ExprKind::Unary { operand, .. } => rebase_spans(operand, span),
         ExprKind::JoinedStr(parts) => {
             for part in parts {
-                if let FStringPart::Expr { expr, .. } = part {
+                if let FStringPart::Expr {
+                    expr, format_spec, ..
+                } = part
+                {
                     rebase_spans(expr, span);
+                    if let Some(spec) = format_spec {
+                        rebase_spans(spec, span);
+                    }
                 }
             }
         }
@@ -2607,7 +2833,14 @@ mod tests {
         };
         assert_eq!(parts.len(), 2);
         assert!(matches!(&parts[0], FStringPart::Literal(s) if s == "a\nb "));
-        assert!(matches!(&parts[1], FStringPart::Expr { format: None, .. }));
+        assert!(matches!(
+            &parts[1],
+            FStringPart::Expr {
+                conversion: None,
+                format_spec: None,
+                ..
+            }
+        ));
 
         let m = parse_ok("s = f'''{{x}} is {y:.2f}'''\n");
         let StmtKind::Assign { value, .. } = &m.body[0].kind else {
@@ -2620,9 +2853,24 @@ mod tests {
         assert!(matches!(
             &parts[1],
             FStringPart::Expr {
-                format: Some(FStringFormat::DotNf { precision: 2 }),
+                conversion: None,
+                format_spec: Some(_),
                 ..
             }
+        ));
+        let FStringPart::Expr {
+            format_spec: Some(spec),
+            ..
+        } = &parts[1]
+        else {
+            panic!();
+        };
+        let ExprKind::JoinedStr(spec_parts) = &spec.kind else {
+            panic!("expected JoinedStr format_spec");
+        };
+        assert!(matches!(
+            &spec_parts[..],
+            [FStringPart::Literal(s)] if s == ".2f"
         ));
     }
 
@@ -2652,7 +2900,8 @@ mod tests {
             &parts[0],
             FStringPart::Expr {
                 expr: e,
-                format: None
+                conversion: None,
+                format_spec: None,
             } if matches!(e.kind, ExprKind::Binary { .. })
         ));
     }
@@ -2692,7 +2941,8 @@ mod tests {
             &parts[0],
             FStringPart::Expr {
                 expr: e,
-                format: None
+                conversion: None,
+                format_spec: None,
             } if matches!(&e.kind, ExprKind::Str(s) if s == "nested")
         ));
     }
@@ -2787,14 +3037,90 @@ else:
     fn parses_for_loop() {
         let m = parse_ok("for i in range(10):\n    print(i)\n");
         let StmtKind::For {
-            var, iter, body, ..
+            target, iter, body, ..
         } = &m.body[0].kind
         else {
             panic!("expected For");
         };
-        assert_eq!(var, "i");
+        assert!(matches!(target, AssignTarget::Name { name, .. } if name == "i"));
         assert!(matches!(&iter.kind, ExprKind::Call { func, .. } if func == "range"));
         assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn parses_for_unpack() {
+        let m = parse_ok("for a, b in xs:\n    print(a, b)\n");
+        let StmtKind::For { target, .. } = &m.body[0].kind else {
+            panic!("expected For");
+        };
+        let AssignTarget::Tuple(items) = target else {
+            panic!("expected tuple target");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[0], AssignTarget::Name { name, .. } if name == "a"));
+        assert!(matches!(&items[1], AssignTarget::Name { name, .. } if name == "b"));
+    }
+
+    #[test]
+    fn parses_for_star_unpack() {
+        let m = parse_ok("for a, *rest in xs:\n    pass\n");
+        let StmtKind::For { target, .. } = &m.body[0].kind else {
+            panic!("expected For");
+        };
+        let AssignTarget::Tuple(items) = target else {
+            panic!("expected tuple target");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(&items[1], AssignTarget::Starred { .. }));
+    }
+
+    #[test]
+    fn parses_list_comp_multi_for() {
+        let m = parse_ok("xs = [(i, j) for i in range(2) for j in range(3) if (i + j) % 2 == 0]\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::ListComp { elem, generators } = &value.kind else {
+            panic!("expected ListComp, got {:?}", value.kind);
+        };
+        assert!(matches!(elem.kind, ExprKind::TupleLit(_)));
+        assert_eq!(generators.len(), 2);
+        assert!(matches!(
+            &generators[0].target,
+            AssignTarget::Name { name, .. } if name == "i"
+        ));
+        assert!(generators[0].ifs.is_empty());
+        assert!(matches!(
+            &generators[1].target,
+            AssignTarget::Name { name, .. } if name == "j"
+        ));
+        assert_eq!(generators[1].ifs.len(), 1);
+    }
+
+    #[test]
+    fn parses_list_comp_unpack() {
+        let m = parse_ok("xs = [a + b for a, b in pairs]\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::ListComp { generators, .. } = &value.kind else {
+            panic!("expected ListComp");
+        };
+        assert_eq!(generators.len(), 1);
+        assert!(matches!(generators[0].target, AssignTarget::Tuple(_)));
+    }
+
+    #[test]
+    fn parses_list_comp_multi_if() {
+        let m = parse_ok("xs = [x for x in range(10) if x > 2 if x % 2 == 0]\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::ListComp { generators, .. } = &value.kind else {
+            panic!("expected ListComp");
+        };
+        assert_eq!(generators.len(), 1);
+        assert_eq!(generators[0].ifs.len(), 2);
     }
 
     #[test]
@@ -3213,12 +3539,20 @@ def f(n: int) -> int:
         };
         assert_eq!(parts.len(), 5);
         assert!(matches!(&parts[0], FStringPart::Literal(s) if s == "a"));
-        assert!(matches!(&parts[1], FStringPart::Expr { format: None, .. }));
+        assert!(matches!(
+            &parts[1],
+            FStringPart::Expr {
+                conversion: None,
+                format_spec: None,
+                ..
+            }
+        ));
         assert!(matches!(
             &parts[3],
             FStringPart::Expr {
                 expr: e,
-                format: None
+                conversion: None,
+                format_spec: None,
             } if matches!(e.kind, ExprKind::Binary { .. })
         ));
     }
@@ -3236,8 +3570,8 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn parses_fstring_dot_nf_format() {
-        let m = parse_ok("s = f\"{x:.2f} {y[1:3]} {z:.0f}\"\n");
+    fn parses_fstring_format_specs() {
+        let m = parse_ok("s = f\"{x:.2f} {y[1:3]} {z:.0f} {n!r} {m!s:5}\"\n");
         let StmtKind::Assign { value, .. } = &m.body[0].kind else {
             panic!();
         };
@@ -3247,27 +3581,87 @@ def f(n: int) -> int:
         assert!(matches!(
             &parts[0],
             FStringPart::Expr {
-                format: Some(FStringFormat::DotNf { precision: 2 }),
+                conversion: None,
+                format_spec: Some(_),
                 ..
             }
         ));
         // slice colon is not a format delimiter
-        assert!(matches!(&parts[2], FStringPart::Expr { format: None, .. }));
+        assert!(matches!(
+            &parts[2],
+            FStringPart::Expr {
+                conversion: None,
+                format_spec: None,
+                ..
+            }
+        ));
         assert!(matches!(
             &parts[4],
             FStringPart::Expr {
-                format: Some(FStringFormat::DotNf { precision: 0 }),
+                conversion: None,
+                format_spec: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parts[6],
+            FStringPart::Expr {
+                conversion: Some(FStringConversion::Repr),
+                format_spec: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &parts[8],
+            FStringPart::Expr {
+                conversion: Some(FStringConversion::Str),
+                format_spec: Some(_),
                 ..
             }
         ));
     }
 
     #[test]
-    fn error_fstring_unsupported_format_spec() {
-        let e = parse_err("s = f\"{x:.2e}\"\n");
-        assert!(e.message.contains("not supported"), "{}", e.message);
-        let e = parse_err("s = f\"{x:10.2f}\"\n");
-        assert!(e.message.contains("not supported"), "{}", e.message);
+    fn parses_fstring_nested_format_width() {
+        let m = parse_ok("s = f\"{x:{w}.{p}f}\"\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!();
+        };
+        let ExprKind::JoinedStr(parts) = &value.kind else {
+            panic!("expected JoinedStr");
+        };
+        let FStringPart::Expr {
+            format_spec: Some(spec),
+            ..
+        } = &parts[0]
+        else {
+            panic!("expected format_spec");
+        };
+        let ExprKind::JoinedStr(sp) = &spec.kind else {
+            panic!();
+        };
+        // `{w}` + `.` + `{p}` + `f`
+        assert_eq!(sp.len(), 4);
+        assert!(matches!(&sp[0], FStringPart::Expr { .. }));
+        assert!(matches!(&sp[1], FStringPart::Literal(s) if s == "."));
+        assert!(matches!(&sp[2], FStringPart::Expr { .. }));
+        assert!(matches!(&sp[3], FStringPart::Literal(s) if s == "f"));
+    }
+
+    #[test]
+    fn error_fstring_debug_form() {
+        let e = parse_err("s = f\"{x=}\"\n");
+        assert!(
+            e.message.contains("self-documenting") || e.message.contains("not supported"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn error_fstring_bad_conversion() {
+        let e = parse_err("s = f\"{x!z}\"\n");
+        assert!(e.message.contains("conversion"), "{}", e.message);
     }
 
     #[test]
@@ -3355,10 +3749,58 @@ def f(n: int) -> int:
     }
 
     #[test]
-    fn star_import_is_rejected() {
-        let e = parse_err("from m import *\n");
+    fn parses_star_import() {
+        let m = parse_ok("from m import *\n");
+        assert!(matches!(
+            &m.body[0].kind,
+            StmtKind::FromImport {
+                module,
+                level: 0,
+                names,
+                star: true,
+                ..
+            } if module == "m" && names.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parses_relative_star_import() {
+        let m = parse_ok("from . import *\nfrom ..pkg import *\n");
+        assert!(matches!(
+            &m.body[0].kind,
+            StmtKind::FromImport {
+                module,
+                level: 1,
+                star: true,
+                ..
+            } if module.is_empty()
+        ));
+        assert!(matches!(
+            &m.body[1].kind,
+            StmtKind::FromImport {
+                module,
+                level: 2,
+                star: true,
+                ..
+            } if module == "pkg"
+        ));
+    }
+
+    #[test]
+    fn star_import_rejects_trailing_names() {
+        let e = parse_err("from m import *, x\n");
         assert!(
-            e.message.contains("from module import *") && e.message.contains("not supported"),
+            e.message.contains("*") && e.message.contains("mix"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn star_import_rejects_as_alias() {
+        let e = parse_err("from m import * as all\n");
+        assert!(
+            e.message.contains("as") && e.message.contains("*"),
             "{}",
             e.message
         );

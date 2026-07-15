@@ -285,9 +285,1161 @@ static void format_double(double v, char *buf) {
     }
 }
 
-void pyrs_print_int(long long v) {
-    printf("%lld", v);
+/* ---- arbitrary-precision int (tagged i64) ----
+ * LSB=1 → small: value = tagged >> 1 (signed, range ±2^62)
+ * LSB=0 → pointer to heap PyrsInt (never freed)
+ * Zero is always the small tag 1 (((0)<<1)|1).
+ *
+ * This file is #include'd into runtime.c (not compiled standalone).
+ */
+
+typedef struct PyrsInt {
+    int sign; /* -1, 0, +1 */
+    long long nlimbs;
+    unsigned long long *limbs; /* little-endian base 2^64 */
+} PyrsInt;
+
+#define PYRS_SMALL_MIN (-(1LL << 62))
+#define PYRS_SMALL_MAX ((1LL << 62) - 1)
+#define PYRS_LIMB_BITS 64
+
+static int pyrs_int_is_small(long long t) {
+    return ((unsigned long long)t & 1ULL) != 0ULL;
 }
+
+static long long pyrs_int_small_val(long long t) {
+    return t >> 1;
+}
+
+static long long pyrs_int_tag_small(long long v) {
+    return (long long)(((unsigned long long)v << 1) | 1ULL);
+}
+
+static PyrsInt *pyrs_int_heap_ptr(long long t) {
+    return (PyrsInt *)(uintptr_t)t;
+}
+
+static void int_trim(unsigned long long *limbs, long long *nlimbs) {
+    while (*nlimbs > 0 && limbs[*nlimbs - 1] == 0ULL) {
+        (*nlimbs)--;
+    }
+}
+
+static long long int_from_sign_limbs(int sign, unsigned long long *limbs,
+                                     long long nlimbs) {
+    int_trim(limbs, &nlimbs);
+    if (nlimbs == 0 || sign == 0) {
+        free(limbs);
+        return pyrs_int_tag_small(0);
+    }
+    if (nlimbs == 1) {
+        unsigned long long mag = limbs[0];
+        if (sign > 0 && mag <= (unsigned long long)PYRS_SMALL_MAX) {
+            free(limbs);
+            return pyrs_int_tag_small((long long)mag);
+        }
+        if (sign < 0 && mag <= (unsigned long long)(-PYRS_SMALL_MIN)) {
+            free(limbs);
+            return pyrs_int_tag_small(-(long long)mag);
+        }
+    }
+    PyrsInt *h = xmalloc(sizeof(PyrsInt));
+    h->sign = sign > 0 ? 1 : -1;
+    h->nlimbs = nlimbs;
+    h->limbs = limbs;
+    return (long long)(uintptr_t)h;
+}
+
+/* Read magnitude; if *owned, caller frees the returned buffer. */
+static unsigned long long *int_read_mag(long long t, int *sign, long long *n,
+                                        int *owned) {
+    if (pyrs_int_is_small(t)) {
+        long long v = pyrs_int_small_val(t);
+        if (v == 0) {
+            *sign = 0;
+            *n = 0;
+            *owned = 0;
+            return NULL;
+        }
+        *sign = v < 0 ? -1 : 1;
+        *n = 1;
+        *owned = 1;
+        unsigned long long *p = xmalloc(sizeof(unsigned long long));
+        p[0] = (unsigned long long)(v < 0 ? -v : v);
+        return p;
+    }
+    PyrsInt *h = pyrs_int_heap_ptr(t);
+    *sign = h->sign;
+    *n = h->nlimbs;
+    *owned = 0;
+    return h->limbs;
+}
+
+static unsigned long long *int_copy_limbs(const unsigned long long *src,
+                                          long long n) {
+    if (n <= 0) {
+        return NULL;
+    }
+    unsigned long long *p = xmalloc((size_t)n * sizeof(unsigned long long));
+    memcpy(p, src, (size_t)n * sizeof(unsigned long long));
+    return p;
+}
+
+long long pyrs_int_from_i64(long long v) {
+    if (v >= PYRS_SMALL_MIN && v <= PYRS_SMALL_MAX) {
+        return pyrs_int_tag_small(v);
+    }
+    unsigned long long *limbs = xmalloc(sizeof(unsigned long long));
+    int sign;
+    if (v < 0) {
+        sign = -1;
+        limbs[0] = (v == LLONG_MIN) ? (1ULL << 63) : (unsigned long long)(-v);
+    } else {
+        sign = (v == 0) ? 0 : 1;
+        limbs[0] = (unsigned long long)v;
+    }
+    return int_from_sign_limbs(sign, limbs, 1);
+}
+
+long long pyrs_int_from_str(const char *s, long long len) {
+    if (s == NULL || len <= 0) {
+        return pyrs_int_tag_small(0);
+    }
+    long long i = 0;
+    int sign = 1;
+    if (s[i] == '+') {
+        i++;
+    } else if (s[i] == '-') {
+        sign = -1;
+        i++;
+    }
+    while (i < len && s[i] == '0') {
+        i++;
+    }
+    if (i >= len) {
+        return pyrs_int_tag_small(0);
+    }
+    unsigned long long *limbs = NULL;
+    long long nlimbs = 0;
+    long long cap = 0;
+    for (; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < '0' || c > '9') {
+            free(limbs);
+            pyrs_die("ValueError: invalid literal for int()");
+        }
+        unsigned long long carry = (unsigned long long)(c - '0');
+        for (long long k = 0; k < nlimbs; k++) {
+            __uint128_t prod = (__uint128_t)limbs[k] * 10ULL + carry;
+            limbs[k] = (unsigned long long)prod;
+            carry = (unsigned long long)(prod >> 64);
+        }
+        if (carry) {
+            if (nlimbs == cap) {
+                long long ncap = cap == 0 ? 2 : cap * 2;
+                unsigned long long *nl =
+                    xmalloc((size_t)ncap * sizeof(unsigned long long));
+                if (limbs) {
+                    memcpy(nl, limbs,
+                           (size_t)nlimbs * sizeof(unsigned long long));
+                    free(limbs);
+                }
+                limbs = nl;
+                cap = ncap;
+            }
+            limbs[nlimbs++] = carry;
+        }
+    }
+    if (nlimbs == 0) {
+        free(limbs);
+        return pyrs_int_tag_small(0);
+    }
+    return int_from_sign_limbs(sign, limbs, nlimbs);
+}
+
+long long pyrs_int_as_i64(long long t) {
+    if (pyrs_int_is_small(t)) {
+        return pyrs_int_small_val(t);
+    }
+    PyrsInt *h = pyrs_int_heap_ptr(t);
+    if (h->sign == 0 || h->nlimbs == 0) {
+        return 0;
+    }
+    if (h->nlimbs > 1) {
+        pyrs_die("OverflowError: Python int too large to convert to C long");
+    }
+    unsigned long long mag = h->limbs[0];
+    if (h->sign > 0) {
+        if (mag > (unsigned long long)LLONG_MAX) {
+            pyrs_die("OverflowError: Python int too large to convert to C long");
+        }
+        return (long long)mag;
+    }
+    if (mag > (unsigned long long)LLONG_MAX + 1ULL) {
+        pyrs_die("OverflowError: Python int too large to convert to C long");
+    }
+    if (mag == (unsigned long long)LLONG_MAX + 1ULL) {
+        return LLONG_MIN;
+    }
+    return -(long long)mag;
+}
+
+double pyrs_int_to_float(long long t) {
+    if (pyrs_int_is_small(t)) {
+        return (double)pyrs_int_small_val(t);
+    }
+    PyrsInt *h = pyrs_int_heap_ptr(t);
+    if (h->sign == 0 || h->nlimbs == 0) {
+        return 0.0;
+    }
+    /* Build from high limb for better rounding (CPython uses similar). */
+    double acc = 0.0;
+    for (long long i = h->nlimbs - 1; i >= 0; i--) {
+        acc = acc * 18446744073709551616.0 + (double)h->limbs[i];
+    }
+    return h->sign < 0 ? -acc : acc;
+}
+
+long long pyrs_int_from_float(double v) {
+    if (isnan(v)) {
+        pyrs_die("ValueError: cannot convert float NaN to integer");
+    }
+    if (isinf(v)) {
+        pyrs_die("OverflowError: cannot convert float infinity to integer");
+    }
+    int neg = signbit(v) && v != 0.0;
+    if (v < 0) {
+        v = -v;
+    }
+    /* truncate toward zero already by using floor on magnitude of |v| for
+     * positive path; for original negative, trunc toward 0 is ceil of -|v|
+     * which is -floor(|v|). */
+    v = floor(v); /* |v| truncated toward 0 for non-negative original */
+    if (v == 0.0) {
+        return pyrs_int_tag_small(0);
+    }
+    if (!neg && v <= (double)PYRS_SMALL_MAX && v >= 0.0) {
+        return pyrs_int_tag_small((long long)v);
+    }
+    if (neg && v <= (double)(-PYRS_SMALL_MIN)) {
+        return pyrs_int_tag_small(-(long long)v);
+    }
+    /* Convert large finite float: extract limbs via repeated mod 2^64. */
+    const double B = 18446744073709551616.0;
+    long long cap = 4;
+    unsigned long long *limbs =
+        xmalloc((size_t)cap * sizeof(unsigned long long));
+    long long n = 0;
+    while (v >= 1.0) {
+        if (n == cap) {
+            long long ncap = cap * 2;
+            unsigned long long *nl =
+                xmalloc((size_t)ncap * sizeof(unsigned long long));
+            memcpy(nl, limbs, (size_t)n * sizeof(unsigned long long));
+            free(limbs);
+            limbs = nl;
+            cap = ncap;
+        }
+        double hi = floor(v / B);
+        double lo = v - hi * B;
+        if (lo < 0) {
+            lo = 0;
+        }
+        limbs[n++] = (unsigned long long)lo;
+        v = hi;
+    }
+    return int_from_sign_limbs(neg ? -1 : 1, limbs, n);
+}
+
+static int u_cmp(const unsigned long long *a, long long na,
+                 const unsigned long long *b, long long nb) {
+    if (na != nb) {
+        return na < nb ? -1 : 1;
+    }
+    for (long long i = na - 1; i >= 0; i--) {
+        if (a[i] != b[i]) {
+            return a[i] < b[i] ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+int pyrs_int_cmp(long long a, long long b) {
+    if (pyrs_int_is_small(a) && pyrs_int_is_small(b)) {
+        long long av = pyrs_int_small_val(a);
+        long long bv = pyrs_int_small_val(b);
+        return (av > bv) - (av < bv);
+    }
+    int sa, sb, oa, ob;
+    long long na, nb;
+    unsigned long long *da = int_read_mag(a, &sa, &na, &oa);
+    unsigned long long *db = int_read_mag(b, &sb, &nb, &ob);
+    int r;
+    if (sa != sb) {
+        r = sa < sb ? -1 : 1;
+    } else if (sa == 0) {
+        r = 0;
+    } else {
+        int uc = u_cmp(da, na, db, nb);
+        r = sa < 0 ? -uc : uc;
+    }
+    if (oa) {
+        free(da);
+    }
+    if (ob) {
+        free(db);
+    }
+    return r;
+}
+
+int pyrs_int_eq(long long a, long long b) {
+    if (a == b) {
+        return 1;
+    }
+    /* two heap pointers or mixed: content equality */
+    return pyrs_int_cmp(a, b) == 0;
+}
+
+int pyrs_int_truth(long long a) {
+    if (pyrs_int_is_small(a)) {
+        return pyrs_int_small_val(a) != 0;
+    }
+    PyrsInt *h = pyrs_int_heap_ptr(a);
+    return h->sign != 0 && h->nlimbs > 0;
+}
+
+unsigned long long pyrs_int_hash(long long a) {
+    /* Hash on mathematical value so small and heap equal values collide. */
+    if (pyrs_int_is_small(a)) {
+        long long v = pyrs_int_small_val(a);
+        unsigned long long x = (unsigned long long)v;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31;
+        return x;
+    }
+    PyrsInt *h = pyrs_int_heap_ptr(a);
+    unsigned long long x = 0x9e3779b97f4a7c15ULL;
+    for (long long i = 0; i < h->nlimbs; i++) {
+        x ^= h->limbs[i] + 0x9e3779b97f4a7c15ULL + (x << 6) + (x >> 2);
+    }
+    if (h->sign < 0) {
+        x = ~x;
+    }
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+static unsigned long long *u_add(const unsigned long long *a, long long na,
+                                 const unsigned long long *b, long long nb,
+                                 long long *rn) {
+    long long n = na > nb ? na : nb;
+    unsigned long long *r =
+        xmalloc((size_t)(n + 1) * sizeof(unsigned long long));
+    unsigned long long carry = 0;
+    for (long long i = 0; i < n; i++) {
+        unsigned long long av = i < na ? a[i] : 0;
+        unsigned long long bv = i < nb ? b[i] : 0;
+        __uint128_t s = (__uint128_t)av + bv + carry;
+        r[i] = (unsigned long long)s;
+        carry = (unsigned long long)(s >> 64);
+    }
+    r[n] = carry;
+    *rn = n + (carry ? 1 : 0);
+    return r;
+}
+
+static unsigned long long *u_sub(const unsigned long long *a, long long na,
+                                 const unsigned long long *b, long long nb,
+                                 long long *rn) {
+    /* assume a >= b */
+    unsigned long long *r = xmalloc((size_t)na * sizeof(unsigned long long));
+    unsigned long long borrow = 0;
+    for (long long i = 0; i < na; i++) {
+        unsigned long long bv = i < nb ? b[i] : 0;
+        unsigned long long av = a[i];
+        unsigned long long tmp = av - borrow;
+        unsigned long long borrow1 = av < borrow;
+        borrow = borrow1 || (tmp < bv);
+        r[i] = tmp - bv;
+    }
+    *rn = na;
+    int_trim(r, rn);
+    return r;
+}
+
+static long long int_add_signed(int sa, const unsigned long long *a, long long na,
+                                int sb, const unsigned long long *b, long long nb) {
+    if (sa == 0) {
+        return int_from_sign_limbs(sb, int_copy_limbs(b, nb), nb);
+    }
+    if (sb == 0) {
+        return int_from_sign_limbs(sa, int_copy_limbs(a, na), na);
+    }
+    if (sa == sb) {
+        long long rn;
+        unsigned long long *r = u_add(a, na, b, nb, &rn);
+        return int_from_sign_limbs(sa, r, rn);
+    }
+    /* opposite signs: subtract magnitudes */
+    int c = u_cmp(a, na, b, nb);
+    if (c == 0) {
+        return pyrs_int_tag_small(0);
+    }
+    if (c > 0) {
+        long long rn;
+        unsigned long long *r = u_sub(a, na, b, nb, &rn);
+        return int_from_sign_limbs(sa, r, rn);
+    }
+    long long rn;
+    unsigned long long *r = u_sub(b, nb, a, na, &rn);
+    return int_from_sign_limbs(sb, r, rn);
+}
+
+long long pyrs_int_add(long long a, long long b) {
+    if (pyrs_int_is_small(a) && pyrs_int_is_small(b)) {
+        long long av = pyrs_int_small_val(a);
+        long long bv = pyrs_int_small_val(b);
+        /* checked add in i128 */
+        __int128 s = (__int128)av + (__int128)bv;
+        if (s >= PYRS_SMALL_MIN && s <= PYRS_SMALL_MAX) {
+            return pyrs_int_tag_small((long long)s);
+        }
+        return pyrs_int_from_i64((long long)s); /* may still be in i64 */
+    }
+    int sa, sb, oa, ob;
+    long long na, nb;
+    unsigned long long *da = int_read_mag(a, &sa, &na, &oa);
+    unsigned long long *db = int_read_mag(b, &sb, &nb, &ob);
+    long long r = int_add_signed(sa, da, na, sb, db, nb);
+    if (oa) {
+        free(da);
+    }
+    if (ob) {
+        free(db);
+    }
+    return r;
+}
+
+long long pyrs_int_neg(long long a) {
+    if (pyrs_int_is_small(a)) {
+        long long v = pyrs_int_small_val(a);
+        if (v == PYRS_SMALL_MIN) {
+            /* -(-2^62) = 2^62 which is outside small max 2^62-1 */
+            return pyrs_int_from_i64(-v);
+        }
+        return pyrs_int_tag_small(-v);
+    }
+    PyrsInt *h = pyrs_int_heap_ptr(a);
+    if (h->sign == 0) {
+        return pyrs_int_tag_small(0);
+    }
+    return int_from_sign_limbs(-h->sign, int_copy_limbs(h->limbs, h->nlimbs),
+                               h->nlimbs);
+}
+
+long long pyrs_int_sub(long long a, long long b) {
+    return pyrs_int_add(a, pyrs_int_neg(b));
+}
+
+long long pyrs_int_abs(long long a) {
+    if (pyrs_int_is_small(a)) {
+        long long v = pyrs_int_small_val(a);
+        if (v >= 0) {
+            return a;
+        }
+        if (v == PYRS_SMALL_MIN) {
+            return pyrs_int_from_i64(-v);
+        }
+        return pyrs_int_tag_small(-v);
+    }
+    PyrsInt *h = pyrs_int_heap_ptr(a);
+    if (h->sign >= 0) {
+        return a;
+    }
+    return int_from_sign_limbs(1, int_copy_limbs(h->limbs, h->nlimbs),
+                               h->nlimbs);
+}
+
+static unsigned long long *u_mul(const unsigned long long *a, long long na,
+                                 const unsigned long long *b, long long nb,
+                                 long long *rn) {
+    if (na == 0 || nb == 0) {
+        *rn = 0;
+        return NULL;
+    }
+    long long n = na + nb;
+    unsigned long long *r = xmalloc((size_t)n * sizeof(unsigned long long));
+    memset(r, 0, (size_t)n * sizeof(unsigned long long));
+    for (long long i = 0; i < na; i++) {
+        unsigned long long carry = 0;
+        for (long long j = 0; j < nb; j++) {
+            __uint128_t cur =
+                (__uint128_t)r[i + j] + (__uint128_t)a[i] * b[j] + carry;
+            r[i + j] = (unsigned long long)cur;
+            carry = (unsigned long long)(cur >> 64);
+        }
+        r[i + nb] = carry;
+    }
+    *rn = n;
+    int_trim(r, rn);
+    return r;
+}
+
+long long pyrs_int_mul(long long a, long long b) {
+    if (pyrs_int_is_small(a) && pyrs_int_is_small(b)) {
+        __int128 p = (__int128)pyrs_int_small_val(a) * (__int128)pyrs_int_small_val(b);
+        if (p >= PYRS_SMALL_MIN && p <= PYRS_SMALL_MAX) {
+            return pyrs_int_tag_small((long long)p);
+        }
+        if (p >= (__int128)LLONG_MIN && p <= (__int128)LLONG_MAX) {
+            return pyrs_int_from_i64((long long)p);
+        }
+        /* need two limbs */
+        int sign = p < 0 ? -1 : 1;
+        unsigned long long mag =
+            p < 0 ? (unsigned long long)(-p) : (unsigned long long)p;
+        /* p may need full 128 bits */
+        __uint128_t um = p < 0 ? (__uint128_t)(-p) : (__uint128_t)p;
+        unsigned long long *limbs = xmalloc(2 * sizeof(unsigned long long));
+        limbs[0] = (unsigned long long)um;
+        limbs[1] = (unsigned long long)(um >> 64);
+        long long n = limbs[1] ? 2 : 1;
+        (void)mag;
+        return int_from_sign_limbs(sign, limbs, n);
+    }
+    int sa, sb, oa, ob;
+    long long na, nb;
+    unsigned long long *da = int_read_mag(a, &sa, &na, &oa);
+    unsigned long long *db = int_read_mag(b, &sb, &nb, &ob);
+    if (sa == 0 || sb == 0) {
+        if (oa) {
+            free(da);
+        }
+        if (ob) {
+            free(db);
+        }
+        return pyrs_int_tag_small(0);
+    }
+    long long rn;
+    unsigned long long *r = u_mul(da, na, db, nb, &rn);
+    int sign = sa * sb;
+    if (oa) {
+        free(da);
+    }
+    if (ob) {
+        free(db);
+    }
+    return int_from_sign_limbs(sign, r, rn);
+}
+
+/* Division: Knuth schoolbook, returns floor-div and mod with CPython signs. */
+
+static void u_divmod(const unsigned long long *num, long long nn,
+                     const unsigned long long *den, long long nd,
+                     unsigned long long **q_out, long long *nq,
+                     unsigned long long **r_out, long long *nr) {
+    if (nd == 0) {
+        pyrs_die("ZeroDivisionError: division by zero");
+    }
+    if (nn == 0 || u_cmp(num, nn, den, nd) < 0) {
+        *q_out = NULL;
+        *nq = 0;
+        *r_out = int_copy_limbs(num, nn);
+        *nr = nn;
+        return;
+    }
+    if (nd == 1) {
+        unsigned long long d = den[0];
+        unsigned long long *q = xmalloc((size_t)nn * sizeof(unsigned long long));
+        unsigned long long rem = 0;
+        for (long long i = nn - 1; i >= 0; i--) {
+            __uint128_t cur = ((__uint128_t)rem << 64) | num[i];
+            q[i] = (unsigned long long)(cur / d);
+            rem = (unsigned long long)(cur % d);
+        }
+        *nq = nn;
+        int_trim(q, nq);
+        *q_out = q;
+        if (rem == 0) {
+            *r_out = NULL;
+            *nr = 0;
+        } else {
+            *r_out = xmalloc(sizeof(unsigned long long));
+            (*r_out)[0] = rem;
+            *nr = 1;
+        }
+        return;
+    }
+    /* General multi-limb: binary long division (simple, not fastest). */
+    unsigned long long *rem = int_copy_limbs(num, nn);
+    long long nr_ = nn;
+    long long qbits = (nn - nd + 1) * 64;
+    unsigned long long *q =
+        xmalloc((size_t)(nn - nd + 2) * sizeof(unsigned long long));
+    memset(q, 0, (size_t)(nn - nd + 2) * sizeof(unsigned long long));
+    long long nq_ = nn - nd + 1;
+
+    /* Align den to top of rem and subtract when possible */
+    for (long long shift = (nn - nd) * 64 + 63; shift >= 0; shift--) {
+        long long limb_shift = shift / 64;
+        int bit = (int)(shift % 64);
+        /* compare rem >= den << shift */
+        long long need = nd + limb_shift + (bit ? 1 : 0);
+        if (nr_ > need) {
+            /* rem larger */
+        } else if (nr_ < nd + limb_shift) {
+            continue;
+        }
+        /* Build shifted den comparison without full alloc when possible:
+         * compare rem[limb_shift..] with den shifted by bit */
+        int ge = 0;
+        {
+            unsigned long long carry = 0;
+            /* We'll try subtract den<<shift from rem; if borrow remains, undo */
+            long long maxn = nr_ > (nd + limb_shift + 1) ? nr_
+                                                         : (nd + limb_shift + 1);
+            unsigned long long *tmp =
+                xmalloc((size_t)maxn * sizeof(unsigned long long));
+            memset(tmp, 0, (size_t)maxn * sizeof(unsigned long long));
+            for (long long i = 0; i < nd; i++) {
+                __uint128_t v = (__uint128_t)den[i] << bit;
+                unsigned long long lo = (unsigned long long)v;
+                unsigned long long hi = (unsigned long long)(v >> 64);
+                long long j = i + limb_shift;
+                __uint128_t s = (__uint128_t)tmp[j] + lo;
+                tmp[j] = (unsigned long long)s;
+                carry = (unsigned long long)(s >> 64);
+                if (hi || carry) {
+                    s = (__uint128_t)tmp[j + 1] + hi + carry;
+                    tmp[j + 1] = (unsigned long long)s;
+                    carry = (unsigned long long)(s >> 64);
+                    if (carry) {
+                        tmp[j + 2] += carry;
+                    }
+                }
+            }
+            long long tn = maxn;
+            int_trim(tmp, &tn);
+            if (u_cmp(rem, nr_, tmp, tn) >= 0) {
+                long long rn2;
+                unsigned long long *diff = u_sub(rem, nr_, tmp, tn, &rn2);
+                free(rem);
+                rem = diff;
+                nr_ = rn2;
+                ge = 1;
+            }
+            free(tmp);
+        }
+        if (ge) {
+            long long qi = shift / 64;
+            q[qi] |= 1ULL << (shift % 64);
+        }
+        (void)qbits;
+    }
+    int_trim(q, &nq_);
+    *q_out = q;
+    *nq = nq_;
+    *r_out = rem;
+    *nr = nr_;
+}
+
+static void divmod_floor(long long a, long long b, long long *q_out,
+                         long long *r_out) {
+    if (!pyrs_int_truth(b)) {
+        pyrs_die("ZeroDivisionError: division by zero");
+    }
+    int sa, sb, oa, ob;
+    long long na, nb;
+    unsigned long long *da = int_read_mag(a, &sa, &na, &oa);
+    unsigned long long *db = int_read_mag(b, &sb, &nb, &ob);
+    if (sa == 0) {
+        *q_out = pyrs_int_tag_small(0);
+        *r_out = pyrs_int_tag_small(0);
+        if (oa) {
+            free(da);
+        }
+        if (ob) {
+            free(db);
+        }
+        return;
+    }
+    unsigned long long *uq, *ur;
+    long long nq, nr;
+    u_divmod(da, na, db, nb, &uq, &nq, &ur, &nr);
+    /* trunc toward zero quotient has sign sa*sb, rem has sign sa */
+    int qs = sa * sb;
+    long long q;
+    if (nq == 0 || uq == NULL) {
+        free(uq);
+        q = pyrs_int_tag_small(0);
+    } else {
+        q = int_from_sign_limbs(qs, uq, nq);
+    }
+    long long r;
+    if (nr == 0 || ur == NULL) {
+        free(ur);
+        r = pyrs_int_tag_small(0);
+    } else {
+        r = int_from_sign_limbs(sa, ur, nr);
+    }
+    /* Floor adjust: if rem != 0 and signs of a,b differ, q -= 1 and r += b */
+    if (pyrs_int_truth(r) && sa != sb) {
+        q = pyrs_int_sub(q, pyrs_int_tag_small(1));
+        r = pyrs_int_add(r, b);
+    }
+    *q_out = q;
+    *r_out = r;
+    if (oa) {
+        free(da);
+    }
+    if (ob) {
+        free(db);
+    }
+}
+
+long long pyrs_int_floordiv(long long a, long long b) {
+    long long q, r;
+    divmod_floor(a, b, &q, &r);
+    (void)r;
+    return q;
+}
+
+long long pyrs_int_mod(long long a, long long b) {
+    long long q, r;
+    divmod_floor(a, b, &q, &r);
+    (void)q;
+    return r;
+}
+
+long long pyrs_int_pow(long long base, long long exp) {
+    if (pyrs_int_is_small(exp)) {
+        long long e = pyrs_int_small_val(exp);
+        if (e < 0) {
+            pyrs_die(
+                "ValueError: integer to a negative power is not supported; "
+                "use a float base (e.g. 2.0 ** -1)");
+        }
+        long long result = pyrs_int_tag_small(1);
+        long long b = base;
+        while (e > 0) {
+            if (e & 1) {
+                result = pyrs_int_mul(result, b);
+            }
+            b = pyrs_int_mul(b, b);
+            e >>= 1;
+        }
+        return result;
+    }
+    /* huge exponent: only  (-1|0|1)**big is practical */
+    if (!pyrs_int_truth(exp) || pyrs_int_cmp(exp, pyrs_int_tag_small(0)) < 0) {
+        if (pyrs_int_cmp(exp, pyrs_int_tag_small(0)) < 0) {
+            pyrs_die(
+                "ValueError: integer to a negative power is not supported; "
+                "use a float base (e.g. 2.0 ** -1)");
+        }
+    }
+    int sb = pyrs_int_cmp(base, pyrs_int_tag_small(0));
+    if (sb == 0) {
+        return pyrs_int_tag_small(0);
+    }
+    long long absb = pyrs_int_abs(base);
+    if (pyrs_int_eq(absb, pyrs_int_tag_small(1))) {
+        /* (-1)**e or 1**e */
+        if (sb > 0) {
+            return pyrs_int_tag_small(1);
+        }
+        /* exp odd/even: look at low bit of exp */
+        int sa, oa;
+        long long na;
+        unsigned long long *d = int_read_mag(exp, &sa, &na, &oa);
+        int odd = na > 0 && (d[0] & 1ULL);
+        if (oa) {
+            free(d);
+        }
+        return odd ? pyrs_int_tag_small(-1) : pyrs_int_tag_small(1);
+    }
+    pyrs_die("ValueError: exponent too large");
+    return pyrs_int_tag_small(0);
+}
+
+long long pyrs_ipow(long long base, long long exp) {
+    return pyrs_int_pow(base, exp);
+}
+
+/* Two's complement bit ops: convert to infinite sign-extended limb form. */
+
+static void to_twos(long long t, unsigned long long **limbs, long long *n,
+                    int *neg_inf) {
+    /* For bitwise, Python uses infinite two's complement.
+     * Represent negative as bitwise not of (mag-1). */
+    int s, o;
+    long long nn;
+    unsigned long long *mag = int_read_mag(t, &s, &nn, &o);
+    if (s >= 0) {
+        *limbs = o ? mag : int_copy_limbs(mag, nn);
+        *n = nn;
+        *neg_inf = 0;
+        return;
+    }
+    /* negative: limbs = ~(mag - 1) = -mag in two's complement */
+    unsigned long long *m = o ? mag : int_copy_limbs(mag, nn);
+    /* m := m - 1 */
+    unsigned long long borrow = 1;
+    for (long long i = 0; i < nn; i++) {
+        unsigned long long v = m[i];
+        m[i] = v - borrow;
+        borrow = v < borrow;
+    }
+    /* invert */
+    for (long long i = 0; i < nn; i++) {
+        m[i] = ~m[i];
+    }
+    *limbs = m;
+    *n = nn;
+    *neg_inf = 1;
+}
+
+static long long from_twos(unsigned long long *limbs, long long n, int neg_inf) {
+    if (!neg_inf) {
+        return int_from_sign_limbs(n == 0 ? 0 : 1, limbs, n);
+    }
+    /* invert then add 1 → mag; sign -1 */
+    for (long long i = 0; i < n; i++) {
+        limbs[i] = ~limbs[i];
+    }
+    unsigned long long carry = 1;
+    for (long long i = 0; i < n; i++) {
+        __uint128_t s = (__uint128_t)limbs[i] + carry;
+        limbs[i] = (unsigned long long)s;
+        carry = (unsigned long long)(s >> 64);
+    }
+    if (carry) {
+        unsigned long long *nl =
+            xmalloc((size_t)(n + 1) * sizeof(unsigned long long));
+        memcpy(nl, limbs, (size_t)n * sizeof(unsigned long long));
+        nl[n] = carry;
+        free(limbs);
+        limbs = nl;
+        n++;
+    }
+    return int_from_sign_limbs(-1, limbs, n);
+}
+
+static long long bit_binop(long long a, long long b, int op) {
+    /* op: 0=and 1=or 2=xor */
+    unsigned long long *la, *lb;
+    long long na, nb;
+    int nia, nib;
+    to_twos(a, &la, &na, &nia);
+    to_twos(b, &lb, &nb, &nib);
+    long long n = na > nb ? na : nb;
+    /* extend with sign limbs (0 or all-ones) */
+    unsigned long long *ra = xmalloc((size_t)n * sizeof(unsigned long long));
+    unsigned long long *rb = xmalloc((size_t)n * sizeof(unsigned long long));
+    unsigned long long fa = nia ? ~0ULL : 0ULL;
+    unsigned long long fb = nib ? ~0ULL : 0ULL;
+    for (long long i = 0; i < n; i++) {
+        ra[i] = i < na ? la[i] : fa;
+        rb[i] = i < nb ? lb[i] : fb;
+    }
+    free(la);
+    free(lb);
+    unsigned long long *r = xmalloc((size_t)n * sizeof(unsigned long long));
+    for (long long i = 0; i < n; i++) {
+        if (op == 0) {
+            r[i] = ra[i] & rb[i];
+        } else if (op == 1) {
+            r[i] = ra[i] | rb[i];
+        } else {
+            r[i] = ra[i] ^ rb[i];
+        }
+    }
+    free(ra);
+    free(rb);
+    int ni = 0;
+    if (op == 0) {
+        ni = nia && nib;
+    } else if (op == 1) {
+        ni = nia || nib;
+    } else {
+        ni = nia ^ nib;
+    }
+    /* if result positive, may need trim; if neg_inf, keep at least 1 limb */
+    if (!ni) {
+        int_trim(r, &n);
+        return int_from_sign_limbs(n == 0 ? 0 : 1, r, n);
+    }
+    return from_twos(r, n, 1);
+}
+
+long long pyrs_int_and(long long a, long long b) {
+    if (pyrs_int_is_small(a) && pyrs_int_is_small(b)) {
+        return pyrs_int_tag_small(pyrs_int_small_val(a) & pyrs_int_small_val(b));
+    }
+    return bit_binop(a, b, 0);
+}
+
+long long pyrs_int_or(long long a, long long b) {
+    if (pyrs_int_is_small(a) && pyrs_int_is_small(b)) {
+        return pyrs_int_tag_small(pyrs_int_small_val(a) | pyrs_int_small_val(b));
+    }
+    return bit_binop(a, b, 1);
+}
+
+long long pyrs_int_xor(long long a, long long b) {
+    if (pyrs_int_is_small(a) && pyrs_int_is_small(b)) {
+        return pyrs_int_tag_small(pyrs_int_small_val(a) ^ pyrs_int_small_val(b));
+    }
+    return bit_binop(a, b, 2);
+}
+
+long long pyrs_int_invert(long long a) {
+    /* ~x = -x - 1 */
+    return pyrs_int_sub(pyrs_int_neg(a), pyrs_int_tag_small(1));
+}
+
+long long pyrs_int_lshift(long long a, long long b) {
+    if (pyrs_int_cmp(b, pyrs_int_tag_small(0)) < 0) {
+        pyrs_die("ValueError: negative shift count");
+    }
+    if (!pyrs_int_truth(a) || !pyrs_int_truth(b)) {
+        return a; /* x<<0 or 0<<n */
+    }
+    long long sh = pyrs_int_as_i64(b); /* may OverflowError */
+    if (sh == 0) {
+        return a;
+    }
+    int s, o;
+    long long n;
+    unsigned long long *mag = int_read_mag(a, &s, &n, &o);
+    if (s == 0) {
+        if (o) {
+            free(mag);
+        }
+        return pyrs_int_tag_small(0);
+    }
+    long long limb_shift = sh / 64;
+    int bit = (int)(sh % 64);
+    long long rn = n + limb_shift + 1;
+    unsigned long long *r = xmalloc((size_t)rn * sizeof(unsigned long long));
+    memset(r, 0, (size_t)rn * sizeof(unsigned long long));
+    if (bit == 0) {
+        memcpy(r + limb_shift, mag, (size_t)n * sizeof(unsigned long long));
+    } else {
+        unsigned long long carry = 0;
+        for (long long i = 0; i < n; i++) {
+            __uint128_t v = ((__uint128_t)mag[i] << bit) | carry;
+            r[i + limb_shift] = (unsigned long long)v;
+            carry = (unsigned long long)(v >> 64);
+        }
+        r[n + limb_shift] = carry;
+    }
+    if (o) {
+        free(mag);
+    }
+    return int_from_sign_limbs(s, r, rn);
+}
+
+long long pyrs_int_rshift(long long a, long long b) {
+    if (pyrs_int_cmp(b, pyrs_int_tag_small(0)) < 0) {
+        pyrs_die("ValueError: negative shift count");
+    }
+    if (!pyrs_int_truth(b)) {
+        return a;
+    }
+    /* Python: a >> b = floor(a / 2^b) */
+    long long sh = pyrs_int_as_i64(b);
+    if (sh == 0) {
+        return a;
+    }
+    if (pyrs_int_is_small(a)) {
+        long long v = pyrs_int_small_val(a);
+        if (sh >= 63) {
+            return pyrs_int_tag_small(v < 0 ? -1 : 0);
+        }
+        return pyrs_int_tag_small(v >> sh);
+    }
+    /* floor div by 2^sh for negatives */
+    int s, o;
+    long long n;
+    unsigned long long *mag = int_read_mag(a, &s, &n, &o);
+    if (s >= 0) {
+        long long limb_shift = sh / 64;
+        int bit = (int)(sh % 64);
+        if (limb_shift >= n) {
+            if (o) {
+                free(mag);
+            }
+            return pyrs_int_tag_small(0);
+        }
+        long long rn = n - limb_shift;
+        unsigned long long *r = xmalloc((size_t)rn * sizeof(unsigned long long));
+        if (bit == 0) {
+            memcpy(r, mag + limb_shift, (size_t)rn * sizeof(unsigned long long));
+        } else {
+            for (long long i = 0; i < rn; i++) {
+                unsigned long long cur = mag[i + limb_shift];
+                unsigned long long next =
+                    (i + limb_shift + 1 < n) ? mag[i + limb_shift + 1] : 0ULL;
+                r[i] = (cur >> bit) | (next << (64 - bit));
+            }
+        }
+        if (o) {
+            free(mag);
+        }
+        return int_from_sign_limbs(1, r, rn);
+    }
+    /* negative: floor = -ceil(mag / 2^sh) = -( (mag + (2^sh - 1)) >> sh ) */
+    unsigned long long *mag_copy = o ? mag : int_copy_limbs(mag, n);
+    long long mag_t = int_from_sign_limbs(1, mag_copy, n);
+    long long one = pyrs_int_lshift(pyrs_int_tag_small(1), b);
+    long long adj = pyrs_int_sub(one, pyrs_int_tag_small(1));
+    long long num = pyrs_int_add(mag_t, adj);
+    long long shifted = pyrs_int_rshift(num, b); /* non-negative */
+    return pyrs_int_neg(shifted);
+}
+
+/* decimal / base conversion for print and format */
+
+static char *int_to_dec(long long t, long long *out_len) {
+    if (pyrs_int_is_small(t)) {
+        long long v = pyrs_int_small_val(t);
+        char buf[32];
+        int n = snprintf(buf, sizeof buf, "%lld", v);
+        char *s = xmalloc((size_t)n + 1);
+        memcpy(s, buf, (size_t)n + 1);
+        *out_len = n;
+        return s;
+    }
+    int s, o;
+    long long n;
+    unsigned long long *mag = int_read_mag(t, &s, &n, &o);
+    if (s == 0) {
+        char *z = xmalloc(2);
+        z[0] = '0';
+        z[1] = '\0';
+        *out_len = 1;
+        if (o) {
+            free(mag);
+        }
+        return z;
+    }
+    /* repeated div by 10 */
+    unsigned long long *tmp = int_copy_limbs(mag, n);
+    long long tn = n;
+    if (o) {
+        free(mag);
+    }
+    /* max digits: nlimbs * 20 + 2 */
+    long long cap = tn * 20 + 4;
+    char *digits = xmalloc((size_t)cap);
+    long long nd = 0;
+    while (tn > 0) {
+        unsigned long long rem = 0;
+        for (long long i = tn - 1; i >= 0; i--) {
+            __uint128_t cur = ((__uint128_t)rem << 64) | tmp[i];
+            tmp[i] = (unsigned long long)(cur / 10ULL);
+            rem = (unsigned long long)(cur % 10ULL);
+        }
+        digits[nd++] = (char)('0' + (int)rem);
+        int_trim(tmp, &tn);
+    }
+    free(tmp);
+    long long total = nd + (s < 0 ? 1 : 0);
+    char *out = xmalloc((size_t)total + 1);
+    long long j = 0;
+    if (s < 0) {
+        out[j++] = '-';
+    }
+    for (long long i = nd - 1; i >= 0; i--) {
+        out[j++] = digits[i];
+    }
+    out[j] = '\0';
+    free(digits);
+    *out_len = total;
+    return out;
+}
+
+static char *int_to_base_str(long long t, int base, int upper, long long *out_len) {
+    if (base == 10) {
+        return int_to_dec(t, out_len);
+    }
+    int s, o;
+    long long n;
+    unsigned long long *mag = int_read_mag(t, &s, &n, &o);
+    if (s == 0) {
+        char *z = xmalloc(2);
+        z[0] = '0';
+        z[1] = '\0';
+        *out_len = 1;
+        if (o) {
+            free(mag);
+        }
+        return z;
+    }
+    unsigned long long *tmp = int_copy_limbs(mag, n);
+    long long tn = n;
+    if (o) {
+        free(mag);
+    }
+    long long cap = tn * 64 + 4; /* worst: base 2 */
+    char *digits = xmalloc((size_t)cap);
+    long long nd = 0;
+    unsigned long long ub = (unsigned long long)base;
+    while (tn > 0) {
+        unsigned long long rem = 0;
+        for (long long i = tn - 1; i >= 0; i--) {
+            __uint128_t cur = ((__uint128_t)rem << 64) | tmp[i];
+            tmp[i] = (unsigned long long)(cur / ub);
+            rem = (unsigned long long)(cur % ub);
+        }
+        int d = (int)rem;
+        if (d < 10) {
+            digits[nd++] = (char)('0' + d);
+        } else {
+            digits[nd++] = (char)((upper ? 'A' : 'a') + (d - 10));
+        }
+        int_trim(tmp, &tn);
+    }
+    free(tmp);
+    long long total = nd + (s < 0 ? 1 : 0);
+    char *out = xmalloc((size_t)total + 1);
+    long long j = 0;
+    if (s < 0) {
+        out[j++] = '-';
+    }
+    for (long long i = nd - 1; i >= 0; i--) {
+        out[j++] = digits[i];
+    }
+    out[j] = '\0';
+    free(digits);
+    *out_len = total;
+    return out;
+}
+
+void pyrs_print_int(long long v) {
+    long long n;
+    char *s = int_to_dec(v, &n);
+    fwrite(s, 1, (size_t)n, stdout);
+    free(s);
+}
+
+PyrsStr *pyrs_str_from_int(long long v) {
+    long long n;
+    char *s = int_to_dec(v, &n);
+    PyrsStr *r = str_alloc(n);
+    memcpy(r->data, s, (size_t)n);
+    free(s);
+    return r;
+}
+
 
 void pyrs_print_float(double v) {
     char buf[40];
@@ -357,7 +1509,7 @@ typedef struct {
 static void print_slot(long long slot, int tag) {
     switch (tag) {
     case TAG_INT:
-        printf("%lld", slot);
+        pyrs_print_int(slot);
         break;
     case TAG_FLOAT: {
         double d;
@@ -825,14 +1977,6 @@ int pyrs_str_contains(const PyrsStr *hay, const PyrsStr *needle) {
     return 0;
 }
 
-PyrsStr *pyrs_str_from_int(long long v) {
-    char buf[24];
-    int n = snprintf(buf, sizeof buf, "%lld", v);
-    PyrsStr *r = str_alloc(n);
-    memcpy(r->data, buf, (size_t)n);
-    return r;
-}
-
 PyrsStr *pyrs_str_from_float(double v) {
     char buf[40];
     format_double(v, buf);
@@ -841,6 +1985,10 @@ PyrsStr *pyrs_str_from_float(double v) {
     memcpy(r->data, buf, n);
     return r;
 }
+
+/* forward decls for format helpers (int may promote to float formatting) */
+PyrsStr *pyrs_format_float(double v, const PyrsStr *spec);
+PyrsStr *pyrs_format_int(long long v, const PyrsStr *spec);
 
 /* f-string `{x:.Nf}` / format(x, ".Nf") fixed-point (CPython %.*f) */
 PyrsStr *pyrs_str_format_float(double v, long long precision) {
@@ -866,6 +2014,735 @@ PyrsStr *pyrs_str_from_bool(int v) {
     PyrsStr *r = str_alloc((long long)n);
     memcpy(r->data, text, n);
     return r;
+}
+
+/* ---- format mini-language (PEP 3101 subset) ----
+ * [[fill]align][sign][#][0][width][.precision][type]
+ * Rejects grouping (,/_) and types n/c with clear messages. */
+
+typedef struct {
+    char fill;           /* default ' ' */
+    char align;          /* '\0', '<', '>', '=', '^' */
+    char sign;           /* '\0', '+', '-', ' ' */
+    int alternate;       /* # */
+    int zero;            /* 0 before width */
+    int zflag;           /* z — coerce negative zero */
+    long long width;     /* -1 = absent */
+    long long precision; /* -1 = absent */
+    char type;           /* '\0' or type letter */
+} PyrsFormatSpec;
+
+static void format_die_invalid(const char *spec, const char *ty_name) {
+    char buf[256];
+    snprintf(buf, sizeof buf,
+             "ValueError: Invalid format specifier '%s' for object of type '%s'",
+             spec, ty_name);
+    pyrs_die(buf);
+}
+
+static void format_die_unknown(char code, const char *ty_name) {
+    char buf[128];
+    snprintf(buf, sizeof buf,
+             "ValueError: Unknown format code '%c' for object of type '%s'", code,
+             ty_name);
+    pyrs_die(buf);
+}
+
+static void parse_format_spec(const PyrsStr *spec, PyrsFormatSpec *out,
+                              const char *ty_name) {
+    check_ref(spec);
+    memset(out, 0, sizeof *out);
+    out->fill = ' ';
+    out->width = -1;
+    out->precision = -1;
+
+    const char *s = spec->data;
+    long long len = spec->len;
+    long long i = 0;
+
+    if (len == 0) {
+        return;
+    }
+
+    /* [[fill]align] */
+    if (i + 1 < len) {
+        char a = s[i + 1];
+        if (a == '<' || a == '>' || a == '=' || a == '^') {
+            out->fill = s[i];
+            out->align = a;
+            i += 2;
+        }
+    }
+    if (out->align == '\0' && i < len) {
+        char a = s[i];
+        if (a == '<' || a == '>' || a == '=' || a == '^') {
+            out->align = a;
+            i += 1;
+        }
+    }
+
+    /* [sign] */
+    if (i < len && (s[i] == '+' || s[i] == '-' || s[i] == ' ')) {
+        out->sign = s[i];
+        i += 1;
+    }
+
+    /* [z] negative-zero coercion (floats) */
+    if (i < len && s[i] == 'z') {
+        out->zflag = 1;
+        i += 1;
+    }
+
+    /* [#] */
+    if (i < len && s[i] == '#') {
+        out->alternate = 1;
+        i += 1;
+    }
+
+    /* [0] zero-pad flag */
+    if (i < len && s[i] == '0') {
+        out->zero = 1;
+        i += 1;
+    }
+
+    /* [width] */
+    if (i < len && s[i] >= '0' && s[i] <= '9') {
+        long long w = 0;
+        while (i < len && s[i] >= '0' && s[i] <= '9') {
+            int digit = s[i] - '0';
+            if (w > (LLONG_MAX - digit) / 10) {
+                format_die_invalid(s, ty_name);
+            }
+            w = w * 10 + digit;
+            i += 1;
+        }
+        out->width = w;
+    }
+
+    /* grouping , or _ — not supported */
+    if (i < len && (s[i] == ',' || s[i] == '_')) {
+        char g = s[i];
+        char buf[128];
+        snprintf(buf, sizeof buf,
+                 "ValueError: grouping option '%c' in format specifiers is not "
+                 "supported yet",
+                 g);
+        pyrs_die(buf);
+    }
+
+    /* [.precision] */
+    if (i < len && s[i] == '.') {
+        i += 1;
+        if (i >= len || s[i] < '0' || s[i] > '9') {
+            format_die_invalid(s, ty_name);
+        }
+        long long p = 0;
+        while (i < len && s[i] >= '0' && s[i] <= '9') {
+            int digit = s[i] - '0';
+            if (p > (LLONG_MAX - digit) / 10) {
+                format_die_invalid(s, ty_name);
+            }
+            p = p * 10 + digit;
+            i += 1;
+        }
+        out->precision = p;
+    }
+
+    /* [type] */
+    if (i < len) {
+        out->type = s[i];
+        i += 1;
+    }
+
+    if (i != len) {
+        format_die_invalid(s, ty_name);
+    }
+
+    /* zero flag implies fill='0' and align='=' when align not set */
+    if (out->zero) {
+        if (out->align == '\0') {
+            out->align = '=';
+        }
+        if (out->fill == ' ' && out->align == '=') {
+            out->fill = '0';
+        }
+    }
+}
+
+/* Build a new string by padding `body` (no sign) with optional sign/prefix. */
+static PyrsStr *format_pad(const char *sign_str, const char *prefix,
+                           const char *body, long long body_len,
+                           const PyrsFormatSpec *fs) {
+    long long sign_len = (long long)strlen(sign_str);
+    long long pref_len = (long long)strlen(prefix);
+    long long content = sign_len + pref_len + body_len;
+    long long width = fs->width < 0 ? content : fs->width;
+    if (width < content) {
+        width = content;
+    }
+    long long pad = width - content;
+    char align = fs->align;
+    if (align == '\0') {
+        align = '>'; /* default for numbers; callers for str override */
+    }
+    char fill = fs->fill ? fs->fill : ' ';
+
+    PyrsStr *r = str_alloc(width);
+    char *p = r->data;
+    long long left = 0, right = 0, mid = 0;
+    if (align == '<') {
+        left = 0;
+        right = pad;
+    } else if (align == '^') {
+        left = pad / 2;
+        right = pad - left;
+    } else if (align == '=') {
+        /* sign + prefix, then pad, then body */
+        mid = pad;
+        left = 0;
+        right = 0;
+    } else { /* '>' */
+        left = pad;
+        right = 0;
+    }
+
+    if (align == '=') {
+        memcpy(p, sign_str, (size_t)sign_len);
+        p += sign_len;
+        memcpy(p, prefix, (size_t)pref_len);
+        p += pref_len;
+        memset(p, fill, (size_t)mid);
+        p += mid;
+        memcpy(p, body, (size_t)body_len);
+    } else {
+        memset(p, fill, (size_t)left);
+        p += left;
+        memcpy(p, sign_str, (size_t)sign_len);
+        p += sign_len;
+        memcpy(p, prefix, (size_t)pref_len);
+        p += pref_len;
+        memcpy(p, body, (size_t)body_len);
+        p += body_len;
+        memset(p, fill, (size_t)right);
+    }
+    return r;
+}
+
+static void int_to_base(unsigned long long v, int base, int upper, char *out,
+                        long long *out_len) {
+    if (v == 0) {
+        out[0] = '0';
+        *out_len = 1;
+        return;
+    }
+    char tmp[128];
+    int n = 0;
+    while (v > 0) {
+        int d = (int)(v % (unsigned)base);
+        if (d < 10) {
+            tmp[n++] = (char)('0' + d);
+        } else {
+            tmp[n++] = (char)((upper ? 'A' : 'a') + (d - 10));
+        }
+        v /= (unsigned)base;
+    }
+    for (int i = 0; i < n; i++) {
+        out[i] = tmp[n - 1 - i];
+    }
+    *out_len = n;
+}
+
+static const char *int_sign_str(long long v, char sign_opt) {
+    if (v < 0) {
+        return "-";
+    }
+    if (sign_opt == '+') {
+        return "+";
+    }
+    if (sign_opt == ' ') {
+        return " ";
+    }
+    return "";
+}
+
+PyrsStr *pyrs_format_int(long long v, const PyrsStr *spec) {
+    check_ref(spec);
+    if (spec->len == 0) {
+        return pyrs_str_from_int(v);
+    }
+
+    PyrsFormatSpec fs;
+    parse_format_spec(spec, &fs, "int");
+
+    char type = fs.type ? fs.type : 'd';
+
+    /* Float presentation types on int: promote (precision is allowed). */
+    if (type == 'e' || type == 'E' || type == 'f' || type == 'F' || type == 'g' ||
+        type == 'G' || type == '%') {
+        return pyrs_format_float(pyrs_int_to_float(v), spec);
+    }
+
+    if (fs.zflag) {
+        pyrs_die(
+            "ValueError: Negative zero coercion (z) not allowed in integer "
+            "format specifier");
+    }
+    if (fs.precision >= 0) {
+        pyrs_die("ValueError: Precision not allowed in integer format specifier");
+    }
+
+    if (type == 'n' || type == 'c') {
+        char buf[96];
+        snprintf(buf, sizeof buf,
+                 "ValueError: format type '%c' is not supported yet", type);
+        pyrs_die(buf);
+    }
+    if (type == 'i' || type == 'u') {
+        /* Not valid in CPython — match. */
+        format_die_unknown(type, "int");
+    }
+    if (type != 'd' && type != 'b' && type != 'o' && type != 'x' && type != 'X') {
+        format_die_unknown(type, "int");
+    }
+
+    int base = 10;
+    int upper = 0;
+    const char *prefix = "";
+    if (type == 'b') {
+        base = 2;
+        if (fs.alternate) {
+            prefix = "0b";
+        }
+    } else if (type == 'o') {
+        base = 8;
+        if (fs.alternate) {
+            prefix = "0o";
+        }
+    } else if (type == 'x') {
+        base = 16;
+        if (fs.alternate) {
+            prefix = "0x";
+        }
+    } else if (type == 'X') {
+        base = 16;
+        upper = 1;
+        if (fs.alternate) {
+            prefix = "0X";
+        }
+    }
+
+    long long raw_len = 0;
+    char *raw = int_to_base_str(v, base, upper, &raw_len);
+    /* strip leading '-' for body; sign handled separately */
+    const char *body_src = raw;
+    long long body_len = raw_len;
+    int neg = 0;
+    if (raw_len > 0 && raw[0] == '-') {
+        neg = 1;
+        body_src = raw + 1;
+        body_len = raw_len - 1;
+    }
+    char *body = xmalloc((size_t)body_len + 1);
+    memcpy(body, body_src, (size_t)body_len);
+    body[body_len] = '\0';
+    free(raw);
+
+    if (fs.align == '\0') {
+        fs.align = '>';
+    }
+
+    const char *sign;
+    if (neg) {
+        sign = "-";
+    } else if (fs.sign == '+') {
+        sign = "+";
+    } else if (fs.sign == ' ') {
+        sign = " ";
+    } else {
+        sign = "";
+    }
+    PyrsStr *out = format_pad(sign, prefix, body, body_len, &fs);
+    free(body);
+    return out;
+}
+
+static void float_sign_and_mag(double v, int zflag, char *sign_out,
+                               double *mag_out) {
+    if (signbit(v) && v == 0.0 && zflag) {
+        /* coerce -0.0 → 0.0 */
+        *sign_out = '\0';
+        *mag_out = 0.0;
+        return;
+    }
+    if (signbit(v)) {
+        *sign_out = '-';
+        *mag_out = -v;
+    } else {
+        *sign_out = '\0';
+        *mag_out = v;
+    }
+}
+
+static const char *float_sign_str(char sign_ch, char sign_opt) {
+    if (sign_ch == '-') {
+        return "-";
+    }
+    if (sign_opt == '+') {
+        return "+";
+    }
+    if (sign_opt == ' ') {
+        return " ";
+    }
+    return "";
+}
+
+/* Format a non-negative finite float body (no sign) per type/precision. */
+static void format_float_body(double mag, char type, long long precision,
+                              int alternate, char *buf, size_t bufsz) {
+    int prec;
+    if (type == 'f' || type == 'F' || type == 'e' || type == 'E' || type == '%') {
+        prec = precision < 0 ? 6 : (precision > 1000 ? 1000 : (int)precision);
+    } else if (type == 'g' || type == 'G' || type == '\0') {
+        prec = precision < 0 ? 6 : (precision > 1000 ? 1000 : (int)precision);
+        if (prec == 0) {
+            prec = 1; /* CPython g with .0 → 1 significant digit */
+        }
+    } else {
+        prec = 6;
+    }
+
+    if (type == '%') {
+        mag *= 100.0;
+        type = 'f';
+    }
+
+    if (type == 'f' || type == 'F') {
+        snprintf(buf, bufsz, alternate ? "%#.*f" : "%.*f", prec, mag);
+        if (type == 'F') {
+            for (char *p = buf; *p; p++) {
+                if (*p >= 'a' && *p <= 'z') {
+                    *p = (char)(*p - 'a' + 'A');
+                }
+            }
+        }
+    } else if (type == 'e' || type == 'E') {
+        snprintf(buf, bufsz, alternate ? "%#.*e" : "%.*e", prec, mag);
+        if (type == 'E') {
+            for (char *p = buf; *p; p++) {
+                if (*p >= 'a' && *p <= 'z') {
+                    *p = (char)(*p - 'a' + 'A');
+                }
+            }
+        }
+        /* CPython uses e+NN with at least 2 exponent digits — snprintf does. */
+    } else if (type == 'g' || type == 'G') {
+        /* CPython g: significant digits = prec; switch to exp like printf. */
+        snprintf(buf, bufsz, alternate ? "%#.*g" : "%.*g", prec, mag);
+        if (type == 'G') {
+            for (char *p = buf; *p; p++) {
+                if (*p >= 'a' && *p <= 'z') {
+                    *p = (char)(*p - 'a' + 'A');
+                }
+            }
+        }
+    } else {
+        /* Should not reach: empty type handled by caller for str path. */
+        snprintf(buf, bufsz, "%.*g", prec, mag);
+    }
+}
+
+PyrsStr *pyrs_format_float(double v, const PyrsStr *spec) {
+    check_ref(spec);
+    if (spec->len == 0) {
+        return pyrs_str_from_float(v);
+    }
+
+    PyrsFormatSpec fs;
+    parse_format_spec(spec, &fs, "float");
+
+    char type = fs.type;
+    /* Integer presentation types are invalid on float. */
+    if (type == 'd' || type == 'b' || type == 'o' || type == 'x' || type == 'X' ||
+        type == 'i' || type == 'u' || type == 'c' || type == 's') {
+        format_die_unknown(type ? type : '?', "float");
+    }
+    if (type == 'n') {
+        pyrs_die("ValueError: format type 'n' is not supported yet");
+    }
+    if (type != '\0' && type != 'e' && type != 'E' && type != 'f' && type != 'F' &&
+        type != 'g' && type != 'G' && type != '%') {
+        format_die_unknown(type, "float");
+    }
+
+    /* Width-only / empty-type with no precision: str() then pad (CPython). */
+    if (type == '\0' && fs.precision < 0) {
+        char raw[64];
+        format_double(v, raw);
+        if (fs.align == '\0') {
+            fs.align = '>';
+        }
+        /* sign is already in raw for negatives; pad as a whole string */
+        return format_pad("", "", raw, (long long)strlen(raw), &fs);
+    }
+
+    /* Empty type with precision → like 'g'. */
+    if (type == '\0') {
+        type = 'g';
+    }
+
+    /* nan / inf */
+    if (isnan(v) || isinf(v)) {
+        char body[8];
+        const char *sign = "";
+        if (isnan(v)) {
+            strcpy(body, (type == 'F' || type == 'E' || type == 'G') ? "NAN" : "nan");
+        } else {
+            if (signbit(v)) {
+                sign = "-";
+            } else if (fs.sign == '+') {
+                sign = "+";
+            } else if (fs.sign == ' ') {
+                sign = " ";
+            }
+            strcpy(body, (type == 'F' || type == 'E' || type == 'G') ? "INF" : "inf");
+        }
+        if (fs.align == '\0') {
+            fs.align = '>';
+        }
+        /* fill with '0' and align='=' → CPython uses space for nan/inf pad? */
+        if (fs.fill == '0' && fs.align == '=') {
+            fs.fill = ' ';
+            fs.align = '>';
+        }
+        return format_pad(sign, "", body, (long long)strlen(body), &fs);
+    }
+
+    char sign_ch = '\0';
+    double mag = v;
+    float_sign_and_mag(v, fs.zflag, &sign_ch, &mag);
+    const char *sign = float_sign_str(sign_ch, fs.sign);
+
+    char body[128];
+    if (type == '%') {
+        /* body includes trailing % */
+        char num[120];
+        format_float_body(mag, '%', fs.precision, fs.alternate, num, sizeof num);
+        snprintf(body, sizeof body, "%s%%", num);
+    } else {
+        format_float_body(mag, type, fs.precision, fs.alternate, body,
+                          sizeof body);
+    }
+
+    if (fs.align == '\0') {
+        fs.align = '>';
+    }
+    return format_pad(sign, "", body, (long long)strlen(body), &fs);
+}
+
+PyrsStr *pyrs_format_bool(int v, const PyrsStr *spec) {
+    check_ref(spec);
+    /* Empty format → "True"/"False"; any non-empty spec uses int formatting. */
+    if (spec->len == 0) {
+        return pyrs_str_from_bool(v);
+    }
+    return pyrs_format_int(pyrs_int_from_i64(v ? 1LL : 0LL), spec);
+}
+
+/* CPython-style repr of a string into a newly allocated PyrsStr. */
+PyrsStr *pyrs_str_repr(const PyrsStr *s) {
+    check_ref(s);
+    int has_single = 0;
+    int has_double = 0;
+    for (long long i = 0; i < s->len; i++) {
+        if (s->data[i] == '\'') {
+            has_single = 1;
+        } else if (s->data[i] == '"') {
+            has_double = 1;
+        }
+    }
+    char quote = (has_single && !has_double) ? '"' : '\'';
+
+    /* worst case: every byte → \xHH (4 chars) + quotes */
+    long long cap = s->len * 4 + 2;
+    char *buf = xmalloc((size_t)cap + 1);
+    long long n = 0;
+    buf[n++] = quote;
+    for (long long i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c == (unsigned char)quote || c == '\\') {
+            buf[n++] = '\\';
+            buf[n++] = (char)c;
+        } else if (c == '\n') {
+            buf[n++] = '\\';
+            buf[n++] = 'n';
+        } else if (c == '\r') {
+            buf[n++] = '\\';
+            buf[n++] = 'r';
+        } else if (c == '\t') {
+            buf[n++] = '\\';
+            buf[n++] = 't';
+        } else if (c < 0x20 || c == 0x7f) {
+            n += sprintf(buf + n, "\\x%02x", c);
+        } else {
+            buf[n++] = (char)c;
+        }
+    }
+    buf[n++] = quote;
+    buf[n] = '\0';
+    PyrsStr *r = str_alloc(n);
+    memcpy(r->data, buf, (size_t)n);
+    free(buf);
+    return r;
+}
+
+/* Decode one UTF-8 codepoint starting at s->data[i]; returns number of bytes
+ * consumed (1 on invalid/truncated sequences, treating the byte as latin-1). */
+static int utf8_next(const PyrsStr *s, long long i, unsigned int *cp) {
+    unsigned char c = (unsigned char)s->data[i];
+    if (c < 0x80) {
+        *cp = c;
+        return 1;
+    }
+    if ((c & 0xe0) == 0xc0 && i + 1 < s->len) {
+        unsigned char c1 = (unsigned char)s->data[i + 1];
+        if ((c1 & 0xc0) == 0x80) {
+            *cp = ((unsigned int)(c & 0x1f) << 6) | (c1 & 0x3f);
+            if (*cp >= 0x80) {
+                return 2;
+            }
+        }
+    } else if ((c & 0xf0) == 0xe0 && i + 2 < s->len) {
+        unsigned char c1 = (unsigned char)s->data[i + 1];
+        unsigned char c2 = (unsigned char)s->data[i + 2];
+        if ((c1 & 0xc0) == 0x80 && (c2 & 0xc0) == 0x80) {
+            *cp = ((unsigned int)(c & 0x0f) << 12) | ((unsigned int)(c1 & 0x3f) << 6) |
+                  (c2 & 0x3f);
+            if (*cp >= 0x800) {
+                return 3;
+            }
+        }
+    } else if ((c & 0xf8) == 0xf0 && i + 3 < s->len) {
+        unsigned char c1 = (unsigned char)s->data[i + 1];
+        unsigned char c2 = (unsigned char)s->data[i + 2];
+        unsigned char c3 = (unsigned char)s->data[i + 3];
+        if ((c1 & 0xc0) == 0x80 && (c2 & 0xc0) == 0x80 && (c3 & 0xc0) == 0x80) {
+            *cp = ((unsigned int)(c & 0x07) << 18) | ((unsigned int)(c1 & 0x3f) << 12) |
+                  ((unsigned int)(c2 & 0x3f) << 6) | (c3 & 0x3f);
+            if (*cp >= 0x10000 && *cp <= 0x10ffff) {
+                return 4;
+            }
+        }
+    }
+    *cp = c;
+    return 1;
+}
+
+/* ascii(): like repr but non-ASCII codepoints escaped (\xHH / \uXXXX / \UXXXXXXXX).
+ * Source strings are UTF-8 bytes; we decode so café → 'caf\xe9' like CPython. */
+PyrsStr *pyrs_str_ascii(const PyrsStr *s) {
+    check_ref(s);
+    int has_single = 0;
+    int has_double = 0;
+    for (long long i = 0; i < s->len; i++) {
+        if (s->data[i] == '\'') {
+            has_single = 1;
+        } else if (s->data[i] == '"') {
+            has_double = 1;
+        }
+    }
+    char quote = (has_single && !has_double) ? '"' : '\'';
+
+    /* worst case: every codepoint → \UXXXXXXXX (10 chars) + quotes */
+    long long cap = s->len * 10 + 2;
+    char *buf = xmalloc((size_t)cap + 1);
+    long long n = 0;
+    buf[n++] = quote;
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp = 0;
+        int adv = utf8_next(s, i, &cp);
+        i += adv;
+        if (cp == (unsigned int)quote || cp == '\\') {
+            buf[n++] = '\\';
+            buf[n++] = (char)cp;
+        } else if (cp == '\n') {
+            buf[n++] = '\\';
+            buf[n++] = 'n';
+        } else if (cp == '\r') {
+            buf[n++] = '\\';
+            buf[n++] = 'r';
+        } else if (cp == '\t') {
+            buf[n++] = '\\';
+            buf[n++] = 't';
+        } else if (cp < 0x20 || cp == 0x7f) {
+            n += sprintf(buf + n, "\\x%02x", cp);
+        } else if (cp < 0x80) {
+            buf[n++] = (char)cp;
+        } else if (cp < 0x100) {
+            n += sprintf(buf + n, "\\x%02x", cp);
+        } else if (cp < 0x10000) {
+            n += sprintf(buf + n, "\\u%04x", cp);
+        } else {
+            n += sprintf(buf + n, "\\U%08x", cp);
+        }
+    }
+    buf[n++] = quote;
+    buf[n] = '\0';
+    PyrsStr *r = str_alloc(n);
+    memcpy(r->data, buf, (size_t)n);
+    free(buf);
+    return r;
+}
+
+PyrsStr *pyrs_format_str(const PyrsStr *s, const PyrsStr *spec) {
+    check_ref(s);
+    check_ref(spec);
+    if (spec->len == 0) {
+        /* return a copy — callers may concat; strings are immutable heap objs
+         * never freed, so sharing the pointer is fine. */
+        return (PyrsStr *)s;
+    }
+
+    PyrsFormatSpec fs;
+    parse_format_spec(spec, &fs, "str");
+
+    if (fs.sign != '\0' || fs.alternate || fs.zero) {
+        /* CPython: '=' align / sign / # / 0 not allowed for strings in some
+         * cases. Mirror common errors. */
+        if (fs.sign != '\0') {
+            pyrs_die("ValueError: Sign not allowed in string format specifier");
+        }
+        if (fs.alternate) {
+            pyrs_die(
+                "ValueError: Alternate form (#) not allowed in string format "
+                "specifier");
+        }
+        if (fs.zero && fs.align == '=') {
+            /* zero flag alone becomes fill=0 align== which is invalid for str */
+            pyrs_die(
+                "ValueError: '=' alignment not allowed in string format "
+                "specifier");
+        }
+    }
+    if (fs.align == '=') {
+        pyrs_die(
+            "ValueError: '=' alignment not allowed in string format specifier");
+    }
+
+    char type = fs.type ? fs.type : 's';
+    if (type != 's') {
+        format_die_unknown(type, "str");
+    }
+
+    const char *body = s->data;
+    long long body_len = s->len;
+    if (fs.precision >= 0 && fs.precision < body_len) {
+        body_len = fs.precision;
+    }
+
+    if (fs.align == '\0') {
+        fs.align = '<'; /* default for strings */
+    }
+    return format_pad("", "", body, body_len, &fs);
 }
 
 int pyrs_str_isdigit(const PyrsStr *s) {
@@ -1069,6 +2946,7 @@ static int slot_eq(long long a, long long b, int tag) {
     }
     switch (tag) {
     case 0:
+        return pyrs_int_eq(a, b);
     case 2:
         return a == b;
     case 1: {
@@ -1171,7 +3049,8 @@ static int cmp_slots_qsort(const void *pa, const void *pb) {
     long long b = *(const long long *)pb;
     int tag = sort_elem_tag;
     switch (tag) {
-    case 0: /* int */
+    case 0: /* int (tagged / heap) */
+        return pyrs_int_cmp(a, b);
     case 2: /* bool as 0/1 */
         return (a > b) - (a < b);
     case 1: { /* float: total order, NaN last */
@@ -1481,27 +3360,7 @@ PyrsStr *pyrs_input(const PyrsStr *prompt) {
     return r;
 }
 
-/* ---- integer power ---- */
-
-/* repeated squaring; unsigned internally so overflow wraps (like the rest
- * of PyRs int arithmetic) instead of being UB */
-long long pyrs_ipow(long long base, long long exp) {
-    if (exp < 0) {
-        pyrs_die(
-            "ValueError: integer to a negative power is not supported; "
-            "use a float base (e.g. 2.0 ** -1)");
-    }
-    unsigned long long result = 1;
-    unsigned long long b = (unsigned long long)base;
-    while (exp > 0) {
-        if (exp & 1) {
-            result *= b;
-        }
-        b *= b;
-        exp >>= 1;
-    }
-    return (long long)result;
-}
+/* ---- integer power: see pyrs_int_pow / pyrs_ipow in bigint_impl.c ---- */
 
 /* ---- tuples ---- */
 
@@ -1623,15 +3482,19 @@ struct PyrsDict {
     long long order_cap;
 };
 
+
+static void die_keyerror_int(long long key) {
+    long long n;
+    char *s = int_to_dec(key, &n);
+    char *buf = xmalloc((size_t)n + 16);
+    snprintf(buf, (size_t)n + 16, "KeyError: %s", s);
+    free(s);
+    pyrs_die(buf);
+}
+
 static unsigned long long hash_key(long long key, int tag) {
     if (tag == TAG_INT) {
-        unsigned long long x = (unsigned long long)key;
-        x ^= x >> 30;
-        x *= 0xbf58476d1ce4e5b9ULL;
-        x ^= x >> 27;
-        x *= 0x94d049bb133111ebULL;
-        x ^= x >> 31;
-        return x;
+        return pyrs_int_hash(key);
     }
     if (tag == TAG_STR) {
         const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
@@ -1767,9 +3630,7 @@ long long pyrs_dict_get(const PyrsDict *d, long long key, int key_tag) {
             }
             pyrs_die(buf);
         } else {
-            char buf[64];
-            snprintf(buf, sizeof buf, "KeyError: %lld", key);
-            pyrs_die(buf);
+            die_keyerror_int(key);
         }
     }
     return d->table[idx].val;
@@ -1798,9 +3659,7 @@ void pyrs_dict_del(PyrsDict *d, long long key, int key_tag) {
             snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)s->len, s->data);
             pyrs_die(buf);
         } else {
-            char buf[64];
-            snprintf(buf, sizeof buf, "KeyError: %lld", key);
-            pyrs_die(buf);
+            die_keyerror_int(key);
         }
     }
     d->table[idx].state = 2;
@@ -1846,9 +3705,7 @@ long long pyrs_dict_pop(PyrsDict *d, long long key, int key_tag, int has_default
             snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)s->len, s->data);
             pyrs_die(buf);
         } else {
-            char buf[64];
-            snprintf(buf, sizeof buf, "KeyError: %lld", key);
-            pyrs_die(buf);
+            die_keyerror_int(key);
         }
     }
     *out = d->table[idx].val;
@@ -2080,9 +3937,7 @@ void pyrs_set_remove(PyrsSet *s, long long key, int key_tag) {
             snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)str->len, str->data);
             pyrs_die(buf);
         } else {
-            char buf[64];
-            snprintf(buf, sizeof buf, "KeyError: %lld", key);
-            pyrs_die(buf);
+            die_keyerror_int(key);
         }
     }
     s->table[idx].state = 2;
@@ -2326,12 +4181,25 @@ static PyrsStr *json_parse_string(const char **p) {
 }
 
 static long long json_parse_int(const char **p) {
-    char *end = NULL;
-    errno = 0;
-    long long v = strtoll(*p, &end, 10);
-    if (end == *p || errno == ERANGE) {
+    const char *start = *p;
+    if (*start == '+' || *start == '-') {
+        start++;
+    }
+    if (*start < '0' || *start > '9') {
         pyrs_die("ValueError: Expecting value");
     }
+    const char *end = *p;
+    if (*end == '+' || *end == '-') {
+        end++;
+    }
+    while (*end >= '0' && *end <= '9') {
+        end++;
+    }
+    if (end == *p || (*p[0] == '+' || *p[0] == '-') && end == *p + 1) {
+        pyrs_die("ValueError: Expecting value");
+    }
+    long long len = (long long)(end - *p);
+    long long v = pyrs_int_from_str(*p, len);
     *p = end;
     return v;
 }
@@ -2639,9 +4507,10 @@ static void jbuf_put_str_escaped(JsonBuf *b, const PyrsStr *s) {
 }
 
 static void jbuf_put_int(JsonBuf *b, long long v) {
-    char tmp[32];
-    snprintf(tmp, sizeof(tmp), "%lld", v);
-    jbuf_puts(b, tmp);
+    long long n;
+    char *s = int_to_dec(v, &n);
+    jbuf_puts(b, s);
+    free(s);
 }
 
 static void jbuf_put_float(JsonBuf *b, double v) {
@@ -2800,7 +4669,12 @@ typedef struct {
     long long return_slot; /* StopIteration.value / `return expr` payload */
     long long return_set;  /* 1 if return_slot is a real return value (not bare end) */
     long long closing;   /* non-zero while close() injects GeneratorExit */
-    long long try_phases[PYRS_GEN_MAX_TRY]; /* phase per active try across yield */
+    long long send_slot; /* value delivered to suspended yield expression */
+    long long send_is_none; /* 1 when send was None / next() */
+    long long throw_type; /* non-zero: inject this PYRS_EXC_* at resume */
+    void *throw_msg;     /* pyrs str* message for throw (may be NULL) */
+    long long try_phases[PYRS_GEN_MAX_TRY]; /* phase per try pool slot across yield */
+    long long try_exits[PYRS_GEN_MAX_TRY];  /* TRY_EXIT_* per pool slot (yield in finally) */
     long long nlocals;
     long long locals[];  /* frame */
 } PyrsGen;
@@ -2815,8 +4689,13 @@ PyrsGen *pyrs_gen_new(void *code, long long nlocals) {
     g->return_slot = 0;
     g->return_set = 0;
     g->closing = 0;
+    g->send_slot = 0;
+    g->send_is_none = 1;
+    g->throw_type = 0;
+    g->throw_msg = NULL;
     for (int i = 0; i < PYRS_GEN_MAX_TRY; i++) {
         g->try_phases[i] = 0;
+        g->try_exits[i] = 0;
     }
     g->nlocals = nlocals;
     for (long long i = 0; i < nlocals; i++) {
@@ -2840,9 +4719,92 @@ long long pyrs_gen_load_try_phase(PyrsGen *g, long long i) {
     return 0;
 }
 
+void pyrs_gen_save_try_exit(PyrsGen *g, long long i, long long exit_kind) {
+    check_ref(g);
+    if (i >= 0 && i < PYRS_GEN_MAX_TRY) {
+        g->try_exits[i] = exit_kind;
+    }
+}
+
+long long pyrs_gen_load_try_exit(PyrsGen *g, long long i) {
+    check_ref(g);
+    if (i >= 0 && i < PYRS_GEN_MAX_TRY) {
+        return g->try_exits[i];
+    }
+    return 0;
+}
+
 int pyrs_gen_closing(PyrsGen *g) {
     check_ref(g);
     return g->closing ? 1 : 0;
+}
+
+/* Prepare send value for the next resume. `is_none` non-zero → yield expr is None. */
+void pyrs_gen_set_send(PyrsGen *g, long long slot, long long is_none) {
+    check_ref(g);
+    /* Exhausted generators do not accept send; caller should short-circuit. */
+    if (g->done) {
+        return;
+    }
+    if (g->state == 0 && !is_none) {
+        pyrs_die("TypeError: can't send non-None value to a just-started generator");
+    }
+    g->send_slot = slot;
+    g->send_is_none = is_none ? 1 : 0;
+}
+
+long long pyrs_gen_send_slot(PyrsGen *g) {
+    check_ref(g);
+    return g->send_slot;
+}
+
+int pyrs_gen_send_is_none(PyrsGen *g) {
+    check_ref(g);
+    return g->send_is_none ? 1 : 0;
+}
+
+/* Arm throw injection for the next resume (type is PYRS_EXC_*; msg is pyrs str*).
+ * Not-yet-started or already-finished generators raise immediately at the
+ * throw() call site (CPython does not run the body). Mark done so later
+ * send/next do not re-enter the body. */
+void pyrs_gen_set_throw(PyrsGen *g, long long type, void *msg) {
+    check_ref(g);
+    if (g->done || g->state == 0) {
+        g->done = 1;
+        g->throw_type = 0;
+        g->throw_msg = NULL;
+        int t = (int)type;
+        const char *m = NULL;
+        if (msg != NULL) {
+            /* pyrs str: i64 len then bytes */
+            m = (const char *)msg + 8;
+        }
+        pyrs_raise(t, m);
+        return;
+    }
+    g->throw_type = type;
+    g->throw_msg = msg;
+}
+
+int pyrs_gen_throwing(PyrsGen *g) {
+    check_ref(g);
+    return g->throw_type != 0 ? 1 : 0;
+}
+
+long long pyrs_gen_throw_type(PyrsGen *g) {
+    check_ref(g);
+    return g->throw_type;
+}
+
+void *pyrs_gen_throw_msg(PyrsGen *g) {
+    check_ref(g);
+    return g->throw_msg;
+}
+
+void pyrs_gen_clear_throw(PyrsGen *g) {
+    check_ref(g);
+    g->throw_type = 0;
+    g->throw_msg = NULL;
 }
 
 /* Inject GeneratorExit and resume until the generator finishes. CPython

@@ -522,6 +522,8 @@ pub struct Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     ConstInt(i64),
+    /// Decimal digits of a source int literal that does not fit in i64.
+    ConstIntDigits(String),
     ConstFloat(f64),
     ConstBool(bool),
     ConstStr(String),
@@ -716,10 +718,15 @@ pub enum ExprKind {
     IntToStr(Box<Expr>),
     FloatToStr(Box<Expr>),
     BoolToStr(Box<Expr>),
-    /// f-string `{x:.Nf}` fixed-point format; operand is always `Float`.
-    FloatFormat {
+    /// `repr(s)` for a string value (quotes + escapes); result is `Str`.
+    StrRepr(Box<Expr>),
+    /// `ascii(s)` for a string value (like repr, non-ASCII → `\xHH` / `\uXXXX`); result is `Str`.
+    StrAscii(Box<Expr>),
+    /// `format(value, spec)` — free-form format mini-language; `spec` is `Str`.
+    /// `value` is Int / Float / Bool / Str. Empty `spec` matches `str(value)`.
+    FormatValue {
         value: Box<Expr>,
-        precision: u32,
+        spec: Box<Expr>,
     },
     /// truthiness test → bool: numerics `!= 0`, containers `len != 0`
     ToBool(Box<Expr>),
@@ -769,8 +776,25 @@ pub enum ExprKind {
         nlocals: i64,
     },
     /// Advance a generator: returns a union `yield_ty | None` where None means
-    /// StopIteration (exhausted). Used by `for` desugaring.
-    GeneratorNext(Box<Expr>),
+    /// StopIteration (exhausted). Used by `for` desugaring and `send`.
+    /// `send` is delivered as the value of the suspended `yield` expression
+    /// (`None` / `ConstNone` for `next` / `send(None)`).
+    GeneratorNext {
+        generator: Box<Expr>,
+        send: Box<Expr>,
+    },
+    /// Inject an exception at the suspended yield point (`g.throw(...)`).
+    /// Returns `yield_ty | None` like `GeneratorNext` when the generator
+    /// catches and yields again; uncaught exceptions propagate via the runtime.
+    GeneratorThrow {
+        generator: Box<Expr>,
+        exc: ExcType,
+        message: Box<Expr>,
+    },
+    /// Value delivered to a `yield` expression after resume (`send` / `next`).
+    /// Type on `expr.ty` is `Optional[yield_ty]`. Valid only as the result of
+    /// a Block that executed `Yield` in a generator resume function.
+    GenSentValue,
     /// Load the StopIteration / `return` payload of a finished generator.
     /// Type on `expr.ty` is `Optional[Y]`: None when the subgen used bare
     /// `return` / fell off the end; `Some(v)` after `return v`.

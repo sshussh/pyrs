@@ -106,9 +106,8 @@ mod tests {
     #[test]
     fn division_guards_against_zero() {
         let ll = lower("def f(a: int, b: int) -> int:\n    return a // b\nprint(f(7, 2))\n");
-        assert!(ll.contains("ZeroDivisionError"), "{ll}");
-        assert!(ll.contains("call void @pyrs_die"), "{ll}");
-        assert!(ll.contains("sdiv i64"), "{ll}");
+        // Floor division is handled in the bigint runtime (zero-div trap included).
+        assert!(ll.contains("pyrs_int_floordiv"), "{ll}");
     }
 
     #[test]

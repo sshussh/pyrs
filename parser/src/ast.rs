@@ -186,10 +186,10 @@ pub enum StmtKind {
         /// Runs when the loop ends without `break`.
         orelse: Vec<Stmt>,
     },
-    /// `for var in iter:` — iter is `range(...)`, a list, a str, or a file.
+    /// `for target in iter:` — iter is `range(...)`, a list, a str, or a file.
+    /// `target` may be a name, unpacking tuple, or other assignment target.
     For {
-        var: String,
-        var_span: Span,
+        target: AssignTarget,
         iter: Expr,
         body: Vec<Stmt>,
         /// Runs when the loop ends without `break`.
@@ -226,12 +226,17 @@ pub enum StmtKind {
     /// (`from . import x`, `from ..pkg import y`). `level` is the number of
     /// leading dots (0 = absolute). `module` is the path after the dots
     /// (empty for `from . import x`).
+    ///
+    /// `from module import *` sets `star = true` and leaves `names` empty.
     FromImport {
         module: String,
         /// Number of leading dots: 0 absolute, 1 = `.`, 2 = `..`, …
         level: u32,
-        /// (imported name, optional local alias, span of the name)
+        /// (imported name, optional local alias, span of the name).
+        /// Empty when `star` is true.
         names: Vec<(String, Option<String>, Span)>,
+        /// `from module import *`
+        star: bool,
         span: Span,
     },
     /// `with expr [as name]:` — files only; close() runs on every exit
@@ -282,8 +287,10 @@ pub enum Pattern {
     Wildcard,
     /// Capture name `x` (also value pattern when name is a constant — treated as capture).
     Capture(String),
-    /// Integer literal.
+    /// Integer literal that fits in i64.
     Int(i64),
+    /// Integer literal with digits that exceed i64.
+    IntDigits(String),
     /// String literal.
     Str(String),
     /// `True` / `False`.
@@ -401,11 +408,15 @@ pub enum UnaryOp {
     Invert,
 }
 
-/// Supported f-string format specs (minimal subset of PEP 3101).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FStringFormat {
-    /// `{x:.Nf}` — fixed-point with `N` digits after the decimal.
-    DotNf { precision: u32 },
+/// f-string conversion `!s` / `!r` / `!a` (applied before formatting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FStringConversion {
+    /// `!s` — `str(value)`
+    Str,
+    /// `!r` — `repr(value)`
+    Repr,
+    /// `!a` — `ascii(value)`
+    Ascii,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -413,7 +424,11 @@ pub enum FStringPart {
     Literal(String),
     Expr {
         expr: Expr,
-        format: Option<FStringFormat>,
+        conversion: Option<FStringConversion>,
+        /// Format mini-language after `:`, typically a [`ExprKind::JoinedStr`]
+        /// of literal chunks and nested `{field}` expressions. `None` when no
+        /// `:` was present (plain `str()` conversion path).
+        format_spec: Option<Box<Expr>>,
     },
 }
 
@@ -425,7 +440,10 @@ pub struct Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
+    /// Integer literal that fits in i64 (after parsing).
     Int(i64),
+    /// Integer literal whose decimal digits exceed i64 (no underscores).
+    IntDigits(String),
     Float(f64),
     Bool(bool),
     Str(String),
@@ -488,13 +506,10 @@ pub enum ExprKind {
     /// `*expr` — only legal inside list displays and unpack targets (validated
     /// in semantic / when converting to assign targets).
     Starred(Box<Expr>),
-    /// `[elem for var in iter if cond]`
+    /// `[elem for target in iter if cond ... for ...]` — one or more generators.
     ListComp {
         elem: Box<Expr>,
-        var: String,
-        var_span: Span,
-        iter: Box<Expr>,
-        cond: Option<Box<Expr>>,
+        generators: Vec<CompFor>,
     },
     /// `int(x)`, `float(x)`, `bool(x)`, `str(x)`
     Cast {
@@ -516,6 +531,14 @@ pub enum ExprKind {
         op: UnaryOp,
         operand: Box<Expr>,
     },
+}
+
+/// One `for target in iter [if ...]...` clause in a comprehension.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompFor {
+    pub target: AssignTarget,
+    pub iter: Expr,
+    pub ifs: Vec<Expr>,
 }
 
 /// One element of a list display: a value or `*iterable` unpack.
