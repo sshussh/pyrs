@@ -150,8 +150,10 @@ $ make ci                           # format check + clippy + tests + parity
 
 PyRs compiles a statically-typed subset of Python. Valid PyRs programs
 are valid Python programs with the same output — the reverse is not true,
-since PyRs requires type annotations on functions and rejects dynamic
-features (each with a "not supported yet" error naming the feature).
+since PyRs rejects unsupported dynamic features (each with a
+"not supported yet" error naming the feature). Parameter annotations are
+optional when a default value is present (the type is inferred from the
+default); bare parameters still need an annotation.
 
 ### Program structure
 
@@ -189,8 +191,10 @@ bump()
 print(counter)          # 1
 ```
 
-`nonlocal` is not supported (nested functions may **read** outer locals but
-cannot assign to them via `nonlocal`).
+`nonlocal` is supported for nested functions: assignments target an
+enclosing function local through a cell (escaping closures that close over
+`nonlocal` variables work). Nested `def` and `lambda` produce first-class
+closure values.
 
 ### Types
 
@@ -563,8 +567,11 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return x
 ```
 
-- Parameter annotations are **required**; the return annotation defaults
-  to "returns nothing" when omitted.
+- Parameter annotations are **optional when a default is present** (type
+  inferred from the default). Bare parameters without defaults still need
+  an annotation. The return annotation is optional: when omitted, the
+  compiler infers a concrete return type from `return` statements when
+  possible; otherwise the function is treated as returning nothing.
 - Default values and keyword arguments work (`def f(a: int, b: int = 1)`
   and `f(1, b=2)`). Defaults are re-evaluated at each call that needs
   them (so `def f(xs: list[int] = [])` does not share one list across
@@ -572,15 +579,20 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - `*args: T` packs extra positionals into `list[T]`; `**kwargs: T` packs
   extra keywords into `dict[str, T]`. Call-site unpacking `f(1, *xs)` and
   `f(**d)` works for homogeneous `list` / `dict[str, …]` values.
-- Nested `def` is allowed inside functions. Free variables from the outer
-  function are **captured by value** at each call. Nested functions may
-  recurse. Returning a nested function as a value is not supported;
-  `nonlocal` is not supported.
-- A function declared `-> T` must return on every path — the compiler
-  checks this (an infinite `while True:` without `break` counts as
-  not falling through).
+- Nested `def` and `lambda` are first-class: free variables are captured
+  by value, or through **cells** when `nonlocal` is used (escaping
+  closures keep shared state). Nested functions may recurse and may be
+  returned / stored as closure values. Rebinding a local name over a
+  nested def shadows the nested function (CPython-like). Closures are
+  not first-class inside list/tuple/dict/set containers yet.
+- A function declared `-> T` (or with an inferred concrete return type)
+  must return on every path — the compiler checks this (an infinite
+  `while True:` without `break` counts as not falling through).
 - Recursion and mutual recursion work; functions may be called before
   their definition in the file.
+- Generator functions use `yield` / `yield from` (basic protocol; no
+  `send`/`throw`). Yielding inside `try` is rejected. Escaping generator
+  functions as values is not supported yet.
 - Function names are internally prefixed, so naming a function `printf`
   or `malloc` cannot collide with the C library.
 
@@ -591,15 +603,17 @@ def total(x: int, *args: int) -> int:
         s = s + a
     return s
 
-def make(n: int) -> int:
+def make_adder(n: int):
     def add(x: int) -> int:
         return x + n
-    return add(5)
+    return add
 
-print(total(1, 2, 3), make(3))  # 6 8
+add3 = make_adder(3)
+print(total(1, 2, 3), add3(5))  # 6 8
+
+inc = lambda x=0: x + 1
+print(inc(2))  # 3
 ```
-
-Not supported yet: `lambda`, and redefining a function.
 
 ### Built-in functions
 
@@ -885,11 +899,15 @@ Multi-name imports work: `import a, b as c` loads each module and binds
 aliases like CPython.
 
 Still unsupported: `from M import *`, namespace packages (no
-`__init__.py`), imports inside functions or other blocks (only **module
-top-level** statements), modules as first-class values beyond
-attribute/call chains, re-assigning another module's attributes from
-outside, and a package **importing itself** by name (`import utilpkg`
-inside `utilpkg/__init__.py` is a compile error).
+`__init__.py`), modules as first-class values beyond attribute/call
+chains, re-assigning another module's attributes from outside, and a
+package **importing itself** by name (`import utilpkg` inside
+`utilpkg/__init__.py` is a compile error).
+
+**Imports inside functions** are allowed (CPython-like): the binding is
+local to that function and not visible at module scope. Module top-level
+and nested `if`/`for` blocks may also import; nested function bodies use
+function-local import scopes.
 
 ## 6. Runtime errors
 
@@ -981,10 +999,10 @@ deliberate exceptions:
    (`0 or 5` is `5`).
 3. **Static types.** Variables can't change type; lists are homogeneous
    (mixed numeric literals coerce to the joined type — `[1, 2.5]` becomes
-   `[1.0, 2.5]`); annotations on parameters are mandatory. Promotions
-   convert the value itself, so `n: int = True` makes `n` print as `1`
-   where Python keeps the bool and prints `True` (they still compare
-   equal).
+   `[1.0, 2.5]`); bare parameters need annotations (defaults may infer).
+   Promotions convert the value itself, so `n: int = True` makes `n`
+   print as `1` where Python keeps the bool and prints `True` (they still
+   compare equal).
 4. **`x ** e` with a dynamic negative int exponent traps** at runtime
    (constant exponents like `2 ** -1` correctly give a float).
 5. **int↔float comparisons convert the int to float**, losing exactness
@@ -1000,15 +1018,21 @@ deliberate exceptions:
    a known limitation for long-running ones.
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
-11. **No control-flow narrowing of Optionals** — `if x is not None: …`
-    does not refine `x` to the non-None member; use `x or default` or
-    keep the union type.
+11. **Narrowing is limited** — `if x is not None:` / `is None` / `not`
+    on **function locals and cell/`nonlocal` names** in `if`/`while`/
+    `elif`/`else` refines unions (including complementary else-arms and
+    after early `return` in a then-arm). Assigning a concrete member
+    re-refines that name in the branch. **Module globals are not
+    narrowed** (no flow-sensitive global refinements yet). No attribute
+    or SAT-style narrowing. Multi-member peels keep a safe storage type
+    for print/tags.
 
-Container notes (v0.13):
+Container notes (v0.14):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`
-  and methods are not supported yet.
+  and methods are not supported yet. Closures/generators are not valid
+  tuple (or list) elements yet.
 - **dict:** keys are `int` or `str` only; bare `get(k)` returns
   `Optional[V]` (`None` on miss); `get(k, default)` keeps value type;
   `keys`/`values`/`items` return lists (not views); insertion-order
@@ -1016,19 +1040,22 @@ Container notes (v0.13):
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
   `{}` is always an empty dict.
 - **unions / Optional:** first-class `None`; `T | U` and `Optional[T]`;
-  `is`/`is not` only with `None`; `|` is not a bitwise-or expression.
+  `is`/`is not` only with `None`; `|` is bitwise-or in expressions and
+  union in type annotations.
 
 Exception notes: `except E as e` binds the message `str`, not an exception
 object. Other traps (`EOFError`, `FileNotFoundError`, …) match bare
 `except:` only, not `except RuntimeError`.
 
 Not implemented yet (clear compile errors): classes, `from M import *`,
-namespace packages, `match`, generators/`yield`, `lambda`, returning nested
-functions as values, `nonlocal` writes, full f-string format specs beyond
-`{x:.Nf}`, unparenthesized multi-line expressions inside f-string
+namespace packages, GC / heap freeing, full generator protocol
+(`send`/`throw`), closures inside containers, full f-string format specs
+beyond `{x:.Nf}`, unparenthesized multi-line expressions inside f-string
 `{...}` (parenthesize instead), same-delimiter triple quotes nested
 inside an f-string expression, `__doc__` attribute access, dynamic
-`json.loads`, and most remaining methods on tuple/dict/set.
+`json.loads`, and most remaining methods on tuple/dict/set. `match`/`case`
+is a documented subset (literals, capture, `or`, sequence, mapping with
+str keys, guards).
 
 ## 9. Performance
 
