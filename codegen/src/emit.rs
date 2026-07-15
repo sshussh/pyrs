@@ -85,7 +85,10 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Dict { .. } => 6,
         Ty::Set(_) => 7,
         Ty::Union(_) => 8,
-        Ty::File | Ty::None | Ty::Closure { .. } | Ty::Cell(_) | Ty::Generator { .. } => {
+        // Closures / generators as list/dict values (pointer slots).
+        Ty::Closure { .. } => 9,
+        Ty::Generator { .. } => 10,
+        Ty::File | Ty::None | Ty::Cell(_) => {
             unreachable!("no print tag for {ty:?}")
         }
     }
@@ -127,13 +130,18 @@ const TRY_EXIT_RERAISE: i32 = 4;
 /// handlers). A runtime `phase_ptr` (0=body, 1=handler) distinguishes the
 /// first longjmp (dispatch to handlers) from a raise/trap during a handler
 /// (go to finally with RERAISE — do not re-enter handlers).
+#[derive(Clone)]
 struct TryScope {
     fin_l: String,
     end_l: String,
+    /// Exception dispatch label (setjmp non-zero path).
+    exc_l: String,
     /// `alloca i32` holding TRY_EXIT_*
     exit_ptr: String,
     /// Runtime flag (`alloca i32`, 1=live): pop at most once on structured exit.
     live_ptr: String,
+    /// 0=body, 1=handler, 2=else
+    phase_ptr: String,
     /// `loops.len()` when this try was entered.
     loops_at_entry: usize,
 }
@@ -167,6 +175,11 @@ struct Emitter {
     /// Next yield resume state id.
     gen_next_state: i64,
     gen_yield_ty: Ty,
+    /// Preallocated try control allocas for generators (dominate all gstates).
+    /// Each entry: (exit_ptr, live_ptr, phase_ptr).
+    gen_try_pool: Vec<(String, String, String)>,
+    /// Next free index into `gen_try_pool`.
+    gen_try_pool_next: usize,
 }
 
 impl Default for Emitter {
@@ -189,7 +202,179 @@ impl Default for Emitter {
             gen_local_index: HashMap::new(),
             gen_next_state: 1,
             gen_yield_ty: Ty::Int,
+            gen_try_pool: Vec::new(),
+            gen_try_pool_next: 0,
         }
+    }
+}
+
+fn max_try_depth_in_stmts(stmts: &[Stmt]) -> usize {
+    let mut max = 0usize;
+    for s in stmts {
+        max = max.max(max_try_depth_in_stmt(s));
+    }
+    max
+}
+
+fn max_try_depth_in_stmt(s: &Stmt) -> usize {
+    match s {
+        Stmt::Try {
+            body,
+            handlers,
+            orelse,
+            finally,
+        } => {
+            let mut inner = max_try_depth_in_stmts(body);
+            for (_, _, b) in handlers {
+                inner = inner.max(max_try_depth_in_stmts(b));
+            }
+            inner = inner.max(max_try_depth_in_stmts(orelse));
+            inner = inner.max(max_try_depth_in_stmts(finally));
+            1 + inner
+        }
+        Stmt::If { branches, orelse } => {
+            let mut m = max_try_depth_in_stmts(orelse);
+            for (c, b) in branches {
+                m = m.max(max_try_depth_in_expr(c));
+                m = m.max(max_try_depth_in_stmts(b));
+            }
+            m
+        }
+        Stmt::While {
+            cond, body, step, ..
+        } => max_try_depth_in_expr(cond)
+            .max(max_try_depth_in_stmts(body))
+            .max(max_try_depth_in_stmts(step)),
+        // yield-from desugars to Block{Try…} inside Assign / ExprStmt / etc.
+        Stmt::Assign { value: e, .. }
+        | Stmt::GlobalAssign { value: e, .. }
+        | Stmt::ExprStmt(e)
+        | Stmt::Return(Some(e))
+        | Stmt::Yield(e)
+        | Stmt::Raise { message: e, .. }
+        | Stmt::GenClose { generator: e }
+        | Stmt::ListAppend { value: e, .. }
+        | Stmt::ListRemove { value: e, .. }
+        | Stmt::CellStore { value: e, .. } => max_try_depth_in_expr(e),
+        Stmt::Print(args) => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
+        Stmt::ListInsert {
+            index: i, value: v, ..
+        }
+        | Stmt::IndexAssign {
+            index: i, value: v, ..
+        } => max_try_depth_in_expr(i).max(max_try_depth_in_expr(v)),
+        Stmt::IndexDelete { index: i, .. } => max_try_depth_in_expr(i),
+        _ => 0,
+    }
+}
+
+fn max_try_depth_in_expr(e: &Expr) -> usize {
+    use ExprKind::*;
+    match &e.kind {
+        Block { stmts, result } => max_try_depth_in_stmts(stmts).max(max_try_depth_in_expr(result)),
+        Let { value, body, .. } => max_try_depth_in_expr(value).max(max_try_depth_in_expr(body)),
+        Binary { left, right, .. } | IsIdentity { left, right, .. } => {
+            max_try_depth_in_expr(left).max(max_try_depth_in_expr(right))
+        }
+        Unary { operand, .. }
+        | ToBool(operand)
+        | Abs(operand)
+        | Len(operand)
+        | IntToFloat(operand)
+        | BoolToInt(operand)
+        | FloatToInt(operand)
+        | IntToStr(operand)
+        | FloatToStr(operand)
+        | BoolToStr(operand)
+        | IsNone { value: operand, .. }
+        | CellNew(operand)
+        | CellLoad(operand)
+        | GeneratorNext(operand)
+        | GeneratorReturnValue(operand)
+        | FromUnion { value: operand, .. }
+        | ToUnion { value: operand, .. }
+        | DictKeys(operand)
+        | DictValues(operand)
+        | DictItems(operand)
+        | SetToList(operand)
+        | Sum(operand)
+        | MinList(operand)
+        | MaxList(operand)
+        | JsonDumps(operand)
+        | JsonLoads { arg: operand, .. }
+        | FloatFormat { value: operand, .. }
+        | MathCall { arg: operand, .. }
+        | ClosureCap {
+            closure: operand, ..
+        } => max_try_depth_in_expr(operand),
+        Call { args, .. } => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
+        CallClosure { closure, args, .. } => args
+            .iter()
+            .map(max_try_depth_in_expr)
+            .max()
+            .unwrap_or(0)
+            .max(max_try_depth_in_expr(closure)),
+        MakeClosure { captures, .. } => captures
+            .iter()
+            .map(max_try_depth_in_expr)
+            .max()
+            .unwrap_or(0),
+        MakeGenerator {
+            args, code_from, ..
+        } => {
+            let m = args.iter().map(max_try_depth_in_expr).max().unwrap_or(0);
+            m.max(
+                code_from
+                    .as_ref()
+                    .map(|c| max_try_depth_in_expr(c))
+                    .unwrap_or(0),
+            )
+        }
+        Index { base, index } => max_try_depth_in_expr(base).max(max_try_depth_in_expr(index)),
+        Slice {
+            base, lo, hi, step, ..
+        } => max_try_depth_in_expr(base)
+            .max(max_try_depth_in_expr(lo))
+            .max(max_try_depth_in_expr(hi))
+            .max(max_try_depth_in_expr(step)),
+        ListLit(items) | TupleLit(items) | SetLit(items) => {
+            items.iter().map(max_try_depth_in_expr).max().unwrap_or(0)
+        }
+        DictLit(pairs) => pairs
+            .iter()
+            .map(|(k, v)| max_try_depth_in_expr(k).max(max_try_depth_in_expr(v)))
+            .max()
+            .unwrap_or(0),
+        Contains { needle, haystack } => {
+            max_try_depth_in_expr(needle).max(max_try_depth_in_expr(haystack))
+        }
+        ListPop { list, index } | ListIndexOf { list, value: index } => {
+            max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
+        }
+        DictGet { dict, key, default } => max_try_depth_in_expr(dict)
+            .max(max_try_depth_in_expr(key))
+            .max(max_try_depth_in_expr(default)),
+        DictPop { dict, key, default } => max_try_depth_in_expr(dict)
+            .max(max_try_depth_in_expr(key))
+            .max(
+                default
+                    .as_ref()
+                    .map(|d| max_try_depth_in_expr(d))
+                    .unwrap_or(0),
+            ),
+        StrCall { args, .. } | FileCall { args, .. } => {
+            args.iter().map(max_try_depth_in_expr).max().unwrap_or(0)
+        }
+        Min { left, right } | Max { left, right } => {
+            max_try_depth_in_expr(left).max(max_try_depth_in_expr(right))
+        }
+        ListNew { cap } => max_try_depth_in_expr(cap),
+        Input { prompt } => prompt
+            .as_ref()
+            .map(|p| max_try_depth_in_expr(p))
+            .unwrap_or(0),
+        Open { path, mode } => max_try_depth_in_expr(path).max(max_try_depth_in_expr(mode)),
+        _ => 0,
     }
 }
 
@@ -203,15 +388,17 @@ fn count_yields_in_stmts(stmts: &[Stmt]) -> i64 {
 
 fn count_yields_in_stmt(s: &Stmt) -> i64 {
     match s {
-        Stmt::Yield(_) => 1,
+        Stmt::Yield(e) => 1 + count_yields_in_expr(e),
         Stmt::If { branches, orelse } => {
             branches
                 .iter()
-                .map(|(_, b)| count_yields_in_stmts(b))
+                .map(|(c, b)| count_yields_in_expr(c) + count_yields_in_stmts(b))
                 .sum::<i64>()
                 + count_yields_in_stmts(orelse)
         }
-        Stmt::While { body, step, .. } => count_yields_in_stmts(body) + count_yields_in_stmts(step),
+        Stmt::While { cond, body, step } => {
+            count_yields_in_expr(cond) + count_yields_in_stmts(body) + count_yields_in_stmts(step)
+        }
         Stmt::Try {
             body,
             handlers,
@@ -226,18 +413,123 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
                 + count_yields_in_stmts(orelse)
                 + count_yields_in_stmts(finally)
         }
-        Stmt::ExprStmt(e) | Stmt::Assign { value: e, .. } | Stmt::GlobalAssign { value: e, .. } => {
-            count_yields_in_expr(e)
+        Stmt::Print(args) => args.iter().map(count_yields_in_expr).sum(),
+        Stmt::ExprStmt(e)
+        | Stmt::Assign { value: e, .. }
+        | Stmt::GlobalAssign { value: e, .. }
+        | Stmt::Return(Some(e))
+        | Stmt::Raise { message: e, .. }
+        | Stmt::GenClose { generator: e }
+        | Stmt::ListAppend { value: e, .. }
+        | Stmt::ListRemove { value: e, .. }
+        | Stmt::CellStore { value: e, .. } => count_yields_in_expr(e),
+        Stmt::ListInsert {
+            index: i, value: v, ..
         }
+        | Stmt::IndexAssign {
+            index: i, value: v, ..
+        } => count_yields_in_expr(i) + count_yields_in_expr(v),
+        Stmt::IndexDelete { index: i, .. } => count_yields_in_expr(i),
         _ => 0,
     }
 }
 
 fn count_yields_in_expr(e: &Expr) -> i64 {
+    use ExprKind::*;
     match &e.kind {
-        ExprKind::Block { stmts, result } => {
-            count_yields_in_stmts(stmts) + count_yields_in_expr(result)
+        Block { stmts, result } => count_yields_in_stmts(stmts) + count_yields_in_expr(result),
+        Let { value, body, .. } => count_yields_in_expr(value) + count_yields_in_expr(body),
+        Binary { left, right, .. } | IsIdentity { left, right, .. } => {
+            count_yields_in_expr(left) + count_yields_in_expr(right)
         }
+        Unary { operand, .. }
+        | ToBool(operand)
+        | Abs(operand)
+        | Len(operand)
+        | IntToFloat(operand)
+        | BoolToInt(operand)
+        | FloatToInt(operand)
+        | IntToStr(operand)
+        | FloatToStr(operand)
+        | BoolToStr(operand)
+        | IsNone { value: operand, .. }
+        | CellNew(operand)
+        | CellLoad(operand)
+        | GeneratorNext(operand)
+        | GeneratorReturnValue(operand)
+        | FromUnion { value: operand, .. }
+        | ToUnion { value: operand, .. }
+        | DictKeys(operand)
+        | DictValues(operand)
+        | DictItems(operand)
+        | SetToList(operand)
+        | Sum(operand)
+        | MinList(operand)
+        | MaxList(operand)
+        | JsonDumps(operand)
+        | JsonLoads { arg: operand, .. }
+        | FloatFormat { value: operand, .. }
+        | MathCall { arg: operand, .. } => count_yields_in_expr(operand),
+        Call { args, .. } => args.iter().map(count_yields_in_expr).sum(),
+        CallClosure { closure, args, .. } => {
+            count_yields_in_expr(closure) + args.iter().map(count_yields_in_expr).sum::<i64>()
+        }
+        MakeClosure { captures, .. } => captures.iter().map(count_yields_in_expr).sum(),
+        MakeGenerator {
+            args, code_from, ..
+        } => {
+            args.iter().map(count_yields_in_expr).sum::<i64>()
+                + code_from
+                    .as_ref()
+                    .map(|c| count_yields_in_expr(c))
+                    .unwrap_or(0)
+        }
+        ClosureCap { closure, .. } => count_yields_in_expr(closure),
+        Index { base, index } => count_yields_in_expr(base) + count_yields_in_expr(index),
+        Slice {
+            base, lo, hi, step, ..
+        } => {
+            count_yields_in_expr(base)
+                + count_yields_in_expr(lo)
+                + count_yields_in_expr(hi)
+                + count_yields_in_expr(step)
+        }
+        ListLit(items) | TupleLit(items) | SetLit(items) => {
+            items.iter().map(count_yields_in_expr).sum()
+        }
+        DictLit(pairs) => pairs
+            .iter()
+            .map(|(k, v)| count_yields_in_expr(k) + count_yields_in_expr(v))
+            .sum(),
+        Contains { needle, haystack } => {
+            count_yields_in_expr(needle) + count_yields_in_expr(haystack)
+        }
+        ListPop { list, index } | ListIndexOf { list, value: index } => {
+            count_yields_in_expr(list) + count_yields_in_expr(index)
+        }
+        DictGet { dict, key, default } => {
+            count_yields_in_expr(dict) + count_yields_in_expr(key) + count_yields_in_expr(default)
+        }
+        DictPop { dict, key, default } => {
+            count_yields_in_expr(dict)
+                + count_yields_in_expr(key)
+                + default
+                    .as_ref()
+                    .map(|d| count_yields_in_expr(d))
+                    .unwrap_or(0)
+        }
+        StrCall { args, .. } | FileCall { args, .. } => args.iter().map(count_yields_in_expr).sum(),
+        Min { left, right } | Max { left, right } => {
+            count_yields_in_expr(left) + count_yields_in_expr(right)
+        }
+        ListNew { cap } => count_yields_in_expr(cap),
+        Input { prompt } => prompt
+            .as_ref()
+            .map(|p| count_yields_in_expr(p))
+            .unwrap_or(0),
+        Open { path, mode } => count_yields_in_expr(path) + count_yields_in_expr(mode),
+        // Leafs / no nested yield: consts, locals, globals, Argv, OsGetcwd,
+        // DictNew, SetNew, CellNewUnbound. Yield-as-expr is a Block with Yield.
         _ => 0,
     }
 }
@@ -277,6 +569,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_unpack_check(i64, i64)\n");
         out.push_str("declare void @pyrs_unpack_check_min(i64, i64)\n");
         out.push_str("declare ptr @pyrs_cell_new(i64)\n");
+        out.push_str("declare ptr @pyrs_cell_new_unbound()\n");
         out.push_str("declare i64 @pyrs_cell_load(ptr)\n");
         out.push_str("declare void @pyrs_cell_store(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_closure_new(ptr, i64)\n");
@@ -292,6 +585,14 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_gen_yield_value(ptr)\n");
         out.push_str("declare i32 @pyrs_gen_done(ptr)\n");
         out.push_str("declare void @pyrs_gen_set_done(ptr)\n");
+        out.push_str("declare void @pyrs_gen_close(ptr)\n");
+        out.push_str("declare void @pyrs_gen_save_try_phase(ptr, i64, i64)\n");
+        out.push_str("declare i64 @pyrs_gen_load_try_phase(ptr, i64)\n");
+        out.push_str("declare i32 @pyrs_gen_closing(ptr)\n");
+        out.push_str("declare i32 @pyrs_gen_is_genexit()\n");
+        out.push_str("declare void @pyrs_gen_set_return(ptr, i64)\n");
+        out.push_str("declare i64 @pyrs_gen_return_value(ptr)\n");
+        out.push_str("declare i32 @pyrs_gen_has_return(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_new()\n");
         out.push_str("declare void @pyrs_dict_set(ptr, i64, i32, i64, i32)\n");
         out.push_str("declare i64 @pyrs_dict_get(ptr, i64, i32)\n");
@@ -438,6 +739,19 @@ impl Emitter {
     }
 
     // ---- low-level helpers ----
+
+    /// Store to try control (phase/exit/live). Must be volatile so LLVM does
+    /// not DSE across `setjmp`/`longjmp` (raise is `noreturn` but longjmps).
+    fn store_try_i32(&mut self, val: impl std::fmt::Display, ptr: &str) {
+        self.line(format!("store volatile i32 {val}, ptr {ptr}"));
+    }
+
+    /// Load try control (phase/exit/live); volatile for setjmp correctness.
+    fn load_try_i32(&mut self, ptr: &str) -> String {
+        let t = self.tmp();
+        self.line(format!("{t} = load volatile i32, ptr {ptr}"));
+        t
+    }
 
     fn line(&mut self, s: impl AsRef<str>) {
         self.body.push_str("  ");
@@ -1217,6 +1531,20 @@ impl Emitter {
         // Count yields for switch
         let yield_count = count_yields_in_stmts(&func.body);
         self.start_block("entry");
+        // Preallocate try control allocas so they dominate every gstate
+        // (needed when yield resumes re-arm setjmp using the same slots).
+        let try_depth = max_try_depth_in_stmts(&func.body).max(1);
+        self.gen_try_pool.clear();
+        self.gen_try_pool_next = 0;
+        for i in 0..try_depth {
+            let e = format!("%gen.try.exit.{i}");
+            let l = format!("%gen.try.live.{i}");
+            let p = format!("%gen.try.phase.{i}");
+            self.line(format!("{e} = alloca i32, align 4"));
+            self.line(format!("{l} = alloca i32, align 4"));
+            self.line(format!("{p} = alloca i32, align 4"));
+            self.gen_try_pool.push((e, l, p));
+        }
         // switch on state
         let st = self.tmp();
         self.line(format!("{st} = call i64 @pyrs_gen_state(ptr %gen)"));
@@ -1232,6 +1560,7 @@ impl Emitter {
         // state 0 = start
         self.start_block("gstate0");
         self.gen_next_state = 1;
+        self.gen_try_pool_next = 0;
         self.emit_block(&func.body);
         if !self.terminated {
             self.line("call void @pyrs_gen_set_done(ptr %gen)");
@@ -1379,6 +1708,11 @@ impl Emitter {
                 let slot = self.slot_from_value(&v, value.ty);
                 self.line(format!("call void @pyrs_cell_store(ptr {c}, i64 {slot})"));
             }
+            Stmt::GenClose { generator } => {
+                let g = self.emit_expr(generator);
+                // CPython close(): inject GeneratorExit, run finally, swallow GenExit.
+                self.line(format!("call void @pyrs_gen_close(ptr {g})"));
+            }
             Stmt::Yield(value) => {
                 let Some(frame) = self.gen_frame.clone() else {
                     panic!("Yield outside generator function");
@@ -1393,11 +1727,79 @@ impl Emitter {
                 self.line(format!(
                     "call void @pyrs_gen_set_state(ptr {frame}, i64 {next})"
                 ));
+                // Persist try phase across suspend (allocas do not survive the
+                // resume call). Pop setjmp frames so the C stack is clean.
+                let ntries = self.tries.len();
+                if ntries > 0 {
+                    let scopes: Vec<TryScope> = self.tries.clone();
+                    for (i, scope) in scopes.iter().enumerate() {
+                        let ph = self.load_try_i32(&scope.phase_ptr);
+                        let ph64 = self.tmp();
+                        self.line(format!("{ph64} = zext i32 {ph} to i64"));
+                        self.line(format!(
+                            "call void @pyrs_gen_save_try_phase(ptr {frame}, i64 {i}, i64 {ph64})"
+                        ));
+                    }
+                }
+                for _ in 0..ntries {
+                    self.line("call void @pyrs_try_pop()");
+                }
                 self.line("ret i32 0");
                 self.terminated = true;
                 // Resume label for this yield
                 let lab = format!("gstate{next}");
                 self.start_block(&lab);
+                // Re-establish active try frames (new setjmp on this call),
+                // restoring the phase that was active at suspend.
+                if ntries > 0 {
+                    let scopes: Vec<TryScope> = self.tries.clone();
+                    for (i, scope) in scopes.iter().enumerate() {
+                        self.store_try_i32(0, &scope.exit_ptr);
+                        self.store_try_i32(1, &scope.live_ptr);
+                        let ph64 = self.tmp();
+                        self.line(format!(
+                            "{ph64} = call i64 @pyrs_gen_load_try_phase(ptr {frame}, i64 {i})"
+                        ));
+                        let ph = self.tmp();
+                        self.line(format!("{ph} = trunc i64 {ph64} to i32"));
+                        self.store_try_i32(&ph, &scope.phase_ptr);
+                        let tframe = self.tmp();
+                        self.line(format!("{tframe} = call ptr @pyrs_try_push()"));
+                        let jc = self.tmp();
+                        self.line(format!(
+                            "{jc} = call i32 @setjmp(ptr {tframe}) returns_twice"
+                        ));
+                        let ok = self.tmp();
+                        self.line(format!("{ok} = icmp eq i32 {jc}, 0"));
+                        let cont = self.fresh_block("try.yreenter");
+                        self.line(format!("br i1 {ok}, label %{cont}, label %{}", scope.exc_l));
+                        self.start_block(&cont);
+                    }
+                }
+                // close() injects GeneratorExit at the resume point so finally runs.
+                let closing = self.tmp();
+                self.line(format!(
+                    "{closing} = call i32 @pyrs_gen_closing(ptr {frame})"
+                ));
+                let is_closing = self.tmp();
+                self.line(format!("{is_closing} = icmp ne i32 {closing}, 0"));
+                let close_l = self.fresh_block("gen.closing");
+                let cont_l = self.fresh_block("gen.resume");
+                self.line(format!(
+                    "br i1 {is_closing}, label %{close_l}, label %{cont_l}"
+                ));
+                self.start_block(&close_l);
+                if ntries > 0 {
+                    // PYRS_EXC_GENEXIT = 7
+                    self.line("call void @pyrs_raise(i32 7, ptr null)");
+                    self.line("unreachable");
+                } else {
+                    // No try frames: GenExit is immediately uncaught → done.
+                    self.line(format!("call void @pyrs_gen_set_done(ptr {frame})"));
+                    self.line("ret i32 1");
+                }
+                self.terminated = true;
+                self.start_block(&cont_l);
             }
             Stmt::Raise { exc, message } => {
                 let m = self.emit_expr(message);
@@ -1486,7 +1888,17 @@ impl Emitter {
                 self.line(format!("store i64 {newlen}, ptr {l}"));
             }
             Stmt::Return(None) => {
-                if !self.tries.is_empty() {
+                if self.gen_frame.is_some() {
+                    // Generator stop — route through finally if inside try.
+                    if !self.tries.is_empty() {
+                        self.emit_try_exit(TRY_EXIT_RETURN, None);
+                    } else {
+                        let frame = self.gen_frame.clone().unwrap();
+                        self.line(format!("call void @pyrs_gen_set_done(ptr {frame})"));
+                        self.line("ret i32 1");
+                        self.terminated = true;
+                    }
+                } else if !self.tries.is_empty() {
                     self.emit_try_exit(TRY_EXIT_RETURN, None);
                 } else {
                     self.line("ret void");
@@ -1494,12 +1906,30 @@ impl Emitter {
                 }
             }
             Stmt::Return(Some(value)) => {
-                let v = self.emit_expr(value);
-                if !self.tries.is_empty() {
-                    self.emit_try_exit(TRY_EXIT_RETURN, Some((v, value.ty)));
+                if self.gen_frame.is_some() {
+                    // Store StopIteration.value for yield-from, then stop
+                    // (through finally when inside try).
+                    let frame = self.gen_frame.clone().unwrap();
+                    let v = self.emit_expr(value);
+                    let slot = self.slot_from_value(&v, value.ty);
+                    self.line(format!(
+                        "call void @pyrs_gen_set_return(ptr {frame}, i64 {slot})"
+                    ));
+                    if !self.tries.is_empty() {
+                        self.emit_try_exit(TRY_EXIT_RETURN, None);
+                    } else {
+                        self.line(format!("call void @pyrs_gen_set_done(ptr {frame})"));
+                        self.line("ret i32 1");
+                        self.terminated = true;
+                    }
                 } else {
-                    self.line(format!("ret {} {v}", lty(value.ty)));
-                    self.terminated = true;
+                    let v = self.emit_expr(value);
+                    if !self.tries.is_empty() {
+                        self.emit_try_exit(TRY_EXIT_RETURN, Some((v, value.ty)));
+                    } else {
+                        self.line(format!("ret {} {v}", lty(value.ty)));
+                        self.terminated = true;
+                    }
                 }
             }
             Stmt::ExprStmt(expr) => {
@@ -1629,6 +2059,7 @@ impl Emitter {
                 self.emit_to_union(&v, value.ty, expr.ty)
             }
             ExprKind::IsNone { value, not } => self.emit_is_none(value, *not),
+            ExprKind::IsIdentity { left, right, not } => self.emit_is_identity(left, right, *not),
             ExprKind::Local(name) => {
                 if let (Some(frame), Some(idx)) = (
                     self.gen_frame.clone(),
@@ -2165,11 +2596,28 @@ impl Emitter {
                     t
                 }
             }
+            ExprKind::ClosureCap {
+                closure,
+                index,
+                cap_ty,
+            } => {
+                let c = self.emit_expr(closure);
+                let slot = self.tmp();
+                self.line(format!(
+                    "{slot} = call i64 @pyrs_closure_get(ptr {c}, i64 {index})"
+                ));
+                self.value_from_slot(&slot, *cap_ty)
+            }
             ExprKind::CellNew(inner) => {
                 let v = self.emit_expr(inner);
                 let slot = self.slot_from_value(&v, inner.ty);
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_cell_new(i64 {slot})"));
+                t
+            }
+            ExprKind::CellNewUnbound => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_cell_new_unbound()"));
                 t
             }
             ExprKind::CellLoad(cell) => {
@@ -2184,10 +2632,20 @@ impl Emitter {
             }
             ExprKind::MakeGenerator {
                 func,
+                code_from,
                 args,
                 nlocals,
             } => {
-                let code = format!("@{}", mangle(func));
+                let code = if let Some(clos) = code_from {
+                    let c = self.emit_expr(clos);
+                    let code = self.tmp();
+                    self.line(format!("{code} = call ptr @pyrs_closure_code(ptr {c})"));
+                    code
+                } else if func.is_empty() {
+                    panic!("MakeGenerator with empty func and no code_from");
+                } else {
+                    format!("@{}", mangle(func))
+                };
                 let t = self.tmp();
                 self.line(format!(
                     "{t} = call ptr @pyrs_gen_new(ptr {code}, i64 {nlocals})"
@@ -2235,6 +2693,49 @@ impl Emitter {
                 let t = self.tmp();
                 self.line(format!(
                     "{t} = phi {{ i32, i64 }} [ {yunion}, %{yblk} ], [ {none_u}, %{dblk} ]"
+                ));
+                t
+            }
+            ExprKind::GeneratorReturnValue(gexpr) => {
+                // CPython: bare return / fall-off → StopIteration.value is None;
+                // `return N` → value is N. Result type is Optional[payload].
+                let g = self.emit_expr(gexpr);
+                let has = self.tmp();
+                self.line(format!("{has} = call i32 @pyrs_gen_has_return(ptr {g})"));
+                let is_set = self.tmp();
+                self.line(format!("{is_set} = icmp ne i32 {has}, 0"));
+                let some_l = self.fresh_block("gret.some");
+                let none_l = self.fresh_block("gret.none");
+                let end_l = self.fresh_block("gret.end");
+                self.line(format!("br i1 {is_set}, label %{some_l}, label %{none_l}"));
+                self.start_block(&some_l);
+                let slot = self.tmp();
+                self.line(format!("{slot} = call i64 @pyrs_gen_return_value(ptr {g})"));
+                // Payload is the non-None member of the Optional result type.
+                let payload_ty = match expr.ty {
+                    Ty::Union(ms) => {
+                        let non_none: Vec<Ty> =
+                            ms.iter().copied().filter(|m| *m != Ty::None).collect();
+                        match non_none.len() {
+                            0 => Ty::None,
+                            1 => non_none[0],
+                            _ => expr.ty, // unexpected multi-member; use as-is
+                        }
+                    }
+                    other => other,
+                };
+                let val = self.value_from_slot(&slot, payload_ty);
+                let some_u = self.emit_to_union(&val, payload_ty, expr.ty);
+                let sblk = self.cur_block.clone();
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&none_l);
+                let none_u = self.emit_to_union("0", Ty::None, expr.ty);
+                let nblk = self.cur_block.clone();
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&end_l);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = phi {{ i32, i64 }} [ {some_u}, %{sblk} ], [ {none_u}, %{nblk} ]"
                 ));
                 t
             }
@@ -2412,11 +2913,10 @@ impl Emitter {
         let o_exit = outer.exit_ptr.clone();
         let o_live = outer.live_ptr.clone();
         let o_fin = outer.fin_l.clone();
-        self.line(format!("store i32 {kind}, ptr {o_exit}"));
+        self.store_try_i32(kind, &o_exit);
         // outer frame is still live until we leave it
-        let was = self.tmp();
-        self.line(format!("{was} = load i32, ptr {o_live}"));
-        self.line(format!("store i32 0, ptr {o_live}"));
+        let was = self.load_try_i32(&o_live);
+        self.store_try_i32(0, &o_live);
         let need = self.tmp();
         self.line(format!("{need} = icmp ne i32 {was}, 0"));
         let pop_l = self.fresh_block("try.chain.pop");
@@ -2458,11 +2958,10 @@ impl Emitter {
                 .expect("return value in try without ret slot");
             self.line(format!("store {} {v}, ptr {ptr}", lty(ty)));
         }
-        self.line(format!("store i32 {kind}, ptr {exit_ptr}"));
+        self.store_try_i32(kind, &exit_ptr);
         // Runtime live flag: every exit edge may reach here; pop at most once.
-        let was = self.tmp();
-        self.line(format!("{was} = load i32, ptr {live_ptr}"));
-        self.line(format!("store i32 0, ptr {live_ptr}"));
+        let was = self.load_try_i32(&live_ptr);
+        self.store_try_i32(0, &live_ptr);
         let need = self.tmp();
         self.line(format!("{need} = icmp ne i32 {was}, 0"));
         let pop_l = self.fresh_block("try.pop");
@@ -2479,8 +2978,7 @@ impl Emitter {
     /// After finally body: dispatch on exit kind (normal / return / break /
     /// continue / reraise), chaining into an outer try's finally when needed.
     fn emit_finally_dispatch(&mut self, exit_ptr: &str, end_l: &str) {
-        let kind = self.tmp();
-        self.line(format!("{kind} = load i32, ptr {exit_ptr}"));
+        let kind = self.load_try_i32(exit_ptr);
 
         let normal_l = self.fresh_block("try.x.normal");
         let ret_l = self.fresh_block("try.x.ret");
@@ -2502,10 +3000,14 @@ impl Emitter {
         self.start_block(&normal_l);
         self.line(format!("br label %{end_l}"));
 
-        // return — chain to outer finally or ret
+        // return — chain to outer finally or ret (generators: mark done)
         self.start_block(&ret_l);
         if self.tries.last().is_some() {
             self.emit_chain_to_outer(TRY_EXIT_RETURN);
+        } else if self.gen_frame.is_some() {
+            let frame = self.gen_frame.clone().unwrap();
+            self.line(format!("call void @pyrs_gen_set_done(ptr {frame})"));
+            self.line("ret i32 1");
         } else if self.fn_ret == Ty::None {
             self.line("ret void");
         } else {
@@ -2543,10 +3045,30 @@ impl Emitter {
         // reraise: longjmp into an outer try's setjmp (frame must still be live),
         // or print+exit if nothing catches. Do not jump to outer finally — CPython
         // runs outer handlers first, then outer finally.
+        // Uncaught GeneratorExit at the generator boundary ends the gen (close()).
         self.start_block(&re_l);
-        self.line("call void @pyrs_reraise()");
-        self.line("unreachable");
-        self.terminated = true;
+        if self.gen_frame.is_some() && self.tries.is_empty() {
+            let frame = self.gen_frame.clone().unwrap();
+            let is_ge = self.tmp();
+            self.line(format!("{is_ge} = call i32 @pyrs_gen_is_genexit()"));
+            let ge_l = self.fresh_block("try.x.genexit");
+            let die_l = self.fresh_block("try.x.reraise");
+            let is_ge_b = self.tmp();
+            self.line(format!("{is_ge_b} = icmp ne i32 {is_ge}, 0"));
+            self.line(format!("br i1 {is_ge_b}, label %{ge_l}, label %{die_l}"));
+            self.start_block(&ge_l);
+            self.line(format!("call void @pyrs_gen_set_done(ptr {frame})"));
+            self.line("ret i32 1");
+            self.terminated = true;
+            self.start_block(&die_l);
+            self.line("call void @pyrs_reraise()");
+            self.line("unreachable");
+            self.terminated = true;
+        } else {
+            self.line("call void @pyrs_reraise()");
+            self.line("unreachable");
+            self.terminated = true;
+        }
 
         self.start_block(&def_l);
         self.line("unreachable");
@@ -2559,25 +3081,49 @@ impl Emitter {
         orelse: &[Stmt],
         finally: &[Stmt],
     ) {
-        let exit_ptr = self.tmp();
-        self.line(format!("{exit_ptr} = alloca i32, align 4"));
-        self.line(format!("store i32 {TRY_EXIT_NORMAL}, ptr {exit_ptr}"));
-        let live_ptr = self.tmp();
-        self.line(format!("{live_ptr} = alloca i32, align 4"));
-        self.line(format!("store i32 1, ptr {live_ptr}"));
+        // Generators: use preallocated pool slots (dominate yield resume).
+        // Ordinary functions: fresh allocas.
+        let (exit_ptr, live_ptr, phase_ptr) = if self.gen_frame.is_some() {
+            let i = self.gen_try_pool_next;
+            self.gen_try_pool_next += 1;
+            if i >= self.gen_try_pool.len() {
+                // Over-deep nesting vs pre-scan — allocate anyway (may not
+                // dominate resume, but rare; grow pool defensively).
+                let e = self.tmp();
+                let l = self.tmp();
+                let p = self.tmp();
+                self.line(format!("{e} = alloca i32, align 4"));
+                self.line(format!("{l} = alloca i32, align 4"));
+                self.line(format!("{p} = alloca i32, align 4"));
+                (e, l, p)
+            } else {
+                self.gen_try_pool[i].clone()
+            }
+        } else {
+            let e = self.tmp();
+            let l = self.tmp();
+            let p = self.tmp();
+            self.line(format!("{e} = alloca i32, align 4"));
+            self.line(format!("{l} = alloca i32, align 4"));
+            self.line(format!("{p} = alloca i32, align 4"));
+            (e, l, p)
+        };
+        self.store_try_i32(TRY_EXIT_NORMAL, &exit_ptr);
+        self.store_try_i32(1, &live_ptr);
         // 0 = try body, 1 = except handler, 2 = else
         // phase != 0 on longjmp → finally/reraise (skip re-dispatch to handlers)
-        let phase_ptr = self.tmp();
-        self.line(format!("{phase_ptr} = alloca i32, align 4"));
-        self.line(format!("store i32 0, ptr {phase_ptr}"));
+        self.store_try_i32(0, &phase_ptr);
 
         let fin_l = self.fresh_block("try.finally");
         let end_l = self.fresh_block("try.end");
+        let exc_l = self.fresh_block("try.exc");
         self.tries.push(TryScope {
             fin_l: fin_l.clone(),
             end_l: end_l.clone(),
+            exc_l: exc_l.clone(),
             exit_ptr: exit_ptr.clone(),
             live_ptr: live_ptr.clone(),
+            phase_ptr: phase_ptr.clone(),
             loops_at_entry: self.loops.len(),
         });
 
@@ -2585,11 +3131,12 @@ impl Emitter {
         self.line(format!("{frame} = call ptr @pyrs_try_push()"));
         let jc = self.tmp();
         // setjmp on the frame pointer — jmp_buf is the first field
-        self.line(format!("{jc} = call i32 @setjmp(ptr {frame})"));
+        self.line(format!(
+            "{jc} = call i32 @setjmp(ptr {frame}) returns_twice"
+        ));
         let ok = self.tmp();
         self.line(format!("{ok} = icmp eq i32 {jc}, 0"));
         let body_l = self.fresh_block("try.body");
-        let exc_l = self.fresh_block("try.exc");
         self.line(format!("br i1 {ok}, label %{body_l}, label %{exc_l}"));
 
         // ---- try body ----
@@ -2601,7 +3148,7 @@ impl Emitter {
             } else {
                 // Normal completion: run else before finally. phase=2 so
                 // exceptions in else skip this try's handlers (CPython).
-                self.line(format!("store i32 2, ptr {phase_ptr}"));
+                self.store_try_i32(2, &phase_ptr);
                 let else_l = self.fresh_block("try.else");
                 self.line(format!("br label %{else_l}"));
                 self.start_block(&else_l);
@@ -2614,8 +3161,7 @@ impl Emitter {
 
         // ---- exception path (frame still live until structured exit) ----
         self.start_block(&exc_l);
-        let phase = self.tmp();
-        self.line(format!("{phase} = load i32, ptr {phase_ptr}"));
+        let phase = self.load_try_i32(&phase_ptr);
         let in_handler = self.tmp();
         self.line(format!("{in_handler} = icmp ne i32 {phase}, 0"));
         let hraise_l = self.fresh_block("try.hreraise");
@@ -2630,7 +3176,7 @@ impl Emitter {
 
         // First longjmp: body exception → match handlers (do not pop yet)
         self.start_block(&dispatch_l);
-        self.line(format!("store i32 1, ptr {phase_ptr}"));
+        self.store_try_i32(1, &phase_ptr);
         let ety = self.tmp();
         self.line(format!("{ety} = call i32 @pyrs_exc_type()"));
 
@@ -2655,7 +3201,19 @@ impl Emitter {
             if let Some(name) = bind {
                 let msg = self.tmp();
                 self.line(format!("{msg} = call ptr @pyrs_exc_message()"));
-                self.line(format!("store ptr {msg}, ptr %v.{name}"));
+                // Generators store locals in the frame, not `%v.*` allocas.
+                if let (Some(frame), Some(idx)) = (
+                    self.gen_frame.clone(),
+                    self.gen_local_index.get(name).copied(),
+                ) {
+                    let slot = self.tmp();
+                    self.line(format!("{slot} = ptrtoint ptr {msg} to i64"));
+                    self.line(format!(
+                        "call void @pyrs_gen_set_local(ptr {frame}, i64 {idx}, i64 {slot})"
+                    ));
+                } else {
+                    self.line(format!("store ptr {msg}, ptr %v.{name}"));
+                }
             }
             self.line("call void @pyrs_exc_clear()");
             // Frame remains live so traps/raises in the handler longjmp here
@@ -2682,6 +3240,9 @@ impl Emitter {
 
         // ---- finally (only reached via emit_try_exit, which pops once) ----
         let scope = self.tries.pop().expect("try scope");
+        if self.gen_frame.is_some() && self.gen_try_pool_next > 0 {
+            self.gen_try_pool_next -= 1;
+        }
         self.start_block(&fin_l);
         self.emit_block(finally);
         if !self.terminated {
@@ -3064,6 +3625,61 @@ impl Emitter {
                 if not { "true" } else { "false" }.to_string()
             }
         }
+    }
+
+    /// Pointer/slot identity for `is` / `is not` (non-None).
+    fn emit_is_identity(&mut self, left: &Expr, right: &Expr, not: bool) -> String {
+        let l = self.emit_expr(left);
+        let r = self.emit_expr(right);
+        let t = self.tmp();
+        match left.ty {
+            Ty::Int | Ty::Bool => {
+                let pred = if not { "ne" } else { "eq" };
+                // bool is i1; zext both for a uniform compare when mixed — types match.
+                if left.ty == Ty::Bool {
+                    self.line(format!("{t} = icmp {pred} i1 {l}, {r}"));
+                } else {
+                    self.line(format!("{t} = icmp {pred} i64 {l}, {r}"));
+                }
+            }
+            Ty::Float => {
+                // Bit-identity (NaN is NaN); not float equality.
+                let lb = self.tmp();
+                let rb = self.tmp();
+                self.line(format!("{lb} = bitcast double {l} to i64"));
+                self.line(format!("{rb} = bitcast double {r} to i64"));
+                let pred = if not { "ne" } else { "eq" };
+                self.line(format!("{t} = icmp {pred} i64 {lb}, {rb}"));
+            }
+            Ty::Union(_) => {
+                // Compare tag and payload bits.
+                let lt = self.tmp();
+                let lp = self.tmp();
+                let rt = self.tmp();
+                let rp = self.tmp();
+                self.line(format!("{lt} = extractvalue {{ i32, i64 }} {l}, 0"));
+                self.line(format!("{lp} = extractvalue {{ i32, i64 }} {l}, 1"));
+                self.line(format!("{rt} = extractvalue {{ i32, i64 }} {r}, 0"));
+                self.line(format!("{rp} = extractvalue {{ i32, i64 }} {r}, 1"));
+                let teq = self.tmp();
+                let peq = self.tmp();
+                self.line(format!("{teq} = icmp eq i32 {lt}, {rt}"));
+                self.line(format!("{peq} = icmp eq i64 {lp}, {rp}"));
+                let both = self.tmp();
+                self.line(format!("{both} = and i1 {teq}, {peq}"));
+                if not {
+                    self.line(format!("{t} = xor i1 {both}, true"));
+                } else {
+                    return both;
+                }
+            }
+            _ => {
+                // Heap pointers (str/list/dict/set/tuple/file/closure/gen/cell)
+                let pred = if not { "ne" } else { "eq" };
+                self.line(format!("{t} = icmp {pred} ptr {l}, {r}"));
+            }
+        }
+        t
     }
 
     /// Truthiness test for short-circuit `and`/`or` (same rules as ToBool).

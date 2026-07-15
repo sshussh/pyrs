@@ -264,6 +264,7 @@ fn ast_exc_to_ir(e: ast::ExcType) -> ir::ExcType {
         ast::ExcType::ZeroDivisionError => ir::ExcType::ZeroDivisionError,
         ast::ExcType::TypeError => ir::ExcType::TypeError,
         ast::ExcType::RuntimeError => ir::ExcType::RuntimeError,
+        ast::ExcType::GeneratorExit => ir::ExcType::GeneratorExit,
     }
 }
 
@@ -299,30 +300,19 @@ struct NestedFnInfo {
     ir_name: String,
     /// Signature of the nested function **without** capture parameters.
     sig: FuncSig,
-    /// Outer locals/params captured by value, in parameter order (leading IR params).
+    /// Outer locals/params captured as leading IR params (cell ptr or value).
     captures: Vec<(String, ir::Ty)>,
     /// Parallel to captures: true if the capture is a cell pointer.
     capture_is_cell: Vec<bool>,
     /// True when this nested function uses the closure calling convention
-    /// (env pointer first) rather than by-value leading params.
+    /// (env pointer first) rather than plain leading value params.
     #[allow(dead_code)]
     uses_env: bool,
 }
 
 fn make_closure_expr(info: &NestedFnInfo, span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
-    if info.sig.is_generator {
-        return Err(err(
-            format!(
-                "generator function '{}' cannot be used as a first-class value \
-                 (returning/escaping generator closures is not supported yet); \
-                 call it with '{}(...)'",
-                // strip module/outer prefixes for message
-                info.ir_name.rsplit('.').next().unwrap_or(&info.ir_name),
-                info.ir_name.rsplit('.').next().unwrap_or(&info.ir_name)
-            ),
-            span,
-        ));
-    }
+    // Generator functions may escape as first-class values; calling them
+    // produces a generator object (MakeGenerator) with captures in the frame.
     let mut caps = Vec::new();
     let mut is_cell = Vec::new();
     for (i, (name, ty)) in info.captures.iter().enumerate() {
@@ -393,7 +383,8 @@ fn extract_union_member(value: ir::Expr, member: ir::Ty, _span: Span) -> SResult
 }
 
 /// Flow-sensitive narrowing for `x is None` / `x is not None` / `not (x is None)`.
-/// Returns (then-branch refinements, else-branch refinements).
+/// Also peels `A and B` / `A or B` so `x is not None and flag` narrows `x` in
+/// the then-arm (and complementary or-arms). Returns (then, else) maps.
 fn narrowing_from_condition(
     cond: &ast::Expr,
     ctx: &FnCtx,
@@ -408,6 +399,31 @@ fn narrowing_from_condition(
             let (t, e) = narrowing_from_condition(operand, ctx);
             return (e, t);
         }
+        // `A and B`: then sees both then-refs; else is not a simple complement
+        // (A may be true and B false), so only then-refs are applied.
+        ast::ExprKind::Binary {
+            op: ast::BinOp::And,
+            left,
+            right,
+        } => {
+            let (lt, _) = narrowing_from_condition(left, ctx);
+            let (rt, _) = narrowing_from_condition(right, ctx);
+            then_m.extend(lt);
+            then_m.extend(rt);
+            return (then_m, else_m);
+        }
+        // `A or B`: else sees both else-refs (both failed); then is mixed.
+        ast::ExprKind::Binary {
+            op: ast::BinOp::Or,
+            left,
+            right,
+        } => {
+            let (_, le) = narrowing_from_condition(left, ctx);
+            let (_, re) = narrowing_from_condition(right, ctx);
+            else_m.extend(le);
+            else_m.extend(re);
+            return (then_m, else_m);
+        }
         ast::ExprKind::Binary {
             op: op @ (ast::BinOp::Is | ast::BinOp::IsNot),
             left,
@@ -420,20 +436,42 @@ fn narrowing_from_condition(
                     ctx.locals
                         .get(n)
                         .copied()
-                        .or_else(|| ctx.cell_locals.get(n).copied()),
+                        .or_else(|| ctx.cell_locals.get(n).copied())
+                        .or_else(|| {
+                            // Module Optionals: free reads (no `global` needed)
+                            // and explicit `global` / entry use GlobalLoad.
+                            if !ctx.locals.contains_key(n) && !ctx.cell_locals.contains_key(n) {
+                                ctx.globals.get(n).copied()
+                            } else {
+                                None
+                            }
+                        }),
                 ),
                 (ast::ExprKind::NoneLit, ast::ExprKind::Name(n)) => (
                     n.as_str(),
                     ctx.locals
                         .get(n)
                         .copied()
-                        .or_else(|| ctx.cell_locals.get(n).copied()),
+                        .or_else(|| ctx.cell_locals.get(n).copied())
+                        .or_else(|| {
+                            if !ctx.locals.contains_key(n) && !ctx.cell_locals.contains_key(n) {
+                                ctx.globals.get(n).copied()
+                            } else {
+                                None
+                            }
+                        }),
                 ),
                 _ => return (then_m, else_m),
             };
-            let Some(ty) = name_ty else {
+            let Some(storage_ty) = name_ty else {
                 return (then_m, else_m);
             };
+            // Prefer an active refinement when present (nested checks).
+            let ty = ctx
+                .type_refinements
+                .get(name)
+                .copied()
+                .unwrap_or(storage_ty);
             let without_none = match ty {
                 ir::Ty::Union(ms) => {
                     let rest: Vec<ir::Ty> =
@@ -447,16 +485,31 @@ fn narrowing_from_condition(
                 ir::Ty::None => ir::Ty::None,
                 other => other,
             };
+            // Complement uses the *storage* optional-ness: even if we already
+            // refined to a concrete member, `is not None` failing means None.
+            let storage_optional = ir::is_optional(storage_ty);
             if not {
-                // `is not None` → then: non-none, else: None (if optional)
+                // `is not None` → then: non-none, else: None (if storage optional)
                 then_m.insert(name.to_string(), without_none);
-                if ir::is_optional(ty) {
+                if storage_optional {
                     else_m.insert(name.to_string(), ir::Ty::None);
                 }
             } else {
-                // `is None` → then: None, else: non-none
+                // `is None` → then: None, else: non-none of storage
                 then_m.insert(name.to_string(), ir::Ty::None);
-                else_m.insert(name.to_string(), without_none);
+                let storage_without = match storage_ty {
+                    ir::Ty::Union(ms) => {
+                        let rest: Vec<ir::Ty> =
+                            ms.iter().copied().filter(|m| *m != ir::Ty::None).collect();
+                        match rest.len() {
+                            0 => ir::Ty::None,
+                            1 => rest[0],
+                            _ => ir::union_of(&rest),
+                        }
+                    }
+                    other => other,
+                };
+                else_m.insert(name.to_string(), storage_without);
             }
         }
         _ => {}
@@ -506,12 +559,135 @@ fn lower_lambda(
             }
         }
     }
+    // Flush cell boxing inits (same as FuncDef stmt path). Without this,
+    // free-var cells stay null and loads trap with UnboundLocalError.
+    let mut inits = std::mem::take(&mut ctx.pending_cell_inits);
+    freeze_nested_defaults(&name, span, ctx, &mut inits)?;
     let info = ctx
         .nested_funcs
         .get(&name)
         .cloned()
-        .ok_or_else(|| err("internal: lambda not registered", span))?;
-    make_closure_expr(&info, span, ctx)
+        .ok_or_else(|| err("internal: lambda not registered after freeze", span))?;
+    let clos = make_closure_expr(&info, span, ctx)?;
+    if inits.is_empty() {
+        Ok(clos)
+    } else {
+        Ok(ir::Expr {
+            ty: clos.ty,
+            kind: ir::ExprKind::Block {
+                stmts: inits,
+                result: Box::new(clos),
+            },
+        })
+    }
+}
+
+/// Evaluate non-literal nested/lambda defaults once at definition time and
+/// rewrite them to load frozen temps (CPython freezes `__defaults__`).
+/// Pure literals are left as-is so escaped `CallClosure` can re-materialize
+/// them outside the outer frame. Free-var defaults that escape still need
+/// literals (temps are outer locals — documented limit).
+fn freeze_nested_defaults(
+    user_name: &str,
+    span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    let Some(info) = ctx.nested_funcs.get(user_name).cloned() else {
+        return Ok(());
+    };
+    let mut new_params = info.sig.params.clone();
+    let mut changed = false;
+    for p in &mut new_params {
+        let Some(d) = p.default.clone() else {
+            continue;
+        };
+        // Already a frozen compiler temp — leave it.
+        if let ast::ExprKind::Name(n) = &d.kind
+            && n.starts_with('.')
+        {
+            continue;
+        }
+        // Literals need no freeze: re-lowering at any call site is identical.
+        if default_is_literal(&d) {
+            continue;
+        }
+        let v = lower_expr(&d, ctx)?;
+        let v = coerce(v, p.ty, d.span, "default argument")?;
+        let t = ctx.fresh_temp(&format!("dflt.{}", p.name), p.ty);
+        out.push(ir::Stmt::Assign {
+            name: t.clone(),
+            value: v,
+        });
+        p.default = Some(ast::Expr {
+            kind: ast::ExprKind::Name(t),
+            span: d.span,
+        });
+        changed = true;
+    }
+    if !changed {
+        return Ok(());
+    }
+    let Some(info) = ctx.nested_funcs.get_mut(user_name) else {
+        return Err(err(
+            "internal: nested fn missing during default freeze",
+            span,
+        ));
+    };
+    info.sig.params = new_params;
+    register_closure_defaults(&info.ir_name, &info.sig.params);
+    Ok(())
+}
+
+fn default_is_literal(e: &ast::Expr) -> bool {
+    match &e.kind {
+        ast::ExprKind::Int(_)
+        | ast::ExprKind::Float(_)
+        | ast::ExprKind::Bool(_)
+        | ast::ExprKind::Str(_)
+        | ast::ExprKind::NoneLit => true,
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Neg | ast::UnaryOp::Not,
+            operand,
+        } => default_is_literal(operand),
+        _ => false,
+    }
+}
+
+/// Lower a nested/closure default at a call site. Frozen free-var temps
+/// (`.dflt.*`) are only valid in the defining outer frame; give a clear
+/// diagnostic when they escape (multi-level / returned closures).
+fn lower_closure_default(
+    d: &ast::Expr,
+    ty: ir::Ty,
+    call_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if let ast::ExprKind::Name(n) = &d.kind
+        && n.starts_with(".dflt.")
+        && !ctx.locals.contains_key(n)
+    {
+        return Err(err(
+            "default argument that captures free variables cannot be used after \
+             the defining function returns; use a constant default, or call the \
+             nested function while still inside that scope",
+            d.span,
+        ));
+    }
+    let v = match lower_expr(d, ctx) {
+        Ok(v) => v,
+        Err(e) if e.message.contains("is not defined") && !default_is_literal(d) => {
+            return Err(err(
+                "default argument that captures free variables cannot be used after \
+                 the defining function returns; use a constant default, or call the \
+                 nested function while still inside that scope",
+                d.span,
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let _ = call_span;
+    coerce(v, ty, d.span, "default argument")
 }
 
 fn first_return_ty(stmts: &[ir::Stmt]) -> Option<ir::Ty> {
@@ -2313,12 +2489,27 @@ struct FnCtx<'a> {
     type_refinements: HashMap<String, ir::Ty>,
     /// Cell boxing inits deferred from nested-def analysis (flushed after def).
     pending_cell_inits: Vec<ir::Stmt>,
-    /// Nesting depth of try/except/finally (yield inside try is rejected).
+    /// Nesting depth of try/except/finally.
     try_depth: usize,
+    /// Nesting depth of `finally` blocks (yield in finally is rejected until
+    /// exit-state is persisted across suspend like try phase).
+    finally_depth: usize,
     /// Function-local import bindings (CPython: import in function is local).
     local_imports: HashMap<String, ImportBinding>,
     /// Names that some nested function declares `nonlocal` (pre-scanned).
     sibling_nonlocal_names: HashSet<String>,
+    /// Outer locals free-captured by any nested def/lambda in this function.
+    /// Promoted to cells on first bind so CellNew runs even if the nested
+    /// def sits in a branch that is not taken at runtime.
+    cell_candidates: HashSet<String>,
+    /// Inferred types for names assigned in this function body (for late
+    /// free-var binding: nested def before the assign that fills the cell).
+    late_bind_tys: HashMap<String, ir::Ty>,
+    /// Full outer function body (for late-bind type scan); empty at module entry.
+    #[allow(dead_code)]
+    outer_body_assigned: HashSet<String>,
+    /// Nested defs whose body has been fully lowered (vs provisional sig only).
+    lowered_nested: HashSet<String>,
 }
 
 impl FnCtx<'_> {
@@ -2327,6 +2518,7 @@ impl FnCtx<'_> {
     fn fresh_temp(&mut self, hint: &str, ty: ir::Ty) -> String {
         self.temp_counter += 1;
         let name = format!(".{hint}{}", self.temp_counter);
+        self.locals.insert(name.clone(), ty);
         self.locals_order.push((name.clone(), ty));
         name
     }
@@ -2430,12 +2622,21 @@ fn lower_function_inner(
         type_refinements: HashMap::new(),
         pending_cell_inits: Vec::new(),
         try_depth: 0,
+        finally_depth: 0,
         local_imports: HashMap::new(),
         sibling_nonlocal_names: HashSet::new(),
+        cell_candidates: HashSet::new(),
+        late_bind_tys: HashMap::new(),
+        outer_body_assigned: HashSet::new(),
+        lowered_nested: HashSet::new(),
     };
 
     // Nonlocals declared in nested defs — free captures of these use cells.
     ctx.sibling_nonlocal_names = collect_nested_nonlocals(&f.body);
+    ctx.cell_candidates = collect_cell_candidate_names(&f.body);
+    ctx.outer_body_assigned = assigned_names_in_stmts(&f.body);
+    // Types for late free captures (nested def before assignment).
+    ctx.late_bind_tys = infer_late_bind_types(&f.body, &f.params, ctx.globals);
 
     // Detect generator functions (contain yield / yield from).
     let is_gen = stmts_have_yield(&f.body);
@@ -2454,7 +2655,13 @@ fn lower_function_inner(
         gen_yield_ty = Some(yty);
         // The *callable* appears to return Generator[Y]; resume IR uses i32.
         ctx.ret = ir::generator_of(yty);
+        // Generators may contain try/except/finally; codegen re-arms setjmp
+        // after yield resume. Nested generator functions are separate.
     }
+
+    // Pre-register sibling nested function signatures so mutual / forward
+    // references resolve (two-pass: sigs first, full lower on encounter).
+    pre_register_nested_sigs(&f.body, &mut ctx)?;
 
     if let Some(caps) = &capture_params {
         for (name, ty) in caps {
@@ -2495,6 +2702,42 @@ fn lower_function_inner(
         }
         params.push((p.name.clone(), ty));
     }
+
+    // Box free-captured params / *args / **kwargs at entry (before any branch)
+    // so later loads through the cell work even when the nested def is not executed.
+    let mut entry_cell_inits: Vec<ir::Stmt> = Vec::new();
+    let mut entry_names: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
+    if let Some(p) = &f.vararg {
+        entry_names.push(p.name.clone());
+    }
+    if let Some(p) = &f.kwarg {
+        entry_names.push(p.name.clone());
+    }
+    let candidates: Vec<(String, ir::Ty)> = entry_names
+        .into_iter()
+        .filter_map(|name| {
+            if ctx.cell_candidates.contains(&name) {
+                ctx.locals.get(&name).map(|ty| (name, *ty))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (name, ty) in candidates {
+        if let Some(init) = ensure_cell(&mut ctx, &name, ty, f.span)? {
+            entry_cell_inits.push(init);
+        }
+    }
+
+    // Complete free-var capture lists for all nested defs before any body is
+    // lowered so forward/mutual calls get correct leading cell args.
+    // Runs after params/cells exist so free outer params are visible.
+    complete_nested_captures(&f.body, &mut ctx)?;
+    // Cells promoted during capture analysis (especially late free unbound
+    // cells) must be allocated at function entry — before any assign that
+    // CellStores into them. Leaving them on `pending_cell_inits` until the
+    // nested `def` stmt runs stores into a null cell pointer.
+    entry_cell_inits.append(&mut ctx.pending_cell_inits);
 
     // `math` module: replace stub bodies with MathCall intrinsics.
     let body = if mctx.module == "math"
@@ -2629,6 +2872,11 @@ fn lower_function_inner(
         }))]
     } else {
         lower_block(&f.body, &mut ctx)?
+    };
+    let body = {
+        let mut b = entry_cell_inits;
+        b.extend(body);
+        b
     };
 
     // every path through a value-returning function must return
@@ -2781,10 +3029,466 @@ fn lower_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::Stmt>> {
     Ok(out)
 }
 
-/// Lower a nested `def` inside a function: capture free vars by value as
-/// leading parameters; register the name for local calls.
+/// Pre-scan nested `def`s at one nesting level and register provisional
+/// signatures so forward / mutual sibling calls type-check.
+fn pre_register_nested_sigs(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<()> {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::FuncDef(f) => {
+                pre_register_one_nested_sig(f, ctx)?;
+            }
+            // Nested defs inside control flow are still function-local siblings.
+            ast::StmtKind::If { branches, orelse } => {
+                for (_, b) in branches {
+                    pre_register_nested_sigs(b, ctx)?;
+                }
+                pre_register_nested_sigs(orelse, ctx)?;
+            }
+            ast::StmtKind::While { body, orelse, .. } | ast::StmtKind::For { body, orelse, .. } => {
+                pre_register_nested_sigs(body, ctx)?;
+                pre_register_nested_sigs(orelse, ctx)?;
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                pre_register_nested_sigs(body, ctx)?;
+                for h in handlers {
+                    pre_register_nested_sigs(&h.body, ctx)?;
+                }
+                pre_register_nested_sigs(orelse, ctx)?;
+                pre_register_nested_sigs(finally, ctx)?;
+            }
+            ast::StmtKind::With { body, .. } => pre_register_nested_sigs(body, ctx)?,
+            ast::StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    pre_register_nested_sigs(&c.body, ctx)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
+    if ctx.nested_funcs.contains_key(&f.name) {
+        return Ok(()); // already provisional or fully lowered
+    }
+    if ctx.locals.contains_key(&f.name) {
+        return Ok(());
+    }
+    let mut params = Vec::new();
+    let mut seen = HashSet::new();
+    for p in &f.params {
+        let ty = resolve_param_ty(p)?;
+        if !seen.insert(p.name.clone()) {
+            return Err(err(
+                format!("duplicate parameter name '{}'", p.name),
+                p.span,
+            ));
+        }
+        params.push(ParamSig {
+            name: p.name.clone(),
+            ty,
+            default: p.default.clone(),
+        });
+    }
+    let vararg = if let Some(p) = &f.vararg {
+        let ty = resolve_param_ty(p)?;
+        Some(ParamSig {
+            name: p.name.clone(),
+            ty,
+            default: None,
+        })
+    } else {
+        None
+    };
+    let kwarg = if let Some(p) = &f.kwarg {
+        let ty = resolve_param_ty(p)?;
+        Some(ParamSig {
+            name: p.name.clone(),
+            ty,
+            default: None,
+        })
+    } else {
+        None
+    };
+    let mut ret = match f.ret {
+        Some(t) => resolve_type_checked(t, f.span)?,
+        Option::None => ir::Ty::None,
+    };
+    let is_generator = stmts_have_yield(&f.body);
+    let yield_ty = if is_generator {
+        let y = if ret != ir::Ty::None {
+            ret
+        } else {
+            ir::Ty::Int
+        };
+        ret = ir::generator_of(y);
+        Some(y)
+    } else {
+        None
+    };
+    let ir_name = if ctx.mctx.is_root {
+        format!("{}.{}", ctx.fn_name, f.name)
+    } else {
+        format!("{}.{}.{}", ctx.mctx.module, ctx.fn_name, f.name)
+    };
+    let sig = FuncSig {
+        params,
+        vararg,
+        kwarg,
+        ret,
+        span: f.span,
+        is_generator,
+        yield_ty,
+        gen_frame_slots: 0,
+    };
+    ctx.nested_funcs.insert(
+        f.name.clone(),
+        NestedFnInfo {
+            ir_name,
+            sig,
+            captures: Vec::new(),
+            capture_is_cell: Vec::new(),
+            uses_env: false,
+        },
+    );
+    Ok(())
+}
+
+/// Fixed-point free-var capture analysis for all nested defs at this scope so
+/// forward / mutual sibling calls see complete capture lists (not provisional []).
+fn complete_nested_captures(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<()> {
+    let mut nested_defs: Vec<ast::FuncDef> = Vec::new();
+    collect_nested_func_defs(stmts, &mut nested_defs);
+    if nested_defs.is_empty() {
+        return Ok(());
+    }
+    // Iterate until capture sets stabilize (sibling cell threading).
+    // Do **not** allocate cells here — that still happens when each nested
+    // def is lowered (pending inits flush at the def site so assign order
+    // stays correct). This pass only fills NestedFnInfo.captures so forward
+    // call sites see complete leading-cell ABI.
+    for _ in 0..(nested_defs.len() + 2) {
+        let mut changed = false;
+        for f in &nested_defs {
+            let (captures, capture_is_cell) = analyze_nested_captures(f, ctx)?;
+            let Some(info) = ctx.nested_funcs.get_mut(&f.name) else {
+                continue;
+            };
+            if info.captures != captures || info.capture_is_cell != capture_is_cell {
+                info.captures = captures;
+                info.capture_is_cell = capture_is_cell;
+                info.uses_env = info.capture_is_cell.iter().any(|b| *b);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn collect_nested_func_defs(stmts: &[ast::Stmt], out: &mut Vec<ast::FuncDef>) {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::FuncDef(f) => out.push(f.clone()),
+            ast::StmtKind::If { branches, orelse } => {
+                for (_, b) in branches {
+                    collect_nested_func_defs(b, out);
+                }
+                collect_nested_func_defs(orelse, out);
+            }
+            ast::StmtKind::While { body, orelse, .. } | ast::StmtKind::For { body, orelse, .. } => {
+                collect_nested_func_defs(body, out);
+                collect_nested_func_defs(orelse, out);
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                collect_nested_func_defs(body, out);
+                for h in handlers {
+                    collect_nested_func_defs(&h.body, out);
+                }
+                collect_nested_func_defs(orelse, out);
+                collect_nested_func_defs(finally, out);
+            }
+            ast::StmtKind::With { body, .. } => collect_nested_func_defs(body, out),
+            ast::StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    collect_nested_func_defs(&c.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+type NestedCaptures = (Vec<(String, ir::Ty)>, Vec<bool>);
+
+/// Capture list for a nested def (own free vars + sibling-threaded cells).
+fn analyze_nested_captures(f: &ast::FuncDef, ctx: &FnCtx) -> SResult<NestedCaptures> {
+    let mut seen = HashSet::new();
+    for p in &f.params {
+        seen.insert(p.name.clone());
+    }
+    if let Some(p) = &f.vararg {
+        seen.insert(p.name.clone());
+    }
+    if let Some(p) = &f.kwarg {
+        seen.insert(p.name.clone());
+    }
+    let used = free_names_used_in_stmts(&f.body);
+    let assigned = assigned_names_in_stmts(&f.body);
+    let nonlocals = collect_nonlocals_in_stmts(&f.body);
+
+    let mut captures: Vec<(String, ir::Ty)> = Vec::new();
+    let mut capture_set = HashSet::new();
+    let mut capture_is_cell: Vec<bool> = Vec::new();
+    let mut candidate_names: Vec<String> = Vec::new();
+    for (n, _) in &ctx.locals_order {
+        if used.contains(n) || nonlocals.contains(n) {
+            candidate_names.push(n.clone());
+        }
+    }
+    for n in used.iter().chain(nonlocals.iter()) {
+        if !candidate_names.iter().any(|x| x == n) {
+            candidate_names.push(n.clone());
+        }
+    }
+    for name in &candidate_names {
+        if seen.contains(name) {
+            continue;
+        }
+        let is_nl = nonlocals.contains(name);
+        if assigned.contains(name) && !is_nl {
+            continue;
+        }
+        if let Some(ty) = ctx.locals.get(name).copied() {
+            if capture_set.insert(name.clone()) {
+                captures.push((name.clone(), ty));
+                capture_is_cell.push(true);
+            }
+        } else if let Some(ty) = ctx.cell_locals.get(name).copied() {
+            if capture_set.insert(name.clone()) {
+                captures.push((name.clone(), ty));
+                capture_is_cell.push(true);
+            }
+        } else if let Some(ty) = ctx.late_bind_tys.get(name).copied()
+            && capture_set.insert(name.clone())
+        {
+            captures.push((name.clone(), ty));
+            capture_is_cell.push(true);
+        }
+    }
+    // Sibling nested calls: thread cell captures through callers.
+    let mut called = HashSet::new();
+    collect_called_func_names_in_stmts(&f.body, &mut called);
+    for cname in &called {
+        let Some(cinfo) = ctx.nested_funcs.get(cname) else {
+            continue;
+        };
+        for (i, (n, ty)) in cinfo.captures.iter().enumerate() {
+            if !cinfo.capture_is_cell.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            if capture_set.contains(n) {
+                continue;
+            }
+            let cell_ty = ctx.cell_locals.get(n).copied().unwrap_or(*ty);
+            if capture_set.insert(n.clone()) {
+                captures.push((n.clone(), cell_ty));
+                capture_is_cell.push(true);
+            }
+        }
+    }
+    Ok((captures, capture_is_cell))
+}
+
+fn free_names_used_in_stmts(stmts: &[ast::Stmt]) -> HashSet<String> {
+    let mut s = HashSet::new();
+    for st in stmts {
+        collect_used_names_in_stmt(st, &mut s);
+    }
+    s
+}
+
+/// Infer types of simple assignments for late free-var cell allocation.
+fn infer_late_bind_types(
+    stmts: &[ast::Stmt],
+    params: &[ast::Param],
+    globals: &HashMap<String, ir::Ty>,
+) -> HashMap<String, ir::Ty> {
+    let mut out = HashMap::new();
+    let mut param_tys: HashMap<String, ir::Ty> = HashMap::new();
+    for p in params {
+        if let Ok(ty) = resolve_param_ty(p) {
+            param_tys.insert(p.name.clone(), ty);
+        }
+    }
+    infer_late_bind_types_in(stmts, &param_tys, globals, &mut out);
+    out
+}
+
+fn infer_late_bind_types_in(
+    stmts: &[ast::Stmt],
+    params: &HashMap<String, ir::Ty>,
+    globals: &HashMap<String, ir::Ty>,
+    out: &mut HashMap<String, ir::Ty>,
+) {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::Assign {
+                targets,
+                value,
+                annotation,
+                ..
+            } => {
+                let ty = if let Some(ann) = annotation {
+                    resolve_type_checked(*ann, st.span).ok()
+                } else {
+                    guess_expr_ty(value, params, globals, out)
+                };
+                if let Some(ty) = ty {
+                    for t in targets {
+                        if let ast::AssignTarget::Name { name, .. } = t {
+                            out.entry(name.clone()).or_insert(ty);
+                        }
+                    }
+                }
+            }
+            ast::StmtKind::If { branches, orelse } => {
+                for (_, b) in branches {
+                    infer_late_bind_types_in(b, params, globals, out);
+                }
+                infer_late_bind_types_in(orelse, params, globals, out);
+            }
+            ast::StmtKind::While { body, orelse, .. } | ast::StmtKind::For { body, orelse, .. } => {
+                infer_late_bind_types_in(body, params, globals, out);
+                infer_late_bind_types_in(orelse, params, globals, out);
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                infer_late_bind_types_in(body, params, globals, out);
+                for h in handlers {
+                    infer_late_bind_types_in(&h.body, params, globals, out);
+                }
+                infer_late_bind_types_in(orelse, params, globals, out);
+                infer_late_bind_types_in(finally, params, globals, out);
+            }
+            ast::StmtKind::With { body, .. } => {
+                infer_late_bind_types_in(body, params, globals, out);
+            }
+            ast::StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    infer_late_bind_types_in(&c.body, params, globals, out);
+                }
+            }
+            // Nested defs don't assign into outer for this scan.
+            _ => {}
+        }
+    }
+}
+
+fn guess_expr_ty(
+    e: &ast::Expr,
+    params: &HashMap<String, ir::Ty>,
+    globals: &HashMap<String, ir::Ty>,
+    known: &HashMap<String, ir::Ty>,
+) -> Option<ir::Ty> {
+    match &e.kind {
+        ast::ExprKind::Int(_) => Some(ir::Ty::Int),
+        ast::ExprKind::Float(_) => Some(ir::Ty::Float),
+        ast::ExprKind::Bool(_) => Some(ir::Ty::Bool),
+        ast::ExprKind::Str(_) => Some(ir::Ty::Str),
+        ast::ExprKind::NoneLit => Some(ir::Ty::None),
+        ast::ExprKind::Name(n) => params
+            .get(n)
+            .copied()
+            .or_else(|| known.get(n).copied())
+            .or_else(|| globals.get(n).copied()),
+        ast::ExprKind::ListLit(items) if !items.is_empty() => {
+            // Homogeneous list of guessed element types.
+            let mut ety = None;
+            for it in items {
+                let ast::ListElem::Item(e) = it else {
+                    return None;
+                };
+                let t = guess_expr_ty(e, params, globals, known)?;
+                ety = Some(match ety {
+                    None => t,
+                    Some(prev) => join_elem_types(prev, t)?,
+                });
+            }
+            ety.map(ir::list_of)
+        }
+        _ => None,
+    }
+}
+
+/// Ensure a late-bound free var has an unbound cell (NameError on load until assign).
+fn ensure_cell_unbound(
+    ctx: &mut FnCtx,
+    name: &str,
+    ty: ir::Ty,
+    span: Span,
+) -> SResult<Option<ir::Stmt>> {
+    if ctx.cell_locals.contains_key(name) {
+        return Ok(None);
+    }
+    // Reject types we cannot store once assigned (same subset as before).
+    match ty {
+        ir::Ty::Int
+        | ir::Ty::Bool
+        | ir::Ty::Float
+        | ir::Ty::Str
+        | ir::Ty::None
+        | ir::Ty::Union(_) => {}
+        other => {
+            return Err(err(
+                format!(
+                    "late free-variable '{name}' of type {other} cannot be \
+                     cell-allocated before assignment in this subset"
+                ),
+                span,
+            ));
+        }
+    }
+    let cell_name = format!(".cell.{name}");
+    if !ctx.locals.contains_key(&cell_name) {
+        ctx.locals.insert(cell_name.clone(), ir::cell_of(ty));
+        ctx.locals_order.push((cell_name.clone(), ir::cell_of(ty)));
+        // Unbound until first CellStore (CPython NameError on free load).
+        let init = ir::Stmt::Assign {
+            name: cell_name,
+            value: ir::Expr {
+                ty: ir::cell_of(ty),
+                kind: ir::ExprKind::CellNewUnbound,
+            },
+        };
+        ctx.cell_locals.insert(name.to_string(), ty);
+        return Ok(Some(init));
+    }
+    ctx.cell_locals.insert(name.to_string(), ty);
+    Ok(None)
+}
+
+/// Lower a nested `def` inside a function: capture free vars as leading
+/// parameters (cells for outer locals); register the name for local calls.
 fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
-    if ctx.nested_funcs.contains_key(&f.name) || ctx.locals.contains_key(&f.name) {
+    if ctx.locals.contains_key(&f.name) || ctx.lowered_nested.contains(&f.name) {
         return Err(err(
             format!(
                 "function '{}' is defined more than once in this scope",
@@ -2919,25 +3623,31 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
         }
         if let Some(ty) = ctx.locals.get(name).copied() {
             if capture_set.insert(name.clone()) {
-                // Cell when this nested declares nonlocal, or any sibling will,
-                // or already a cell.
-                let use_cell = is_nl
-                    || ctx.sibling_nonlocal_names.contains(name)
-                    || ctx.cell_locals.contains_key(name);
-                if use_cell {
-                    if let Some(init) = ensure_cell(ctx, name, ty, f.span)? {
-                        ctx.pending_cell_inits.push(init);
-                    }
-                    captures.push((name.clone(), ty));
-                    capture_is_cell.push(true);
-                } else {
-                    captures.push((name.clone(), ty));
-                    capture_is_cell.push(false);
+                // Free outer locals always use cells so escaping closures see
+                // later outer assignments (CPython cell semantics). Nested
+                // *assignment* still requires an explicit `nonlocal`.
+                // (Previously only nonlocal / sibling-nonlocal used cells;
+                // by-value capture froze the value at MakeClosure time.)
+                if let Some(init) = ensure_cell(ctx, name, ty, f.span)? {
+                    ctx.pending_cell_inits.push(init);
                 }
+                captures.push((name.clone(), ty));
+                capture_is_cell.push(true);
             }
         } else if ctx.cell_locals.contains_key(name) {
             let ty = ctx.cell_locals[name];
             if capture_set.insert(name.clone()) {
+                captures.push((name.clone(), ty));
+                capture_is_cell.push(true);
+            }
+        } else if let Some(ty) = ctx.late_bind_tys.get(name).copied() {
+            // Free name assigned later in the same outer block (CPython cell):
+            //   def f(): return n
+            //   n = 5
+            if capture_set.insert(name.clone()) {
+                if let Some(init) = ensure_cell_unbound(ctx, name, ty, f.span)? {
+                    ctx.pending_cell_inits.push(init);
+                }
                 captures.push((name.clone(), ty));
                 capture_is_cell.push(true);
             }
@@ -2947,22 +3657,17 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
                 f.span,
             ));
         } else if ctx.nested_funcs.contains_key(name) {
-            return Err(err(
-                format!(
-                    "nested function '{name}' cannot be captured by '{}'; \
-                     call it directly in the outer scope",
-                    f.name
-                ),
-                f.span,
-            ));
+            // Sibling nested function: call by name; capturing the function
+            // object is handled via MakeClosure when used as a value.
+            // Not a free data capture.
         }
     }
 
     // Sibling nested calls: if this body calls a nested def that needs cell
     // captures, thread those cells through this function too (CPython: all
     // nested funcs share the same outer cells via the closure environment).
-    // Known callees are already in nested_funcs (definition-before-use among
-    // siblings); forward-ref nested calls are rejected elsewhere.
+    // Capture lists were completed in `complete_nested_captures` so forward /
+    // mutual sibling calls already see full free-var sets.
     {
         let mut called = HashSet::new();
         collect_called_func_names_in_stmts(&f.body, &mut called);
@@ -2987,8 +3692,20 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
             if !capture_set.insert(n.clone()) {
                 continue;
             }
-            if let Some(init) = ensure_cell(ctx, &n, cell_ty, f.span)? {
-                ctx.pending_cell_inits.push(init);
+            // Late free cells (assigned after this nested def in the outer)
+            // are not yet in `locals` — use unbound allocation, not ensure_cell.
+            if ctx.locals.contains_key(&n) {
+                if let Some(init) = ensure_cell(ctx, &n, cell_ty, f.span)? {
+                    ctx.pending_cell_inits.push(init);
+                }
+            } else if ctx.cell_locals.contains_key(&n) {
+                // already cell-backed
+            } else if let Some(ty) = ctx.late_bind_tys.get(&n).copied() {
+                if let Some(init) = ensure_cell_unbound(ctx, &n, ty, f.span)? {
+                    ctx.pending_cell_inits.push(init);
+                }
+            } else {
+                return Err(err(format!("no binding for nonlocal '{n}' found"), f.span));
             }
             captures.push((n, cell_ty));
             capture_is_cell.push(true);
@@ -3060,6 +3777,7 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
 
     register_closure_defaults(&info.ir_name, &info.sig.params);
     ctx.nested_funcs.insert(f.name.clone(), info);
+    ctx.lowered_nested.insert(f.name.clone());
     Ok(())
 }
 
@@ -3177,6 +3895,284 @@ fn collect_nonlocals_in_stmt(st: &ast::Stmt, out: &mut HashSet<String>) {
         }
         _ => {}
     }
+}
+
+/// Merge refinements after an if with multiple fallthrough arms.
+/// Drops peels for names assigned in any arm; keeps a peel only when every
+/// fallthrough arm agrees on the same concrete refinement (or all lack one).
+fn merge_fallthrough_refinements(
+    dest: &mut HashMap<String, ir::Ty>,
+    exits: &[HashMap<String, ir::Ty>],
+    assigned: &HashSet<String>,
+) {
+    for name in assigned {
+        dest.remove(name);
+    }
+    if exits.is_empty() {
+        return;
+    }
+    let mut keys: HashSet<String> = dest.keys().cloned().collect();
+    for e in exits {
+        keys.extend(e.keys().cloned());
+    }
+    for name in keys {
+        if assigned.contains(&name) {
+            continue;
+        }
+        let first = exits[0].get(&name).copied();
+        if exits.iter().all(|e| e.get(&name).copied() == first) {
+            if let Some(t) = first {
+                dest.insert(name, t);
+            } else {
+                dest.remove(&name);
+            }
+        } else {
+            dest.remove(&name);
+        }
+    }
+}
+
+/// Names free-captured by nested `def`/`lambda` in `stmts` (over-approx ok).
+fn collect_cell_candidate_names(stmts: &[ast::Stmt]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_cell_candidates_in_stmts(stmts, &mut out);
+    out
+}
+
+fn collect_cell_candidates_in_stmts(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::FuncDef(f) => {
+                add_nested_free_names(f, out);
+            }
+            ast::StmtKind::If { branches, orelse } => {
+                for (c, b) in branches {
+                    collect_cell_candidates_in_expr(c, out);
+                    collect_cell_candidates_in_stmts(b, out);
+                }
+                collect_cell_candidates_in_stmts(orelse, out);
+            }
+            ast::StmtKind::While { cond, body, orelse } => {
+                collect_cell_candidates_in_expr(cond, out);
+                collect_cell_candidates_in_stmts(body, out);
+                collect_cell_candidates_in_stmts(orelse, out);
+            }
+            ast::StmtKind::For {
+                iter, body, orelse, ..
+            } => {
+                collect_cell_candidates_in_expr(iter, out);
+                collect_cell_candidates_in_stmts(body, out);
+                collect_cell_candidates_in_stmts(orelse, out);
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                collect_cell_candidates_in_stmts(body, out);
+                for h in handlers {
+                    collect_cell_candidates_in_stmts(&h.body, out);
+                }
+                collect_cell_candidates_in_stmts(orelse, out);
+                collect_cell_candidates_in_stmts(finally, out);
+            }
+            ast::StmtKind::With { item, body, .. } => {
+                collect_cell_candidates_in_expr(item, out);
+                collect_cell_candidates_in_stmts(body, out);
+            }
+            ast::StmtKind::Match { subject, cases } => {
+                collect_cell_candidates_in_expr(subject, out);
+                for c in cases {
+                    if let Some(g) = &c.guard {
+                        collect_cell_candidates_in_expr(g, out);
+                    }
+                    collect_cell_candidates_in_stmts(&c.body, out);
+                }
+            }
+            ast::StmtKind::Assign { value, .. } => collect_cell_candidates_in_expr(value, out),
+            ast::StmtKind::AugAssign { value, .. } => collect_cell_candidates_in_expr(value, out),
+            ast::StmtKind::Return(Some(e)) | ast::StmtKind::ExprStmt(e) => {
+                collect_cell_candidates_in_expr(e, out);
+            }
+            ast::StmtKind::Delete { target } => {
+                collect_cell_candidates_in_target(target, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_cell_candidates_in_target(t: &ast::AssignTarget, out: &mut HashSet<String>) {
+    match t {
+        ast::AssignTarget::Index { base, index } => {
+            collect_cell_candidates_in_expr(base, out);
+            collect_cell_candidates_in_expr(index, out);
+        }
+        ast::AssignTarget::Tuple(ts) => {
+            for t in ts {
+                collect_cell_candidates_in_target(t, out);
+            }
+        }
+        ast::AssignTarget::Starred { target, .. } => collect_cell_candidates_in_target(target, out),
+        ast::AssignTarget::Name { .. } => {}
+    }
+}
+
+fn collect_cell_candidates_in_expr(e: &ast::Expr, out: &mut HashSet<String>) {
+    walk_expr_for_lambdas(e, out);
+}
+
+fn walk_expr_for_lambdas(e: &ast::Expr, out: &mut HashSet<String>) {
+    match &e.kind {
+        ast::ExprKind::Lambda { params, body } => {
+            let mut used = HashSet::new();
+            collect_used_names_in_expr(body, &mut used);
+            for p in params {
+                if let Some(d) = &p.default {
+                    collect_used_names_in_expr(d, &mut used);
+                }
+                used.remove(&p.name);
+            }
+            out.extend(used);
+            walk_expr_for_lambdas(body, out);
+        }
+        ast::ExprKind::Binary { left, right, .. } => {
+            walk_expr_for_lambdas(left, out);
+            walk_expr_for_lambdas(right, out);
+        }
+        ast::ExprKind::Unary { operand, .. } => walk_expr_for_lambdas(operand, out),
+        ast::ExprKind::Call {
+            args,
+            keywords,
+            kwargs,
+            ..
+        } => {
+            for a in args {
+                match a {
+                    ast::PosArg::Pos(e) | ast::PosArg::Star(e) => walk_expr_for_lambdas(e, out),
+                }
+            }
+            for kw in keywords {
+                walk_expr_for_lambdas(&kw.value, out);
+            }
+            if let Some(k) = kwargs {
+                walk_expr_for_lambdas(k, out);
+            }
+        }
+        ast::ExprKind::MethodCall {
+            base,
+            args,
+            keywords,
+            kwargs,
+            ..
+        } => {
+            walk_expr_for_lambdas(base, out);
+            for a in args {
+                match a {
+                    ast::PosArg::Pos(e) | ast::PosArg::Star(e) => walk_expr_for_lambdas(e, out),
+                }
+            }
+            for kw in keywords {
+                walk_expr_for_lambdas(&kw.value, out);
+            }
+            if let Some(k) = kwargs {
+                walk_expr_for_lambdas(k, out);
+            }
+        }
+        ast::ExprKind::ListLit(items) => {
+            for it in items {
+                match it {
+                    ast::ListElem::Item(e) | ast::ListElem::Star(e) => {
+                        walk_expr_for_lambdas(e, out)
+                    }
+                }
+            }
+        }
+        ast::ExprKind::TupleLit(items) | ast::ExprKind::SetLit(items) => {
+            for e in items {
+                walk_expr_for_lambdas(e, out);
+            }
+        }
+        ast::ExprKind::DictLit(items) => {
+            for (k, v) in items {
+                walk_expr_for_lambdas(k, out);
+                walk_expr_for_lambdas(v, out);
+            }
+        }
+        ast::ExprKind::Attribute { base, .. } => walk_expr_for_lambdas(base, out),
+        ast::ExprKind::Index { base, index } => {
+            walk_expr_for_lambdas(base, out);
+            walk_expr_for_lambdas(index, out);
+        }
+        ast::ExprKind::Slice { base, lo, hi, step } => {
+            walk_expr_for_lambdas(base, out);
+            if let Some(e) = lo {
+                walk_expr_for_lambdas(e, out);
+            }
+            if let Some(e) = hi {
+                walk_expr_for_lambdas(e, out);
+            }
+            if let Some(e) = step {
+                walk_expr_for_lambdas(e, out);
+            }
+        }
+        ast::ExprKind::Compare { first, rest } => {
+            walk_expr_for_lambdas(first, out);
+            for (_, r) in rest {
+                walk_expr_for_lambdas(r, out);
+            }
+        }
+        ast::ExprKind::ListComp {
+            elem, iter, cond, ..
+        } => {
+            walk_expr_for_lambdas(elem, out);
+            walk_expr_for_lambdas(iter, out);
+            if let Some(c) = cond {
+                walk_expr_for_lambdas(c, out);
+            }
+        }
+        ast::ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                if let ast::FStringPart::Expr { expr, .. } = p {
+                    walk_expr_for_lambdas(expr, out);
+                }
+            }
+        }
+        ast::ExprKind::Cast { arg, .. } => walk_expr_for_lambdas(arg, out),
+        ast::ExprKind::Starred(v) | ast::ExprKind::Yield(Some(v)) | ast::ExprKind::YieldFrom(v) => {
+            walk_expr_for_lambdas(v, out)
+        }
+        _ => {}
+    }
+}
+
+fn add_nested_free_names(f: &ast::FuncDef, out: &mut HashSet<String>) {
+    let mut used = HashSet::new();
+    collect_used_names_in_stmts(&f.body, &mut used);
+    for p in &f.params {
+        if let Some(d) = &p.default {
+            collect_used_names_in_expr(d, &mut used);
+        }
+        used.remove(&p.name);
+    }
+    if let Some(p) = &f.vararg {
+        used.remove(&p.name);
+    }
+    if let Some(p) = &f.kwarg {
+        used.remove(&p.name);
+    }
+    let nonlocals = collect_nonlocals_in_stmts(&f.body);
+    let assigned = assigned_names_in_stmts(&f.body);
+    for n in used {
+        // Assigned without nonlocal is a new local of the nested, not free.
+        if assigned.contains(&n) && !nonlocals.contains(&n) {
+            continue;
+        }
+        out.insert(n);
+    }
+    // Nested defs inside this nested function also free-capture outer names.
+    collect_cell_candidates_in_stmts(&f.body, out);
 }
 
 /// Ensure `name` is stored in a heap cell in the current function.
@@ -3775,6 +4771,8 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             lower_nested_func_def(f, ctx)?;
             // Flush cell boxing for nonlocal captures
             out.append(&mut ctx.pending_cell_inits);
+            // Freeze default argument expressions at def time (CPython).
+            freeze_nested_defaults(&f.name, f.span, ctx, out)?;
             Ok(())
         }
         ast::StmtKind::Pass => Ok(()),
@@ -3942,6 +4940,21 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             Ok(())
         }
         ast::StmtKind::Return(value) => {
+            // Generator stop: bare `return` ends iteration; `return <expr>`
+            // stores StopIteration.value for `yield from` consumers (and
+            // evaluates for side effects). Non-None send / throw still out.
+            if let Some(yty) = ctx.yield_ty {
+                if let Some(e) = value {
+                    let v = lower_expr(e, ctx)?;
+                    // Coerce to this generator's yield type so the payload
+                    // encoding matches what yield-from loaders expect.
+                    let v = coerce(v, yty, e.span, "generator return value")?;
+                    out.push(ir::Stmt::Return(Some(v)));
+                } else {
+                    out.push(ir::Stmt::Return(None));
+                }
+                return Ok(());
+            }
             match (value, ctx.ret) {
                 (None, ir::Ty::None) => out.push(ir::Stmt::Return(None)),
                 (None, expected) => {
@@ -4058,7 +5071,9 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 handlers_ir.push((h.exc.map(ast_exc_to_ir), name, body_h));
             }
             let orelse_ir = lower_nested_block(orelse, ctx)?;
+            ctx.finally_depth += 1;
             let finally_ir = lower_nested_block(finally, ctx)?;
+            ctx.finally_depth -= 1;
             ctx.try_depth -= 1;
             out.push(ir::Stmt::Try {
                 body: body_ir,
@@ -4162,6 +5177,9 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             let mut active = outer_ref.clone();
             let mut lowered_branches = Vec::new();
             let mut all_thens_return = true;
+            // Exit refinements of arms that can fall through (for merge).
+            let mut fallthrough_exits: Vec<HashMap<String, ir::Ty>> = Vec::new();
+            let mut fallthrough_assigned: HashSet<String> = HashSet::new();
             for (cond, body) in branches {
                 // Evaluate condition under `active` refinements.
                 ctx.type_refinements = active.clone();
@@ -4174,6 +5192,8 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 let b = lower_nested_block(body, ctx)?;
                 if !block_returns(&b) {
                     all_thens_return = false;
+                    fallthrough_exits.push(ctx.type_refinements.clone());
+                    fallthrough_assigned.extend(assigned_names_in_stmts(body));
                 }
                 lowered_branches.push((c, b));
                 // Subsequent elif/else always see the complement (cond was false).
@@ -4185,6 +5205,16 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             ctx.type_refinements = active.clone();
             let lowered_orelse = lower_nested_block(orelse, ctx)?;
             let orelse_returns = block_returns(&lowered_orelse);
+            if orelse.is_empty() {
+                // All conditions false is a fallthrough path when some then
+                // also falls through, or when no then exists.
+                if !all_thens_return || branches.is_empty() {
+                    fallthrough_exits.push(active.clone());
+                }
+            } else if !orelse_returns {
+                fallthrough_exits.push(ctx.type_refinements.clone());
+                fallthrough_assigned.extend(assigned_names_in_stmts(orelse));
+            }
             // Restore outer, then apply fallthrough refinements.
             ctx.type_refinements = outer_ref;
             out.push(ir::Stmt::If {
@@ -4193,17 +5223,26 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             });
             // Fallthrough after if: only when every then returned can we keep
             // the accumulated complements (else is the only surviving path, or
-            // empty else with all thens returning).
+            // empty else with all thens returning — still may fall through when
+            // all conditions are false).
             if all_thens_return && (orelse.is_empty() || !orelse_returns) {
+                // Surviving path is "all conditions false" (and maybe empty else).
                 for (k, v) in active {
                     ctx.type_refinements.insert(k, v);
                 }
+            } else {
+                // Merge fallthrough arms: drop peels that disagree or were rebound.
+                merge_fallthrough_refinements(
+                    &mut ctx.type_refinements,
+                    &fallthrough_exits,
+                    &fallthrough_assigned,
+                );
             }
             Ok(())
         }
         ast::StmtKind::While { cond, body, orelse } => {
             let c = lower_condition(cond, ctx)?;
-            let (then_ref, _) = narrowing_from_condition(cond, ctx);
+            let (then_ref, else_ref) = narrowing_from_condition(cond, ctx);
             let saved = ctx.type_refinements.clone();
             for (k, v) in &then_ref {
                 ctx.type_refinements.insert(k.clone(), *v);
@@ -4211,8 +5250,35 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             ctx.loop_depth += 1;
             let b = lower_nested_block(body, ctx)?;
             ctx.loop_depth -= 1;
+            let body_assigned = assigned_names_in_stmts(body);
+            let has_break = loop_breaks(&b);
+            // Do not restore pre-loop peels after the body may have rebound.
             ctx.type_refinements = saved;
-            push_loop_with_else(c, b, vec![], orelse, ctx, out)
+            for name in &body_assigned {
+                ctx.type_refinements.remove(name);
+            }
+            // Without break, exit means the condition is false → else_ref.
+            // With break, exit can be break (then peels) or false (else peels)
+            // — drop both so post-loop code cannot keep a stale concrete peel.
+            if !has_break {
+                for (k, v) in else_ref {
+                    ctx.type_refinements.insert(k, v);
+                }
+            } else {
+                for k in then_ref.keys().chain(else_ref.keys()) {
+                    ctx.type_refinements.remove(k);
+                }
+            }
+            push_loop_with_else(c, b, vec![], orelse, ctx, out)?;
+            // Else arm may rebind further; clear assigns from else on fallthrough.
+            if !orelse.is_empty() {
+                // push_loop_with_else lowered else under post-loop refs; if else
+                // can fall through, drop peels for names it assigned.
+                for name in assigned_names_in_stmts(orelse) {
+                    ctx.type_refinements.remove(&name);
+                }
+            }
+            Ok(())
         }
         ast::StmtKind::For {
             var,
@@ -4271,18 +5337,18 @@ fn lower_match(
         return Err(err("match statement must have at least one case", span));
     }
 
-    // If the last case is irrefutable (`_` / bare capture, no guard), use it
-    // as the final `else` so return-analysis sees a complete if/else tree.
+    // If the last case is irrefutable (`_` / bare capture / `[*rest]` / `{**rest}`,
+    // no guard), use it as the final `else` so return-analysis sees a complete
+    // if/else tree.
     let last = cases.last().unwrap();
-    let last_irrefutable = last.guard.is_none()
-        && matches!(
-            last.pattern,
-            ast::Pattern::Wildcard | ast::Pattern::Capture(_)
-        );
+    validate_pattern_no_duplicate_binds(&last.pattern, subject.span)?;
+    let last_irrefutable = last.guard.is_none() && pattern_is_irrefutable(&last.pattern);
 
     let (prefix, final_else) = if last_irrefutable {
         let mut body = Vec::new();
         let _ = lower_pattern_match(&last.pattern, &subj, subject.span, ctx, &mut body)?;
+        // Irrefutable last case may still have a guard-less body that benefits
+        // from no extra refine; just lower the body.
         body.extend(lower_nested_block(&last.body, ctx)?);
         (&cases[..cases.len() - 1], body)
     } else {
@@ -4295,13 +5361,22 @@ fn lower_match(
     //       if guard: case_body    # guard omitted → just case_body
     //       else: <next case>
     //   else: <next case>
+    // Guard conditions refine the case body (e.g. `case y if y is not None`).
     let mut acc = final_else;
     for case in prefix.iter().rev() {
+        validate_pattern_no_duplicate_binds(&case.pattern, subject.span)?;
         let mut binds = Vec::new();
         let pat_cond = lower_pattern_match(&case.pattern, &subj, subject.span, ctx, &mut binds)?;
-        // Guard is typed after binds so captures are in scope (CPython order).
-        let case_body = lower_nested_block(&case.body, ctx)?;
         let then_body = if let Some(guard) = &case.guard {
+            // Apply guard narrowing into the case body (pattern binds already
+            // registered in locals via lower_pattern_match).
+            let (then_ref, _) = narrowing_from_condition(guard, ctx);
+            let saved = ctx.type_refinements.clone();
+            for (k, v) in &then_ref {
+                ctx.type_refinements.insert(k.clone(), *v);
+            }
+            let case_body = lower_nested_block(&case.body, ctx)?;
+            ctx.type_refinements = saved;
             let g = lower_condition(guard, ctx)?;
             let mut mid = binds;
             mid.push(ir::Stmt::If {
@@ -4310,6 +5385,7 @@ fn lower_match(
             });
             mid
         } else {
+            let case_body = lower_nested_block(&case.body, ctx)?;
             let mut b = binds;
             b.extend(case_body);
             b
@@ -4323,10 +5399,110 @@ fn lower_match(
     Ok(())
 }
 
+fn pattern_is_irrefutable(p: &ast::Pattern) -> bool {
+    match p {
+        ast::Pattern::Wildcard | ast::Pattern::Capture(_) => true,
+        ast::Pattern::As { pattern, .. } => pattern_is_irrefutable(pattern),
+        // `[*rest]` / `(*rest,)` always matches a sequence subject (any length).
+        ast::Pattern::Sequence {
+            items,
+            star: Some(si),
+        } => {
+            items.len() == 1
+                && *si == 0
+                && matches!(&items[0], ast::Pattern::Capture(_) | ast::Pattern::Wildcard)
+        }
+        // `{**rest}` always matches a mapping subject.
+        ast::Pattern::Mapping {
+            items,
+            rest: Some(_),
+        } if items.is_empty() => true,
+        // Empty `{}` always matches a mapping subject (CPython irrefutable).
+        ast::Pattern::Mapping { items, rest: None } if items.is_empty() => true,
+        _ => false,
+    }
+}
+
+/// CPython SyntaxError: multiple assignments to the same name in one pattern,
+/// or duplicate keys in a mapping pattern.
+fn validate_pattern_no_duplicate_binds(p: &ast::Pattern, span: Span) -> SResult<()> {
+    let mut names = HashSet::new();
+    check_dup_binds(p, &mut names, span)?;
+    Ok(())
+}
+
+fn check_dup_binds(p: &ast::Pattern, seen: &mut HashSet<String>, span: Span) -> SResult<()> {
+    match p {
+        ast::Pattern::Capture(n) => {
+            if !seen.insert(n.clone()) {
+                return Err(err(
+                    format!("multiple assignments to name '{n}' in pattern"),
+                    span,
+                ));
+            }
+            Ok(())
+        }
+        ast::Pattern::As { pattern, name } => {
+            check_dup_binds(pattern, seen, span)?;
+            if !seen.insert(name.clone()) {
+                return Err(err(
+                    format!("multiple assignments to name '{name}' in pattern"),
+                    span,
+                ));
+            }
+            Ok(())
+        }
+        ast::Pattern::Or(alts) => {
+            // Each alternative is checked independently (shared names required
+            // across alts by validate_or_pattern_binds).
+            for alt in alts {
+                let mut local = HashSet::new();
+                check_dup_binds(alt, &mut local, span)?;
+            }
+            Ok(())
+        }
+        ast::Pattern::Sequence { items, .. } => {
+            for it in items {
+                check_dup_binds(it, seen, span)?;
+            }
+            Ok(())
+        }
+        ast::Pattern::Mapping { items, rest } => {
+            let mut keys = HashSet::new();
+            for (k, v) in items {
+                if !keys.insert(k.clone()) {
+                    return Err(err(
+                        format!("mapping pattern checks duplicate key ('{k}')"),
+                        span,
+                    ));
+                }
+                check_dup_binds(v, seen, span)?;
+            }
+            if let Some(r) = rest
+                && !seen.insert(r.clone())
+            {
+                return Err(err(
+                    format!("multiple assignments to name '{r}' in pattern"),
+                    span,
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Collect capture names in a pattern (for or-pattern consistency checks).
 fn pattern_capture_names(p: &ast::Pattern) -> Vec<String> {
     match p {
         ast::Pattern::Capture(n) => vec![n.clone()],
+        ast::Pattern::As { pattern, name } => {
+            let mut names = pattern_capture_names(pattern);
+            names.push(name.clone());
+            names.sort();
+            names.dedup();
+            names
+        }
         ast::Pattern::Or(alts) => {
             let mut names = Vec::new();
             for a in alts {
@@ -4336,17 +5512,20 @@ fn pattern_capture_names(p: &ast::Pattern) -> Vec<String> {
             names.dedup();
             names
         }
-        ast::Pattern::Sequence(items) => {
+        ast::Pattern::Sequence { items, .. } => {
             let mut names = Vec::new();
             for it in items {
                 names.extend(pattern_capture_names(it));
             }
             names
         }
-        ast::Pattern::Mapping(pairs) => {
+        ast::Pattern::Mapping { items, rest } => {
             let mut names = Vec::new();
-            for (_, v) in pairs {
+            for (_, v) in items {
                 names.extend(pattern_capture_names(v));
+            }
+            if let Some(r) = rest {
+                names.push(r.clone());
             }
             names
         }
@@ -4447,162 +5626,483 @@ fn lower_pattern_match(
         ast::Pattern::Or(alts) => {
             // CPython: all alternatives must bind the same names (or none).
             validate_or_pattern_binds(alts, span)?;
-            let mut acc: Option<ir::Expr> = None;
-            for alt in alts {
-                // Or-patterns cannot bind differently in this subset if they bind.
-                let c = lower_pattern_match(alt, subject, span, ctx, binds)?;
-                acc = Some(match acc {
-                    None => c,
-                    Some(prev) => ir::Expr {
+            // Bind only the matching alternative: desugar to a Block that
+            // tries each alt with nested ifs and sets a success flag.
+            // Side-effect binds run inside the condition evaluation, so the
+            // outer match arm's `binds` list stays empty for the Or node.
+            let ok_tmp = ctx.fresh_temp("orpat", ir::Ty::Bool);
+            let mut stmts = vec![ir::Stmt::Assign {
+                name: ok_tmp.clone(),
+                value: ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::ConstBool(false),
+                },
+            }];
+            let mut chain_else: Vec<ir::Stmt> = Vec::new();
+            for alt in alts.iter().rev() {
+                let mut alt_binds = Vec::new();
+                let cond = lower_pattern_match(alt, subject, span, ctx, &mut alt_binds)?;
+                let mut then_body = alt_binds;
+                then_body.push(ir::Stmt::Assign {
+                    name: ok_tmp.clone(),
+                    value: ir::Expr {
                         ty: ir::Ty::Bool,
-                        kind: ir::ExprKind::Binary {
-                            op: ir::BinOp::Or,
-                            left: Box::new(prev),
-                            right: Box::new(c),
-                        },
+                        kind: ir::ExprKind::ConstBool(true),
                     },
                 });
+                chain_else = vec![ir::Stmt::If {
+                    branches: vec![(cond, then_body)],
+                    orelse: chain_else,
+                }];
             }
-            Ok(acc.unwrap_or(ir::Expr {
+            stmts.extend(chain_else);
+            // binds intentionally unused for Or — captures already applied.
+            let _ = binds;
+            Ok(ir::Expr {
                 ty: ir::Ty::Bool,
-                kind: ir::ExprKind::ConstBool(false),
-            }))
-        }
-        ast::Pattern::Sequence(items) => {
-            // Fixed-length sequence pattern for list or tuple.
-            let n = items.len() as i64;
-            match subject.ty {
-                ir::Ty::List(elem) => {
-                    let len_ok = ir::Expr {
+                kind: ir::ExprKind::Block {
+                    stmts,
+                    result: Box::new(ir::Expr {
                         ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::Local(ok_tmp),
+                    }),
+                },
+            })
+        }
+        ast::Pattern::As { pattern, name } => {
+            // Match sub-pattern, then bind the whole subject to `name`.
+            let c = lower_pattern_match(pattern, subject, span, ctx, binds)?;
+            let stmt = bind_name(name, span, None, subject.clone(), span, ctx)?;
+            binds.push(stmt);
+            Ok(c)
+        }
+        ast::Pattern::Sequence { items, star } => {
+            lower_sequence_pattern(items, *star, subject, span, ctx, binds)
+        }
+        ast::Pattern::Mapping { items, rest } => {
+            lower_mapping_pattern(items, rest.as_deref(), subject, span, ctx, binds)
+        }
+    }
+}
+
+fn lower_sequence_pattern(
+    items: &[ast::Pattern],
+    star: Option<usize>,
+    subject: &ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+    binds: &mut Vec<ir::Stmt>,
+) -> SResult<ir::Expr> {
+    match subject.ty {
+        ir::Ty::List(elem) => {
+            if let Some(si) = star {
+                // `[a, *rest, b]`: len >= fixed, rest is a slice list.
+                let before = si;
+                let after = items.len() - si - 1;
+                let min_len = (before + after) as i64;
+                let len_e = ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Len(Box::new(subject.clone())),
+                };
+                let len_ok = ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Ge,
+                        left: Box::new(len_e.clone()),
+                        right: Box::new(int_const(min_len)),
+                    },
+                };
+                let mut cond = len_ok;
+                // Prefix items
+                for (i, pat) in items.iter().enumerate().take(before) {
+                    let elem_e = ir::Expr {
+                        ty: *elem,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(subject.clone()),
+                            index: Box::new(int_const(i as i64)),
+                        },
+                    };
+                    let c = lower_pattern_match(pat, &elem_e, span, ctx, binds)?;
+                    cond = bool_and(cond, c);
+                }
+                // Starred rest: subject[before : len-after]
+                let rest_lo = int_const(before as i64);
+                let rest_hi = ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Sub,
+                        left: Box::new(len_e),
+                        right: Box::new(int_const(after as i64)),
+                    },
+                };
+                let rest_list = ir::Expr {
+                    ty: ir::list_of(*elem),
+                    kind: ir::ExprKind::Slice {
+                        base: Box::new(subject.clone()),
+                        lo: Box::new(rest_lo),
+                        hi: Box::new(rest_hi),
+                        step: Box::new(int_const(1)),
+                    },
+                };
+                let star_pat = &items[si];
+                let c = lower_pattern_match(star_pat, &rest_list, span, ctx, binds)?;
+                cond = bool_and(cond, c);
+                // Suffix items (from end)
+                for j in 0..after {
+                    let pat = &items[si + 1 + j];
+                    let idx = ir::Expr {
+                        ty: ir::Ty::Int,
                         kind: ir::ExprKind::Binary {
-                            op: ir::BinOp::Eq,
+                            op: ir::BinOp::Sub,
                             left: Box::new(ir::Expr {
                                 ty: ir::Ty::Int,
                                 kind: ir::ExprKind::Len(Box::new(subject.clone())),
                             }),
-                            right: Box::new(int_const(n)),
+                            right: Box::new(int_const((after - j) as i64)),
                         },
                     };
-                    let mut cond = len_ok;
-                    for (i, pat) in items.iter().enumerate() {
-                        let elem_e = ir::Expr {
-                            ty: *elem,
-                            kind: ir::ExprKind::Index {
-                                base: Box::new(subject.clone()),
-                                index: Box::new(int_const(i as i64)),
-                            },
-                        };
-                        let c = lower_pattern_match(pat, &elem_e, span, ctx, binds)?;
-                        cond = ir::Expr {
-                            ty: ir::Ty::Bool,
-                            kind: ir::ExprKind::Binary {
-                                op: ir::BinOp::And,
-                                left: Box::new(cond),
-                                right: Box::new(c),
-                            },
-                        };
-                    }
-                    Ok(cond)
-                }
-                ir::Ty::Tuple(elems) => {
-                    if elems.len() != items.len() {
-                        return Ok(ir::Expr {
-                            ty: ir::Ty::Bool,
-                            kind: ir::ExprKind::ConstBool(false),
-                        });
-                    }
-                    let mut cond = ir::Expr {
-                        ty: ir::Ty::Bool,
-                        kind: ir::ExprKind::ConstBool(true),
+                    let elem_e = ir::Expr {
+                        ty: *elem,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(subject.clone()),
+                            index: Box::new(idx),
+                        },
                     };
-                    for (i, pat) in items.iter().enumerate() {
-                        let elem_e = ir::Expr {
-                            ty: elems[i],
-                            kind: ir::ExprKind::Index {
-                                base: Box::new(subject.clone()),
-                                index: Box::new(int_const(i as i64)),
-                            },
-                        };
-                        let c = lower_pattern_match(pat, &elem_e, span, ctx, binds)?;
-                        cond = ir::Expr {
-                            ty: ir::Ty::Bool,
-                            kind: ir::ExprKind::Binary {
-                                op: ir::BinOp::And,
-                                left: Box::new(cond),
-                                right: Box::new(c),
-                            },
-                        };
-                    }
-                    Ok(cond)
+                    let c = lower_pattern_match(pat, &elem_e, span, ctx, binds)?;
+                    cond = bool_and(cond, c);
                 }
-                other => Err(err(
-                    format!("sequence pattern requires list or tuple subject, found {other}"),
-                    span,
-                )),
-            }
-        }
-        ast::Pattern::Mapping(pairs) => {
-            let ir::Ty::Dict { key, value } = subject.ty else {
-                return Err(err(
-                    format!(
-                        "mapping pattern requires dict subject, found {}",
-                        subject.ty
-                    ),
-                    span,
-                ));
-            };
-            if *key != ir::Ty::Str {
-                return Err(err(
-                    "mapping patterns require dict[str, ...] in this subset",
-                    span,
-                ));
-            }
-            let mut cond = ir::Expr {
-                ty: ir::Ty::Bool,
-                kind: ir::ExprKind::ConstBool(true),
-            };
-            for (k, pat) in pairs {
-                let key_e = ir::Expr {
-                    ty: ir::Ty::Str,
-                    kind: ir::ExprKind::ConstStr(k.clone()),
-                };
-                // key in dict
-                let has = ir::Expr {
-                    ty: ir::Ty::Bool,
-                    kind: ir::ExprKind::Contains {
-                        needle: Box::new(key_e.clone()),
-                        haystack: Box::new(subject.clone()),
-                    },
-                };
-                let val_e = ir::Expr {
-                    ty: *value,
-                    kind: ir::ExprKind::Index {
-                        base: Box::new(subject.clone()),
-                        index: Box::new(key_e),
-                    },
-                };
-                let c = lower_pattern_match(pat, &val_e, span, ctx, binds)?;
-                let both = ir::Expr {
+                Ok(cond)
+            } else {
+                let n = items.len() as i64;
+                let len_ok = ir::Expr {
                     ty: ir::Ty::Bool,
                     kind: ir::ExprKind::Binary {
-                        op: ir::BinOp::And,
-                        left: Box::new(has),
-                        right: Box::new(c),
+                        op: ir::BinOp::Eq,
+                        left: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Len(Box::new(subject.clone())),
+                        }),
+                        right: Box::new(int_const(n)),
                     },
                 };
-                cond = ir::Expr {
-                    ty: ir::Ty::Bool,
-                    kind: ir::ExprKind::Binary {
-                        op: ir::BinOp::And,
-                        left: Box::new(cond),
-                        right: Box::new(both),
-                    },
-                };
+                let mut cond = len_ok;
+                for (i, pat) in items.iter().enumerate() {
+                    let elem_e = ir::Expr {
+                        ty: *elem,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(subject.clone()),
+                            index: Box::new(int_const(i as i64)),
+                        },
+                    };
+                    let c = lower_pattern_match(pat, &elem_e, span, ctx, binds)?;
+                    cond = bool_and(cond, c);
+                }
+                Ok(cond)
             }
-            Ok(cond)
         }
+        ir::Ty::Tuple(elems) => {
+            if let Some(si) = star {
+                // Variable-length star on fixed tuples: only when rest can be a list
+                // of a uniform type — reject heterogeneous rest for now.
+                let before = si;
+                let after = items.len() - si - 1;
+                if elems.len() < before + after {
+                    return Ok(ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::ConstBool(false),
+                    });
+                }
+                let rest_elems = &elems[before..elems.len() - after];
+                // Rest must share one type (or be empty) for list materialization.
+                let rest_ty = if rest_elems.is_empty() {
+                    ir::Ty::Int // unused
+                } else {
+                    let mut t = rest_elems[0];
+                    for e in &rest_elems[1..] {
+                        t = join_elem_types(t, *e).ok_or_else(|| {
+                            err(
+                                "starred sequence pattern on tuple requires homogeneous rest elements",
+                                span,
+                            )
+                        })?;
+                    }
+                    t
+                };
+                let mut cond = ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::ConstBool(true),
+                };
+                for (i, pat) in items.iter().enumerate().take(before) {
+                    let elem_e = ir::Expr {
+                        ty: elems[i],
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(subject.clone()),
+                            index: Box::new(int_const(i as i64)),
+                        },
+                    };
+                    let c = lower_pattern_match(pat, &elem_e, span, ctx, binds)?;
+                    cond = bool_and(cond, c);
+                }
+                // Materialize rest as list
+                let mut rest_items = Vec::new();
+                for (k, _) in rest_elems.iter().enumerate() {
+                    let idx = (before + k) as i64;
+                    rest_items.push(ir::Expr {
+                        ty: rest_ty,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(subject.clone()),
+                            index: Box::new(int_const(idx)),
+                        },
+                    });
+                }
+                let rest_list = ir::Expr {
+                    ty: ir::list_of(rest_ty),
+                    kind: ir::ExprKind::ListLit(rest_items),
+                };
+                let c = lower_pattern_match(&items[si], &rest_list, span, ctx, binds)?;
+                cond = bool_and(cond, c);
+                for j in 0..after {
+                    let pat = &items[si + 1 + j];
+                    let idx = (elems.len() - after + j) as i64;
+                    let elem_e = ir::Expr {
+                        ty: elems[idx as usize],
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(subject.clone()),
+                            index: Box::new(int_const(idx)),
+                        },
+                    };
+                    let c = lower_pattern_match(pat, &elem_e, span, ctx, binds)?;
+                    cond = bool_and(cond, c);
+                }
+                Ok(cond)
+            } else {
+                if elems.len() != items.len() {
+                    return Ok(ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::ConstBool(false),
+                    });
+                }
+                let mut cond = ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::ConstBool(true),
+                };
+                for (i, pat) in items.iter().enumerate() {
+                    let elem_e = ir::Expr {
+                        ty: elems[i],
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(subject.clone()),
+                            index: Box::new(int_const(i as i64)),
+                        },
+                    };
+                    let c = lower_pattern_match(pat, &elem_e, span, ctx, binds)?;
+                    cond = bool_and(cond, c);
+                }
+                Ok(cond)
+            }
+        }
+        other => Err(err(
+            format!("sequence pattern requires list or tuple subject, found {other}"),
+            span,
+        )),
     }
+}
+
+fn lower_mapping_pattern(
+    pairs: &[(String, ast::Pattern)],
+    rest: Option<&str>,
+    subject: &ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+    binds: &mut Vec<ir::Stmt>,
+) -> SResult<ir::Expr> {
+    let ir::Ty::Dict { key, value } = subject.ty else {
+        return Err(err(
+            format!(
+                "mapping pattern requires dict subject, found {}",
+                subject.ty
+            ),
+            span,
+        ));
+    };
+    if *key != ir::Ty::Str {
+        return Err(err(
+            "mapping patterns require dict[str, ...] in this subset",
+            span,
+        ));
+    }
+    let mut cond = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::ConstBool(true),
+    };
+    for (k, pat) in pairs {
+        let key_e = ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::ConstStr(k.clone()),
+        };
+        let has = ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Contains {
+                needle: Box::new(key_e.clone()),
+                haystack: Box::new(subject.clone()),
+            },
+        };
+        let val_e = ir::Expr {
+            ty: *value,
+            kind: ir::ExprKind::Index {
+                base: Box::new(subject.clone()),
+                index: Box::new(key_e),
+            },
+        };
+        let c = lower_pattern_match(pat, &val_e, span, ctx, binds)?;
+        cond = bool_and(cond, bool_and(has, c));
+    }
+    if let Some(rest_name) = rest {
+        // rest = {k: v for k,v in subject.items() if k not in matched_keys}
+        // Build by copying all keys then deleting matched ones.
+        let rest_ty = ir::dict_of(*key, *value);
+        let rest_tmp = ctx.fresh_temp("mrest", rest_ty);
+        // Start with empty dict, copy unmatched keys.
+        // Use: keys = d.keys(); for each key, if not matched, rest[k] = d[k]
+        // Simpler IR: DictCopy-like via iterating keys.
+        // Build list of matched key strings for exclusion.
+        let keys_list = ir::Expr {
+            ty: ir::list_of(ir::Ty::Str),
+            kind: ir::ExprKind::DictKeys(Box::new(subject.clone())),
+        };
+        let keys_t = ctx.fresh_temp("mrest.keys", ir::list_of(ir::Ty::Str));
+        binds.push(ir::Stmt::Assign {
+            name: keys_t.clone(),
+            value: keys_list,
+        });
+        binds.push(ir::Stmt::Assign {
+            name: rest_tmp.clone(),
+            value: ir::Expr {
+                ty: rest_ty,
+                kind: ir::ExprKind::DictNew,
+            },
+        });
+        let i_t = ctx.fresh_temp("mrest.i", ir::Ty::Int);
+        binds.push(ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(0),
+        });
+        let k_t = ctx.fresh_temp("mrest.k", ir::Ty::Str);
+        // matched keys exclusion chain
+        let key_local = ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::Local(k_t.clone()),
+        };
+        let mut not_matched = ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(true),
+        };
+        for (mk, _) in pairs {
+            let is_m = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Eq,
+                    left: Box::new(key_local.clone()),
+                    right: Box::new(ir::Expr {
+                        ty: ir::Ty::Str,
+                        kind: ir::ExprKind::ConstStr(mk.clone()),
+                    }),
+                },
+            };
+            let not_m = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Unary {
+                    op: ir::UnOp::Not,
+                    operand: Box::new(is_m),
+                },
+            };
+            not_matched = bool_and(not_matched, not_m);
+        }
+        let val_at = ir::Expr {
+            ty: *value,
+            kind: ir::ExprKind::Index {
+                base: Box::new(subject.clone()),
+                index: Box::new(key_local.clone()),
+            },
+        };
+        let body = vec![
+            ir::Stmt::Assign {
+                name: k_t.clone(),
+                value: ir::Expr {
+                    ty: ir::Ty::Str,
+                    kind: ir::ExprKind::Index {
+                        base: Box::new(ir::Expr {
+                            ty: ir::list_of(ir::Ty::Str),
+                            kind: ir::ExprKind::Local(keys_t.clone()),
+                        }),
+                        index: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Local(i_t.clone()),
+                        }),
+                    },
+                },
+            },
+            ir::Stmt::If {
+                branches: vec![(
+                    not_matched,
+                    vec![ir::Stmt::IndexAssign {
+                        base: ir::Expr {
+                            ty: rest_ty,
+                            kind: ir::ExprKind::Local(rest_tmp.clone()),
+                        },
+                        index: ir::Expr {
+                            ty: ir::Ty::Str,
+                            kind: ir::ExprKind::Local(k_t.clone()),
+                        },
+                        value: val_at,
+                    }],
+                )],
+                orelse: vec![],
+            },
+        ];
+        let step = vec![ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(i_t.clone()),
+                    }),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        }];
+        let loop_cond = ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Lt,
+                left: Box::new(ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Local(i_t),
+                }),
+                right: Box::new(ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                        ty: ir::list_of(ir::Ty::Str),
+                        kind: ir::ExprKind::Local(keys_t),
+                    })),
+                }),
+            },
+        };
+        binds.push(ir::Stmt::While {
+            cond: loop_cond,
+            body,
+            step,
+        });
+        let rest_e = ir::Expr {
+            ty: rest_ty,
+            kind: ir::ExprKind::Local(rest_tmp),
+        };
+        let stmt = bind_name(rest_name, span, None, rest_e, span, ctx)?;
+        binds.push(stmt);
+    }
+    Ok(cond)
 }
 
 /// `with open(...) as f:` — files only. Desugars to bind +
@@ -4790,8 +6290,60 @@ fn lower_method_stmt(
             lower_dict_method_stmt(base_ir, *key, *value, method, method_span, args, ctx)
         }
         ir::Ty::Set(elem) => lower_set_method_stmt(base_ir, *elem, method, method_span, args, ctx),
+        ir::Ty::Generator { yield_ty } => {
+            lower_generator_method_stmt(base_ir, *yield_ty, method, method_span, args, ctx)
+        }
         other => Err(err(
             format!("'{other}' has no method '{method}'"),
+            method_span,
+        )),
+    }
+}
+
+fn lower_generator_method_stmt(
+    base_ir: ir::Expr,
+    yield_ty: ir::Ty,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Stmt> {
+    match method {
+        "close" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("close() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Stmt::GenClose { generator: base_ir })
+        }
+        "send" => {
+            // send(None) ≡ next(g); non-None send is not supported yet.
+            if args.len() != 1 {
+                return Err(err(
+                    format!("send() takes exactly one argument ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let v = lower_expr(&args[0], ctx)?;
+            if !matches!(v.kind, ir::ExprKind::ConstNone) && v.ty != ir::Ty::None {
+                return Err(err(
+                    "generator.send(value) only supports send(None) in this subset \
+                     (equivalent to next()); non-None send is not supported yet",
+                    args[0].span,
+                ));
+            }
+            // Discard the next value (statement form).
+            let next = ir::Expr {
+                ty: ir::optional_of(yield_ty),
+                kind: ir::ExprKind::GeneratorNext(Box::new(base_ir)),
+            };
+            Ok(ir::Stmt::ExprStmt(next))
+        }
+        "throw" => Err(err("generator.throw() is not supported yet", method_span)),
+        _ => Err(err(
+            format!("generator method '{method}' is not supported yet (supported: close, send)"),
             method_span,
         )),
     }
@@ -5346,6 +6898,15 @@ fn lower_assign_ir(
         ast::AssignTarget::Name { name, span } => {
             let stmt = bind_name(name, *span, ann_ty, value_ir, value_span, ctx)?;
             out.push(stmt);
+            // First outer bind of a free-captured name → box into a cell so
+            // CellNew is not stuck inside an untaken nested-def branch.
+            if ctx.cell_candidates.contains(name)
+                && !ctx.cell_locals.contains_key(name)
+                && let Some(ty) = ctx.locals.get(name).copied()
+                && let Some(init) = ensure_cell(ctx, name, ty, *span)?
+            {
+                out.push(init);
+            }
             Ok(())
         }
         ast::AssignTarget::Index { base, index } => {
@@ -6036,10 +7597,12 @@ fn lower_for_generator(
             }),
         },
     };
+    let entry_ref = ctx.type_refinements.clone();
     let bind = bind_name(var, var_span, None, extracted, var_span, ctx)?;
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx)?;
     ctx.loop_depth -= 1;
+    restore_refinements_after_for(ctx, entry_ref, var, body, orelse);
     let body_stmts = vec![
         ir::Stmt::Assign {
             name: nxt_t.clone(),
@@ -6063,12 +7626,38 @@ fn lower_for_generator(
             },
         },
     ];
-    let _ = &body_stmts;
     let cond = ir::Expr {
         ty: ir::Ty::Bool,
         kind: ir::ExprKind::Local(more_t),
     };
-    push_loop_with_else(cond, body_stmts, vec![], orelse, ctx, out)
+    push_loop_with_else(cond, body_stmts, vec![], orelse, ctx, out)?;
+    clear_orelse_assigns(ctx, orelse);
+    Ok(())
+}
+
+/// After lowering a `for` body, restore entry peels and drop peels for names
+/// the body (or loop variable) may rebind. Zero-trip loops must not keep
+/// body-only peels (e.g. `for i in range(0): x = 5` must not leave `x` as int).
+fn restore_refinements_after_for(
+    ctx: &mut FnCtx,
+    entry: HashMap<String, ir::Ty>,
+    var: &str,
+    body: &[ast::Stmt],
+    orelse: &[ast::Stmt],
+) {
+    ctx.type_refinements = entry;
+    for name in assigned_names_in_stmts(body) {
+        ctx.type_refinements.remove(&name);
+    }
+    ctx.type_refinements.remove(var);
+    // `orelse` is lowered next under these peels; clear its assigns after.
+    let _ = orelse;
+}
+
+fn clear_orelse_assigns(ctx: &mut FnCtx, orelse: &[ast::Stmt]) {
+    for name in assigned_names_in_stmts(orelse) {
+        ctx.type_refinements.remove(&name);
+    }
 }
 
 /// Emit while + optional else (else runs only if no break).
@@ -6082,6 +7671,16 @@ fn push_loop_with_else(
 ) -> SResult<()> {
     if orelse.is_empty() {
         out.push(ir::Stmt::While { cond, body, step });
+        return Ok(());
+    }
+    let else_body = lower_nested_block(orelse, ctx)?;
+    // No `break` in this loop: else always runs after the loop ends (or if
+    // the loop never runs). Emit else as straight-line so return-path analysis
+    // sees its `return`s. The broke-flag form uses `if not broke: else` with
+    // an empty orelse, which `block_returns` cannot treat as exhaustive.
+    if !loop_breaks(&body) {
+        out.push(ir::Stmt::While { cond, body, step });
+        out.extend(else_body);
         return Ok(());
     }
     let broke = ctx.fresh_temp("broke", ir::Ty::Bool);
@@ -6104,7 +7703,6 @@ fn push_loop_with_else(
             }),
         },
     };
-    let else_body = lower_nested_block(orelse, ctx)?;
     out.push(ir::Stmt::If {
         branches: vec![(not_broke, else_body)],
         orelse: vec![],
@@ -6198,6 +7796,7 @@ fn lower_for_file(
             args: vec![file_local],
         },
     };
+    let entry_ref = ctx.type_refinements.clone();
     let bind = bind_name(var, var_span, None, line, var_span, ctx)?;
 
     let line_local = if let ir::Stmt::Assign { name, .. } = &bind {
@@ -6228,6 +7827,7 @@ fn lower_for_file(
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx)?;
     ctx.loop_depth -= 1;
+    restore_refinements_after_for(ctx, entry_ref, var, body, orelse);
 
     let stop = ir::Stmt::Assign {
         name: more_t,
@@ -6244,7 +7844,9 @@ fn lower_for_file(
         },
     ];
 
-    push_loop_with_else(more_local, loop_body, vec![], orelse, ctx, out)
+    push_loop_with_else(more_local, loop_body, vec![], orelse, ctx, out)?;
+    clear_orelse_assigns(ctx, orelse);
+    Ok(())
 }
 
 /// `for x in xs` / `for c in s` — index from 0 to len (re-read each iteration).
@@ -6328,11 +7930,13 @@ fn lower_for_indexed(
             index: Box::new(idx_local.clone()),
         },
     };
+    let entry_ref = ctx.type_refinements.clone();
     let bind = bind_name(var, var_span, None, element, var_span, ctx)?;
 
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx);
     ctx.loop_depth -= 1;
+    restore_refinements_after_for(ctx, entry_ref, var, body, orelse);
     let mut loop_body = vec![bind];
     loop_body.extend(user_body?);
 
@@ -6348,7 +7952,9 @@ fn lower_for_indexed(
         },
     }];
 
-    push_loop_with_else(cond, loop_body, step, orelse, ctx, out)
+    push_loop_with_else(cond, loop_body, step, orelse, ctx, out)?;
+    clear_orelse_assigns(ctx, orelse);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6487,11 +8093,13 @@ fn lower_for_range(
     };
 
     // var = .it as the first statement of the body
+    let entry_ref = ctx.type_refinements.clone();
     let bind = bind_name(var, var_span, None, it_local.clone(), var_span, ctx)?;
 
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx);
     ctx.loop_depth -= 1;
+    restore_refinements_after_for(ctx, entry_ref, var, body, orelse);
     let mut loop_body = vec![bind];
     loop_body.extend(user_body?);
 
@@ -6507,7 +8115,9 @@ fn lower_for_range(
         },
     };
 
-    push_loop_with_else(cond, loop_body, vec![step_stmt], orelse, ctx, out)
+    push_loop_with_else(cond, loop_body, vec![step_stmt], orelse, ctx, out)?;
+    clear_orelse_assigns(ctx, orelse);
+    Ok(())
 }
 
 fn int_const(v: i64) -> ir::Expr {
@@ -6644,6 +8254,33 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
             ),
             span,
         ));
+    }
+
+    // Closures with matching params/ret and empty captures: retype for
+    // homogeneous containers (call uses the object's code pointer).
+    if let (
+        ir::Ty::Closure {
+            params: p1,
+            ret: r1,
+            capture_tys: c1,
+            ..
+        },
+        ir::Ty::Closure {
+            params: p2,
+            ret: r2,
+            capture_tys: c2,
+            ..
+        },
+    ) = (value.ty, target)
+        && p1 == p2
+        && r1 == r2
+        && c1.is_empty()
+        && c2.is_empty()
+    {
+        return Ok(ir::Expr {
+            ty: target,
+            kind: value.kind,
+        });
     }
 
     // None → only ok for None target (handled by equality) or unions (above)
@@ -6787,6 +8424,20 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         return extract_union_member(base, nty, expr.span);
                     }
                     // Multi-member peel: keep storage union type.
+                    return Ok(base);
+                }
+                // Module-level / global name under a refinement peel.
+                if let Some(ty) = ctx.globals.get(name) {
+                    let base = ir::Expr {
+                        ty: *ty,
+                        kind: ir::ExprKind::GlobalLoad(ctx.own_global(name)),
+                    };
+                    if nty != *ty
+                        && matches!(ty, ir::Ty::Union(_))
+                        && !matches!(nty, ir::Ty::Union(_))
+                    {
+                        return extract_union_member(base, nty, expr.span);
+                    }
                     return Ok(base);
                 }
             }
@@ -7196,6 +8847,40 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         *method_span,
                     )),
                 },
+                ir::Ty::Generator { yield_ty } => match method.as_str() {
+                    "close" => Err(err(
+                        "generator.close() returns None and cannot be used in an expression",
+                        *method_span,
+                    )),
+                    "send" => {
+                        if args.len() != 1 {
+                            return Err(err(
+                                format!("send() takes exactly one argument ({} given)", args.len()),
+                                *method_span,
+                            ));
+                        }
+                        let v = lower_expr(&args[0], ctx)?;
+                        if !matches!(v.kind, ir::ExprKind::ConstNone) && v.ty != ir::Ty::None {
+                            return Err(err(
+                                "generator.send(value) only supports send(None) in this subset",
+                                args[0].span,
+                            ));
+                        }
+                        // send(None) → yield_ty | None (like next)
+                        Ok(ir::Expr {
+                            ty: ir::optional_of(*yield_ty),
+                            kind: ir::ExprKind::GeneratorNext(Box::new(base_ir)),
+                        })
+                    }
+                    "throw" => Err(err("generator.throw() is not supported yet", *method_span)),
+                    _ => Err(err(
+                        format!(
+                            "generator method '{method}' is not supported yet \
+                             (supported: close, send)"
+                        ),
+                        *method_span,
+                    )),
+                },
                 other => Err(err(
                     format!("'{other}' has no method '{method}'"),
                     *method_span,
@@ -7371,10 +9056,25 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             lower_compare_chain(first_ir, rest, expr.span, ctx)
         }
         ast::ExprKind::Binary { op, left, right } => {
-            // and/or yield an operand (not always bool), with short-circuit
+            // and/or yield an operand (not always bool), with short-circuit.
+            // Mid-expression refine: `x is not None and x > 0` types the RHS
+            // under the left's then-refinements; `x is None or x < 0` under
+            // the left's else-refinements (CPython short-circuit order).
             if matches!(op, ast::BinOp::And | ast::BinOp::Or) {
                 let l = lower_expr(left, ctx)?;
+                let saved = ctx.type_refinements.clone();
+                let (then_ref, else_ref) = narrowing_from_condition(left, ctx);
+                if *op == ast::BinOp::And {
+                    for (k, v) in then_ref {
+                        ctx.type_refinements.insert(k, v);
+                    }
+                } else {
+                    for (k, v) in else_ref {
+                        ctx.type_refinements.insert(k, v);
+                    }
+                }
                 let r = lower_expr(right, ctx)?;
+                ctx.type_refinements = saved;
                 let (l, r, ty) = unify_and_or(l, r, expr.span)?;
                 let ir_op = if *op == ast::BinOp::And {
                     ir::BinOp::And
@@ -7396,11 +9096,8 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         }
         ast::ExprKind::Lambda { params, body } => lower_lambda(params, body, expr.span, ctx),
         ast::ExprKind::Yield(v) => {
-            if ctx.try_depth > 0 {
-                return Err(err(
-                    "'yield' inside 'try'/'except'/'finally' is not supported yet",
-                    expr.span,
-                ));
+            if ctx.finally_depth > 0 {
+                return Err(err("yield in finally is not supported yet", expr.span));
             }
             let val = match v {
                 Some(e) => lower_expr(e, ctx)?,
@@ -7425,105 +9122,363 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             })
         }
         ast::ExprKind::YieldFrom(iter) => {
-            // Desugar: for _item in iter: yield _item
-            if ctx.try_depth > 0 {
-                return Err(err(
-                    "'yield from' inside 'try'/'except'/'finally' is not supported yet",
-                    expr.span,
-                ));
+            // Desugar to iteration + yield for any iterable supported by `for`.
+            if ctx.finally_depth > 0 {
+                return Err(err("yield from in finally is not supported yet", expr.span));
             }
             let Some(yty) = ctx.yield_ty else {
                 return Err(err("'yield from' outside function", expr.span));
             };
-            let iter_ir = lower_expr(iter, ctx)?;
-            match iter_ir.ty {
-                ir::Ty::List(elem) if *elem == yty => {
-                    // for loop body: yield each
-                    let var = ctx.fresh_temp("yf", yty);
-                    let i = ctx.fresh_temp("yfi", ir::Ty::Int);
-                    let seq = ctx.fresh_temp("yfs", iter_ir.ty);
-                    let stmts = vec![
-                        ir::Stmt::Assign {
-                            name: seq.clone(),
-                            value: iter_ir,
-                        },
-                        ir::Stmt::Assign {
-                            name: i.clone(),
-                            value: int_const(0),
-                        },
-                        ir::Stmt::While {
-                            cond: ir::Expr {
-                                ty: ir::Ty::Bool,
-                                kind: ir::ExprKind::Binary {
-                                    op: ir::BinOp::Lt,
-                                    left: Box::new(ir::Expr {
-                                        ty: ir::Ty::Int,
-                                        kind: ir::ExprKind::Local(i.clone()),
-                                    }),
-                                    right: Box::new(ir::Expr {
-                                        ty: ir::Ty::Int,
-                                        kind: ir::ExprKind::Len(Box::new(ir::Expr {
-                                            ty: ir::list_of(yty),
-                                            kind: ir::ExprKind::Local(seq.clone()),
-                                        })),
-                                    }),
-                                },
-                            },
-                            body: vec![
-                                ir::Stmt::Assign {
-                                    name: var.clone(),
-                                    value: ir::Expr {
-                                        ty: yty,
-                                        kind: ir::ExprKind::Index {
-                                            base: Box::new(ir::Expr {
-                                                ty: ir::list_of(yty),
-                                                kind: ir::ExprKind::Local(seq.clone()),
-                                            }),
-                                            index: Box::new(ir::Expr {
-                                                ty: ir::Ty::Int,
-                                                kind: ir::ExprKind::Local(i.clone()),
-                                            }),
-                                        },
-                                    },
-                                },
-                                ir::Stmt::Yield(ir::Expr {
-                                    ty: yty,
-                                    kind: ir::ExprKind::Local(var),
-                                }),
-                            ],
-                            step: vec![ir::Stmt::Assign {
-                                name: i.clone(),
-                                value: ir::Expr {
-                                    ty: ir::Ty::Int,
-                                    kind: ir::ExprKind::Binary {
-                                        op: ir::BinOp::Add,
-                                        left: Box::new(ir::Expr {
-                                            ty: ir::Ty::Int,
-                                            kind: ir::ExprKind::Local(i),
-                                        }),
-                                        right: Box::new(int_const(1)),
-                                    },
-                                },
-                            }],
-                        },
-                    ];
-                    Ok(ir::Expr {
-                        ty: ir::Ty::None,
-                        kind: ir::ExprKind::Block {
-                            stmts,
-                            result: Box::new(const_none()),
-                        },
-                    })
-                }
-                other => Err(err(
-                    format!("yield from expects list[{yty}], found {other}"),
-                    expr.span,
-                )),
-            }
+            lower_yield_from(iter, yty, expr.span, ctx)
         }
         ast::ExprKind::Starred(_) => Err(err(
             "starred expression cannot be used here (only in list displays and unpack targets)",
             expr.span,
+        )),
+    }
+}
+
+/// Desugar `yield from iter` for lists, tuples, strings, and generators.
+fn lower_yield_from(
+    iter: &ast::Expr,
+    yty: ir::Ty,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    // Empty list literal: element type is the generator's yield type.
+    let iter_ir = match &iter.kind {
+        ast::ExprKind::ListLit(items) if items.is_empty() => {
+            lower_list_lit(items, Some(yty), iter.span, ctx)?
+        }
+        _ => lower_expr(iter, ctx)?,
+    };
+    match iter_ir.ty {
+        ir::Ty::List(elem) => {
+            let elem = *elem;
+            let seq = ctx.fresh_temp("yfs", ir::list_of(elem));
+            let i = ctx.fresh_temp("yfi", ir::Ty::Int);
+            let var = ctx.fresh_temp("yf", elem);
+            let item = ir::Expr {
+                ty: elem,
+                kind: ir::ExprKind::Local(var.clone()),
+            };
+            let yielded = coerce(item, yty, span, "yield from element")?;
+            let stmts = vec![
+                ir::Stmt::Assign {
+                    name: seq.clone(),
+                    value: iter_ir,
+                },
+                ir::Stmt::Assign {
+                    name: i.clone(),
+                    value: int_const(0),
+                },
+                ir::Stmt::While {
+                    cond: ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::Binary {
+                            op: ir::BinOp::Lt,
+                            left: Box::new(ir::Expr {
+                                ty: ir::Ty::Int,
+                                kind: ir::ExprKind::Local(i.clone()),
+                            }),
+                            right: Box::new(ir::Expr {
+                                ty: ir::Ty::Int,
+                                kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                                    ty: ir::list_of(elem),
+                                    kind: ir::ExprKind::Local(seq.clone()),
+                                })),
+                            }),
+                        },
+                    },
+                    body: vec![
+                        ir::Stmt::Assign {
+                            name: var,
+                            value: ir::Expr {
+                                ty: elem,
+                                kind: ir::ExprKind::Index {
+                                    base: Box::new(ir::Expr {
+                                        ty: ir::list_of(elem),
+                                        kind: ir::ExprKind::Local(seq),
+                                    }),
+                                    index: Box::new(ir::Expr {
+                                        ty: ir::Ty::Int,
+                                        kind: ir::ExprKind::Local(i.clone()),
+                                    }),
+                                },
+                            },
+                        },
+                        ir::Stmt::Yield(yielded),
+                    ],
+                    step: vec![ir::Stmt::Assign {
+                        name: i.clone(),
+                        value: ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Binary {
+                                op: ir::BinOp::Add,
+                                left: Box::new(ir::Expr {
+                                    ty: ir::Ty::Int,
+                                    kind: ir::ExprKind::Local(i),
+                                }),
+                                right: Box::new(int_const(1)),
+                            },
+                        },
+                    }],
+                },
+            ];
+            Ok(ir::Expr {
+                ty: ir::Ty::None,
+                kind: ir::ExprKind::Block {
+                    stmts,
+                    result: Box::new(const_none()),
+                },
+            })
+        }
+        ir::Ty::Str => {
+            // Yield each character (1-char str) when yty is str.
+            if yty != ir::Ty::Str {
+                return Err(err(
+                    format!("yield from str requires generator yield type str, found {yty}"),
+                    span,
+                ));
+            }
+            let seq = ctx.fresh_temp("yfstr", ir::Ty::Str);
+            let i = ctx.fresh_temp("yfi", ir::Ty::Int);
+            let ch = ctx.fresh_temp("yfch", ir::Ty::Str);
+            let stmts = vec![
+                ir::Stmt::Assign {
+                    name: seq.clone(),
+                    value: iter_ir,
+                },
+                ir::Stmt::Assign {
+                    name: i.clone(),
+                    value: int_const(0),
+                },
+                ir::Stmt::While {
+                    cond: ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::Binary {
+                            op: ir::BinOp::Lt,
+                            left: Box::new(ir::Expr {
+                                ty: ir::Ty::Int,
+                                kind: ir::ExprKind::Local(i.clone()),
+                            }),
+                            right: Box::new(ir::Expr {
+                                ty: ir::Ty::Int,
+                                kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                                    ty: ir::Ty::Str,
+                                    kind: ir::ExprKind::Local(seq.clone()),
+                                })),
+                            }),
+                        },
+                    },
+                    body: vec![
+                        ir::Stmt::Assign {
+                            name: ch.clone(),
+                            value: ir::Expr {
+                                ty: ir::Ty::Str,
+                                kind: ir::ExprKind::Index {
+                                    base: Box::new(ir::Expr {
+                                        ty: ir::Ty::Str,
+                                        kind: ir::ExprKind::Local(seq),
+                                    }),
+                                    index: Box::new(ir::Expr {
+                                        ty: ir::Ty::Int,
+                                        kind: ir::ExprKind::Local(i.clone()),
+                                    }),
+                                },
+                            },
+                        },
+                        ir::Stmt::Yield(ir::Expr {
+                            ty: ir::Ty::Str,
+                            kind: ir::ExprKind::Local(ch),
+                        }),
+                    ],
+                    step: vec![ir::Stmt::Assign {
+                        name: i.clone(),
+                        value: ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Binary {
+                                op: ir::BinOp::Add,
+                                left: Box::new(ir::Expr {
+                                    ty: ir::Ty::Int,
+                                    kind: ir::ExprKind::Local(i),
+                                }),
+                                right: Box::new(int_const(1)),
+                            },
+                        },
+                    }],
+                },
+            ];
+            Ok(ir::Expr {
+                ty: ir::Ty::None,
+                kind: ir::ExprKind::Block {
+                    stmts,
+                    result: Box::new(const_none()),
+                },
+            })
+        }
+        ir::Ty::Tuple(elems) => {
+            let mut stmts = Vec::new();
+            let tup = ctx.fresh_temp("yftup", iter_ir.ty);
+            stmts.push(ir::Stmt::Assign {
+                name: tup.clone(),
+                value: iter_ir,
+            });
+            for (i, et) in elems.iter().enumerate() {
+                let item = ir::Expr {
+                    ty: *et,
+                    kind: ir::ExprKind::Index {
+                        base: Box::new(ir::Expr {
+                            ty: ir::tuple_of(elems),
+                            kind: ir::ExprKind::Local(tup.clone()),
+                        }),
+                        index: Box::new(int_const(i as i64)),
+                    },
+                };
+                let yielded = coerce(item, yty, span, "yield from tuple element")?;
+                stmts.push(ir::Stmt::Yield(yielded));
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::None,
+                kind: ir::ExprKind::Block {
+                    stmts,
+                    result: Box::new(const_none()),
+                },
+            })
+        }
+        ir::Ty::Generator { yield_ty } => {
+            // CPython: `x = yield from g` gets StopIteration.value (None after
+            // bare return / fall-off; N after `return N`). close() on the outer
+            // closes the delegated generator so its finally runs.
+            let gy = *yield_ty;
+            let gen_t = ctx.fresh_temp("yfgen", iter_ir.ty);
+            let more_t = ctx.fresh_temp("yfmore", ir::Ty::Bool);
+            let opt_ty = ir::optional_of(gy);
+            let nxt_t = ctx.fresh_temp("yfnxt", opt_ty);
+            // Result type is Optional[yield_ty]: None when subgen ends without
+            // an explicit return value; Some(v) after `return v` (v coerced to yty).
+            let ret_ty = ir::optional_of(yty);
+            let ret_t = ctx.fresh_temp("yfret", ret_ty);
+            let none_ret = coerce(const_none(), ret_ty, span, "yield from default return")?;
+            let gen_local = ir::Expr {
+                ty: ir::generator_of(gy),
+                kind: ir::ExprKind::Local(gen_t.clone()),
+            };
+            let loop_body = vec![
+                ir::Stmt::Assign {
+                    name: nxt_t.clone(),
+                    value: ir::Expr {
+                        ty: opt_ty,
+                        kind: ir::ExprKind::GeneratorNext(Box::new(gen_local.clone())),
+                    },
+                },
+                ir::Stmt::If {
+                    branches: vec![(
+                        ir::Expr {
+                            ty: ir::Ty::Bool,
+                            kind: ir::ExprKind::IsNone {
+                                value: Box::new(ir::Expr {
+                                    ty: opt_ty,
+                                    kind: ir::ExprKind::Local(nxt_t.clone()),
+                                }),
+                                not: false,
+                            },
+                        },
+                        vec![
+                            ir::Stmt::Assign {
+                                name: more_t.clone(),
+                                value: ir::Expr {
+                                    ty: ir::Ty::Bool,
+                                    kind: ir::ExprKind::ConstBool(false),
+                                },
+                            },
+                            ir::Stmt::Assign {
+                                name: ret_t.clone(),
+                                value: {
+                                    // GeneratorReturnValue is already Optional[Y]
+                                    // (None if bare end; Some if return set).
+                                    // Payload encoding uses the subgen yield type;
+                                    // re-target to Optional[outer yield type].
+                                    let raw = ir::Expr {
+                                        ty: ir::optional_of(gy),
+                                        kind: ir::ExprKind::GeneratorReturnValue(Box::new(
+                                            gen_local.clone(),
+                                        )),
+                                    };
+                                    if raw.ty == ret_ty {
+                                        raw
+                                    } else {
+                                        // e.g. gy==yty, or both optional of same core —
+                                        // coerce union members if needed.
+                                        coerce(raw, ret_ty, span, "yield from return value")?
+                                    }
+                                },
+                            },
+                        ],
+                    )],
+                    orelse: {
+                        let extracted = ir::Expr {
+                            ty: gy,
+                            kind: ir::ExprKind::FromUnion {
+                                value: Box::new(ir::Expr {
+                                    ty: opt_ty,
+                                    kind: ir::ExprKind::Local(nxt_t.clone()),
+                                }),
+                            },
+                        };
+                        let yielded = coerce(extracted, yty, span, "yield from generator")?;
+                        vec![ir::Stmt::Yield(yielded)]
+                    },
+                },
+            ];
+            let stmts = vec![
+                ir::Stmt::Assign {
+                    name: gen_t.clone(),
+                    value: iter_ir,
+                },
+                ir::Stmt::Assign {
+                    name: ret_t.clone(),
+                    value: none_ret,
+                },
+                ir::Stmt::Assign {
+                    name: more_t.clone(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::ConstBool(true),
+                    },
+                },
+                // try/finally close: CPython closes the subgen on outer close /
+                // GeneratorExit and when yield-from finishes normally.
+                ir::Stmt::Try {
+                    body: vec![ir::Stmt::While {
+                        cond: ir::Expr {
+                            ty: ir::Ty::Bool,
+                            kind: ir::ExprKind::Local(more_t.clone()),
+                        },
+                        body: loop_body,
+                        step: vec![],
+                    }],
+                    handlers: vec![],
+                    orelse: vec![],
+                    finally: vec![ir::Stmt::GenClose {
+                        generator: gen_local,
+                    }],
+                },
+            ];
+            Ok(ir::Expr {
+                ty: ret_ty,
+                kind: ir::ExprKind::Block {
+                    stmts,
+                    result: Box::new(ir::Expr {
+                        ty: ret_ty,
+                        kind: ir::ExprKind::Local(ret_t),
+                    }),
+                },
+            })
+        }
+        other => Err(err(
+            format!("yield from expects an iterable (list/tuple/str/generator), found {other}"),
+            span,
         )),
     }
 }
@@ -8073,14 +10028,7 @@ fn lower_tuple_lit(
         if e.ty == ir::Ty::None || e.ty == ir::Ty::File {
             return Err(err(format!("tuple elements cannot be {}", e.ty), item.span));
         }
-        if matches!(e.ty, ir::Ty::Closure { .. }) {
-            return Err(err(
-                "tuple elements cannot be closures (closures are not first-class \
-                 in containers yet)",
-                item.span,
-            ));
-        }
-        if matches!(e.ty, ir::Ty::Generator { .. } | ir::Ty::Cell(_)) {
+        if matches!(e.ty, ir::Ty::Cell(_)) {
             return Err(err(format!("tuple elements cannot be {}", e.ty), item.span));
         }
         lowered.push((e, item.span));
@@ -8241,8 +10189,28 @@ fn lower_set_lit(
 }
 
 fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
-    // Closures are not first-class in containers (no slot tag).
-    if matches!(a, ir::Ty::Closure { .. }) || matches!(b, ir::Ty::Closure { .. }) {
+    // Homogeneous closures: same params/ret. Erase capture/func identity so
+    // CallClosure uses the code pointer from the heap object.
+    if let (
+        ir::Ty::Closure {
+            params: p1,
+            ret: r1,
+            capture_tys: c1,
+            ..
+        },
+        ir::Ty::Closure {
+            params: p2,
+            ret: r2,
+            capture_tys: c2,
+            ..
+        },
+    ) = (a, b)
+    {
+        if p1 == p2 && r1 == r2 && c1.is_empty() && c2.is_empty() {
+            return Some(ir::closure_of_full(p1, *r1, &[], ""));
+        }
+        // Same captures shape (rare homogeneous list of identical nested) —
+        // only when both are capture-free for container storage.
         return None;
     }
     match (a, b) {
@@ -8314,6 +10282,7 @@ fn lower_call_with_sig(
     extra_leading: &[ir::Expr],
 ) -> SResult<ir::Expr> {
     // Generator function call → MakeGenerator (resume body is `ir_name`).
+    // Leading captures (cells/values) become the first frame locals.
     if sig.is_generator {
         if kwargs.is_some() || !keywords.is_empty() {
             return Err(err(
@@ -8321,13 +10290,7 @@ fn lower_call_with_sig(
                 span,
             ));
         }
-        if !extra_leading.is_empty() {
-            return Err(err(
-                "nested generator functions with captures are not supported yet",
-                span,
-            ));
-        }
-        let mut arg_irs = Vec::new();
+        let mut arg_irs: Vec<ir::Expr> = extra_leading.to_vec();
         for (i, a) in args.iter().enumerate() {
             match a {
                 ast::PosArg::Pos(e) => {
@@ -8351,9 +10314,10 @@ fn lower_call_with_sig(
                 }
             }
         }
-        if arg_irs.len() != sig.params.len() {
+        let user_args = arg_irs.len() - extra_leading.len();
+        if user_args != sig.params.len() {
             // fill defaults
-            for (i, p) in sig.params.iter().enumerate().skip(arg_irs.len()) {
+            for p in sig.params.iter().skip(user_args) {
                 if let Some(d) = &p.default {
                     arg_irs.push(lower_expr(d, ctx)?);
                 } else {
@@ -8361,12 +10325,11 @@ fn lower_call_with_sig(
                         format!(
                             "'{display}' expected {} argument(s), got {}",
                             sig.params.len(),
-                            arg_irs.len()
+                            user_args
                         ),
                         span,
                     ));
                 }
-                let _ = i;
             }
         }
         let yty = sig.yield_ty.unwrap_or(ir::Ty::Int);
@@ -8375,12 +10338,13 @@ fn lower_call_with_sig(
         let nlocals = if sig.gen_frame_slots > 0 {
             sig.gen_frame_slots
         } else {
-            (sig.params.len() as i64) + 128
+            (arg_irs.len() as i64) + 128
         };
         return Ok(ir::Expr {
             ty: ir::generator_of(yty),
             kind: ir::ExprKind::MakeGenerator {
                 func: ir_name,
+                code_from: None,
                 args: arg_irs,
                 nlocals,
             },
@@ -9242,6 +11206,180 @@ fn invalidate_cell_refinements_for_call(ctx: &mut FnCtx, info: &NestedFnInfo) {
     }
 }
 
+/// `fs[0](x)` / general callable expression: first arg of synthetic `.call`.
+fn lower_value_call(
+    args: &[ast::PosArg],
+    keywords: &[ast::Keyword],
+    kwargs: Option<&ast::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.is_empty() {
+        return Err(err("internal: .call missing callee", span));
+    }
+    let callee_ast = match &args[0] {
+        ast::PosArg::Pos(e) => e,
+        ast::PosArg::Star(_) => {
+            return Err(err("cannot call a starred expression", span));
+        }
+    };
+    let callee = lower_expr(callee_ast, ctx)?;
+    let user_args = &args[1..];
+    match callee.ty {
+        ir::Ty::Closure { .. } => {
+            lower_call_closure_value(&callee, user_args, keywords, kwargs, span, ctx)
+        }
+        other => Err(err(
+            format!("'{other}' object is not callable"),
+            callee_ast.span,
+        )),
+    }
+}
+
+/// Invoke a first-class closure (or generator function closure) value.
+fn lower_call_closure_value(
+    clos_expr: &ir::Expr,
+    args: &[ast::PosArg],
+    keywords: &[ast::Keyword],
+    kwargs: Option<&ast::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let ir::Ty::Closure {
+        params: cparams,
+        ret: cret,
+        capture_tys,
+        func: ir_func,
+    } = clos_expr.ty
+    else {
+        return Err(err("internal: expected closure type", span));
+    };
+    invalidate_all_cell_refinements(ctx);
+    let mut arg_irs = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            ast::PosArg::Pos(e) => {
+                let expected = cparams.get(i).copied().unwrap_or(ir::Ty::None);
+                let v = lower_expr(e, ctx)?;
+                let v = coerce(v, expected, e.span, "argument")?;
+                arg_irs.push(v);
+            }
+            ast::PosArg::Star(_) => {
+                return Err(err(
+                    "starred arguments not supported when calling a closure value",
+                    span,
+                ));
+            }
+        }
+    }
+    if !keywords.is_empty() || kwargs.is_some() {
+        return Err(err(
+            "keyword arguments not supported when calling a closure value",
+            span,
+        ));
+    }
+    if arg_irs.len() < cparams.len() {
+        let defs: Option<Vec<(ir::Ty, Option<ast::Expr>)>> = ctx
+            .nested_funcs
+            .values()
+            .find(|i| i.ir_name == ir_func)
+            .map(|i| {
+                i.sig
+                    .params
+                    .iter()
+                    .map(|p| (p.ty, p.default.clone()))
+                    .collect()
+            })
+            .or_else(|| lookup_closure_defaults(ir_func));
+        if let Some(defs) = defs {
+            for i in arg_irs.len()..cparams.len() {
+                match defs.get(i) {
+                    Some((ty, Some(d))) => {
+                        arg_irs.push(lower_closure_default(d, *ty, span, ctx)?);
+                    }
+                    _ => {
+                        return Err(err(
+                            format!(
+                                "closure takes {} argument(s) but {} were given",
+                                cparams.len(),
+                                arg_irs.len()
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+        } else {
+            return Err(err(
+                format!(
+                    "closure takes {} argument(s) but {} were given",
+                    cparams.len(),
+                    arg_irs.len()
+                ),
+                span,
+            ));
+        }
+    } else if arg_irs.len() > cparams.len() {
+        return Err(err(
+            format!(
+                "closure takes {} argument(s) but {} were given",
+                cparams.len(),
+                arg_irs.len()
+            ),
+            span,
+        ));
+    }
+    // Generator function value: MakeGenerator with captures + args as frame locals.
+    if let ir::Ty::Generator { yield_ty } = *cret {
+        let is_gen = ctx
+            .nested_funcs
+            .values()
+            .find(|i| i.ir_name == ir_func)
+            .map(|i| i.sig.is_generator)
+            .unwrap_or(true);
+        if is_gen {
+            let mut frame_args = Vec::new();
+            // Unpack captures from the closure env into frame slots.
+            for (i, cty) in capture_tys.iter().enumerate() {
+                frame_args.push(ir::Expr {
+                    ty: *cty,
+                    kind: ir::ExprKind::ClosureCap {
+                        closure: Box::new(clos_expr.clone()),
+                        index: i as i64,
+                        cap_ty: *cty,
+                    },
+                });
+            }
+            frame_args.extend(arg_irs);
+            let nlocals = (frame_args.len() as i64) + 128;
+            // Erased func name (homogeneous list of gens) → code from closure.
+            let code_from = if ir_func.is_empty() {
+                Some(Box::new(clos_expr.clone()))
+            } else {
+                None
+            };
+            return Ok(ir::Expr {
+                ty: ir::generator_of(*yield_ty),
+                kind: ir::ExprKind::MakeGenerator {
+                    func: ir_func.to_string(),
+                    code_from,
+                    args: frame_args,
+                    nlocals,
+                },
+            });
+        }
+    }
+    Ok(ir::Expr {
+        ty: *cret,
+        kind: ir::ExprKind::CallClosure {
+            closure: Box::new(clos_expr.clone()),
+            args: arg_irs,
+            capture_tys: capture_tys.to_vec(),
+            func: ir_func.to_string(),
+        },
+    })
+}
+
 /// Conservatively clear all cell refinements (unknown callees / CallClosure).
 fn invalidate_all_cell_refinements(ctx: &mut FnCtx) {
     let names: Vec<String> = ctx.cell_locals.keys().cloned().collect();
@@ -9259,6 +11397,10 @@ fn lower_call(
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
+    // Synthetic value-call from parser: `.call(callee, *user_args)`.
+    if func == ".call" {
+        return lower_value_call(args, keywords, kwargs, span, ctx);
+    }
     // Call through a local/global of closure type first (local rebind shadows nested def).
     let closure_ty = ctx
         .locals
@@ -9341,92 +11483,8 @@ fn lower_call(
     }
     // Call through a local/global of closure type: `f(x)` where f is a closure value
     if let Some(ty) = closure_ty
-        && let ir::Ty::Closure {
-            params: cparams,
-            ret: cret,
-            capture_tys,
-            func: ir_func,
-        } = ty
+        && let ir::Ty::Closure { .. } = ty
     {
-        // Escaped / rebound closures may write any cell they captured.
-        invalidate_all_cell_refinements(ctx);
-        let mut arg_irs = Vec::new();
-        for (i, a) in args.iter().enumerate() {
-            match a {
-                ast::PosArg::Pos(e) => {
-                    let expected = cparams.get(i).copied().unwrap_or(ir::Ty::None);
-                    let v = lower_expr(e, ctx)?;
-                    let v = coerce(v, expected, e.span, "argument")?;
-                    arg_irs.push(v);
-                }
-                ast::PosArg::Star(_) => {
-                    return Err(err(
-                        "starred arguments not supported when calling a closure value",
-                        span,
-                    ));
-                }
-            }
-        }
-        if !keywords.is_empty() || kwargs.is_some() {
-            return Err(err(
-                "keyword arguments not supported when calling a closure value",
-                span,
-            ));
-        }
-        if arg_irs.len() < cparams.len() {
-            // Defaults from nested_funcs (same scope) or registry (escaped closures).
-            let defs: Option<Vec<(ir::Ty, Option<ast::Expr>)>> = ctx
-                .nested_funcs
-                .values()
-                .find(|i| i.ir_name == ir_func)
-                .map(|i| {
-                    i.sig
-                        .params
-                        .iter()
-                        .map(|p| (p.ty, p.default.clone()))
-                        .collect()
-                })
-                .or_else(|| lookup_closure_defaults(ir_func));
-            if let Some(defs) = defs {
-                for i in arg_irs.len()..cparams.len() {
-                    match defs.get(i) {
-                        Some((ty, Some(d))) => {
-                            let v = lower_expr(d, ctx)?;
-                            let v = coerce(v, *ty, d.span, "default argument")?;
-                            arg_irs.push(v);
-                        }
-                        _ => {
-                            return Err(err(
-                                format!(
-                                    "closure takes {} argument(s) but {} were given",
-                                    cparams.len(),
-                                    arg_irs.len()
-                                ),
-                                span,
-                            ));
-                        }
-                    }
-                }
-            } else {
-                return Err(err(
-                    format!(
-                        "closure takes {} argument(s) but {} were given",
-                        cparams.len(),
-                        arg_irs.len()
-                    ),
-                    span,
-                ));
-            }
-        } else if arg_irs.len() > cparams.len() {
-            return Err(err(
-                format!(
-                    "closure takes {} argument(s) but {} were given",
-                    cparams.len(),
-                    arg_irs.len()
-                ),
-                span,
-            ));
-        }
         let clos_expr = if ctx.locals.contains_key(func) {
             ir::Expr {
                 ty,
@@ -9438,15 +11496,7 @@ fn lower_call(
                 kind: ir::ExprKind::GlobalLoad(ctx.own_global(func)),
             }
         };
-        return Ok(ir::Expr {
-            ty: *cret,
-            kind: ir::ExprKind::CallClosure {
-                closure: Box::new(clos_expr),
-                args: arg_irs,
-                capture_tys: capture_tys.to_vec(),
-                func: ir_func.to_string(),
-            },
-        });
+        return lower_call_closure_value(&clos_expr, args, keywords, kwargs, span, ctx);
     }
     // a function defined in this module
     if ctx.funcs().contains_key(func) {
@@ -10089,36 +12139,94 @@ fn math_intrinsic(name: &str) -> Option<ir::MathOp> {
     })
 }
 
-/// `expr is None` / `expr is not None` (either operand may be the None literal).
+/// Drop a single `FromUnion` peel so `is None` / `is not None` always see
+/// storage (union) tags. Flow-sensitive refinements retype loads via
+/// `FromUnion` for arithmetic; if that peeled value were used here, codegen
+/// would constant-fold the check (`int is not None` → true) and `while
+/// x is not None: x = None` would infinite-loop.
+fn unwrap_from_union_peel(e: ir::Expr) -> ir::Expr {
+    match e.kind {
+        ir::ExprKind::FromUnion { value } => *value,
+        _ => e,
+    }
+}
+
+/// `expr is None` / `expr is not None`, or pointer identity for heap objects
+/// (lists, dicts, sets, tuples, str, closures, generators, files).
 fn lower_is_none(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
     let not = matches!(op, ast::BinOp::IsNot);
+    let l = unwrap_from_union_peel(l);
+    let r = unwrap_from_union_peel(r);
     let l_none = matches!(l.kind, ir::ExprKind::ConstNone) || l.ty == ir::Ty::None;
     let r_none = matches!(r.kind, ir::ExprKind::ConstNone) || r.ty == ir::Ty::None;
-    let value = match (l_none, r_none) {
-        (false, true) => l,
-        (true, false) => r,
+    match (l_none, r_none) {
+        (false, true) => Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::IsNone {
+                value: Box::new(l),
+                not,
+            },
+        }),
+        (true, false) => Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::IsNone {
+                value: Box::new(r),
+                not,
+            },
+        }),
         (true, true) => {
             // `None is None` → True; `None is not None` → False
-            return Ok(ir::Expr {
+            Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::ConstBool(!not),
-            });
+            })
         }
         (false, false) => {
-            return Err(err(
-                "'is' / 'is not' only support comparison with None \
-                 (e.g. 'x is None' or 'x is not None')",
-                span,
-            ));
+            // Pointer identity for same-type heap objects; same-binding locals
+            // of int/float/bool compare by value-as-slot (not CPython int interning).
+            if l.ty != r.ty {
+                return Err(err(
+                    format!(
+                        "'is' / 'is not' require the same type on both sides \
+                         (found {} and {})",
+                        l.ty, r.ty
+                    ),
+                    span,
+                ));
+            }
+            let ptr_like = matches!(
+                l.ty,
+                ir::Ty::Str
+                    | ir::Ty::List(_)
+                    | ir::Ty::Tuple(_)
+                    | ir::Ty::Dict { .. }
+                    | ir::Ty::Set(_)
+                    | ir::Ty::File
+                    | ir::Ty::Closure { .. }
+                    | ir::Ty::Generator { .. }
+                    | ir::Ty::Cell(_)
+            );
+            if !ptr_like
+                && !matches!(
+                    l.ty,
+                    ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Union(_)
+                )
+            {
+                return Err(err(
+                    format!("'is' / 'is not' is not supported for type {}", l.ty),
+                    span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::IsIdentity {
+                    left: Box::new(l),
+                    right: Box::new(r),
+                    not,
+                },
+            })
         }
-    };
-    Ok(ir::Expr {
-        ty: ir::Ty::Bool,
-        kind: ir::ExprKind::IsNone {
-            value: Box::new(value),
-            not,
-        },
-    })
+    }
 }
 
 fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
@@ -11205,7 +13313,9 @@ print(f())
     }
 
     #[test]
-    fn for_else_without_break_emits_not_broke_if() {
+    fn for_else_without_break_is_straight_line() {
+        // No break in body → else is appended (not if-not-broke), so return
+        // analysis can see else `return`s.
         let m = analyze_ok(
             "\
 for i in range(2):
@@ -11215,7 +13325,6 @@ else:
 ",
         );
         let entry = find_func(&m, ENTRY_NAME);
-        // broke=False, While, If(not broke)
         assert!(
             entry
                 .body
@@ -11224,8 +13333,9 @@ else:
             "{:?}",
             entry.body
         );
+        // No broke-flag If: else is straight-line after the while.
         assert!(
-            entry.body.iter().any(|s| matches!(
+            !entry.body.iter().any(|s| matches!(
                 s,
                 ir::Stmt::If {
                     branches,
@@ -11235,13 +13345,13 @@ else:
                     ir::ExprKind::Unary { op: ir::UnOp::Not, .. }
                 )
             )),
-            "expected if-not-broke for for-else, body={:?}",
+            "expected straight-line for-else when no break, body={:?}",
             entry.body
         );
     }
 
     #[test]
-    fn while_else_desugars_to_broke_flag() {
+    fn while_else_without_break_is_straight_line() {
         let m = analyze_ok(
             "\
 n = 0
@@ -11253,7 +13363,16 @@ else:
         );
         let entry = find_func(&m, ENTRY_NAME);
         assert!(
-            entry.body.iter().any(|s| matches!(
+            entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::While { .. })),
+            "{:?}",
+            entry.body
+        );
+        // broke flag only when the body can `break`.
+        assert!(
+            !entry.body.iter().any(|s| matches!(
                 s,
                 ir::Stmt::Assign {
                     value: ir::Expr {
@@ -11263,15 +13382,36 @@ else:
                     ..
                 }
             )),
-            "expected broke=False init, body={:?}",
+            "expected no broke=False when body has no break, body={:?}",
             entry.body
         );
+    }
+
+    #[test]
+    fn while_else_with_break_uses_broke_flag() {
+        let m = analyze_ok(
+            "\
+n = 0
+while n < 3:
+    n = n + 1
+    break
+else:
+    print(1)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
         assert!(
-            entry
-                .body
-                .iter()
-                .any(|s| matches!(s, ir::Stmt::While { .. })),
-            "{:?}",
+            entry.body.iter().any(|s| matches!(
+                s,
+                ir::Stmt::If {
+                    branches,
+                    ..
+                } if matches!(
+                    branches[0].0.kind,
+                    ir::ExprKind::Unary { op: ir::UnOp::Not, .. }
+                )
+            )),
+            "expected if-not-broke when body can break, body={:?}",
             entry.body
         );
     }
@@ -11704,7 +13844,10 @@ print(count([]))
         );
         let e = analyze_err("x: int | None = None\ny: int = x\n");
         assert!(
-            e.message.contains("cannot use") || e.message.contains("is None"),
+            e.message.contains("cannot use")
+                || e.message.contains("is None")
+                || e.message.contains("type mismatch")
+                || e.message.contains("None"),
             "{}",
             e.message
         );

@@ -690,12 +690,13 @@ impl Parser {
             "ZeroDivisionError" => ExcType::ZeroDivisionError,
             "TypeError" => ExcType::TypeError,
             "RuntimeError" => ExcType::RuntimeError,
+            "GeneratorExit" => ExcType::GeneratorExit,
             other => {
                 return Err(Diagnostic::new(
                     Phase::Parse,
                     format!(
                         "unknown exception type '{other}'; supported: ValueError, KeyError, \
-                         IndexError, ZeroDivisionError, TypeError, RuntimeError"
+                         IndexError, ZeroDivisionError, TypeError, RuntimeError, GeneratorExit"
                     ),
                     span,
                 ));
@@ -1416,11 +1417,47 @@ impl Parser {
         Ok(base)
     }
 
-    /// Postfix operators: subscripts `x[i]` and method calls `x.m(...)`.
+    /// Postfix operators: subscripts `x[i]`, calls `x(...)` / `x[i](...)`,
+    /// and method calls `x.m(...)`.
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_primary()?;
         loop {
             match self.peek() {
+                Token::LParen => {
+                    // Call on a primary/postfix value: `fs[0](x)`, `(f)(x)`.
+                    // Bare `name(...)` is usually parsed in parse_primary; this
+                    // also covers parenthesized names and index/attr results.
+                    self.advance();
+                    let (args, keywords, kwargs) = self.parse_call_args()?;
+                    let close = self.expect(Token::RParen, "after call arguments")?;
+                    let span = expr.span.to(close);
+                    if let ExprKind::Name(name) = &expr.kind {
+                        expr = Expr {
+                            kind: ExprKind::Call {
+                                func: name.clone(),
+                                func_span: expr.span,
+                                args,
+                                keywords,
+                                kwargs: kwargs.map(Box::new),
+                            },
+                            span,
+                        };
+                    } else {
+                        // Synthetic: `.call(callee, *args)` — lowered in semantic.
+                        let mut full_args = vec![PosArg::Pos(expr)];
+                        full_args.extend(args);
+                        expr = Expr {
+                            kind: ExprKind::Call {
+                                func: ".call".to_string(),
+                                func_span: span,
+                                args: full_args,
+                                keywords,
+                                kwargs: kwargs.map(Box::new),
+                            },
+                            span,
+                        };
+                    }
+                }
                 Token::LBracket => {
                     self.advance();
                     // `[index]`, `[lo:hi]`, `[:hi]`, `[lo:]`, `[:]`
@@ -1945,7 +1982,7 @@ impl Parser {
 
     fn parse_match_case(&mut self) -> PResult<MatchCase> {
         let start = self.expect(Token::Case, "")?;
-        let pattern = self.parse_pattern()?;
+        let pattern = self.parse_as_pattern()?;
         let guard = if self.eat(&Token::If) {
             Some(self.parse_expr()?)
         } else {
@@ -1962,8 +1999,28 @@ impl Parser {
         })
     }
 
+    /// `pattern ['as' NAME]` — PEP 634 as-pattern (binds the whole match).
+    fn parse_as_pattern(&mut self) -> PResult<Pattern> {
+        let pat = self.parse_or_pattern()?;
+        if self.eat(&Token::As) {
+            let (name, nspan) = self.expect_ident("after 'as' in pattern")?;
+            if name == "_" {
+                return Err(Diagnostic::new(
+                    Phase::Parse,
+                    "cannot use '_' as an as-pattern target",
+                    nspan,
+                ));
+            }
+            return Ok(Pattern::As {
+                pattern: Box::new(pat),
+                name,
+            });
+        }
+        Ok(pat)
+    }
+
     /// Pattern grammar (subset): or-patterns of closed patterns.
-    fn parse_pattern(&mut self) -> PResult<Pattern> {
+    fn parse_or_pattern(&mut self) -> PResult<Pattern> {
         let first = self.parse_closed_pattern()?;
         if self.peek() != &Token::Pipe {
             return Ok(first);
@@ -1973,6 +2030,49 @@ impl Parser {
             alts.push(self.parse_closed_pattern()?);
         }
         Ok(Pattern::Or(alts))
+    }
+
+    /// Or-pattern without trailing `as` (used inside sequences/mappings).
+    fn parse_pattern(&mut self) -> PResult<Pattern> {
+        self.parse_as_pattern()
+    }
+
+    fn parse_sequence_items_until(
+        &mut self,
+        close: Token,
+        close_msg: &str,
+    ) -> PResult<(Vec<Pattern>, Option<usize>)> {
+        let mut items = Vec::new();
+        let mut star: Option<usize> = None;
+        if self.peek() != &close {
+            loop {
+                if self.peek() == &Token::Star {
+                    self.advance();
+                    if star.is_some() {
+                        return Err(self.error("multiple starred expressions in sequence pattern"));
+                    }
+                    let (name, nspan) = self.expect_ident("after '*' in sequence pattern")?;
+                    if name == "_" {
+                        // `*_` — match rest without binding
+                        items.push(Pattern::Wildcard);
+                    } else {
+                        items.push(Pattern::Capture(name));
+                    }
+                    let _ = nspan;
+                    star = Some(items.len() - 1);
+                } else {
+                    items.push(self.parse_pattern()?);
+                }
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+                if self.peek() == &close {
+                    break;
+                }
+            }
+        }
+        self.expect(close, close_msg)?;
+        Ok((items, star))
     }
 
     fn parse_closed_pattern(&mut self) -> PResult<Pattern> {
@@ -2007,47 +2107,86 @@ impl Parser {
             }
             Token::LBracket => {
                 self.advance();
-                let mut items = Vec::new();
-                if self.peek() != &Token::RBracket {
-                    loop {
-                        items.push(self.parse_pattern()?);
-                        if !self.eat(&Token::Comma) {
-                            break;
-                        }
-                        if self.peek() == &Token::RBracket {
-                            break;
-                        }
-                    }
-                }
-                self.expect(Token::RBracket, "to close sequence pattern")?;
-                Ok(Pattern::Sequence(items))
+                let (items, star) =
+                    self.parse_sequence_items_until(Token::RBracket, "to close sequence pattern")?;
+                Ok(Pattern::Sequence { items, star })
             }
             Token::LParen => {
                 self.advance();
                 if self.peek() == &Token::RParen {
                     self.advance();
-                    return Ok(Pattern::Sequence(vec![]));
+                    return Ok(Pattern::Sequence {
+                        items: vec![],
+                        star: None,
+                    });
+                }
+                // May be parenthesized pattern or sequence. Parse first item;
+                // without a comma it is just grouping (unless starred).
+                if self.peek() == &Token::Star {
+                    let (items, star) = self
+                        .parse_sequence_items_until(Token::RParen, "to close sequence pattern")?;
+                    return Ok(Pattern::Sequence { items, star });
                 }
                 let first = self.parse_pattern()?;
                 if self.peek() != &Token::Comma {
                     self.expect(Token::RParen, "to close parenthesized pattern")?;
                     return Ok(first);
                 }
+                // Put first back into a sequence by parsing the rest.
                 let mut items = vec![first];
+                let mut star = None;
                 while self.eat(&Token::Comma) {
                     if self.peek() == &Token::RParen {
                         break;
                     }
-                    items.push(self.parse_pattern()?);
+                    if self.peek() == &Token::Star {
+                        self.advance();
+                        if star.is_some() {
+                            return Err(
+                                self.error("multiple starred expressions in sequence pattern")
+                            );
+                        }
+                        let (name, _) = self.expect_ident("after '*' in sequence pattern")?;
+                        if name == "_" {
+                            items.push(Pattern::Wildcard);
+                        } else {
+                            items.push(Pattern::Capture(name));
+                        }
+                        star = Some(items.len() - 1);
+                    } else {
+                        items.push(self.parse_pattern()?);
+                    }
                 }
                 self.expect(Token::RParen, "to close sequence pattern")?;
-                Ok(Pattern::Sequence(items))
+                Ok(Pattern::Sequence { items, star })
             }
             Token::LBrace => {
                 self.advance();
                 let mut items = Vec::new();
+                let mut rest: Option<String> = None;
                 if self.peek() != &Token::RBrace {
                     loop {
+                        if self.peek() == &Token::DoubleStar {
+                            self.advance();
+                            if rest.is_some() {
+                                return Err(self.error("multiple ** patterns in mapping pattern"));
+                            }
+                            let (name, nspan) =
+                                self.expect_ident("after '**' in mapping pattern")?;
+                            if name == "_" {
+                                return Err(Diagnostic::new(
+                                    Phase::Parse,
+                                    "cannot use '_' as a mapping ** rest target",
+                                    nspan,
+                                ));
+                            }
+                            rest = Some(name);
+                            // **rest must be last (optional trailing comma)
+                            if self.eat(&Token::Comma) && self.peek() != &Token::RBrace {
+                                return Err(self.error("** rest must be the last mapping pattern"));
+                            }
+                            break;
+                        }
                         let key = match self.advance() {
                             (Token::Strlit(s), _) => s,
                             (_, span) => {
@@ -2070,7 +2209,7 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RBrace, "to close mapping pattern")?;
-                Ok(Pattern::Mapping(items))
+                Ok(Pattern::Mapping { items, rest })
             }
             other => Err(self.error(format!(
                 "unsupported match pattern starting with {}",

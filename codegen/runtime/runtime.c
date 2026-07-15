@@ -34,6 +34,7 @@
 #define PYRS_EXC_ZERODIV 4
 #define PYRS_EXC_TYPE 5
 #define PYRS_EXC_RUNTIME 6
+#define PYRS_EXC_GENEXIT 7
 #define PYRS_EXC_OTHER 99
 
 /* value tags for heterogeneous containers */
@@ -47,6 +48,8 @@
 /* heap box for union/Optional values in containers: { i32 print_tag, i64 payload }
  * print_tag = -1 means None; otherwise a normal TAG_* for the active member. */
 #define TAG_UNION 8
+#define TAG_CLOSURE 9
+#define TAG_GENERATOR 10
 /* list tags: 4 + 8 * elem_tag */
 
 /* layout shared with codegen: leading i64 length, then bytes (+ NUL) */
@@ -94,6 +97,8 @@ static const char *exc_type_name(int ty) {
         return "TypeError";
     case PYRS_EXC_RUNTIME:
         return "RuntimeError";
+    case PYRS_EXC_GENEXIT:
+        return "GeneratorExit";
     default:
         return "Exception";
     }
@@ -384,6 +389,12 @@ static void print_slot(long long slot, int tag) {
         }
         break;
     }
+    case TAG_CLOSURE:
+        fputs("<function>", stdout);
+        break;
+    case TAG_GENERATOR:
+        fputs("<generator>", stdout);
+        break;
     default:
         /* tag encoding for nested list: 4 + 8 * inner_tag */
         if (tag >= 4 && ((tag - 4) % 8) == 0) {
@@ -2706,22 +2717,38 @@ PyrsStr *pyrs_json_dumps(long long slot, int tag) {
 /* ---- cells (nonlocal / mutable free vars) ---- */
 typedef struct {
     long long slot;
+    int bound; /* 0 = unbound (NameError on load); 1 = assigned */
 } PyrsCell;
 
 PyrsCell *pyrs_cell_new(long long slot) {
     PyrsCell *c = (PyrsCell *)xmalloc(sizeof(PyrsCell));
     c->slot = slot;
+    c->bound = 1;
+    return c;
+}
+
+/* Unbound cell for late free-var capture (CPython empty cell until assign). */
+PyrsCell *pyrs_cell_new_unbound(void) {
+    PyrsCell *c = (PyrsCell *)xmalloc(sizeof(PyrsCell));
+    c->slot = 0;
+    c->bound = 0;
     return c;
 }
 
 long long pyrs_cell_load(PyrsCell *c) {
     check_ref(c);
+    if (!c->bound) {
+        /* Free-var cells: CPython NameError (not UnboundLocalError). */
+        pyrs_die("NameError: cannot access free variable where it is not "
+                 "associated with a value in enclosing scope");
+    }
     return c->slot;
 }
 
 void pyrs_cell_store(PyrsCell *c, long long slot) {
     check_ref(c);
     c->slot = slot;
+    c->bound = 1;
 }
 
 /* ---- closures ---- */
@@ -2764,11 +2791,16 @@ long long pyrs_closure_get(PyrsClosure *c, long long i) {
 }
 
 /* ---- generators ---- */
+#define PYRS_GEN_MAX_TRY 16
 typedef struct {
     void *code;          /* resume function: i32 (PyrsGen*) */
     long long state;     /* program counter */
     long long done;      /* non-zero when exhausted */
     long long yield_slot;/* last yielded value as slot */
+    long long return_slot; /* StopIteration.value / `return expr` payload */
+    long long return_set;  /* 1 if return_slot is a real return value (not bare end) */
+    long long closing;   /* non-zero while close() injects GeneratorExit */
+    long long try_phases[PYRS_GEN_MAX_TRY]; /* phase per active try across yield */
     long long nlocals;
     long long locals[];  /* frame */
 } PyrsGen;
@@ -2780,11 +2812,102 @@ PyrsGen *pyrs_gen_new(void *code, long long nlocals) {
     g->state = 0;
     g->done = 0;
     g->yield_slot = 0;
+    g->return_slot = 0;
+    g->return_set = 0;
+    g->closing = 0;
+    for (int i = 0; i < PYRS_GEN_MAX_TRY; i++) {
+        g->try_phases[i] = 0;
+    }
     g->nlocals = nlocals;
     for (long long i = 0; i < nlocals; i++) {
         g->locals[i] = 0;
     }
     return g;
+}
+
+void pyrs_gen_save_try_phase(PyrsGen *g, long long i, long long phase) {
+    check_ref(g);
+    if (i >= 0 && i < PYRS_GEN_MAX_TRY) {
+        g->try_phases[i] = phase;
+    }
+}
+
+long long pyrs_gen_load_try_phase(PyrsGen *g, long long i) {
+    check_ref(g);
+    if (i >= 0 && i < PYRS_GEN_MAX_TRY) {
+        return g->try_phases[i];
+    }
+    return 0;
+}
+
+int pyrs_gen_closing(PyrsGen *g) {
+    check_ref(g);
+    return g->closing ? 1 : 0;
+}
+
+/* Inject GeneratorExit and resume until the generator finishes. CPython
+ * close() swallows an uncaught GeneratorExit after finally runs. Yielding
+ * again after swallowing GeneratorExit is RuntimeError.
+ *
+ * Nested close (yield-from finally while outer GE is pending) must not
+ * clear the outer exception. */
+void pyrs_gen_close(PyrsGen *g) {
+    check_ref(g);
+    if (g->done) {
+        return;
+    }
+    int saved_type = g_exc_type;
+    char saved_msg[sizeof g_exc_msg];
+    memcpy(saved_msg, g_exc_msg, sizeof g_exc_msg);
+
+    g->closing = 1;
+    typedef int (*ResumeFn)(void *);
+    ResumeFn resume = (ResumeFn)g->code;
+    for (int i = 0; i < 10000 && !g->done; i++) {
+        int r = resume(g);
+        if (r != 0) {
+            break;
+        }
+        /* Yielded again while closing — CPython:
+         * RuntimeError: generator ignored GeneratorExit */
+        g->closing = 0;
+        g->done = 1;
+        /* Restore any outer exception before dying. */
+        if (saved_type != 0) {
+            g_exc_type = saved_type;
+            memcpy(g_exc_msg, saved_msg, sizeof g_exc_msg);
+        }
+        pyrs_die("RuntimeError: generator ignored GeneratorExit");
+    }
+    g->done = 1;
+    g->closing = 0;
+    if (saved_type != 0) {
+        /* Preserve outer pending exception (e.g. outer GeneratorExit). */
+        g_exc_type = saved_type;
+        memcpy(g_exc_msg, saved_msg, sizeof g_exc_msg);
+    } else if (g_exc_type == PYRS_EXC_GENEXIT) {
+        /* Swallow GeneratorExit produced by this close only. */
+        g_exc_type = 0;
+        g_exc_msg[0] = '\0';
+    }
+}
+
+void pyrs_gen_set_return(PyrsGen *g, long long slot) {
+    check_ref(g);
+    g->return_slot = slot;
+    g->return_set = 1;
+}
+
+long long pyrs_gen_return_value(PyrsGen *g) {
+    check_ref(g);
+    return g->return_slot;
+}
+
+/* 1 if generator executed `return <expr>` (StopIteration.value set).
+ * Bare `return` / fall-off leave this 0 so yield-from yields None. */
+int pyrs_gen_has_return(PyrsGen *g) {
+    check_ref(g);
+    return g->return_set ? 1 : 0;
 }
 
 long long pyrs_gen_get_local(PyrsGen *g, long long i) {
@@ -2831,4 +2954,8 @@ int pyrs_gen_done(PyrsGen *g) {
 void pyrs_gen_set_done(PyrsGen *g) {
     check_ref(g);
     g->done = 1;
+}
+
+int pyrs_gen_is_genexit(void) {
+    return g_exc_type == PYRS_EXC_GENEXIT ? 1 : 0;
 }

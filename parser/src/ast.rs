@@ -77,6 +77,7 @@ pub enum ExcType {
     ZeroDivisionError,
     TypeError,
     RuntimeError,
+    GeneratorExit,
 }
 
 impl ExcType {
@@ -88,6 +89,7 @@ impl ExcType {
             ExcType::ZeroDivisionError => "ZeroDivisionError",
             ExcType::TypeError => "TypeError",
             ExcType::RuntimeError => "RuntimeError",
+            ExcType::GeneratorExit => "GeneratorExit",
         }
     }
 }
@@ -290,10 +292,20 @@ pub enum Pattern {
     None,
     /// `p1 | p2 | ...`
     Or(Vec<Pattern>),
-    /// Fixed-length sequence `[a, b]` / `(a, b)`.
-    Sequence(Vec<Pattern>),
-    /// Mapping `{ "k": v, ... }` — string keys only in this subset.
-    Mapping(Vec<(String, Pattern)>),
+    /// Sequence `[a, b]` / `(a, b)`, optionally with one starred rest (`[a, *rest, b]`).
+    Sequence {
+        items: Vec<Pattern>,
+        /// Index of a starred rest capture in `items`, if any.
+        star: Option<usize>,
+    },
+    /// Mapping `{ "k": v, ... }` with optional `**rest` capture — string keys only.
+    Mapping {
+        items: Vec<(String, Pattern)>,
+        /// Optional `**rest` binding (remaining key/value pairs as `dict[str, V]`).
+        rest: Option<String>,
+    },
+    /// `pattern as name` (PEP 634 as-pattern).
+    As { pattern: Box<Pattern>, name: String },
 }
 
 /// One `except` clause under a `try`.

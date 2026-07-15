@@ -326,6 +326,8 @@ pub enum ExcType {
     ZeroDivisionError = 4,
     TypeError = 5,
     RuntimeError = 6,
+    /// Injected by `generator.close()` (CPython BaseException subclass).
+    GeneratorExit = 7,
 }
 
 impl ExcType {
@@ -337,6 +339,7 @@ impl ExcType {
             ExcType::ZeroDivisionError => "ZeroDivisionError",
             ExcType::TypeError => "TypeError",
             ExcType::RuntimeError => "RuntimeError",
+            ExcType::GeneratorExit => "GeneratorExit",
         }
     }
 
@@ -502,6 +505,10 @@ pub enum Stmt {
     },
     /// `yield value` inside a generator function — suspend and produce value.
     Yield(Expr),
+    /// `gen.close()` — inject GeneratorExit, run finally, mark done.
+    GenClose {
+        generator: Expr,
+    },
     Break,
     Continue,
 }
@@ -535,6 +542,12 @@ pub enum ExprKind {
     IsNone {
         value: Box<Expr>,
         /// When true, this is `is not None`.
+        not: bool,
+    },
+    /// Pointer / slot identity: `a is b` / `a is not b` for same-type values.
+    IsIdentity {
+        left: Box<Expr>,
+        right: Box<Expr>,
         not: bool,
     },
     /// Load a local variable.
@@ -728,15 +741,29 @@ pub enum ExprKind {
         /// Fully-qualified IR function name to call (captures + user args).
         func: String,
     },
+    /// Load capture slot `index` from a closure env (for MakeGenerator from
+    /// an escaped generator function value).
+    ClosureCap {
+        closure: Box<Expr>,
+        index: i64,
+        /// Type of the capture slot (cell ptr or by-value payload).
+        cap_ty: Ty,
+    },
     /// Allocate a cell and store the initial value.
     CellNew(Box<Expr>),
+    /// Allocate an unbound cell (load traps until the first store). Used for
+    /// late free-var capture before the outer assignment runs.
+    CellNewUnbound,
     /// Load the value from a cell.
     CellLoad(Box<Expr>),
     /// Create a generator object by calling a generator function's constructor.
-    /// `func` is the resume IR function; `args` are the original call args
-    /// (stored as generator locals). Yield type is on `expr.ty`.
+    /// `func` is the resume IR function; when empty, `code_from` supplies a
+    /// closure whose code pointer is the resume function (container of gens).
+    /// `args` are frame locals (captures then call args). Yield type is on `expr.ty`.
     MakeGenerator {
         func: String,
+        /// When `func` is empty, load `@code` via `pyrs_closure_code` on this value.
+        code_from: Option<Box<Expr>>,
         args: Vec<Expr>,
         /// Total frame slots (params + locals + temps). Over-estimate is fine.
         nlocals: i64,
@@ -744,6 +771,10 @@ pub enum ExprKind {
     /// Advance a generator: returns a union `yield_ty | None` where None means
     /// StopIteration (exhausted). Used by `for` desugaring.
     GeneratorNext(Box<Expr>),
+    /// Load the StopIteration / `return` payload of a finished generator.
+    /// Type on `expr.ty` is `Optional[Y]`: None when the subgen used bare
+    /// `return` / fell off the end; `Some(v)` after `return v`.
+    GeneratorReturnValue(Box<Expr>),
 }
 
 /// Unary ops from the pure-PyRs `math` module (bodies replaced at lower).
