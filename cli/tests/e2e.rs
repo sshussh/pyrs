@@ -2982,16 +2982,17 @@ fn assignment_after_reexport_wins() {
 }
 
 #[test]
-fn nested_import_in_if_is_rejected() {
-    let stderr = compile_project_expect_fail(
+fn nested_import_in_if_works() {
+    // Imports inside if/functions are allowed; module body still runs once.
+    let out = run_project(
         "nested_imp",
-        &[("main.py", "if True:\n    import mathx\n")],
+        &[
+            ("mathx.py", "X = 7\n"),
+            ("main.py", "if True:\n    import mathx\nprint(mathx.X)\n"),
+        ],
         "main.py",
     );
-    assert!(
-        stderr.contains("imports are only supported at module top level"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(out, "7\n");
 }
 
 #[test]
@@ -3277,21 +3278,21 @@ fn nested_package_only_import() {
 }
 
 #[test]
-fn nested_import_inside_package_module_is_rejected() {
-    let stderr = compile_project_expect_fail(
+fn nested_import_inside_package_module_works() {
+    let out = run_project(
         "pkg_nested_imp",
         &[
             ("utilpkg/__init__.py", ""),
-            ("utilpkg/a.py", "if True:\n    from . import b\n"),
+            (
+                "utilpkg/a.py",
+                "if True:\n    from . import b\nprint(b.X)\n",
+            ),
             ("utilpkg/b.py", "X = 1\n"),
             ("main.py", "import utilpkg.a\n"),
         ],
         "main.py",
     );
-    assert!(
-        stderr.contains("imports are only supported at module top level"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(out, "1\n");
 }
 
 #[test]
@@ -4582,25 +4583,403 @@ print(fact(5))
 }
 
 #[test]
-fn nested_function_return_is_rejected() {
-    let dir = TempDir::new("ret_nested");
-    let src = dir.0.join("prog.py");
-    fs::write(
-        &src,
-        "def outer(n: int) -> int:\n    def inner(x: int) -> int:\n        return x + n\n    return inner\n",
-    )
-    .unwrap();
-    let out = Command::new(PYRS)
-        .args(["compile", "-i"])
-        .arg(&src)
+fn nested_function_return_and_call_match_python() {
+    let src = "\
+def outer(n: int):
+    def inner(x: int) -> int:
+        return x + n
+    return inner
+
+f = outer(10)
+print(f(5))
+";
+    assert_eq!(run_program("closure_ret", src), "15\n");
+}
+
+#[test]
+fn bitwise_ops_match_python() {
+    let src = "\
+print(5 & 3)
+print(5 | 3)
+print(5 ^ 3)
+print(~5)
+print(1 << 4)
+print(16 >> 2)
+x = 7
+x &= 3
+print(x)
+y = 1
+y <<= 3
+print(y)
+print(True | False)
+";
+    let out = run_program("bitwise", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
         .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+        .expect("python3");
+    assert!(py.status.success(), "python3 failed");
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn star_unpack_and_list_star_match_python() {
+    let src = "\
+xs: list[int] = [1, 2, 3, 4, 5]
+a, *rest, b = xs
+print(a)
+print(rest)
+print(b)
+ys: list[int] = [10, 20]
+print([*ys, 30, *ys])
+";
+    let out = run_program("star_unpack", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success(), "python3 failed");
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn narrowing_is_not_none_match_python() {
+    let src = "\
+def f(x: int | None) -> int:
+    if x is not None:
+        return x + 1
+    return 0
+
+print(f(3))
+print(f(None))
+";
+    let out = run_program("narrow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success(), "python3 failed");
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn nonlocal_escaping_closure_match_python() {
+    let src = "\
+def make_counter():
+    n = 0
+    def inc() -> int:
+        nonlocal n
+        n = n + 1
+        return n
+    return inc
+
+c = make_counter()
+print(c())
+print(c())
+";
+    let out = run_program("nonlocal", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success(), "python3 failed");
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn lambda_match_python() {
+    // Defaults infer param types; bare `lambda x:` still needs annotation or default.
+    // CallClosure currently requires all args (defaults filled for nested defs only).
+    let src = "\
+f = lambda x=0, y=1: x + y
+print(f(2, 1))
+print(f(2, 3))
+print(f(0, 1))
+";
+    let out = run_program("lambda", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success(), "python3 failed");
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_yield_for_match_python() {
+    let src = "\
+def gen(n: int):
+    i = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+for x in gen(3):
+    print(x)
+";
+    let out = run_program("generator", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success(), "python3 failed");
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_case_literals_match_python() {
+    let src = "\
+def check(x: int) -> str:
+    match x:
+        case 1:
+            return \"one\"
+        case 2 | 3:
+            return \"two-or-three\"
+        case _:
+            return \"other\"
+
+print(check(1))
+print(check(2))
+print(check(9))
+";
+    let out = run_program("match", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success(), "python3 failed");
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn optional_param_annotation_from_default() {
+    let src = "\
+def f(x=1, y: int = 2) -> int:
+    return x + y
+print(f())
+print(f(10))
+";
+    let out = run_program("opt_param", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success(), "python3 failed");
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn import_in_function_match_python() {
+    // Multi-file: import inside function binds for use after.
+    let out = run_project(
+        "fn_import",
+        &[
+            ("helper.py", "VAL = 42\n"),
+            (
+                "main.py",
+                "def load() -> int:\n    import helper\n    return helper.VAL\nprint(load())\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn yield_in_try_is_compile_error() {
+    let (_, stderr) = run_program_expect_fail(
+        "yield_try",
+        "def g():\n    try:\n        yield 1\n    finally:\n        pass\n",
+    );
     assert!(
-        stderr.contains("not a value") || stderr.contains("not supported"),
+        stderr.contains("yield") && stderr.contains("try"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn reassignment_after_narrow_rejects() {
+    // After `x = None` the refinement becomes None; `x + 1` is rejected.
+    let (_, stderr) = run_program_expect_fail(
+        "narrow_reassign",
+        "\
+def f(x: int | None) -> int:
+    if x is not None:
+        x = None
+        return x + 1
+    return 0
+",
+    );
+    assert!(
+        stderr.contains("operator") && stderr.contains("None"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn early_return_none_check_narrows_fallthrough() {
+    let src = "\
+def f(x: int | None) -> int:
+    if x is None:
+        return 0
+    return x + 1
+print(f(3))
+print(f(None))
+";
+    let out = run_program("early_narrow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn multi_member_union_narrow_print() {
+    // int|str|None narrowed to int|str must not segfault on print.
+    let src = "\
+def f(x: int | str | None) -> None:
+    if x is not None:
+        print(x)
+f(1)
+f(\"a\")
+f(None)
+";
+    let out = run_program("multi_narrow", src);
+    assert_eq!(out, "1\na\n");
+}
+
+#[test]
+fn match_guard_sees_capture() {
+    let src = "\
+def check(x: int) -> str:
+    match x:
+        case n if n > 0:
+            return \"pos\"
+        case _:
+            return \"other\"
+print(check(3))
+print(check(-1))
+";
+    let out = run_program("match_guard", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_or_pattern_different_names_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "or_pat",
+        "\
+def f(x: int) -> int:
+    match x:
+        case 1 | y:
+            return 1
+        case _:
+            return 0
+",
+    );
+    assert!(
+        stderr.contains("alternative patterns bind different names"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn negative_shift_traps() {
+    let (code, stderr) = run_program_expect_fail("neg_shift", "print(1 << -1)\n");
+    assert_eq!(code, 1);
+    assert!(stderr.contains("negative shift count"), "stderr: {stderr}");
+}
+
+#[test]
+fn star_unpack_min_length_traps() {
+    let (code, stderr) = run_program_expect_fail(
+        "star_min",
+        "xs: list[int] = [1]\na, *rest, b = xs\nprint(a)\n",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("not enough values to unpack (expected at least 2, got 1)"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn generator_escape_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "gen_esc",
+        "\
+def outer():
+    def gen():
+        yield 1
+    return gen
+f = outer()
+",
+    );
+    assert!(
+        stderr.contains("cannot be used as a first-class value") && stderr.contains("generator"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn bare_unannotated_param_error() {
+    let (_, stderr) =
+        run_program_expect_fail("no_ann", "def f(x) -> int:\n    return x\nprint(f(1))\n");
+    assert!(
+        stderr.contains("missing a type annotation") && stderr.contains("parameter 'x'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn import_in_function_not_visible_outside() {
+    let stderr = compile_project_expect_fail(
+        "fn_imp_scope",
+        &[
+            ("helper.py", "VAL = 1\n"),
+            (
+                "main.py",
+                "def load() -> None:\n    import helper\nprint(helper.VAL)\n",
+            ),
+        ],
+        "main.py",
+    );
+    // Module name bound only inside load(); top-level `helper.VAL` fails.
+    assert!(
+        stderr.contains("attribute access is only supported")
+            || stderr.contains("name 'helper' is not defined"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn arithmetic_rshift_const_fold() {
+    let src = "print((-8) >> 2)\nprint((-1) >> 1)\n";
+    let out = run_program("ashr", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
@@ -4638,6 +5017,467 @@ hello\n\
 True\n\
 [1, 2]\n"
     );
+}
+
+#[test]
+fn match_sequence_mapping_str_bool_none_match_python() {
+    let src = "\
+def seq(xs: list[int]) -> int:
+    match xs:
+        case [a, b]:
+            return a + b
+        case _:
+            return -1
+
+def mp(d: dict[str, int]) -> int:
+    match d:
+        case {\"x\": v}:
+            return v
+        case _:
+            return 0
+
+def kind(x: int | str | bool | None) -> str:
+    match x:
+        case None:
+            return \"none\"
+        case True:
+            return \"true\"
+        case False:
+            return \"false\"
+        case s:
+            # capture last: str or other int — use type via later checks
+            return \"other\"
+
+print(seq([3, 4]))
+print(seq([1]))
+print(mp({\"x\": 9}))
+print(mp({\"y\": 1}))
+print(kind(None))
+print(kind(True))
+print(kind(False))
+";
+    let out = run_program("match_rich", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "python3 failed: {}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn yield_from_list_match_python() {
+    let src = "\
+def g():
+    yield from [10, 20, 30]
+
+for x in g():
+    print(x)
+";
+    let out = run_program("yield_from", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn escaped_nested_def_defaults_via_call_closure() {
+    let src = "\
+def outer():
+    def g(s: str = \"hi\") -> str:
+        return s
+    return g
+
+f = outer()
+print(f())
+print(f(\"ok\"))
+";
+    let out = run_program("esc_defaults", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn while_not_none_narrowing_match_python() {
+    let src = "\
+def f(x: int | None) -> int:
+    s = 0
+    while x is not None:
+        s = s + x
+        x = None
+    return s
+
+print(f(5))
+print(f(None))
+";
+    let out = run_program("while_narrow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn if_return_else_and_elif_narrowing_match_python() {
+    let src = "\
+def f(x: int | None) -> int:
+    if x is None:
+        return 0
+    else:
+        y = 1
+    return x + y
+
+def g(x: int | None) -> int:
+    if x is None:
+        return 0
+    elif x > 10:
+        return x
+    else:
+        y = 1
+    return x + y
+
+print(f(3))
+print(f(None))
+print(g(3))
+print(g(None))
+print(g(20))
+";
+    let out = run_program("elif_narrow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn cell_local_optional_narrowing_match_python() {
+    let src = "\
+def outer(x: int | None) -> int:
+    def inner() -> int:
+        nonlocal x
+        if x is None:
+            return 0
+        return x + 1
+    return inner()
+
+print(outer(4))
+print(outer(None))
+";
+    let out = run_program("cell_narrow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn lambda_string_default_and_ret_inference() {
+    let src = "\
+f = lambda x=\"a\": x
+print(f())
+print(f(\"b\"))
+";
+    let out = run_program("lambda_str", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn nested_def_rebind_to_lambda_match_python() {
+    let src = "\
+def outer() -> int:
+    def inner() -> int:
+        return 1
+    inner = lambda: 2
+    return inner()
+
+print(outer())
+";
+    let out = run_program("rebind_nested", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn optional_return_inference_forward_ref() {
+    // g is defined after f; pre-infer must give g a non-None ret.
+    let src = "\
+def f(n: int) -> int:
+    return g(n)
+
+def g(x: int):
+    return x + 1
+
+print(f(3))
+";
+    let out = run_program("ret_fwd", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn tuple_of_closures_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "tuple_clos",
+        "\
+def outer():
+    def f(x: int = 0) -> int:
+        return x
+    return f
+g = outer()
+t = (g, g)
+print(t)
+",
+    );
+    assert!(
+        stderr.contains("tuple elements cannot be closures"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn nonlocal_optional_cell_store_and_load() {
+    // CellStore must ToUnion so None / int both round-trip through the cell.
+    let src = "\
+def outer() -> int:
+    x: int | None = 5
+    def setn() -> None:
+        nonlocal x
+        x = None
+    def seti() -> None:
+        nonlocal x
+        x = 7
+    setn()
+    if x is None:
+        print(1)
+    seti()
+    if x is None:
+        return 0
+    return x
+print(outer())
+";
+    let out = run_program("cell_opt_store", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn nested_unannotated_return_cell_union() {
+    // Nested get() returns cell Optional; outer return get() must be valued, not void.
+    let src = "\
+def outer():
+    x: int | None = 1
+    def get():
+        nonlocal x
+        return x
+    return get()
+print(outer())
+";
+    let out = run_program("cell_ret_union", src);
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn else_arm_complementary_narrowing() {
+    // Then falls through; else must still see non-None x.
+    let src = "\
+def f(x: int | None) -> int:
+    if x is None:
+        y = 0
+    else:
+        y = x + 1
+    return y
+print(f(None))
+print(f(3))
+";
+    let out = run_program("else_narrow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn re_refine_after_concrete_assign_in_narrowed_branch() {
+    let src = "\
+def f(x: int | None) -> int:
+    if x is not None:
+        x = x + 1
+        return x
+    return 0
+print(f(3))
+print(f(None))
+";
+    let out = run_program("rerefine", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_or_pattern_three_arms_match_python() {
+    let src = "\
+def check(x: int) -> int:
+    match x:
+        case 1 | 2 | 3:
+            return x
+        case _:
+            return -1
+print(check(1))
+print(check(2))
+print(check(3))
+print(check(4))
+";
+    let out = run_program("or_three", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn bare_lambda_param_without_default_rejected() {
+    let (_, stderr) = run_program_expect_fail("bare_lam", "f = lambda x: x + 1\nprint(f(1))\n");
+    assert!(
+        stderr.contains("lambda parameter annotation"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn yield_from_non_list_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "yf_nonlist",
+        "def g():\n    yield from 1\nfor x in g():\n    print(x)\n",
+    );
+    assert!(
+        stderr.contains("yield from expects list"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn match_class_pattern_unsupported() {
+    // Class patterns are out of the supported match subset.
+    let (_, stderr) = run_program_expect_fail(
+        "match_cls",
+        "\
+def f(x: int) -> int:
+    match x:
+        case int():
+            return 1
+        case _:
+            return 0
+",
+    );
+    assert!(
+        stderr.contains("unsupported match pattern starting with 'int'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn sibling_nested_cell_call_threads_cell() {
+    // Sibling nested defs share outer cells: both() calls inc()/get() without
+    // naming x itself — must pass the cell through (CPython parity).
+    let src = "\
+def outer() -> int:
+    x = 1
+    def inc() -> None:
+        nonlocal x
+        x = x + 1
+    def get() -> int:
+        return x
+    def both() -> int:
+        inc()
+        return get()
+    return both()
+print(outer())
+";
+    let out = run_program("sib_cell", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn sibling_nested_optional_cell_call_match_python() {
+    let src = "\
+def outer():
+    x: int | None = 1
+    def get() -> int | None:
+        nonlocal x
+        return x
+    def use() -> int | None:
+        return get()
+    return use()
+print(outer())
+";
+    let out = run_program("sib_opt_cell", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
