@@ -208,7 +208,7 @@ value.
 
 | type | representation | notes |
 |------|----------------|-------|
-| `int`   | 64-bit signed integer | wraps on overflow (no bigints) |
+| `int`   | arbitrary precision | tagged i64 small ints (±2⁶²) or heap limbs (base 2⁶⁴); never freed |
 | `float` | IEEE-754 double | |
 | `bool`  | `True` / `False` | assignable where int/float is expected |
 | `str`   | immutable string | heap-allocated, length-prefixed |
@@ -426,10 +426,23 @@ print(f'''{"""nested"""}''')   # ok
 # print(f"""{"""nested"""}""") # not supported
 ```
 
-**Format specs:** `{x:.Nf}` (fixed-point with `N` digits after the
-decimal) is supported for `int`/`float`/`bool`. Other format codes
-(`e`, `g`, width/alignment, …) and conversions (`{x!r}`, `{x!s}`) are
-not supported yet and produce a targeted compile error.
+**Conversions:** `{x!s}`, `{x!r}`, and `{x!a}` apply `str` / `repr` /
+`ascii` before formatting (supported for `int`/`float`/`bool`/`str`).
+
+**Format specs:** free-form mini-language on scalars:
+
+```text
+[[fill]align][sign][#][0][width][.precision][type]
+```
+
+- align `<>^=`, sign `+ -` space, `#`, `0`, width, precision
+- types: `d b o x X f F e E g G s %` (empty type = default for the value)
+- nested fields: `{x:{w}}`, `{x:{w}.{p}f}` (no `!` / `:` inside nested fields)
+- empty format (`{x}` / `{x:}`) matches `str(x)` for int/float/bool/str
+
+Not supported yet (clear errors): self-documenting `{x=}`, grouping
+(`,` / `_`), types `n` / `c`. Containers cannot appear in f-strings
+(same as `str()`).
 
 ### Lists
 
@@ -471,20 +484,22 @@ for x in xs:     # iteration re-reads the live length,
     xs.append(x) # so appending inside the loop extends it (careful!)
 ```
 
-List comprehensions work with an optional filter and follow Python 3
-scoping (the variable shadows inside and does not leak):
+List comprehensions support multiple `for` / `if` clauses and unpack
+targets. Simple loop names follow Python 3 scoping (shadow inside; do
+not leak). Unpack targets bind real locals (like a nested `for`):
 
 ```python
 squares = [x * x for x in range(10)]
 big = [w.upper() for w in words if len(w) > 3]
+pairs = [(i, j) for i in range(2) for j in range(3) if (i + j) % 2 == 0]
+sums = [a + b for a, b in [(1, 2), (3, 4)]]
 matrix = [[v * 2 for v in row] for row in grid]
 ```
 
 They are also the fastest way to build a list: the compiler pre-sizes
-the result when the length is knowable and inlines the appends, making
-a comprehension ~2.4x faster than the equivalent append loop. Multiple
-`for`/`if` clauses in one comprehension are not supported yet — nest
-comprehensions instead.
+the result when a single generator has no filters and the length is
+knowable, and inlines the appends — a comprehension is ~2.4x faster than
+the equivalent append loop in that case.
 
 Lists slice with steps too: `xs[::-1]` reverses, `xs[::2]` takes every
 other element. Lists nest — `grid[i][j]`, `grid[i][j] = v`, and printing
@@ -534,6 +549,8 @@ for i in range(10, 0, -3):   # 10, 7, 4, 1
     print(i)
 for x in [1, 2, 3]: ...      # over a list
 for c in "hello": ...        # over a string's characters
+for a, b in pairs: ...       # unpack each element
+for a, *rest in rows: ...    # starred rest, same as assignment
 
 # else runs only when the loop ends without break
 for x in xs:
@@ -550,11 +567,12 @@ else:
 
 `range()` is lazy (no list is materialized) and accepts any int
 expressions; a step of zero raises `ValueError` at runtime (or at compile
-time when it's a constant). The loop variable keeps its final value after
-the loop, like Python. `break`/`continue` work in both loop kinds;
-`continue` in a `for` still advances the iteration. A `for`/`while` `else`
-clause runs when the loop finishes normally (including zero iterations)
-and is skipped if the loop exits via `break`.
+time when it's a constant). Loop targets keep their final values after
+the loop, like Python (including names bound by unpack). `break`/`continue`
+work in both loop kinds; `continue` in a `for` still advances the
+iteration. A `for`/`while` `else` clause runs when the loop finishes
+normally (including zero iterations) and is skipped if the loop exits
+via `break`.
 
 ### Functions
 
@@ -587,16 +605,17 @@ def clamp(x: float, lo: float, hi: float) -> float:
   untaken branch does not leave outer loads unbound. Nested *assignment*
   still needs `nonlocal`. Nested functions may recurse and may be
   returned / stored as closure values (including in homogeneous lists/
-  tuples of capture-free closures — call with `fs[0](args)`). Late free
-  binding works for the common pattern (`def f(): return n` then `n = 5`
-  then `f()`). Sibling nested defs may call each other without
-  define-before-use (sigs are pre-registered). Rebinding a local name
-  over a nested def shadows the nested function (CPython-like).
-  **Default arguments** of nested defs/lambdas are evaluated once at
-  definition time (CPython). Free-var defaults that only work after the
-  outer frame returns (escaped / multi-level `CallClosure` with a
-  non-literal default) need a constant default — the compiler reports a
-  clear error rather than a missing frozen temp name.
+  tuples of closures with matching params/ret and capture env shape —
+  call with `fs[0](args)`). Late free binding works for the common
+  pattern (`def f(): return n` then `n = 5` then `f()`). Sibling nested
+  defs may call each other without define-before-use (sigs are
+  pre-registered). Rebinding a local name over a nested def shadows the
+  nested function (CPython-like). **Default arguments** of nested
+  defs/lambdas are evaluated once at definition time (CPython). Free-var
+  defaults that only work after the outer frame returns (escaped /
+  multi-level `CallClosure` with a non-literal default) need a constant
+  default — the compiler reports a clear error rather than a missing
+  frozen temp name.
 - A function declared `-> T` (or with an inferred concrete return type)
   must return on every path — the compiler checks this (an infinite
   `while True:` without `break` counts as not falling through). `while` /
@@ -611,18 +630,27 @@ def clamp(x: float, lo: float, hi: float) -> float:
   receive it as `Y | None` (None after bare `return` / fall-off; the value
   after an explicit `return`). Empty `yield from []` is allowed.
   `try`/`except`/`else`/
-  `finally` (including yield inside try/except) is supported; setjmp
-  frames and try **phase** are restored on resume after yield (a raise
-  after yield in `except`/`else` does not re-enter that try's handlers).
-  **`yield` / `yield from` inside `finally` is not supported yet**
-  (compile error). `yield from` a generator closes the subgenerator on
-  finish or when the outer is closed (sub `finally` runs). Escaping
-  nested generator functions as values works (including capture-free
+  `finally` (including yield / yield from inside try/except/**finally**)
+  is supported; setjmp frames, try **phase**, and try **exit kind** are
+  restored on resume after yield (a raise after yield in `except`/`else`
+  does not re-enter that try's handlers; yield in finally keeps the
+  pending exit for finally dispatch). `yield from` a generator closes
+  the subgenerator on finish or when the outer is closed (sub `finally`
+  runs). Escaping nested generator functions as values works (including
   lists). Methods: `close()` injects **GeneratorExit** (a supported
   `except` type) so active `finally` blocks run; uncaught GeneratorExit
   is swallowed; yielding again after swallowing it is
   `RuntimeError: generator ignored GeneratorExit`. `send(None)` ≡ next;
-  non-None `send` and `throw` are not supported yet.
+  `send(v)` delivers `v` (typed as the yield type) as the yield
+  expression value (`Optional[Y]`; non-None before the first yield is
+  TypeError). `throw(ExcType)` / `throw(ExcType("msg"))` inject at the
+  suspended yield (uncaught exceptions propagate; not-yet-started gens
+  raise immediately). Exhaustion via `for`/`send` is Optional None (not
+  a raised StopIteration). After close, exhaust, or an uncaught `throw`,
+  further `send`/`for` advances yield Optional None and do not re-enter
+  the body. `send`/`throw` are **not** forwarded through `yield from`
+  (the subgenerator is only advanced with `None`; full PEP 380
+  send/throw/close delegation through `yield from` is unsupported).
 - Function names are internally prefixed, so naming a function `printf`
   or `malloc` cannot collide with the C library.
 
@@ -767,7 +795,8 @@ only structural difference).
 ### Modules and packages
 
 Split a program across files and packages. A directory with `__init__.py`
-counts as a package.
+is a regular package; a directory without `__init__.py` is a namespace
+package (PEP 420 subset — see below).
 
 **Import search order** (stacked; first hit wins — user code shadows the
 stdlib):
@@ -880,6 +909,8 @@ from ..other import x      # parent package (when nested)
 - `import pkg.mod as m` — binds `m` to the leaf module.
 - `from M import a, b as c` — bring names into scope (functions, globals,
   or submodules of a package).
+- `from M import *` — module-level only; public names of `M`, or static
+  `__all__` when present (see below).
 - **Package re-exports:** a package `__init__.py` may
   `from .mod import name` (or `from . import mod`). Those names are then
   available as `pkg.name` and `from pkg import name`.
@@ -928,11 +959,25 @@ go above the top-level package.
 Multi-name imports work: `import a, b as c` loads each module and binds
 aliases like CPython.
 
-Still unsupported: `from M import *`, namespace packages (no
-`__init__.py`), modules as first-class values beyond attribute/call
-chains, re-assigning another module's attributes from outside, and a
-package **importing itself** by name (`import utilpkg` inside
-`utilpkg/__init__.py` is a compile error).
+**Namespace packages (PEP 420 subset):** a directory without `__init__.py`
+that exists on a search root is a package. `import utilpkg.mod` works when
+only `utilpkg/mod.py` exists; `import utilpkg` alone loads a synthetic empty
+package. Nested namespace directories work. Prefer, per name:
+`__init__.py` package → `name.py` module → namespace directory. Children stay
+under the origin that resolved the top-level package (no multi-path /
+split packages; embedded stdlib is not searched for namespace dirs).
+
+**`from M import *`:** module-level only (function-level →
+`import * only allowed at module level`). Expands to public names of `M`
+(not starting with `_`), or to a static `__all__ = ["a", "b"]` /
+`("a", "b")` list/tuple of string literals when present (including private
+names listed there). Dynamic/`__all__` that is not a static string sequence
+is a compile error. `from sys import *` is not supported.
+
+Still unsupported: multi-path split namespace packages, modules as
+first-class values beyond attribute/call chains, re-assigning another
+module's attributes from outside, and a package **importing itself** by
+name (`import utilpkg` inside `utilpkg/__init__.py` is a compile error).
 
 **Imports inside functions** are allowed (CPython-like): the binding is
 local to that function and not visible at module scope. Module top-level
@@ -1021,8 +1066,11 @@ first error.
 Everything PyRs *does* support behaves like Python — these are the known,
 deliberate exceptions:
 
-1. **`int` is 64-bit** and wraps on overflow; there are no big integers.
-   Integer literals beyond ±2⁶³ don't lex.
+1. **`int` is arbitrary precision** (like CPython). Values that fit in
+   ±2⁶² are tagged in an i64 slot; larger values are heap `PyrsInt`
+   limbs (base 2⁶⁴, never freed — same interim memory model as other
+   heaps). Equal bigints are not interned, so `is` is pointer/tag
+   identity, not value identity.
 2. **`and`/`or` yield an operand** (like CPython), including mixed
    non-numeric pairs typed as a union (e.g. `0 or "x"` → `int | str`).
    Same-type / both-numeric operands keep the previous unify rules.
@@ -1065,12 +1113,13 @@ deliberate exceptions:
     checks always read storage tags. No attribute or full SAT-style
     narrowing. Multi-member peels keep a safe storage type for print/tags.
 
-Container notes (v0.15):
+Container notes (v0.17):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`
-  and methods are not supported yet. Homogeneous capture-free closures
-  (and generators) may be tuple/list elements; call via `t[i](args)`.
+  and methods are not supported yet. Homogeneous closures (same
+  params/ret and capture env shape) and generators may be tuple/list
+  elements; call via `t[i](args)`.
 - **dict:** keys are `int` or `str` only; bare `get(k)` returns
   `Optional[V]` (`None` on miss); `get(k, default)` keeps value type;
   `keys`/`values`/`items` return lists (not views); insertion-order
@@ -1081,29 +1130,34 @@ Container notes (v0.15):
   `is`/`is not` with `None` and same-type identity; `|` is bitwise-or in
   expressions and union in type annotations.
 - **generators:** `yield` / `yield from` (list, tuple, str chars, other
-  generators; subgen `return` value available to yield-from; subgen
-  closed on outer close), try/except/else/finally (setjmp re-armed after
-  yield resume; try phase preserved; **no yield in finally yet**),
-  `close()` (GeneratorExit + finally; ignore-GE → RuntimeError) and
-  `send(None)` (≡ next). Non-None `send` and `throw` are not supported
-  yet. Escaping nested generator functions (including lists of gen
-  functions) works; homogeneous capture-free closures in containers too.
+  generators; including inside `finally`; subgen `return` value available
+  to yield-from; subgen closed on outer close), try/except/else/finally
+  (setjmp re-armed after yield resume; try phase and exit kind preserved),
+  `close()` (GeneratorExit + finally; ignore-GE → RuntimeError),
+  `send(None|value)` (yield expression is `Optional[Y]`), and
+  `throw(ExcType)` / `throw(ExcType("msg"))`. Exhaustion is Optional
+  None in `for`/`send` (not StopIteration); post-close/exhaust/uncaught
+  throw stays done. `send`/`throw` are not forwarded through
+  `yield from` (subgen advanced with None only). Escaping nested
+  generator functions (including lists of gen functions) works;
+  homogeneous capturing closures in containers too.
 
 Exception notes: supported types are ValueError, KeyError, IndexError,
 ZeroDivisionError, TypeError, RuntimeError, **GeneratorExit**.
 `except E as e` binds the message `str`, not an exception object. Other
 traps (`EOFError`, `FileNotFoundError`, …) match bare `except:` only.
 
-Not implemented yet (clear compile errors): classes, `from M import *`,
-namespace packages, GC / heap freeing, generator `throw` / non-None
-`send`, full f-string format specs beyond `{x:.Nf}`, unparenthesized
+Not implemented yet (clear compile errors): classes, GC / heap freeing,
+f-string debug form `{x=}` / grouping / types `n`/`c`, unparenthesized
 multi-line expressions inside f-string `{...}` (parenthesize instead),
-same-delimiter triple quotes nested
-inside an f-string expression, `__doc__` attribute access, dynamic
-`json.loads`, and most remaining methods on tuple/dict/set. `match`/`case`
-is a documented subset (literals, capture, `or`, sequence with optional
-`*rest`, mapping with str keys and optional `**rest`, `as` patterns,
-guards — **no class patterns**).
+same-delimiter triple quotes nested inside an f-string expression,
+`__doc__` attribute access, dynamic `json.loads`, multi-path split
+namespace packages, `from sys import *`, and most remaining methods on
+tuple/dict/set. Generator exhaustion is **Optional None** (not raised
+`StopIteration`) by design for this subset.
+`match`/`case` is a documented subset (literals, capture, `or`, sequence
+with optional `*rest`, mapping with str keys and optional `**rest`, `as`
+patterns, guards — **no class patterns**).
 
 ## 9. Performance
 

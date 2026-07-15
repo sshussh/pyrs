@@ -18,7 +18,7 @@ surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
 0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
 **PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
 use** (not merely because the minor is large). Current milestone:
-**v0.15** / `0.15.0`. Optional release tags: `vX.Y.Z`.
+**v0.17** / `0.17.0`. Optional release tags: `vX.Y.Z`.
 
 ---
 
@@ -302,10 +302,15 @@ programs** link only the object file from the shim plus `runtime.c`.
   child-loading import; child **function bodies** may use deferred parent
   attributes/calls after full parent init.
 - Multi-name `import a, b as c` is supported.
-- Still unsupported: `from m import *`, namespace packages (no
-  `__init__.py`), dynamic import. Function-local `import` / `from …
-  import` are supported (local scope). Load-time diagnostics use phase
-  tag `load`.
+- Namespace packages (PEP 420 subset): directory without `__init__.py` is
+  a package (`ModuleLoc::Namespace`); empty synthetic body; nested dirs;
+  prefer `__init__.py` > `.py` > namespace dir; no multi-path split.
+- `from m import *`: module-level only; expands public names or static
+  `__all__` (list/tuple of string lits); dynamic `__all__` rejected;
+  `from sys import *` unsupported.
+- Still unsupported: multi-path namespace packages, dynamic import.
+  Function-local `import` / `from … import` are supported (local scope;
+  not star). Load-time diagnostics use phase tag `load`.
 
 **Pipeline:**
 
@@ -327,7 +332,7 @@ programs** link only the object file from the shim plus `runtime.c`.
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.15 subset):**
+**Today (v0.17 subset):**
 
 - Static types after first assignment; cannot rebind a name to a
   different type.
@@ -341,14 +346,15 @@ programs** link only the object file from the shim plus `runtime.c`.
 - Function-wide local scoping with `global` / `nonlocal`; nested
   `def`/`lambda` as closures (free vars via cells boxed at outer bind;
   late free cells unbound until assign; nested assign needs `nonlocal`;
-  defaults freeze at def; capture-free closures may live in containers);
-  generators (`yield` / `yield from` list/tuple/str/gen; `return` stops
-  after SE; `try`/`except`/`else`/`finally` with yield, phase restored on
-  resume; `close()` runs finally); control-flow narrowing on `is None` /
-  `is not None` (body peels via simple `and`/`or`, mid-expr refine,
-  match-guard refine; post-loop/if rebind clears stale peels; free module
-  Optionals peel); `match`/`case` subset (`as`, `*rest`, `**rest`, or,
-  guards).
+  defaults freeze at def; homogeneous closures with matching capture env
+  may live in containers); generators (`yield` / `yield from`
+  list/tuple/str/gen including in finally; `return` stops after SE;
+  `try`/`except`/`else`/`finally` with yield, phase and exit restored on
+  resume; `close()` / `send` / `throw`); control-flow narrowing on
+  `is None` / `is not None` (body peels via simple `and`/`or`, mid-expr
+  refine, match-guard refine; post-loop/if rebind clears stale peels; free
+  module Optionals peel); `match`/`case` subset (`as`, `*rest`, `**rest`,
+  or, guards).
 - Minimal exceptions: `raise` + `try`/`except`/`else`/`finally` via setjmp
   frames (process-global, single-threaded); runtime traps (`pyrs_die`) are
   catchable. `return`/`break`/`continue` pop the frame and run `finally`.
@@ -456,19 +462,19 @@ These are product constraints that affect design choices:
 
 | Area             | Current                                              | Direction                                                                 |
 | ---------------- | ---------------------------------------------------- | ------------------------------------------------------------------------- |
-| Modules          | Packages + relative imports; sibling modules         | `from m import *`, namespace pkgs, richer package semantics if needed   |
+| Modules          | Packages, relative imports, namespace pkgs, `import *` | richer package semantics if needed                                      |
 | Memory           | Never free heap strings/lists                        | GC / freeing **before 1.0**                                               |
 | Typing           | Optional params with defaults; fixed types after assign | Fuller optional typing + more dynamism                                 |
 | Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
-| Language surface | Subset (see README v0.15); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
-| Product version  | `0.15.0` (and later `0.16.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
+| Language surface | Subset (see README v0.17); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
+| Product version  | `0.17.0` (and later `0.18.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
-`from m import *`, advanced match patterns, full generator protocol
-(`send`/`throw`), f-string format codes beyond `{x:.Nf}`, GC. Prefer
-compile-time rejection with a clear message over silent wrong behavior.
-`*args`/`**kwargs` on defs and call-site unpacking are supported.
+advanced match patterns, full `yield from` send/throw forwarding,
+f-string `{x=}` / grouping / `n`/`c`, GC. Prefer compile-time rejection with a
+clear message over silent wrong behavior. `*args`/`**kwargs` on defs and
+call-site unpacking, `from m import *`, and namespace packages are supported.
 
 **Strategy:** finish optimized **primitives** (IR + C) for current and new
 core types; grow pure-PyRs **stdlib** modules under repo `stdlib/` (embedded

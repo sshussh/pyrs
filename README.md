@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.15)
+## The language (v0.17)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.16.0**, not 1.0) until it is ready for
+milestone after this one is **0.18.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **classes** and **GC / heap freeing** are planned as the **last two**
@@ -50,24 +50,27 @@ No new stdlib until the language can host pure-PyRs libraries.
 
 A statically-typed Python subset:
 
-- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `None`,
+- **Types:** `int` (arbitrary precision; tagged small / heap limbs), `float` (f64), `bool`, `str`, `None`,
   unions (`int | None`, `str | int | None`), `Optional[T]`, `list[T]`,
   `tuple[T1, T2, …]`, `dict[K, V]`, `set[T]` — including nested lists
   (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only;
   list elements and dict values may be Optional/unions; homogeneous
-  capture-free closures may be list/tuple elements
+  closures (same params/ret and capture env shape, with or without
+  captures) may be list/tuple elements
 - **Functions:** `def` with optional parameter/return annotations
   (defaults infer param types; return type inferred from `return` when
   omitted), defaults and keyword args, recursion, forward references;
   pass/return tuples and other containers; nested `def` / `lambda` as
   first-class closures (including in containers and sibling/forward
   nested calls); late free-var binding (`def f(): return n` then
-  `n = 5`); `nonlocal`; generator functions with `yield` (may escape,
-  capture free vars, and use `try`/`except`/`finally`)
+  `n = 5`); `nonlocal`; generator functions with `yield` / `yield from`
+  (may escape, capture free vars, use `try`/`except`/`finally` including
+  yield in finally; `send` / `throw` / `close`)
 - **Statements:** `if`/`elif`/`else`, `while` / `for` (including
   `else` on loops — runs only if no `break`),
   `for x in range(...)` / lists / strings / files / tuples / dict keys /
-  sets / generators, `break`/`continue`, assignments (plain, annotated,
+  sets / generators (including unpack targets `for a, b in xs` and
+  `for a, *rest in xs`), `break`/`continue`, assignments (plain, annotated,
   multi-target, unpacking `a, b = t`, augmented — including
   `xs[i] += v`), `del d[k]`, `return`, `pass`, `raise ExcType("msg")`,
   `try`/`except`/`else`/`finally` (including inside generators),
@@ -87,10 +90,12 @@ A statically-typed Python subset:
   negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
   `print(...)` with any mix of values (including tuples/dicts/sets)
 - **f-strings:** `f"x={x}, next={x + 1}"` and multi-line `f"""…"""` /
-  `f'''…'''` with `{{`/`}}` escapes, nesting, and fixed-point `{x:.Nf}`
-  (other format codes / `!r` still unsupported; multi-line *expressions*
-  inside `{...}` need parentheses; same-delimiter triples inside `{...}`
-  unsupported — use the other quote style)
+  `f'''…'''` with `{{`/`}}` escapes, nesting, conversions `!s`/`!r`/`!a`,
+  and free-form format specs (fill/align/sign/`#`/`0`/width/precision/
+  types `dboxXfeEgGs%`, nested `{x:{w}.{p}f}`); no `{x=}`, grouping
+  `,`/`_`, or types `n`/`c` yet; multi-line *expressions* inside `{...}`
+  need parentheses; same-delimiter triples inside `{...}` unsupported —
+  use the other quote style
 - **Strings:** immutable; single/double and triple-quoted literals
   (`"""…"""` / `'''…'''`, multi-line; escapes as for single-line);
   module/function first-statement string docstrings are accepted as
@@ -101,8 +106,10 @@ A statically-typed Python subset:
   `rindex` `count` `replace` `split` `join` `isdigit` `isalpha`
   `isspace` `isupper` `islower`
 - **Lists:** homogeneous, growable; literals, comprehensions
-  (`[x * x for x in xs if x > 0]`, with Python 3 scoping — and faster
-  than the equivalent loop: results are pre-sized and appends inlined),
+  (`[x * x for x in xs if x > 0]`, multi-`for` / multi-`if`, unpack
+  targets `[a+b for a, b in pairs]`; simple names use Python 3 scoping
+  and do not leak — and faster than the equivalent loop when length is
+  knowable: results are pre-sized and appends inlined),
   indexing (read/write), slicing (copies, like Python),
   `append`/`pop`/`insert`/`remove`/`index`/`clear`/`sort`, `sorted()`,
   `+`/`*` (concat / repeat), `==`/`!=`, `in`, `len`, iteration;
@@ -138,7 +145,11 @@ A statically-typed Python subset:
   and partial package init (child module top level may read simple parent
   assigns set before the child import; child function bodies may use
   deferred parent attrs/calls after full init); a directory with
-  `__init__.py` is a package; module bodies run once at the import site
+  `__init__.py` is a regular package; a directory **without** `__init__.py`
+  is a **namespace package** (PEP 420 subset: single origin, no multi-path
+  split; prefer `__init__.py` > `name.py` > namespace dir); `from M import *`
+  expands public names (or static `__all__` list/tuple of string lits) at
+  module level only; module bodies run once at the import site
   (like Python). Import search order (stacked, first hit wins): (1) entry
   script directory, (2) `PYRS_STDLIB` if set, (3) workspace `stdlib/` when
   present (dev; not XOR with env), (4) **embedded** stdlib inside the
@@ -175,7 +186,9 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.15): no bigints (int is 64-bit and wraps), `min`/`max`
+Known limits (v0.17): `int` is arbitrary precision (tagged small ±2⁶² /
+heap limbs; limbs never freed, no interning/`is` identity for equal
+values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
 not the int `1`); iterable `min`/`max` is only for
 `list[int|float|bool]` (empty list → ValueError like CPython),
@@ -192,26 +205,35 @@ convert the int to float (exactness loss past 2^53), list literals
 coerce mixed numerics to one element type, `nan in [nan]` is False
 (IEEE equality), str methods use ASCII case/whitespace rules, heap
 memory is never freed, files support text modes "r"/"w"/"a" only, no
-`from m import *`, namespace packages without `__init__.py`, a package
+multi-path split namespace packages, no `from sys import *`, a package
 importing itself by name, or treating modules as first-class values
 beyond attribute/call chains; `os.path` is POSIX only; `*args` /
 `**kwargs` on defs and `*`/`**` unpacking in calls are supported for
 homogeneous list/dict types; starred assignment `a, *rest = xs` and
 list displays `[*a, *b]` work for lists/tuples; `json` has no dynamic
-`loads`; full f-string format specs (beyond `{x:.Nf}`) are unsupported;
-match/case is still a subset (**no class patterns**; or-patterns bind
+`loads`; f-string `{x=}`, grouping (`,`/`_`), and types `n`/`c` are
+unsupported; match/case is still a subset (**no class patterns**; or-patterns bind
 only the matching alt; duplicate names/keys rejected); generators
-support `yield` / `yield from` on list/tuple/str/generator (subgen
-`return` feeds yield-from; close cascades to yield-from subgens),
-`try`/`except`/`else`/`finally` (phase preserved across yield resume),
-`close()` (GeneratorExit + finally; ignore-GE → RuntimeError) and
-`send(None)` (≡ next; non-None `send` and `throw` unsupported);
-`except GeneratorExit` is supported; free captures use cells (late
-bind; load before assign → NameError); nested defaults freeze at def
-time (escaped free-var defaults need literals); lambda params without
-defaults still need annotations or defaults for inference; closures in
-containers require matching capture-free signatures (generator
-functions in lists OK); no classes / GC yet.
+support `yield` / `yield from` on list/tuple/str/generator (including
+inside `finally`; subgen `return` feeds yield-from; close cascades to
+yield-from subgens), `try`/`except`/`else`/`finally` (phase and try
+exit kind preserved across yield resume), `close()` (GeneratorExit +
+finally; ignore-GE → RuntimeError), `send(None|value)` (value must
+match yield type; non-None before first yield → TypeError; yield
+expression is `Optional[Y]`), and `throw(ExcType)` /
+`throw(ExcType("msg"))` (inject at yield; uncaught propagates);
+`for`/`send` treat exhaustion as Optional None rather than raising
+StopIteration; after close/exhaust/uncaught throw, further send is
+None and does not re-enter the body; `send`/`throw` are **not**
+forwarded through `yield from` (the subgenerator is only advanced with
+`None` — full PEP 380 send/throw delegation is unsupported);
+`except GeneratorExit`
+is supported; free captures use cells (late bind; load before assign
+→ NameError); nested defaults freeze at def time (escaped free-var
+defaults need literals); lambda params without defaults still need
+annotations or defaults for inference; homogeneous closures in
+containers need matching params/ret/capture-env shape; no classes /
+GC yet.
 
 Errors come with source snippets:
 
@@ -295,4 +317,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.15.0 && git push origin v0.15.0`.
+Release tags: `git tag v0.17.0 && git push origin v0.17.0`.
