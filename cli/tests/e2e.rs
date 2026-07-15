@@ -1256,10 +1256,214 @@ print(f\"x={pi:.3f} y={n:.0f}\")
 }
 
 #[test]
-fn fstring_unsupported_format_spec_is_compile_error() {
-    let dir = TempDir::new("fspecbad");
+fn fstring_conversions_match_python() {
+    let out = run_program(
+        "fconv",
+        "\
+name = \"world\"
+n = 42
+pi = 3.14159
+flag = True
+print(f\"{name!s}\")
+print(f\"{name!r}\")
+print(f\"{name!a}\")
+print(f\"{n!r}\")
+print(f\"{pi!r}\")
+print(f\"{flag!r}\")
+s = \"café\"
+print(f\"{s!a}\")
+print(f\"{n!s:>5}\")
+print(f\"{name!r:>12}\")
+",
+    );
+    assert_eq!(
+        out,
+        concat!(
+            "world\n",
+            "'world'\n",
+            "'world'\n",
+            "42\n",
+            "3.14159\n",
+            "True\n",
+            "'caf\\xe9'\n",
+            "   42\n",
+            "     'world'\n",
+        )
+    );
+}
+
+#[test]
+fn fstring_int_format_match_python() {
+    let out = run_program(
+        "fint",
+        "\
+n = 42
+print(f\"{n:d}\")
+print(f\"{n:x}\")
+print(f\"{n:X}\")
+print(f\"{n:o}\")
+print(f\"{n:b}\")
+print(f\"{n:#x}\")
+print(f\"{n:#X}\")
+print(f\"{n:#o}\")
+print(f\"{n:#b}\")
+print(f\"{n:05d}\")
+print(f\"{n:>5}\")
+print(f\"{n:<5}\")
+print(f\"{n:^5}\")
+print(f\"{n:+d}\")
+print(f\"{n: d}\")
+print(f\"{-n:d}\")
+print(f\"{-n:+d}\")
+print(f\"{n:08x}\")
+print(f\"{-n:05d}\")
+print(f\"{42:x>5d}\")
+print(f\"{0:b}\")
+print(f\"{255:#x}\")
+print(f\"{7:#o}\")
+print(f\"{True:d}\")
+print(f\"{False:d}\")
+print(f\"{True:10}\")
+print(f\"{False:10}\")
+",
+    );
+    assert_eq!(
+        out,
+        concat!(
+            "42\n",
+            "2a\n",
+            "2A\n",
+            "52\n",
+            "101010\n",
+            "0x2a\n",
+            "0X2A\n",
+            "0o52\n",
+            "0b101010\n",
+            "00042\n",
+            "   42\n",
+            "42   \n",
+            " 42  \n",
+            "+42\n",
+            " 42\n",
+            "-42\n",
+            "-42\n",
+            "0000002a\n",
+            "-0042\n",
+            "xxx42\n",
+            "0\n",
+            "0xff\n",
+            "0o7\n",
+            "1\n",
+            "0\n",
+            "         1\n",
+            "         0\n",
+        )
+    );
+}
+
+#[test]
+fn fstring_float_format_match_python() {
+    let out = run_program(
+        "ffloat",
+        "\
+pi = 3.14159
+n = 42
+flag = True
+print(f\"{pi:.2f}\")
+print(f\"{pi:.2e}\")
+print(f\"{pi:.2E}\")
+print(f\"{pi:.2g}\")
+print(f\"{pi:%}\")
+print(f\"{pi:.2%}\")
+print(f\"{pi:10.2f}\")
+print(f\"{pi:<10.2f}\")
+print(f\"{pi:^10.2f}\")
+print(f\"{pi:*>10.2f}\")
+print(f\"{pi:+.2f}\")
+print(f\"{n:.2f}\")
+print(f\"{flag:.1f}\")
+print(f\"{1e-4:.2e}\")
+print(f\"{-pi:.2f}\")
+print(f\"{0.001:.4f}\")
+print(f\"x={pi:.3f} y={n:.0f}\")
+",
+    );
+    assert_eq!(
+        out,
+        concat!(
+            "3.14\n",
+            "3.14e+00\n",
+            "3.14E+00\n",
+            "3.1\n",
+            "314.159000%\n",
+            "314.16%\n",
+            "      3.14\n",
+            "3.14      \n",
+            "   3.14   \n",
+            "******3.14\n",
+            "+3.14\n",
+            "42.00\n",
+            "1.0\n",
+            "1.00e-04\n",
+            "-3.14\n",
+            "0.0010\n",
+            "x=3.142 y=42\n",
+        )
+    );
+}
+
+#[test]
+fn fstring_str_and_nested_format_match_python() {
+    let out = run_program(
+        "fnest",
+        "\
+name = \"world\"
+n = 42
+pi = 3.14159
+w = 10
+p = 2
+print(f\"{name:>10}\")
+print(f\"{name:<10}\")
+print(f\"{name:^10}\")
+print(f\"{name:*^10}\")
+print(f\"{name:.3}\")
+print(f\"{name:10.3}\")
+print(f\"{pi:{w}.{p}f}\")
+print(f\"{n:{w}d}\")
+print(f\"{n:0{w}d}\")
+print(f\"{n}\")
+print(f\"{pi}\")
+print(f\"{True}\")
+print(f\"{name}\")
+print(f\"{n:}\")
+",
+    );
+    assert_eq!(
+        out,
+        concat!(
+            "     world\n",
+            "world     \n",
+            "  world   \n",
+            "**world***\n",
+            "wor\n",
+            "wor       \n",
+            "      3.14\n",
+            "        42\n",
+            "0000000042\n",
+            "42\n",
+            "3.14159\n",
+            "True\n",
+            "world\n",
+            "42\n",
+        )
+    );
+}
+
+#[test]
+fn fstring_debug_form_is_compile_error() {
+    let dir = TempDir::new("fdebug");
     let src = dir.0.join("prog.py");
-    fs::write(&src, "x = 1.0\nprint(f\"{x:.2e}\")\n").unwrap();
+    fs::write(&src, "x = 1\nprint(f\"{x=}\")\n").unwrap();
     let out = Command::new(PYRS)
         .args(["compile", "-i"])
         .arg(&src)
@@ -1267,7 +1471,34 @@ fn fstring_unsupported_format_spec_is_compile_error() {
         .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not supported"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("self-documenting") || stderr.contains("not supported"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn fstring_grouping_is_runtime_error() {
+    let dir = TempDir::new("fgroup");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "x = 1000\nprint(f\"{x:,}\")\n").unwrap();
+    let status = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    // compile may succeed; runtime must reject grouping
+    if status.status.success() {
+        panic!(
+            "expected failure for grouping format, stdout={}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("grouping") || stderr.contains("not supported"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -2317,20 +2548,44 @@ print(doubled, x)
 }
 
 #[test]
-fn comprehension_multiple_clauses_are_rejected() {
-    let dir = TempDir::new("compmulti");
-    let src = dir.0.join("prog.py");
-    fs::write(&src, "m = [i + j for i in range(2) for j in range(2)]\n").unwrap();
-    let out = Command::new(PYRS)
-        .args(["compile", "-i"])
-        .arg(&src)
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("comprehension clauses"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+fn multi_for_comprehensions_match_python() {
+    let out = run_program(
+        "compmulti",
+        "\
+print([(i, j) for i in range(2) for j in range(3) if (i + j) % 2 == 0])
+print([x for x in range(10) if x > 2 if x % 2 == 0])
+print([(i, j) for i in range(3) for j in range(3) if i != j if i + j < 3])
+xs = [10, 20]
+print([i + j for i in range(2) for j in xs])
+print([a + b for a, b in [(1, 2), (3, 4)]])
+",
+    );
+    assert_eq!(
+        out,
+        "[(0, 0), (0, 2), (1, 1)]\n[4, 6, 8]\n\
+         [(0, 1), (0, 2), (1, 0), (2, 0)]\n\
+         [10, 20, 11, 21]\n[3, 7]\n"
+    );
+}
+
+#[test]
+fn for_unpack_match_python() {
+    let out = run_program(
+        "forunpack",
+        "\
+for a, b in [(1, 2), (3, 4)]:
+    print(a, b)
+for a, *rest in [[1, 2, 3], [4, 5]]:
+    print(a, rest)
+for x, *ys, z in [[1, 2, 3, 4], [5, 6, 7]]:
+    print(x, ys, z)
+for (a, b) in [(1, 2), (3, 4)]:
+    print(a + b)
+",
+    );
+    assert_eq!(
+        out,
+        "1 2\n3 4\n1 [2, 3]\n4 [5]\n1 [2, 3] 4\n5 [6] 7\n3\n7\n"
     );
 }
 
@@ -3053,20 +3308,211 @@ fn nested_import_in_if_works() {
 }
 
 #[test]
-fn directory_without_init_is_not_a_package() {
-    let stderr = compile_project_expect_fail(
+fn namespace_package_import_child() {
+    // PEP 420 subset: directory without __init__.py is a namespace package.
+    let out = run_project(
         "ns_pkg",
         &[
             ("utilpkg/mod.py", "X = 1\n"),
-            ("main.py", "import utilpkg.mod\n"),
+            (
+                "main.py",
+                "import utilpkg.mod\nprint(utilpkg.mod.X)\nimport utilpkg\nprint(1)\n",
+            ),
         ],
         "main.py",
     );
-    // Namespace packages are unsupported: utilpkg has no __init__.py.
+    assert_eq!(out, "1\n1\n");
+}
+
+#[test]
+fn nested_namespace_package() {
+    let out = run_project(
+        "ns_nested",
+        &[
+            ("a/b/c.py", "Y = 2\n"),
+            ("main.py", "import a.b.c\nprint(a.b.c.Y)\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn star_import_public_names() {
+    let out = run_project(
+        "star_pub",
+        &[
+            ("m.py", "a = 1\n_b = 2\nc = 3\n"),
+            ("main.py", "from m import *\nprint(a, c)\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "1 3\n");
+}
+
+#[test]
+fn star_import_hides_private() {
+    // Private names are not bound by star without __all__.
+    let stderr = compile_project_expect_fail(
+        "star_priv",
+        &[
+            ("m.py", "a = 1\n_b = 2\n"),
+            ("main.py", "from m import *\nprint(_b)\n"),
+        ],
+        "main.py",
+    );
     assert!(
-        stderr.contains("No module named 'utilpkg.mod'"),
+        stderr.contains("_b")
+            || stderr.contains("undefined")
+            || stderr.contains("not defined")
+            || stderr.contains("unknown"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn star_import_all_list() {
+    let out = run_project(
+        "star_all",
+        &[
+            (
+                "m2.py",
+                "__all__ = [\"_priv\", \"x\"]\n_priv = 1\nx = 2\ny = 3\n",
+            ),
+            ("main.py", "from m2 import *\nprint(_priv, x)\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "1 2\n");
+}
+
+#[test]
+fn star_import_all_excludes_others() {
+    let stderr = compile_project_expect_fail(
+        "star_all_excl",
+        &[
+            ("m2.py", "__all__ = [\"x\"]\nx = 2\ny = 3\n"),
+            ("main.py", "from m2 import *\nprint(y)\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains('y')
+            || stderr.contains("undefined")
+            || stderr.contains("not defined")
+            || stderr.contains("unknown"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn star_import_all_tuple() {
+    let out = run_project(
+        "star_all_tup",
+        &[
+            ("m4.py", "__all__ = (\"a\", \"_b\")\na = 1\n_b = 2\n"),
+            ("main.py", "from m4 import *\nprint(a, _b)\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "1 2\n");
+}
+
+#[test]
+fn star_import_empty_all() {
+    let out = run_project(
+        "star_empty_all",
+        &[
+            ("m3.py", "__all__: list[str] = []\na = 1\n"),
+            ("main.py", "from m3 import *\nprint(1)\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn star_import_empty_all_hides_names() {
+    let stderr = compile_project_expect_fail(
+        "star_empty_all_hide",
+        &[
+            ("m3.py", "__all__: list[str] = []\na = 1\n"),
+            ("main.py", "from m3 import *\nprint(a)\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains('a')
+            || stderr.contains("undefined")
+            || stderr.contains("not defined")
+            || stderr.contains("unknown"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn star_import_function_level_rejected() {
+    let stderr = compile_project_expect_fail(
+        "star_fn",
+        &[
+            ("m.py", "a = 1\n"),
+            ("main.py", "def f() -> None:\n    from m import *\nf()\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("import * only allowed at module level"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn star_import_dynamic_all_rejected() {
+    let stderr = compile_project_expect_fail(
+        "star_dyn_all",
+        &[
+            ("m.py", "names = [\"x\"]\n__all__ = names\nx = 1\n"),
+            ("main.py", "from m import *\n"),
+        ],
+        "main.py",
+    );
+    assert!(
+        stderr.contains("non-static __all__") || stderr.contains("__all__"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn star_import_funcs_and_values() {
+    let out = run_project(
+        "star_fn_val",
+        &[
+            (
+                "lib.py",
+                "VAL = 7\ndef twice(n: int) -> int:\n    return n * 2\n",
+            ),
+            (
+                "main.py",
+                "from lib import *\nprint(VAL)\nprint(twice(3))\n",
+            ),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "7\n6\n");
+}
+
+#[test]
+fn relative_star_import() {
+    let out = run_project(
+        "rel_star",
+        &[
+            ("pkg2/__init__.py", "A = 10\n_B = 20\n"),
+            ("pkg2/sub.py", "from . import *\nprint(A)\n"),
+            ("main.py", "import pkg2.sub\n"),
+        ],
+        "main.py",
+    );
+    assert_eq!(out, "10\n");
 }
 
 // ---- additional package edge cases (review follow-up) ----
@@ -6621,26 +7067,107 @@ print(y is y)
 }
 
 #[test]
-fn generator_throw_rejected() {
-    let (_, stderr) = run_program_expect_fail(
-        "gen_throw",
-        "\
+fn generator_throw_match_python() {
+    let src = "\
 def g():
-    yield 1
+    try:
+        yield 1
+        yield 2
+    except ValueError as e:
+        print(\"caught\", e)
+        yield 99
+    finally:
+        print(\"fin\")
 it = g()
-it.throw(ValueError(\"x\"))
-",
-    );
-    assert!(
-        stderr.contains("throw") && stderr.contains("not supported"),
-        "stderr: {stderr}"
-    );
+print(it.send(None))
+print(it.throw(ValueError(\"x\")))
+it.close()
+print(\"after\")
+";
+    let out = run_program("gen_throw", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
-fn generator_send_non_none_rejected() {
+fn generator_throw_uncaught_match_python() {
+    let src = "\
+def g():
+    yield 1
+    yield 2
+it = g()
+print(it.send(None))
+try:
+    it.throw(ValueError(\"x\"))
+except ValueError as e:
+    print(\"outer\", e)
+";
+    let out = run_program("gen_throw_out", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_throw_type_only_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+    except ValueError as e:
+        print(\"caught\", e)
+        yield 2
+it = g()
+print(it.send(None))
+print(it.throw(ValueError))
+";
+    let out = run_program("gen_throw_type", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_send_value_match_python() {
+    let src = "\
+def g():
+    x = yield 1
+    print(\"got\", x)
+    y = yield 2
+    print(\"got\", y)
+    yield 3
+it = g()
+print(it.send(None))
+print(it.send(10))
+print(it.send(20))
+";
+    let out = run_program("gen_send_val", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_send_before_start_traps() {
     let (_, stderr) = run_program_expect_fail(
-        "gen_send_nn",
+        "gen_send_early",
         "\
 def g():
     yield 1
@@ -6649,23 +7176,358 @@ it.send(1)
 ",
     );
     assert!(
-        stderr.contains("send") && stderr.contains("not supported"),
+        stderr.contains("TypeError") && stderr.contains("just-started"),
         "stderr: {stderr}"
     );
 }
 
 #[test]
-fn capturing_closure_in_list_rejected() {
-    let (_, stderr) = run_program_expect_fail(
-        "cap_list",
-        "\
+fn capturing_closure_in_list_match_python() {
+    let src = "\
 def outer(n: int):
     def a(x: int) -> int:
         return x + n
     def b(x: int) -> int:
-        return x + n
+        return x * n
     return [a, b]
-print(outer(1)[0](2))
+fs = outer(3)
+print(fs[0](2))
+print(fs[1](2))
+for f in fs:
+    print(f(10))
+";
+    let out = run_program("cap_list", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn capturing_closure_in_tuple_match_python() {
+    let src = "\
+def outer(n: int):
+    def a(x: int) -> int:
+        return x + n
+    def b(x: int) -> int:
+        return x * n
+    return (a, b)
+t = outer(4)
+print(t[0](1))
+print(t[1](1))
+";
+    let out = run_program("cap_tup", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// After exhaustion, further send/next must not re-run the tail (Optional None).
+#[test]
+fn generator_post_exhaust_send_is_none() {
+    let src = "\
+def g():
+    print(\"start\")
+    yield 1
+    print(\"tail\")
+it = g()
+print(it.send(None))
+print(it.send(None))
+print(it.send(None))
+print(it.send(None))
+";
+    let out = run_program("gen_post_ex", src);
+    assert_eq!(out, "start\n1\ntail\nNone\nNone\nNone\n");
+}
+
+#[test]
+fn generator_post_close_send_is_none() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"fin\")
+it = g()
+print(it.send(None))
+it.close()
+print(\"closed\")
+print(it.send(None))
+";
+    let out = run_program("gen_post_close", src);
+    assert_eq!(out, "1\nfin\nclosed\nNone\n");
+}
+
+#[test]
+fn generator_uncaught_throw_then_send_is_none() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"fin3\")
+it = g()
+print(it.send(None))
+try:
+    it.throw(ValueError(\"x\"))
+except ValueError as e:
+    print(\"caught\", e)
+print(it.send(None))
+";
+    let out = run_program("gen_throw_done", src);
+    assert_eq!(out, "1\nfin3\ncaught x\nNone\n");
+}
+
+#[test]
+fn generator_throw_before_start_then_send_is_none() {
+    let src = "\
+def g():
+    print(\"body\")
+    yield 1
+it = g()
+try:
+    it.throw(ValueError(\"early\"))
+except ValueError as e:
+    print(\"early\", e)
+print(it.send(None))
+";
+    let out = run_program("gen_throw_early", src);
+    assert_eq!(out, "early early\nNone\n");
+}
+
+#[test]
+fn generator_throw_type_msg_two_arg_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+    except ValueError as e:
+        print(\"caught\", e)
+        yield 2
+it = g()
+print(it.send(None))
+print(it.throw(ValueError, \"msg\"))
+";
+    let out = run_program("gen_throw_2arg", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_throw_genexit_propagates_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"fin6\")
+it = g()
+print(it.send(None))
+try:
+    it.throw(GeneratorExit)
+except GeneratorExit:
+    print(\"outer GE\")
+print(it.send(None))
+";
+    let out = run_program("gen_throw_ge", src);
+    assert_eq!(out, "1\nfin6\nouter GE\nNone\n");
+}
+
+#[test]
+fn generator_throw_genexit_caught_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+    except GeneratorExit:
+        print(\"caught GE\")
+        yield 99
+    finally:
+        print(\"fin5\")
+it = g()
+print(it.send(None))
+print(it.throw(GeneratorExit))
+it.close()
+print(\"after\")
+";
+    let out = run_program("gen_throw_ge_c", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// Nested try inside generator finally must not clobber outer exit kind.
+#[test]
+fn gen_nested_try_in_finally_reraise_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        raise ValueError(\"boom\")
+    finally:
+        try:
+            print(\"inner\")
+            yield 2
+        finally:
+            print(\"inner-fin\")
+        print(\"outer-after\")
+try:
+    for x in g():
+        print(\"y\", x)
+except ValueError as e:
+    print(\"outer\", e)
+";
+    let out = run_program("gen_nest_fin", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// `return` exit-kind survives yield in finally (resume continues return path).
+#[test]
+fn gen_return_then_yield_in_finally_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        print(\"before return\")
+        return
+    finally:
+        print(\"fin start\")
+        yield 2
+        print(\"fin end\")
+    print(\"after try\")
+    yield 3
+for x in g():
+    print(\"y\", x)
+print(\"done\")
+";
+    let out = run_program("gen_ret_fin", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// Explicit `return N` + yield in finally feeds yield-from with N after resume.
+#[test]
+fn gen_return_value_yield_in_finally_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        return 42
+    finally:
+        print(\"fin\")
+        yield 2
+        print(\"fin done\")
+def outer():
+    x = yield from g()
+    print(\"got\", x)
+    yield 99
+for v in outer():
+    print(\"v\", v)
+";
+    let out = run_program("gen_retv_fin", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// Intentional PyRs limit: `send` is not forwarded through `yield from`
+/// (subgen is advanced with None). CPython would deliver the sent value.
+#[test]
+fn yield_from_does_not_forward_send() {
+    let src = "\
+def inner():
+    x = yield 1
+    print(\"inner got\", x)
+    yield 2
+def outer():
+    yield from inner()
+    yield 3
+it = outer()
+print(it.send(None))
+print(it.send(10))
+print(it.send(None))
+";
+    let out = run_program("yf_no_fwd_send", src);
+    // Pin PyRs: sent 10 is not delivered to inner's yield expression.
+    assert_eq!(out, "1\ninner got None\n2\n3\n");
+}
+
+/// Intentional PyRs limit: `throw` is not delegated into the subgenerator of
+/// `yield from` (exception is raised at the outer yield point).
+#[test]
+fn yield_from_does_not_forward_throw() {
+    let src = "\
+def inner():
+    try:
+        yield 1
+        yield 2
+    except ValueError as e:
+        print(\"inner caught\", e)
+        yield 99
+def outer():
+    try:
+        yield from inner()
+    except ValueError as e:
+        print(\"outer caught\", e)
+        yield 50
+    yield 3
+it = outer()
+print(it.send(None))
+print(it.throw(ValueError(\"x\")))
+print(it.send(None))
+";
+    let out = run_program("yf_no_fwd_throw", src);
+    // Pin PyRs: outer catches; inner does not see the throw.
+    assert_eq!(out, "1\nouter caught x\n50\n3\n");
+}
+
+/// Homogeneous lists of closures require matching capture env shapes.
+#[test]
+fn mismatched_capture_env_closures_in_list_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "cap_mismatch",
+        "\
+def outer(n: int, m: str):
+    def a(x: int) -> int:
+        return x + n
+    def b(x: int) -> int:
+        return x + len(m)
+    return [a, b]
+print(outer(1, \"hi\")[0](2))
 ",
     );
     assert!(
@@ -6918,25 +7780,75 @@ for v in g(1):
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
-/// Yield in finally: rejected until try exit state persists across suspend.
 #[test]
-fn yield_in_finally_rejected() {
-    let (_, stderr) = run_program_expect_fail(
-        "yf_fin",
-        "\
+fn yield_in_finally_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"fin-start\")
+        yield 3
+        print(\"fin-end\")
+for x in g():
+    print(\"y\", x)
+";
+    let out = run_program("yf_fin", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn yield_from_in_finally_match_python() {
+    let src = "\
 def g():
     try:
         yield 1
     finally:
-        yield 2
+        yield from [2, 3]
 for x in g():
     print(x)
-",
-    );
-    assert!(
-        stderr.contains("yield in finally is not supported"),
-        "stderr: {stderr}"
-    );
+";
+    let out = run_program("yf_fin_from", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn close_while_yield_in_finally_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+    finally:
+        print(\"fin\")
+        yield 2
+        print(\"after\")
+it = g()
+print(it.send(None))
+print(it.send(None))
+it.close()
+print(\"closed\")
+";
+    let out = run_program("yf_fin_close", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 /// Empty mapping pattern `case {}:` is irrefutable for return analysis.
@@ -7025,6 +7937,85 @@ it.close()
 print(\"after\")
 ";
     let out = run_program_timeout("ge_reraise", src, Duration::from_secs(3));
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn bigint_pow_and_literals_match_python() {
+    let src = "\
+print(2**100)
+print(10**20 + 1)
+print(-2**100)
+print(abs(-(2**63)))
+print(9999999999999999999999)
+print(f\"{2**40:d}\")
+";
+    let out = run_program("bigint_pow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "python failed: {}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn bigint_floor_mod_and_dict_keys_match_python() {
+    let src = "\
+print((-7) // 3)
+print((-7) % 3)
+print(7 // -3)
+print(7 % -3)
+d: dict[int, int] = {}
+k = 2**80
+d[k] = 1
+d[2**80] = 2
+print(d[k])
+print(k in d)
+s: set[int] = {2**60, 3}
+print(2**60 in s)
+print(len(s))
+";
+    let out = run_program("bigint_ops", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "python failed: {}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn bigint_indices_and_range_still_work() {
+    let src = "\
+xs = [10, 20, 30]
+print(xs[1])
+print(len(xs))
+print(xs[-1])
+total = 0
+for i in range(5):
+    total = total + i
+print(total)
+print(\"ab\" * 3)
+print([1, 2] * 2)
+";
+    let out = run_program("bigint_idx", src);
     let py = Command::new("python3")
         .arg("-c")
         .arg(src)
