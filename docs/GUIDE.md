@@ -270,7 +270,7 @@ From lowest to highest precedence:
 | 1 | `or` |
 | 2 | `and` |
 | 3 | `not x` |
-| 4 | `==  !=  <  <=  >  >=  in  not in  is  is not` (chainable; `is` only with `None`) |
+| 4 | `==  !=  <  <=  >  >=  in  not in  is  is not` (chainable; `is`/`is not` with `None` or same-type identity) |
 | 5 | `+  -` |
 | 6 | `*  /  //  %` |
 | 7 | `-x  +x` (unary) |
@@ -579,20 +579,50 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - `*args: T` packs extra positionals into `list[T]`; `**kwargs: T` packs
   extra keywords into `dict[str, T]`. Call-site unpacking `f(1, *xs)` and
   `f(**d)` works for homogeneous `list` / `dict[str, …]` values.
-- Nested `def` and `lambda` are first-class: free variables are captured
-  by value, or through **cells** when `nonlocal` is used (escaping
-  closures keep shared state). Nested functions may recurse and may be
-  returned / stored as closure values. Rebinding a local name over a
-  nested def shadows the nested function (CPython-like). Closures are
-  not first-class inside list/tuple/dict/set containers yet.
+- Nested `def` and `lambda` are first-class: free variables from an
+  enclosing function are captured through **cells** (CPython-like, so
+  later assignments in the outer function are visible to escaped
+  closures). Cells for free names are boxed at the outer bind (or at
+  function entry for free-captured params), so a nested def in an
+  untaken branch does not leave outer loads unbound. Nested *assignment*
+  still needs `nonlocal`. Nested functions may recurse and may be
+  returned / stored as closure values (including in homogeneous lists/
+  tuples of capture-free closures — call with `fs[0](args)`). Late free
+  binding works for the common pattern (`def f(): return n` then `n = 5`
+  then `f()`). Sibling nested defs may call each other without
+  define-before-use (sigs are pre-registered). Rebinding a local name
+  over a nested def shadows the nested function (CPython-like).
+  **Default arguments** of nested defs/lambdas are evaluated once at
+  definition time (CPython). Free-var defaults that only work after the
+  outer frame returns (escaped / multi-level `CallClosure` with a
+  non-literal default) need a constant default — the compiler reports a
+  clear error rather than a missing frozen temp name.
 - A function declared `-> T` (or with an inferred concrete return type)
   must return on every path — the compiler checks this (an infinite
-  `while True:` without `break` counts as not falling through).
+  `while True:` without `break` counts as not falling through). `while` /
+  `for` `else` that always runs (no `break` in the body) counts toward
+  covering return paths.
 - Recursion and mutual recursion work; functions may be called before
   their definition in the file.
-- Generator functions use `yield` / `yield from` (basic protocol; no
-  `send`/`throw`). Yielding inside `try` is rejected. Escaping generator
-  functions as values is not supported yet.
+- Generator functions use `yield` / `yield from` list, tuple, str
+  (chars), or another generator. Bare `return` ends the generator after
+  active `finally` blocks. `return <expr>` stores StopIteration.value
+  (coerced to the generator's yield type) so `x = yield from g()` can
+  receive it as `Y | None` (None after bare `return` / fall-off; the value
+  after an explicit `return`). Empty `yield from []` is allowed.
+  `try`/`except`/`else`/
+  `finally` (including yield inside try/except) is supported; setjmp
+  frames and try **phase** are restored on resume after yield (a raise
+  after yield in `except`/`else` does not re-enter that try's handlers).
+  **`yield` / `yield from` inside `finally` is not supported yet**
+  (compile error). `yield from` a generator closes the subgenerator on
+  finish or when the outer is closed (sub `finally` runs). Escaping
+  nested generator functions as values works (including capture-free
+  lists). Methods: `close()` injects **GeneratorExit** (a supported
+  `except` type) so active `finally` blocks run; uncaught GeneratorExit
+  is swallowed; yielding again after swallowing it is
+  `RuntimeError: generator ignored GeneratorExit`. `send(None)` ≡ next;
+  non-None `send` and `throw` are not supported yet.
 - Function names are internally prefixed, so naming a function `printf`
   or `malloc` cannot collide with the C library.
 
@@ -993,10 +1023,9 @@ deliberate exceptions:
 
 1. **`int` is 64-bit** and wraps on overflow; there are no big integers.
    Integer literals beyond ±2⁶³ don't lex.
-2. **`and`/`or` require compatible types** (same type, or both numeric).
-   Mixed non-numeric pairs like `0 or "x"` are a compile error (CPython
-   returns `"x"`). When types match, the winning operand is returned
-   (`0 or 5` is `5`).
+2. **`and`/`or` yield an operand** (like CPython), including mixed
+   non-numeric pairs typed as a union (e.g. `0 or "x"` → `int | str`).
+   Same-type / both-numeric operands keep the previous unify rules.
 3. **Static types.** Variables can't change type; lists are homogeneous
    (mixed numeric literals coerce to the joined type — `[1, 2.5]` becomes
    `[1.0, 2.5]`); bare parameters need annotations (defaults may infer).
@@ -1007,55 +1036,74 @@ deliberate exceptions:
    (constant exponents like `2 ** -1` correctly give a float).
 5. **int↔float comparisons convert the int to float**, losing exactness
    above 2⁵³ (Python compares exactly).
-6. **No identity semantics**: `nan in [nan]` is `False` (Python's
-   membership checks identity first).
-7. **Possibly-unbound variables** read as `0`/`0.0`/`False` for scalars;
-   str/list reads trap with `UnboundLocalError`. (Straight-line
-   use-before-assignment is caught at compile time.)
+6. **`nan in [nan]` is `False`** (IEEE equality; CPython membership
+   checks identity first). `is` / `is not` for floats use bit-identity
+   (so a NaN `is` itself).
+7. **Possibly-unbound locals** read as `0`/`0.0`/`False` for plain
+   scalar locals; str/list and **unbound free cells** trap
+   (`UnboundLocalError` / `NameError`). Straight-line use-before-assignment
+   is often caught at compile time.
 8. **str methods use ASCII rules** for case (`upper`/`lower`) and
    whitespace (`strip`/`split`) — Python is Unicode-aware.
 9. **Memory is never freed** (no GC yet); fine for short-lived programs,
-   a known limitation for long-running ones.
+   a known limitation for long-running ones. Explicit `generator.close()`
+   still runs `finally` (GeneratorExit); abandoned gens without `close`
+   do not (no GC finalizers yet).
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
-11. **Narrowing is limited** — `if x is not None:` / `is None` / `not`
-    on **function locals and cell/`nonlocal` names** in `if`/`while`/
-    `elif`/`else` refines unions (including complementary else-arms and
-    after early `return` in a then-arm). Assigning a concrete member
-    re-refines that name in the branch. **Module globals are not
-    narrowed** (no flow-sensitive global refinements yet). No attribute
-    or SAT-style narrowing. Multi-member peels keep a safe storage type
-    for print/tags.
+11. **Narrowing is limited** — `if x is not None:` / `is None` / `not`,
+    and simple `and`/`or` chains of those checks for **then/else body**
+    refinements and **mid-expression** refine (e.g. `x is not None and
+    x > 0` types `x` as non-None on the RHS of `and`; `x is None or
+    x < 0` types the RHS of `or` under the else-peel), on **function
+    locals, cell/`nonlocal` names, and free module Optionals** (no
+    `global` required for reads) in `if`/`while`/`elif`/`else` and match
+    guards. Complementary else-arms and early `return` in a then-arm
+    refine fallthrough. Assigning a concrete member re-refines in the
+    branch; fallthrough after a rebind clears disagreeing peels. After a
+    `while` without `break`, the condition's complement applies. `is None`
+    checks always read storage tags. No attribute or full SAT-style
+    narrowing. Multi-member peels keep a safe storage type for print/tags.
 
-Container notes (v0.14):
+Container notes (v0.15):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`
-  and methods are not supported yet. Closures/generators are not valid
-  tuple (or list) elements yet.
+  and methods are not supported yet. Homogeneous capture-free closures
+  (and generators) may be tuple/list elements; call via `t[i](args)`.
 - **dict:** keys are `int` or `str` only; bare `get(k)` returns
   `Optional[V]` (`None` on miss); `get(k, default)` keeps value type;
   `keys`/`values`/`items` return lists (not views); insertion-order
-  iteration over keys.
+  iteration over keys; mapping match supports `**rest`.
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
   `{}` is always an empty dict.
 - **unions / Optional:** first-class `None`; `T | U` and `Optional[T]`;
-  `is`/`is not` only with `None`; `|` is bitwise-or in expressions and
-  union in type annotations.
+  `is`/`is not` with `None` and same-type identity; `|` is bitwise-or in
+  expressions and union in type annotations.
+- **generators:** `yield` / `yield from` (list, tuple, str chars, other
+  generators; subgen `return` value available to yield-from; subgen
+  closed on outer close), try/except/else/finally (setjmp re-armed after
+  yield resume; try phase preserved; **no yield in finally yet**),
+  `close()` (GeneratorExit + finally; ignore-GE → RuntimeError) and
+  `send(None)` (≡ next). Non-None `send` and `throw` are not supported
+  yet. Escaping nested generator functions (including lists of gen
+  functions) works; homogeneous capture-free closures in containers too.
 
-Exception notes: `except E as e` binds the message `str`, not an exception
-object. Other traps (`EOFError`, `FileNotFoundError`, …) match bare
-`except:` only, not `except RuntimeError`.
+Exception notes: supported types are ValueError, KeyError, IndexError,
+ZeroDivisionError, TypeError, RuntimeError, **GeneratorExit**.
+`except E as e` binds the message `str`, not an exception object. Other
+traps (`EOFError`, `FileNotFoundError`, …) match bare `except:` only.
 
 Not implemented yet (clear compile errors): classes, `from M import *`,
-namespace packages, GC / heap freeing, full generator protocol
-(`send`/`throw`), closures inside containers, full f-string format specs
-beyond `{x:.Nf}`, unparenthesized multi-line expressions inside f-string
-`{...}` (parenthesize instead), same-delimiter triple quotes nested
+namespace packages, GC / heap freeing, generator `throw` / non-None
+`send`, full f-string format specs beyond `{x:.Nf}`, unparenthesized
+multi-line expressions inside f-string `{...}` (parenthesize instead),
+same-delimiter triple quotes nested
 inside an f-string expression, `__doc__` attribute access, dynamic
 `json.loads`, and most remaining methods on tuple/dict/set. `match`/`case`
-is a documented subset (literals, capture, `or`, sequence, mapping with
-str keys, guards).
+is a documented subset (literals, capture, `or`, sequence with optional
+`*rest`, mapping with str keys and optional `**rest`, `as` patterns,
+guards — **no class patterns**).
 
 ## 9. Performance
 

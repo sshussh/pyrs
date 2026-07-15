@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.14)
+## The language (v0.15)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.15.0**, not 1.0) until it is ready for
+milestone after this one is **0.16.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **classes** and **GC / heap freeing** are planned as the **last two**
@@ -54,23 +54,30 @@ A statically-typed Python subset:
   unions (`int | None`, `str | int | None`), `Optional[T]`, `list[T]`,
   `tuple[T1, T2, …]`, `dict[K, V]`, `set[T]` — including nested lists
   (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only;
-  list elements and dict values may be Optional/unions
+  list elements and dict values may be Optional/unions; homogeneous
+  capture-free closures may be list/tuple elements
 - **Functions:** `def` with optional parameter/return annotations
   (defaults infer param types; return type inferred from `return` when
   omitted), defaults and keyword args, recursion, forward references;
   pass/return tuples and other containers; nested `def` / `lambda` as
-  first-class closures; `nonlocal`; generator functions with `yield`
+  first-class closures (including in containers and sibling/forward
+  nested calls); late free-var binding (`def f(): return n` then
+  `n = 5`); `nonlocal`; generator functions with `yield` (may escape,
+  capture free vars, and use `try`/`except`/`finally`)
 - **Statements:** `if`/`elif`/`else`, `while` / `for` (including
   `else` on loops — runs only if no `break`),
   `for x in range(...)` / lists / strings / files / tuples / dict keys /
-  sets, `break`/`continue`, assignments (plain, annotated, multi-target,
-  unpacking `a, b = t`, augmented — including `xs[i] += v`),
-  `del d[k]`, `return`, `pass`, `raise ExcType("msg")`,
-  `try`/`except`/`else`/`finally`, `match`/`case` (literal, wildcard,
-  capture, or-patterns, guards, fixed sequence/mapping patterns)
+  sets / generators, `break`/`continue`, assignments (plain, annotated,
+  multi-target, unpacking `a, b = t`, augmented — including
+  `xs[i] += v`), `del d[k]`, `return`, `pass`, `raise ExcType("msg")`,
+  `try`/`except`/`else`/`finally` (including inside generators),
+  `match`/`case` (literal, wildcard, capture, or-patterns, guards,
+  sequence with optional `*rest`, mapping with optional `**rest`,
+  `as` patterns)
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
-  `is`/`is not` (only with `None` for now), bitwise `& | ^ ~ << >>`
+  `is`/`is not` (None checks plus pointer/slot identity for same-type
+  heap objects and scalars), bitwise `& | ^ ~ << >>`
   (and augassign) on int/bool, `and`/`or`/`not`
   (short-circuit; `and`/`or` return an operand, not always `bool`, and
   may yield a union when operands differ, e.g. `0 or "x"`), casts
@@ -168,30 +175,43 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; a variable's type is fixed by its
   first assignment
 
-Known limits (v0.14): no bigints (int is 64-bit and wraps), `min`/`max`
+Known limits (v0.15): no bigints (int is 64-bit and wraps), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
 not the int `1`); iterable `min`/`max` is only for
 `list[int|float|bool]` (empty list → ValueError like CPython),
-control-flow narrowing covers `is None` / `is not None` (and `not`) on
-name bindings in `if`/`while` (not full SAT / attribute narrowing),
-`is`/`is not` only with `None` (no general identity), `x ** e` with a
-*dynamic* negative int exponent traps (a constant like `2 ** -1` works
-and gives float), int↔float comparisons convert the int to float
-(exactness loss past 2^53), list literals coerce mixed numerics to one
-element type, `nan in [nan]` is False (no identity semantics), str
-methods use ASCII case/whitespace rules, heap memory is never freed,
-files support text modes "r"/"w"/"a" only, no `from m import *`,
-namespace packages without `__init__.py`, a package importing itself by
-name, or treating modules as first-class values beyond attribute/call
-chains; `os.path` is POSIX only; `*args` / `**kwargs` on defs and
-`*`/`**` unpacking in calls are supported for homogeneous list/dict
-types; starred assignment `a, *rest = xs` and list displays `[*a, *b]`
-work for lists/tuples; `json` has no dynamic `loads`; full f-string
-format specs (beyond `{x:.Nf}`) are unsupported; match/case is a
-subset (no class patterns, no starred sequence patterns, no mapping
-rest); generators support basic `yield` / `yield from` list (no
-`send`/`throw`); lambda params without defaults still need annotations
-or defaults for inference; no classes / GC yet.
+control-flow narrowing covers `is None` / `is not None` (and `not`,
+`and`/`or` body peels and **mid-expression** refine of
+`x is not None and x > 0` / `x is None or x < 0`) on locals, cells, and
+module Optionals (free reads, no `global` required) in `if`/`while` /
+match guards (not full SAT / attribute narrowing); post-loop / post-if
+rebinds clear stale peels; `is`/`is not` works with `None` and same-type
+identity (heap pointers, scalar slots, float bitcast — not CPython int
+interning); `x ** e` with a *dynamic* negative int exponent traps (a
+constant like `2 ** -1` works and gives float), int↔float comparisons
+convert the int to float (exactness loss past 2^53), list literals
+coerce mixed numerics to one element type, `nan in [nan]` is False
+(IEEE equality), str methods use ASCII case/whitespace rules, heap
+memory is never freed, files support text modes "r"/"w"/"a" only, no
+`from m import *`, namespace packages without `__init__.py`, a package
+importing itself by name, or treating modules as first-class values
+beyond attribute/call chains; `os.path` is POSIX only; `*args` /
+`**kwargs` on defs and `*`/`**` unpacking in calls are supported for
+homogeneous list/dict types; starred assignment `a, *rest = xs` and
+list displays `[*a, *b]` work for lists/tuples; `json` has no dynamic
+`loads`; full f-string format specs (beyond `{x:.Nf}`) are unsupported;
+match/case is still a subset (**no class patterns**; or-patterns bind
+only the matching alt; duplicate names/keys rejected); generators
+support `yield` / `yield from` on list/tuple/str/generator (subgen
+`return` feeds yield-from; close cascades to yield-from subgens),
+`try`/`except`/`else`/`finally` (phase preserved across yield resume),
+`close()` (GeneratorExit + finally; ignore-GE → RuntimeError) and
+`send(None)` (≡ next; non-None `send` and `throw` unsupported);
+`except GeneratorExit` is supported; free captures use cells (late
+bind; load before assign → NameError); nested defaults freeze at def
+time (escaped free-var defaults need literals); lambda params without
+defaults still need annotations or defaults for inference; closures in
+containers require matching capture-free signatures (generator
+functions in lists OK); no classes / GC yet.
 
 Errors come with source snippets:
 
@@ -275,4 +295,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.14.0 && git push origin v0.14.0`.
+Release tags: `git tag v0.15.0 && git push origin v0.15.0`.
