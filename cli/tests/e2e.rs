@@ -3,8 +3,11 @@
 //! would produce.
 
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const PYRS: &str = env!("CARGO_BIN_EXE_pyrs");
 
@@ -41,6 +44,60 @@ fn run_program(tag: &str, source: &str) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap()
+}
+
+/// Like `run_program`, but kills the child after `timeout` so hang regressions
+/// fail CI quickly instead of blocking the suite.
+fn run_program_timeout(tag: &str, source: &str, timeout: Duration) -> String {
+    let dir = TempDir::new(tag);
+    let src = dir.0.join("prog.py");
+    fs::write(&src, source).unwrap();
+    let mut child = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(&src)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn PyRs");
+    let start = Instant::now();
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                let stdout = {
+                    let mut buf = Vec::new();
+                    if let Some(mut pipe) = child.stdout.take() {
+                        let _ = pipe.read_to_end(&mut buf);
+                    }
+                    buf
+                };
+                let stderr = {
+                    let mut buf = Vec::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_end(&mut buf);
+                    }
+                    buf
+                };
+                assert!(
+                    status.success(),
+                    "PyRs run failed\nstdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+                return String::from_utf8(stdout).unwrap();
+            }
+            None => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "PyRs run timed out after {timeout:?} (tag={tag}); \
+                         likely infinite loop regression"
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 /// Compile-and-run `source`, expecting failure; returns (exit_code, stderr).
@@ -4693,7 +4750,7 @@ print(c())
 #[test]
 fn lambda_match_python() {
     // Defaults infer param types; bare `lambda x:` still needs annotation or default.
-    // CallClosure currently requires all args (defaults filled for nested defs only).
+    // Partial calls with defaults work for lambdas and nested defs.
     let src = "\
 f = lambda x=0, y=1: x + y
 print(f(2, 1))
@@ -4794,15 +4851,25 @@ fn import_in_function_match_python() {
 }
 
 #[test]
-fn yield_in_try_is_compile_error() {
-    let (_, stderr) = run_program_expect_fail(
-        "yield_try",
-        "def g():\n    try:\n        yield 1\n    finally:\n        pass\n",
-    );
-    assert!(
-        stderr.contains("yield") && stderr.contains("try"),
-        "stderr: {stderr}"
-    );
+fn yield_in_try_finally_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"fin\")
+for x in g():
+    print(x)
+";
+    let out = run_program("yield_try", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
@@ -4921,21 +4988,25 @@ fn star_unpack_min_length_traps() {
 }
 
 #[test]
-fn generator_escape_rejected() {
-    let (_, stderr) = run_program_expect_fail(
-        "gen_esc",
-        "\
+fn generator_escape_and_call_match_python() {
+    let src = "\
 def outer():
     def gen():
         yield 1
+        yield 2
     return gen
 f = outer()
-",
-    );
-    assert!(
-        stderr.contains("cannot be used as a first-class value") && stderr.contains("generator"),
-        "stderr: {stderr}"
-    );
+for x in f():
+    print(x)
+";
+    let out = run_program("gen_esc", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
@@ -5254,23 +5325,25 @@ print(f(3))
 }
 
 #[test]
-fn tuple_of_closures_rejected() {
-    let (_, stderr) = run_program_expect_fail(
-        "tuple_clos",
-        "\
+fn tuple_of_closures_and_call_match_python() {
+    let src = "\
 def outer():
     def f(x: int = 0) -> int:
-        return x
+        return x + 1
     return f
 g = outer()
 t = (g, g)
-print(t)
-",
-    );
-    assert!(
-        stderr.contains("tuple elements cannot be closures"),
-        "stderr: {stderr}"
-    );
+print(t[0](3))
+print(t[1](4))
+";
+    let out = run_program("tuple_clos", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
@@ -5398,13 +5471,13 @@ fn bare_lambda_param_without_default_rejected() {
 }
 
 #[test]
-fn yield_from_non_list_rejected() {
+fn yield_from_non_iterable_rejected() {
     let (_, stderr) = run_program_expect_fail(
         "yf_nonlist",
         "def g():\n    yield from 1\nfor x in g():\n    print(x)\n",
     );
     assert!(
-        stderr.contains("yield from expects list"),
+        stderr.contains("yield from expects an iterable"),
         "stderr: {stderr}"
     );
 }
@@ -5504,4 +5577,1459 @@ print(add3(*[1, 2, 3]))
 ";
     let out = run_program("star_fixed", src);
     assert_eq!(out, "6\n6\n");
+}
+
+// ---- v0.14.x hardening: control-flow, cells, generators ----
+
+#[test]
+fn while_local_optional_reassign_none_terminates() {
+    // Regression: refined `is not None` must not constant-fold the loop cond
+    // after a prior concrete assign (would infinite-loop on `x = None`).
+    // Timeout so a hang fails CI quickly instead of blocking the suite.
+    let src = "\
+def f() -> int:
+    x: int | None = 3
+    s = 0
+    while x is not None:
+        s = s + x
+        if s > 5:
+            x = None
+        else:
+            x = x - 1
+    return s
+print(f())
+";
+    let out = run_program_timeout("while_local_opt", src, Duration::from_secs(5));
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn free_var_cell_escape_sees_later_assign() {
+    let src = "\
+def outer() -> int:
+    n = 0
+    f = lambda: n
+    n = 5
+    return f()
+
+def outer2() -> int:
+    n = 0
+    def make():
+        def read() -> int:
+            return n
+        return read
+    g = make()
+    n = 7
+    return g()
+
+print(outer())
+print(outer2())
+";
+    let out = run_program("free_cell", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_bare_return_and_yield_from_empty() {
+    let src = "\
+def g():
+    yield 1
+    return
+    yield 2
+
+def h():
+    yield from []
+    yield 9
+
+for x in g():
+    print(x)
+for y in h():
+    print(y)
+print(\"ok\")
+";
+    let out = run_program("gen_ret_yf", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn while_else_return_paths_and_and_narrow() {
+    let src = "\
+def w(n: int) -> int:
+    while n > 0:
+        return n
+    else:
+        return 0
+
+def a(x: int | None, flag: bool) -> int:
+    if x is not None and flag:
+        return x + 1
+    return 0
+
+print(w(3))
+print(w(0))
+print(a(3, True))
+print(a(3, False))
+print(a(None, True))
+";
+    let out = run_program("while_else_and", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_as_pattern_match_python() {
+    let src = "\
+def f(x: int) -> int:
+    match x:
+        case 1 as y:
+            return y
+        case z as w:
+            return z + w
+print(f(1))
+print(f(3))
+";
+    let out = run_program("match_as", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_return_expr_side_effects() {
+    let src = "\
+def side() -> int:
+    print(\"side\")
+    return 0
+
+def g():
+    yield 1
+    return side()
+
+for x in g():
+    print(x)
+print(\"done\")
+";
+    let out = run_program("gen_ret_se", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn post_while_optional_arith_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "post_while",
+        "\
+def f() -> int:
+    x: int | None = 1
+    while x is not None:
+        x = None
+    return x + 1
+",
+    );
+    assert!(
+        stderr.contains("operator '+' is not supported for values of type None"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn if_rebind_none_fallthrough_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "if_rebind",
+        "\
+def f() -> int:
+    x: int | None = 5
+    if True:
+        x = None
+    return x + 1
+",
+    );
+    assert!(
+        stderr.contains("operator '+' is not supported for values of type"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn free_cell_untaken_branch_outer_load() {
+    let src = "\
+def outer(flag: bool) -> int:
+    n = 10
+    if flag:
+        def read() -> int:
+            return n
+        return read()
+    return n
+
+print(outer(False))
+print(outer(True))
+";
+    let out = run_program("cell_branch", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn free_cell_plain_param_untaken_branch() {
+    // Entry cell boxing for a free-captured plain param (not only locals / *args).
+    let src = "\
+def outer(flag: bool, n: int) -> int:
+    if flag:
+        def r() -> int:
+            return n
+        return r()
+    return n
+
+print(outer(False, 10))
+print(outer(True, 10))
+";
+    let out = run_program("cell_param", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn try_except_in_generator_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        raise ValueError(\"x\")
+    except ValueError:
+        yield 2
+    finally:
+        print(\"fin\")
+for x in g():
+    print(x)
+";
+    let out = run_program("try_gen", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn nested_default_frozen_at_def() {
+    let src = "\
+def outer() -> int:
+    n = 1
+    def f(x: int = n) -> int:
+        return x
+    n = 99
+    return f()
+print(outer())
+";
+    let out = run_program("dflt_freeze", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn for_else_return_paths_match_python() {
+    let src = "\
+def f(n: int) -> int:
+    for i in range(n):
+        return i + 1
+    else:
+        return -1
+print(f(3))
+print(f(0))
+";
+    let out = run_program("for_else_ret", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn post_for_zero_trip_rebind_rejected() {
+    // Body peels must not survive a zero-trip for (while-style restore).
+    let (_, stderr) = run_program_expect_fail(
+        "post_for",
+        "\
+def f() -> int:
+    x: int | None = None
+    for i in range(0):
+        x = 5
+    return x + 1
+",
+    );
+    assert!(
+        stderr.contains("operator '+' is not supported for values of type"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn post_for_empty_list_rebind_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "post_for_list",
+        "\
+def f() -> int:
+    x: int | None = None
+    xs: list[int] = []
+    for i in xs:
+        x = 5
+    return x + 1
+",
+    );
+    assert!(
+        stderr.contains("operator '+' is not supported for values of type"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn free_cell_vararg_untaken_branch() {
+    let src = "\
+def outer(*args: int) -> int:
+    if False:
+        def read() -> int:
+            return args[0]
+        return read()
+    return args[0]
+
+def outer_kw(**kwargs: int) -> int:
+    if False:
+        def read() -> int:
+            return kwargs[\"k\"]
+        return read()
+    return kwargs[\"k\"]
+
+print(outer(7))
+print(outer_kw(k=8))
+";
+    let out = run_program("vararg_cell", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn or_narrow_else_arm_match_python() {
+    // `x is None or flag` else-arm sees x non-None (both failed).
+    let src = "\
+def f(x: int | None, flag: bool) -> int:
+    if x is None or flag:
+        return 0
+    return x + 1
+
+print(f(None, False))
+print(f(3, True))
+print(f(3, False))
+";
+    let out = run_program("or_narrow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn multi_level_free_default_escaped_clear_error() {
+    let (_, stderr) = run_program_expect_fail(
+        "ml_dflt",
+        "\
+def outer() -> int:
+    n = 1
+    def mid():
+        def f(x: int = n) -> int:
+            return x
+        return f
+    g = mid()
+    return g()
+print(outer())
+",
+    );
+    assert!(
+        stderr.contains("default argument that captures free variables")
+            && stderr.contains("constant default"),
+        "stderr: {stderr}"
+    );
+}
+
+// ---- v0.15: mid-expr refine, match expand, late bind, closures, gens ----
+
+#[test]
+fn mid_expr_and_or_refine_match_python() {
+    let src = "\
+def a(x: int | None) -> int:
+    if x is not None and x > 0:
+        return x + 1
+    return 0
+
+def b(x: int | None) -> int:
+    if x is None or x < 0:
+        return -1
+    return x
+
+print(a(3))
+print(a(None))
+print(a(-1))
+print(b(None))
+print(b(-2))
+print(b(5))
+";
+    let out = run_program("mid_refine", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn free_var_late_binding_match_python() {
+    let src = "\
+def outer() -> int:
+    def f() -> int:
+        return n
+    n = 5
+    return f()
+
+print(outer())
+";
+    let out = run_program("late_bind", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn sibling_forward_nested_match_python() {
+    let src = "\
+def outer() -> int:
+    def a() -> int:
+        return b() + 1
+    def b() -> int:
+        return 10
+    return a()
+
+print(outer())
+";
+    let out = run_program("fwd_nested", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn list_of_closures_call_match_python() {
+    let src = "\
+def outer() -> int:
+    def c1(x: int) -> int:
+        return x + 1
+    def c2(x: int) -> int:
+        return x * 2
+    fs = [c1, c2]
+    return fs[0](5) + fs[1](3)
+
+print(outer())
+";
+    let out = run_program("list_clos", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_star_sequence_and_mapping_rest_match_python() {
+    let src = "\
+def seq(xs: list[int]) -> int:
+    match xs:
+        case [a, *rest, b]:
+            s = a + b
+            for x in rest:
+                s = s + x
+            return s
+        case _:
+            return -1
+
+def mp(d: dict[str, int]) -> int:
+    match d:
+        case {\"k\": v, **rest}:
+            s = v
+            for x in rest.values():
+                s = s + x
+            return s
+        case _:
+            return -1
+
+print(seq([1, 2, 3, 4]))
+print(seq([1, 9]))
+print(mp({\"k\": 1, \"m\": 2, \"n\": 3}))
+";
+    let out = run_program("match_star", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn yield_from_tuple_and_gen_match_python() {
+    let src = "\
+def inner():
+    yield 10
+    yield 20
+
+def g():
+    yield from (1, 2)
+    yield from [3]
+    yield from inner()
+
+for x in g():
+    print(x)
+";
+    let out = run_program("yf_expand", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn yield_from_str_chars_match_python() {
+    // Annotate return as str so yield type is str (chars).
+    let src = "\
+def g() -> str:
+    yield from \"ab\"
+    yield \"c\"
+
+for c in g():
+    print(c)
+";
+    let out = run_program("yf_str", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn identity_is_for_containers_match_python() {
+    let src = "\
+xs = [1, 2]
+ys = xs
+zs = [1, 2]
+print(xs is ys)
+print(xs is zs)
+print(xs is not zs)
+s = \"hi\"
+print(s is s)
+";
+    let out = run_program("ident_is", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_close_and_send_none_match_python() {
+    let src = "\
+def g():
+    yield 1
+    yield 2
+    yield 3
+
+it = g()
+print(it.send(None))
+it.close()
+print(\"closed\")
+";
+    let out = run_program("gen_close", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn nested_gen_with_capture_match_python() {
+    let src = "\
+def outer(n: int):
+    def gen():
+        i = 0
+        while i < n:
+            yield i
+            i = i + 1
+    return gen
+
+f = outer(3)
+for x in f():
+    print(x)
+";
+    let out = run_program("nested_gen_cap", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn global_optional_narrow_match_python() {
+    let src = "\
+x: int | None = 7
+
+def f() -> int:
+    global x
+    if x is not None:
+        return x + 1
+    return 0
+
+print(f())
+x = None
+print(f())
+";
+    let out = run_program("glob_narrow", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn gen_yield_in_except_reraise_match_python() {
+    // Raise after yield in except must not re-enter sibling handlers.
+    let src = "\
+def g():
+    try:
+        raise ValueError(\"boom\")
+    except ValueError:
+        yield 1
+        raise RuntimeError(\"after\")
+    except RuntimeError:
+        print(\"caught-sibling\")
+        yield 99
+    finally:
+        print(\"finally\")
+
+it = g()
+print(it.send(None))
+try:
+    print(it.send(None))
+except RuntimeError as e:
+    print(\"RuntimeError\", e)
+";
+    // 15s: hang guard under parallel e2e load (compile is slow; true hang is endless).
+    let out = run_program_timeout("gen_phase", src, Duration::from_secs(15));
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// Bare `except:` after yield must not infinite-loop on re-raise.
+#[test]
+fn gen_yield_in_bare_except_reraise_no_hang() {
+    let src = "\
+def g():
+    try:
+        raise ValueError(\"boom\")
+    except:
+        print(\"handler\")
+        yield 1
+        print(\"after yield\")
+        raise RuntimeError(\"after\")
+    finally:
+        print(\"fin\")
+
+try:
+    for x in g():
+        print(x)
+except RuntimeError as e:
+    print(\"RuntimeError\", e)
+";
+    let out = run_program_timeout("gen_bare_exc", src, Duration::from_secs(15));
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn gen_except_as_bind_match_python() {
+    let src = "\
+def g():
+    try:
+        raise ValueError(\"boom\")
+    except ValueError as e:
+        print(e)
+        yield 1
+        yield 2
+for x in g():
+    print(x)
+";
+    let out = run_program("gen_as_bind", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn gen_func_list_match_python() {
+    let src = "\
+def outer():
+    def g1():
+        yield 1
+    def g2():
+        yield 2
+    return [g1, g2]
+fs = outer()
+for f in fs:
+    for x in f():
+        print(x)
+";
+    let out = run_program("gen_list", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn gen_close_runs_finally_match_python() {
+    let src = "\
+def g():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"fin\")
+it = g()
+print(it.send(None))
+it.close()
+print(\"after close\")
+";
+    let out = run_program("gen_close_fin", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn gen_yield_in_print_match_python() {
+    let src = "\
+def g():
+    print((yield 1))
+    print(\"after\")
+    yield 2
+for x in g():
+    print(\"v\", x)
+";
+    let out = run_program("gen_yprint", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn mutual_nested_free_capture_match_python() {
+    let src = "\
+def outer(n: int) -> int:
+    def a() -> int:
+        return b()
+    def b() -> int:
+        return n
+    return a()
+print(outer(7))
+";
+    let out = run_program("mutual_free", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn late_free_cell_load_before_assign_traps() {
+    let (_, stderr) = run_program_expect_fail(
+        "late_free_trap",
+        "\
+def outer() -> int:
+    def f() -> int:
+        return n
+    print(f())
+    n = 5
+    return f()
+print(outer())
+",
+    );
+    assert!(
+        stderr.contains("NameError") && stderr.contains("free variable"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn match_or_pattern_binds_matching_alt_match_python() {
+    let src = "\
+def t(x: list[int]):
+    match x:
+        case [1, y] | [y, 2]:
+            print(\"y\", y)
+        case _:
+            print(\"no\")
+t([1, 9])
+t([8, 2])
+t([1, 2])
+";
+    let out = run_program("or_bind", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_duplicate_capture_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "dup_cap",
+        "\
+def f(x: list[int]) -> int:
+    match x:
+        case [a, a]:
+            return a
+    return 0
+",
+    );
+    assert!(
+        stderr.contains("multiple assignments to name"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn match_duplicate_key_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "dup_key",
+        "\
+def f(x: dict[str, int]) -> int:
+    match x:
+        case {\"k\": a, \"k\": b}:
+            return a
+    return 0
+",
+    );
+    assert!(stderr.contains("duplicate key"), "stderr: {stderr}");
+}
+
+#[test]
+fn match_guard_refines_body_match_python() {
+    let src = "\
+def h(y: int | None) -> int:
+    match y:
+        case z if z is not None:
+            return z + 1
+        case _:
+            return 0
+print(h(3))
+print(h(None))
+";
+    let out = run_program("guard_refine", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_star_rest_irrefutable_return_ok() {
+    let src = "\
+def f(xs: list[int]) -> int:
+    match xs:
+        case [*rest]:
+            return len(rest)
+print(f([1, 2, 3]))
+";
+    let out = run_program("star_irref", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn free_module_optional_narrow_match_python() {
+    // Free module Optional read (no `global`) still peels in if.
+    let src = "\
+x: int | None = 7
+def f() -> int:
+    if x is not None:
+        return x + 1
+    return 0
+print(f())
+";
+    let out = run_program("free_mod_opt", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn float_is_identity_match_python() {
+    let src = "\
+x = 3.14
+print(x is x)
+print(x is not x)
+y = 1.0
+print(y is y)
+";
+    let out = run_program("float_is", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_throw_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "gen_throw",
+        "\
+def g():
+    yield 1
+it = g()
+it.throw(ValueError(\"x\"))
+",
+    );
+    assert!(
+        stderr.contains("throw") && stderr.contains("not supported"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn generator_send_non_none_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "gen_send_nn",
+        "\
+def g():
+    yield 1
+it = g()
+it.send(1)
+",
+    );
+    assert!(
+        stderr.contains("send") && stderr.contains("not supported"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn capturing_closure_in_list_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "cap_list",
+        "\
+def outer(n: int):
+    def a(x: int) -> int:
+        return x + n
+    def b(x: int) -> int:
+        return x + n
+    return [a, b]
+print(outer(1)[0](2))
+",
+    );
+    assert!(
+        stderr.contains("list elements must share one type"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn yield_from_subgen_return_value_match_python() {
+    // Explicit return N → yield-from result is N (Optional peels after assign
+    // is not automatic; print the Optional value for parity).
+    let src = "\
+def inner():
+    yield 1
+    return 42
+def outer():
+    x = yield from inner()
+    print(x)
+    yield 99
+for v in outer():
+    print(\"y\", v)
+";
+    let out = run_program("yf_ret", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// Bare return / fall-off → yield-from expression is None (not typed zero).
+#[test]
+fn yield_from_bare_return_is_none_match_python() {
+    let src = "\
+def g_fall():
+    yield 1
+def g_bare():
+    yield 1
+    return
+def h(which: int):
+    if which == 0:
+        x = yield from g_fall()
+    else:
+        x = yield from g_bare()
+    print(x)
+    yield 99
+for v in h(0):
+    print(\"y\", v)
+for v in h(1):
+    print(\"y\", v)
+";
+    let out = run_program("yf_none", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn close_cascades_to_yield_from_subgen_match_python() {
+    let src = "\
+def sub():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print(\"sub-fin\")
+def outer():
+    try:
+        yield from sub()
+    finally:
+        print(\"outer-fin\")
+g = outer()
+print(g.send(None))
+g.close()
+print(\"after\")
+";
+    let out = run_program("yf_close", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn generator_ignore_generator_exit_runtime_error() {
+    let src = "\
+def bad():
+    try:
+        yield 1
+    except:
+        print(\"swallowed\")
+        yield 2
+g = bad()
+print(g.send(None))
+g.close()
+print(\"after\")
+";
+    let (code, stderr) = run_program_expect_fail("ge_ignore", src);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("RuntimeError") && stderr.contains("GeneratorExit"),
+        "stderr: {stderr}"
+    );
+    // stdout before the trap should match CPython's prints before the error
+    // (we only check stderr trap here; CPython also raises on close).
+}
+
+#[test]
+fn except_generator_exit_match_python() {
+    let src = "\
+def make():
+    def g():
+        try:
+            yield 1
+        except GeneratorExit:
+            print(\"caught-ge\")
+    return g()
+it = make()
+print(it.send(None))
+it.close()
+print(\"after\")
+";
+    let out = run_program("ge_except", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn float_nan_is_nan_match_python() {
+    // inf - inf is nan; bit-identity: nan is nan; IEEE: nan != nan.
+    let src = "\
+x = 1e308 * 1e308
+y = x - x
+print(y is y)
+print(y == y)
+";
+    let out = run_program("nan_is", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_as_whole_sequence_match_python() {
+    let src = "\
+def f(xs: list[int]) -> None:
+    match xs:
+        case [a, b] as whole:
+            print(a, b, whole)
+        case _:
+            print(\"no\")
+f([1, 2])
+f([1])
+";
+    let out = run_program("match_as_wh", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_tuple_star_rest_match_python() {
+    let src = "\
+def f(t: tuple[int, int, int]) -> None:
+    match t:
+        case (a, *rest, b):
+            print(a, rest, b)
+f((1, 2, 3))
+";
+    let out = run_program("tup_rest", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn match_mapping_empty_rest_match_python() {
+    let src = "\
+def f(d: dict[str, int]) -> None:
+    match d:
+        case {**rest}:
+            print(rest)
+f({\"a\": 1})
+empty: dict[str, int] = {}
+f(empty)
+";
+    let out = run_program("map_rest", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn try_else_in_generator_match_python() {
+    let src = "\
+def g(flag: int):
+    try:
+        if flag == 0:
+            raise ValueError(\"x\")
+        yield 1
+    except ValueError:
+        yield 2
+    else:
+        yield 3
+    finally:
+        print(\"fin\")
+for v in g(0):
+    print(v)
+for v in g(1):
+    print(v)
+";
+    let out = run_program("gen_else", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// Yield in finally: rejected until try exit state persists across suspend.
+#[test]
+fn yield_in_finally_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "yf_fin",
+        "\
+def g():
+    try:
+        yield 1
+    finally:
+        yield 2
+for x in g():
+    print(x)
+",
+    );
+    assert!(
+        stderr.contains("yield in finally is not supported"),
+        "stderr: {stderr}"
+    );
+}
+
+/// Empty mapping pattern `case {}:` is irrefutable for return analysis.
+#[test]
+fn match_empty_mapping_irrefutable_return() {
+    let src = "\
+def f(d: dict[str, int]) -> int:
+    match d:
+        case {}:
+            return 1
+empty: dict[str, int] = {}
+print(f(empty))
+print(f({\"a\": 1}))
+";
+    let out = run_program("empty_map_pat", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// Forward nested call + late free cell (sibling threads unbound cell).
+#[test]
+fn forward_nested_late_free_match_python() {
+    let src = "\
+def outer() -> int:
+    def a() -> int:
+        return b()
+    def b() -> int:
+        return n
+    n = 7
+    return a()
+print(outer())
+";
+    let out = run_program("fwd_late", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+/// while+break must not leave a stale Optional peel on fallthrough.
+#[test]
+fn while_break_clears_optional_peel() {
+    // After break, `x` is still Optional — arithmetic must not type-check
+    // as bare int (would be unsound if then-peel leaked past break).
+    let (_, stderr) = run_program_expect_fail(
+        "while_brk_peel",
+        "\
+def f(x: int | None) -> int:
+    while x is not None:
+        break
+    return x + 1
+print(f(3))
+",
+    );
+    assert!(
+        stderr.contains("operator '+' is not supported for values of type")
+            && stderr.contains("None"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn close_genexit_reraise_completes_match_python() {
+    // Re-raising GeneratorExit from its handler must run finally and end
+    // close() — not re-enter the handler (O2 setjmp/phase correctness).
+    let src = "\
+def g():
+    try:
+        yield 1
+    except GeneratorExit:
+        print(\"handler\")
+        raise GeneratorExit(\"x\")
+    finally:
+        print(\"fin\")
+it = g()
+print(it.send(None))
+it.close()
+print(\"after\")
+";
+    let out = run_program_timeout("ge_reraise", src, Duration::from_secs(3));
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
