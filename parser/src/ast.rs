@@ -28,6 +28,8 @@ pub enum TypeName {
     /// `A | B | ...` or `Optional[T]` (flattened/sorted in semantic).
     /// At least two members after parsing (parser intern helper).
     Union(&'static [TypeName]),
+    /// User class type annotation (`def f(p: Point)`). Resolved in semantic.
+    Class(&'static str),
 }
 
 impl std::fmt::Display for TypeName {
@@ -64,6 +66,7 @@ impl std::fmt::Display for TypeName {
                 }
                 Ok(())
             }
+            TypeName::Class(name) => write!(f, "{name}"),
         }
     }
 }
@@ -168,6 +171,18 @@ pub struct FuncDef {
     pub span: Span,
 }
 
+/// `class Name[(Base, ...)]:` body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassDef {
+    pub name: String,
+    /// Base class names (empty = no base). Multiple bases rejected in semantic.
+    pub bases: Vec<(String, Span)>,
+    /// Class body statements (methods, `pass`, annotated class attrs).
+    pub body: Vec<Stmt>,
+    /// Span of the `class Name(...)` header.
+    pub span: Span,
+}
+
 /// One positional slot in a call: a value or `*iterable` unpack.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PosArg {
@@ -200,11 +215,18 @@ pub enum AssignTarget {
         target: Box<AssignTarget>,
         span: Span,
     },
+    /// `obj.attr = ...` (instance field store).
+    Attr {
+        base: Expr,
+        attr: String,
+        attr_span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     FuncDef(FuncDef),
+    ClassDef(ClassDef),
     /// `if`/`elif` chain: each branch is (condition, body).
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,

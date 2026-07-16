@@ -62,7 +62,34 @@
 #define TAG_UNION 8
 #define TAG_CLOSURE 9
 #define TAG_GENERATOR 10
+/* 11 = exception (union-box print only) */
+/* Class instances: 13 + 8*class_id (distinct per class; avoids list 4+8*k). */
+#define TAG_CLASS_BASE 13
 /* list tags: 4 + 8 * elem_tag */
+
+/* Class display names filled by compiled main (optional; null → "<object>"). */
+static const char **g_class_names = NULL;
+static long long g_class_n = 0;
+
+void pyrs_set_class_names(const char **names, long long n) {
+    g_class_names = names;
+    g_class_n = n;
+}
+
+void pyrs_print_class_instance(void *obj) {
+    if (obj == NULL) {
+        fputs("<object>", stdout);
+        return;
+    }
+    long long tid = *(long long *)obj;
+    if (g_class_names != NULL && tid >= 0 && tid < g_class_n && g_class_names[tid] != NULL) {
+        fputc('<', stdout);
+        fputs(g_class_names[tid], stdout);
+        fputs(" object>", stdout);
+        return;
+    }
+    fputs("<object>", stdout);
+}
 
 /* layout shared with codegen: leading i64 length, then bytes (+ NUL) */
 typedef struct {
@@ -1671,6 +1698,11 @@ static void print_slot(long long slot, int tag) {
         fputs("<generator>", stdout);
         break;
     default:
+        /* Class instance: 13 + 8*class_id — print via type_id on the object. */
+        if (tag >= TAG_CLASS_BASE && ((tag - TAG_CLASS_BASE) % 8) == 0) {
+            pyrs_print_class_instance((void *)(uintptr_t)slot);
+            break;
+        }
         /* tag encoding for nested list: 4 + 8 * inner_tag */
         if (tag >= 4 && ((tag - 4) % 8) == 0) {
             pyrs_print_list((const PyrsList *)(uintptr_t)slot, (tag - 4) / 8);
@@ -3082,6 +3114,10 @@ static int slot_eq(long long a, long long b, int tag) {
     case 3:
         return pyrs_str_cmp((const PyrsStr *)a, (const PyrsStr *)b) == 0;
     default:
+        /* Class instances (13+8*id) and other pointer-like tags: identity. */
+        if (tag >= TAG_CLASS_BASE && ((tag - TAG_CLASS_BASE) % 8) == 0) {
+            return a == b;
+        }
         return 0;
     }
 }
@@ -5088,4 +5124,64 @@ void pyrs_gen_set_done(PyrsGen *g) {
 
 int pyrs_gen_is_genexit(void) {
     return g_exc_type == PYRS_EXC_GENEXIT ? 1 : 0;
+}
+/* ---- user class objects (closed-world layouts; never freed) ---- */
+
+/* Allocate nbytes (including i64 type_id header) and write type_id at offset 0.
+ * Remaining bytes are zeroed so fields start as 0/null. */
+void *pyrs_object_new(long long type_id, long long nbytes) {
+    if (nbytes < (long long)sizeof(long long)) {
+        nbytes = (long long)sizeof(long long);
+    }
+    void *p = xmalloc((size_t)nbytes);
+    memset(p, 0, (size_t)nbytes);
+    *(long long *)p = type_id;
+    return p;
+}
+
+/* isinstance(obj, Class): walk parent chain. parents[i] is parent of class i,
+ * or -1 for no parent. n is table length. */
+int pyrs_isinstance_class(void *obj, long long target, long long *parents, long long n) {
+    if (obj == NULL || parents == NULL || n <= 0) {
+        return 0;
+    }
+    long long tid = *(long long *)obj;
+    for (int depth = 0; depth < 64; depth++) {
+        if (tid == target) {
+            return 1;
+        }
+        if (tid < 0 || tid >= n) {
+            return 0;
+        }
+        tid = parents[tid];
+        if (tid < 0) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* Optional: print via prebuilt str (codegen usually uses interned "<Name object>"). */
+void pyrs_print_object(void *obj) {
+    pyrs_print_class_instance(obj);
+}
+
+/* Build a PyrsStr `"<Name object>"` from runtime type_id (for str(obj)). */
+PyrsStr *pyrs_str_from_object(void *obj) {
+    char buf[256];
+    if (obj != NULL && g_class_names != NULL) {
+        long long tid = *(long long *)obj;
+        if (tid >= 0 && tid < g_class_n && g_class_names[tid] != NULL) {
+            snprintf(buf, sizeof buf, "<%s object>", g_class_names[tid]);
+        } else {
+            snprintf(buf, sizeof buf, "<object>");
+        }
+    } else {
+        snprintf(buf, sizeof buf, "<object>");
+    }
+    size_t n = strlen(buf);
+    PyrsStr *s = xmalloc(sizeof(long long) + n + 1);
+    s->len = (long long)n;
+    memcpy(s->data, buf, n + 1);
+    return s;
 }

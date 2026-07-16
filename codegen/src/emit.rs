@@ -22,7 +22,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use ir::{
-    BinOp, Expr, ExprKind, FileFn, Function, JsonLoadsKind, MathOp, Module, Stmt, StrFn, Ty, UnOp,
+    BinOp, ClassInfo, Expr, ExprKind, FileFn, Function, JsonLoadsKind, MathOp, Module, Stmt, StrFn,
+    Ty, UnOp,
 };
 
 pub fn emit_llvm_ir(module: &Module) -> String {
@@ -47,7 +48,8 @@ fn lty(ty: Ty) -> &'static str {
         | Ty::Closure { .. }
         | Ty::Cell(_)
         | Ty::Generator { .. }
-        | Ty::Exception => "ptr",
+        | Ty::Exception
+        | Ty::Class(_) => "ptr",
         // Value-level None (expression); not the void function return.
         Ty::None => "i8",
         Ty::Union(_) => "{ i32, i64 }",
@@ -91,10 +93,25 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Generator { .. } => 10,
         // Exception objects: union-box print tag only (not list/dict elements).
         Ty::Exception => 11,
+        // User class instances: per-class tag so multi-class unions in containers
+        // do not share one print_tag (switch cases must be unique).
+        // Encoding 13 + 8*class_id avoids collision with list tags (4+8*k).
+        Ty::Class(id) => 13 + 8 * id,
         Ty::File | Ty::None | Ty::Cell(_) => {
             unreachable!("no print tag for {ty:?}")
         }
     }
+}
+
+/// LLVM struct type for a class instance: `{ i64 type_id, field0, field1, ... }`.
+fn class_struct_ty(info: &ClassInfo) -> String {
+    let mut s = String::from("{ i64");
+    for (_, ty) in &info.fields {
+        s.push_str(", ");
+        s.push_str(lty(*ty));
+    }
+    s.push_str(" }");
+    s
 }
 
 /// Print tag stored inside a heap union box for the active member (-1 = None).
@@ -195,6 +212,8 @@ struct Emitter {
     gen_try_pool_next: usize,
     /// Tries currently executing their `finally` (innermost last).
     gen_fin_stack: Vec<FinallyScope>,
+    /// Class layouts for field GEP / isinstance parent walk.
+    classes: Vec<ClassInfo>,
 }
 
 impl Default for Emitter {
@@ -220,6 +239,7 @@ impl Default for Emitter {
             gen_try_pool: Vec::new(),
             gen_try_pool_next: 0,
             gen_fin_stack: Vec::new(),
+            classes: Vec::new(),
         }
     }
 }
@@ -272,6 +292,11 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         | Stmt::ListAppend { value: e, .. }
         | Stmt::ListRemove { value: e, .. }
         | Stmt::CellStore { value: e, .. } => max_try_depth_in_expr(e),
+        Stmt::SetField {
+            object: o,
+            value: v,
+            ..
+        } => max_try_depth_in_expr(o).max(max_try_depth_in_expr(v)),
         Stmt::Print(args) => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
         Stmt::ListInsert {
             index: i, value: v, ..
@@ -378,7 +403,13 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         Contains { needle, haystack } => {
             max_try_depth_in_expr(needle).max(max_try_depth_in_expr(haystack))
         }
-        IsInstance { value, .. } | ExcIsInstance { value, .. } => max_try_depth_in_expr(value),
+        IsInstance { value, .. }
+        | ExcIsInstance { value, .. }
+        | ClassIsInstance { value, .. }
+        | GetField { object: value, .. } => max_try_depth_in_expr(value),
+        CallMethod { args, .. } => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
+        NewObject { .. } => 0,
+        ObjectToStr(operand) => max_try_depth_in_expr(operand),
         SetUnion { left, right } => max_try_depth_in_expr(left).max(max_try_depth_in_expr(right)),
         ListPop { list, index } | ListIndexOf { list, value: index } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
@@ -455,6 +486,11 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
         | Stmt::ListAppend { value: e, .. }
         | Stmt::ListRemove { value: e, .. }
         | Stmt::CellStore { value: e, .. } => count_yields_in_expr(e),
+        Stmt::SetField {
+            object: o,
+            value: v,
+            ..
+        } => count_yields_in_expr(o) + count_yields_in_expr(v),
         Stmt::ListInsert {
             index: i, value: v, ..
         }
@@ -548,7 +584,13 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         Contains { needle, haystack } => {
             count_yields_in_expr(needle) + count_yields_in_expr(haystack)
         }
-        IsInstance { value, .. } | ExcIsInstance { value, .. } => count_yields_in_expr(value),
+        IsInstance { value, .. }
+        | ExcIsInstance { value, .. }
+        | ClassIsInstance { value, .. }
+        | GetField { object: value, .. } => count_yields_in_expr(value),
+        CallMethod { args, .. } => args.iter().map(count_yields_in_expr).sum(),
+        NewObject { .. } => 0,
+        ObjectToStr(operand) => count_yields_in_expr(operand),
         SetUnion { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
         ListPop { list, index } | ListIndexOf { list, value: index } => {
             count_yields_in_expr(list) + count_yields_in_expr(index)
@@ -785,7 +827,13 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_json_loads_dict_str_int(ptr)\n");
         out.push_str("declare ptr @pyrs_json_loads_dict_str_float(ptr)\n");
         out.push_str("declare ptr @pyrs_json_loads_dict_str_str(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_dict_str_bool(ptr)\n\n");
+        out.push_str("declare ptr @pyrs_json_loads_dict_str_bool(ptr)\n");
+        out.push_str("declare ptr @pyrs_object_new(i64, i64)\n");
+        out.push_str("declare i32 @pyrs_isinstance_class(ptr, i64, ptr, i64)\n");
+        out.push_str("declare void @pyrs_print_object(ptr)\n");
+        out.push_str("declare void @pyrs_print_class_instance(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_from_object(ptr)\n");
+        out.push_str("declare void @pyrs_set_class_names(ptr, i64)\n\n");
         out.push_str(&self.global_defs);
         out.push_str(&self.string_defs);
         out.push('\n');
@@ -794,6 +842,49 @@ impl Emitter {
     }
 
     fn emit_module(&mut self, module: &Module) {
+        self.classes = module.classes.clone();
+        // Class parent table + C-string name table for isinstance / print / str.
+        if !module.classes.is_empty() {
+            let n = module.classes.len();
+            let mut elems = String::new();
+            for (i, c) in module.classes.iter().enumerate() {
+                if i > 0 {
+                    elems.push_str(", ");
+                }
+                let p = c.parent.map(|p| p as i64).unwrap_or(-1);
+                elems.push_str(&format!("i64 {p}"));
+            }
+            self.global_defs.push_str(&format!(
+                "@pyrs_class_parents = internal constant [{n} x i64] [{elems}]\n"
+            ));
+            // C-string globals for each class simple name (for runtime print/str).
+            for c in &module.classes {
+                let (esc, len) = escape_bytes(&c.name);
+                self.global_defs.push_str(&format!(
+                    "@.cn.{} = private unnamed_addr constant [{len} x i8] c\"{esc}\", align 1\n",
+                    c.id
+                ));
+            }
+            let mut name_ptrs = String::new();
+            for (i, c) in module.classes.iter().enumerate() {
+                if i > 0 {
+                    name_ptrs.push_str(", ");
+                }
+                let blen = c.name.len() + 1;
+                name_ptrs.push_str(&format!(
+                    "ptr getelementptr inbounds ([{blen} x i8], ptr @.cn.{}, i32 0, i32 0)",
+                    c.id
+                ));
+            }
+            self.global_defs.push_str(&format!(
+                "@pyrs_class_name_ptrs = internal constant [{n} x ptr] [{name_ptrs}]\n"
+            ));
+            // Also intern display forms for static ObjectDefaultStr paths.
+            for c in &module.classes {
+                let label = format!("<{} object>", c.name);
+                let _ = self.intern_string(&label);
+            }
+        }
         // module globals, zero/null-initialized; assigned when the entry
         // function runs its top-level statements
         for (name, ty) in &module.globals {
@@ -810,7 +901,8 @@ impl Emitter {
                 | Ty::Closure { .. }
                 | Ty::Cell(_)
                 | Ty::Generator { .. }
-                | Ty::Exception => "null".to_string(),
+                | Ty::Exception
+                | Ty::Class(_) => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
                 _ => "0".to_string(),
             };
@@ -824,9 +916,18 @@ impl Emitter {
         }
         // the real C main: call the entry function and exit 0
         let entry = mangle(&module.entry);
+        let class_setup = if module.classes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  call void @pyrs_set_class_names(ptr @pyrs_class_name_ptrs, i64 {})\n",
+                module.classes.len()
+            )
+        };
         self.funcs.push_str(&format!(
             "define i32 @main(i32 %argc, ptr %argv) {{\nentry:\n  \
-             call void @pyrs_set_args(i32 %argc, ptr %argv)\n  \
+             call void @pyrs_set_args(i32 %argc, ptr %argv)\n\
+             {class_setup}  \
              call void @{entry}()\n  ret i32 0\n}}\n\n"
         ));
     }
@@ -1276,7 +1377,8 @@ impl Emitter {
             | Ty::Closure { .. }
             | Ty::Cell(_)
             | Ty::Generator { .. }
-            | Ty::Exception => {
+            | Ty::Exception
+            | Ty::Class(_) => {
                 let t = self.tmp();
                 self.line(format!("{t} = ptrtoint ptr {value} to i64"));
                 t
@@ -1334,7 +1436,8 @@ impl Emitter {
             | Ty::Closure { .. }
             | Ty::Cell(_)
             | Ty::Generator { .. }
-            | Ty::Exception => {
+            | Ty::Exception
+            | Ty::Class(_) => {
                 let t = self.tmp();
                 self.line(format!("{t} = inttoptr i64 {slot} to ptr"));
                 t
@@ -1511,6 +1614,29 @@ impl Emitter {
         u1
     }
 
+    /// Call a mangled method/function with already-emitted arg values.
+    fn emit_direct_method_call(
+        &mut self,
+        func: &str,
+        arg_vals: &[(String, Ty)],
+        ret: Ty,
+    ) -> String {
+        let args_str = arg_vals
+            .iter()
+            .map(|(v, ty)| format!("{} {v}", lty(*ty)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let callee = mangle(func);
+        if ret == Ty::None {
+            self.line(format!("call void @{callee}({args_str})"));
+            "0".to_string()
+        } else {
+            let t = self.tmp();
+            self.line(format!("{t} = call {} @{callee}({args_str})", lty_ret(ret)));
+            t
+        }
+    }
+
     /// Print a value of any supported type (including None and unions).
     fn emit_print_value(&mut self, v: &str, ty: Ty) {
         match ty {
@@ -1523,6 +1649,10 @@ impl Emitter {
             }
             Ty::Str => self.line(format!("call void @pyrs_print_str(ptr {v})")),
             Ty::Exception => self.line(format!("call void @pyrs_print_exc(ptr {v})")),
+            Ty::Class(_) => {
+                // Runtime type_id → class display name (needs pyrs_set_class_names).
+                self.line(format!("call void @pyrs_print_class_instance(ptr {v})"));
+            }
             Ty::List(elem) => self.line(format!(
                 "call void @pyrs_print_list(ptr {v}, i32 {})",
                 elem_tag(elem)
@@ -1609,7 +1739,8 @@ impl Emitter {
                 | Ty::Closure { .. }
                 | Ty::Cell(_)
                 | Ty::Generator { .. }
-                | Ty::Exception => "null".to_string(),
+                | Ty::Exception
+                | Ty::Class(_) => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
                 _ => "0".to_string(),
             };
@@ -1880,6 +2011,27 @@ impl Emitter {
                 let v = self.emit_expr(value);
                 let slot = self.slot_from_value(&v, value.ty);
                 self.line(format!("call void @pyrs_cell_store(ptr {c}, i64 {slot})"));
+            }
+            Stmt::SetField {
+                object,
+                class_id,
+                field_index,
+                value,
+            } => {
+                let obj = self.emit_expr(object);
+                let v = self.emit_expr(value);
+                let info = self
+                    .classes
+                    .get(*class_id as usize)
+                    .expect("SetField class_id");
+                let sty = class_struct_ty(info);
+                // field_index is 0-based into fields; LLVM index is 1+field (0=type_id)
+                let idx = *field_index as i32 + 1;
+                let fp = self.tmp();
+                self.line(format!(
+                    "{fp} = getelementptr inbounds {sty}, ptr {obj}, i32 0, i32 {idx}"
+                ));
+                self.line(format!("store {} {v}, ptr {fp}", lty(value.ty)));
             }
             Stmt::GenClose { generator } => {
                 let g = self.emit_expr(generator);
@@ -2592,11 +2744,12 @@ impl Emitter {
                 type_tags,
                 bool_is_int,
                 exc_filters,
+                class_filters,
             } => {
                 // Locals/unions store `{ i32 member_index, i64 payload }` by value
                 // (not a heap box). Match member_index against members whose
                 // print-tag satisfies any of `type_tags` (list=4 means any list).
-                // Exception members use hierarchy filters on the payload.
+                // Exception/Class members use hierarchy filters on the payload.
                 let v = self.emit_expr(value);
                 let Ty::Union(members) = value.ty else {
                     // Monomorphic path should have been folded in semantic.
@@ -2610,10 +2763,15 @@ impl Emitter {
                 self.line(format!("{payload} = extractvalue {{ i32, i64 }} {v}, 1"));
                 let mut matching: Vec<usize> = Vec::new();
                 let mut exc_member: Option<usize> = None;
+                let mut class_members: Vec<(usize, u32)> = Vec::new(); // (member_idx, class_id)
                 for (i, m) in members.iter().enumerate() {
                     if *m == Ty::Exception {
                         exc_member = Some(i);
                         continue; // never match Exception via print tags alone
+                    }
+                    if let Ty::Class(cid) = *m {
+                        class_members.push((i, cid));
+                        continue; // never match Class via print tags alone
                     }
                     let ptag = member_print_tag(*m);
                     let hit = type_tags.iter().any(|&want| {
@@ -2692,6 +2850,61 @@ impl Emitter {
                             or
                         }
                     });
+                }
+                // Class members: hierarchy check when active.
+                if !class_filters.is_empty() && !class_members.is_empty() {
+                    let n = self.classes.len() as i64;
+                    for (mi, _cid) in &class_members {
+                        let is_cls = self.tmp();
+                        self.line(format!("{is_cls} = icmp eq i32 {idx}, {mi}"));
+                        let yes_l = self.fresh_block("isinstance.cls.yes");
+                        let no_l = self.fresh_block("isinstance.cls.no");
+                        let end_l = self.fresh_block("isinstance.cls.end");
+                        self.line(format!("br i1 {is_cls}, label %{yes_l}, label %{no_l}"));
+
+                        self.start_block(&yes_l);
+                        let obj = self.tmp();
+                        self.line(format!("{obj} = inttoptr i64 {payload} to ptr"));
+                        let mut cls_hit: Option<String> = None;
+                        for &want in class_filters {
+                            let m = self.tmp();
+                            self.line(format!(
+                                "{m} = call i32 @pyrs_isinstance_class(ptr {obj}, i64 {}, ptr @pyrs_class_parents, i64 {n})",
+                                want as i64
+                            ));
+                            let cmp = self.tmp();
+                            self.line(format!("{cmp} = icmp ne i32 {m}, 0"));
+                            cls_hit = Some(match cls_hit {
+                                None => cmp,
+                                Some(prev) => {
+                                    let or = self.tmp();
+                                    self.line(format!("{or} = or i1 {prev}, {cmp}"));
+                                    or
+                                }
+                            });
+                        }
+                        let yes_v = cls_hit.unwrap();
+                        let yes_pred = self.cur_block.clone();
+                        self.line(format!("br label %{end_l}"));
+
+                        self.start_block(&no_l);
+                        let no_pred = self.cur_block.clone();
+                        self.line(format!("br label %{end_l}"));
+
+                        self.start_block(&end_l);
+                        let cls_ok = self.tmp();
+                        self.line(format!(
+                            "{cls_ok} = phi i1 [ {yes_v}, %{yes_pred} ], [ false, %{no_pred} ]"
+                        ));
+                        acc = Some(match acc {
+                            None => cls_ok,
+                            Some(prev) => {
+                                let or = self.tmp();
+                                self.line(format!("{or} = or i1 {prev}, {cls_ok}"));
+                                or
+                            }
+                        });
+                    }
                 }
                 match acc {
                     Some(a) => a,
@@ -3215,6 +3428,158 @@ impl Emitter {
                 self.line(format!(
                     "{t} = phi {{ i32, i64 }} [ {some_u}, %{sblk} ], [ {none_u}, %{nblk} ]"
                 ));
+                t
+            }
+            ExprKind::NewObject { class_id } => {
+                let info = self
+                    .classes
+                    .get(*class_id as usize)
+                    .expect("NewObject class_id")
+                    .clone();
+                let sty = class_struct_ty(&info);
+                // sizeof via GEP: ptrtoint of getelementptr one past
+                let size_p = self.tmp();
+                self.line(format!("{size_p} = getelementptr {sty}, ptr null, i32 1"));
+                let nbytes = self.tmp();
+                self.line(format!("{nbytes} = ptrtoint ptr {size_p} to i64"));
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_object_new(i64 {}, i64 {nbytes})",
+                    *class_id as i64
+                ));
+                // Typed zero-init for every field (raw memset leaves int as
+                // untagged 0 → SEGV on arithmetic/print).
+                for (fi, (_, fty)) in info.fields.iter().enumerate() {
+                    let idx = fi as i32 + 1;
+                    let fp = self.tmp();
+                    self.line(format!(
+                        "{fp} = getelementptr inbounds {sty}, ptr {t}, i32 0, i32 {idx}"
+                    ));
+                    let zero = match fty {
+                        Ty::Int => "1".to_string(), // tagged small 0
+                        Ty::Float => fconst(0.0),
+                        Ty::Bool => "false".to_string(),
+                        Ty::None => "0".to_string(),
+                        Ty::Union(_) => "zeroinitializer".to_string(),
+                        Ty::Str
+                        | Ty::List(_)
+                        | Ty::Tuple(_)
+                        | Ty::Dict { .. }
+                        | Ty::Set(_)
+                        | Ty::File
+                        | Ty::Closure { .. }
+                        | Ty::Cell(_)
+                        | Ty::Generator { .. }
+                        | Ty::Exception
+                        | Ty::Class(_) => "null".to_string(),
+                    };
+                    self.line(format!("store {} {zero}, ptr {fp}", lty(*fty)));
+                }
+                t
+            }
+            ExprKind::GetField {
+                object,
+                class_id,
+                field_index,
+            } => {
+                let obj = self.emit_expr(object);
+                let info = self
+                    .classes
+                    .get(*class_id as usize)
+                    .expect("GetField class_id");
+                let sty = class_struct_ty(info);
+                let fty = info.fields[*field_index as usize].1;
+                let idx = *field_index as i32 + 1;
+                let fp = self.tmp();
+                self.line(format!(
+                    "{fp} = getelementptr inbounds {sty}, ptr {obj}, i32 0, i32 {idx}"
+                ));
+                let t = self.tmp();
+                self.line(format!("{t} = load {}, ptr {fp}", lty(fty)));
+                t
+            }
+            ExprKind::CallMethod {
+                direct_func,
+                candidates,
+                args,
+                virtual_dispatch,
+            } => {
+                let mut arg_vals = Vec::new();
+                for a in args {
+                    arg_vals.push((self.emit_expr(a), a.ty));
+                }
+                if !*virtual_dispatch || candidates.len() <= 1 {
+                    return self.emit_direct_method_call(direct_func, &arg_vals, expr.ty);
+                }
+                // Virtual: switch on type_id of self (args[0]).
+                let self_ptr = &arg_vals[0].0;
+                let tid_p = self.tmp();
+                self.line(format!(
+                    "{tid_p} = getelementptr inbounds {{ i64 }}, ptr {self_ptr}, i32 0, i32 0"
+                ));
+                let tid = self.tmp();
+                self.line(format!("{tid} = load i64, ptr {tid_p}"));
+                let end_l = self.fresh_block("vcall.end");
+                let default_l = self.fresh_block("vcall.def");
+                let mut cases = String::new();
+                let mut blocks = Vec::new();
+                for (cid, func) in candidates {
+                    let bl = self.fresh_block(&format!("vcall.{}", cid));
+                    cases.push_str(&format!(" i64 {}, label %{bl}", *cid as i64));
+                    blocks.push((bl, func.clone()));
+                }
+                self.line(format!("switch i64 {tid}, label %{default_l} [{cases} ]"));
+                let ret_void = expr.ty == Ty::None;
+                let mut phi_preds = Vec::new();
+                for (bl, func) in &blocks {
+                    self.start_block(bl);
+                    let r = self.emit_direct_method_call(func, &arg_vals, expr.ty);
+                    let cblk = self.cur_block.clone();
+                    if !ret_void {
+                        phi_preds.push((r, cblk));
+                    }
+                    self.line(format!("br label %{end_l}"));
+                }
+                self.start_block(&default_l);
+                // Fall back to direct_func for unknown type_ids.
+                let rdef = self.emit_direct_method_call(direct_func, &arg_vals, expr.ty);
+                let dblk = self.cur_block.clone();
+                if !ret_void {
+                    phi_preds.push((rdef, dblk));
+                }
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&end_l);
+                if ret_void {
+                    "0".to_string()
+                } else {
+                    let t = self.tmp();
+                    let mut phi = format!("{t} = phi {} ", lty(expr.ty));
+                    for (i, (v, b)) in phi_preds.iter().enumerate() {
+                        if i > 0 {
+                            phi.push_str(", ");
+                        }
+                        phi.push_str(&format!("[ {v}, %{b} ]"));
+                    }
+                    self.line(phi);
+                    t
+                }
+            }
+            ExprKind::ClassIsInstance { value, class_id } => {
+                let v = self.emit_expr(value);
+                let n = self.classes.len() as i64;
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i32 @pyrs_isinstance_class(ptr {v}, i64 {}, ptr @pyrs_class_parents, i64 {n})",
+                    *class_id as i64
+                ));
+                let b = self.tmp();
+                self.line(format!("{b} = icmp ne i32 {t}, 0"));
+                b
+            }
+            ExprKind::ObjectToStr(obj) => {
+                let v = self.emit_expr(obj);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_str_from_object(ptr {v})"));
                 t
             }
             ExprKind::Binary { op, left, right } => self.emit_binary(*op, left, right),
@@ -4332,7 +4697,9 @@ impl Emitter {
                 t
             }
             // Exception instances are always truthy (CPython BaseException).
-            Ty::Exception => {
+            // User class instances are always truthy when non-null (we never
+            // produce null instances after construction).
+            Ty::Exception | Ty::Class(_) => {
                 let _ = v;
                 "true".to_string()
             }

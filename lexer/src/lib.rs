@@ -619,7 +619,13 @@ impl<'a> Iterator for Lexer<'a> {
                     } else if slice.starts_with("\"\"\"") || slice.starts_with("'''") {
                         "unterminated triple-quoted string literal".to_string()
                     } else {
-                        format!("unexpected character {:?}", slice)
+                        if slice == "@" {
+                            "decorators (@property / @classmethod / @staticmethod / \
+                             class decorators) are not supported yet"
+                                .to_string()
+                        } else {
+                            format!("unexpected character {:?}", slice)
+                        }
                     };
                     return Some(Err(Diagnostic::new(Phase::Lex, message, span)));
                 }

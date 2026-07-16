@@ -66,7 +66,13 @@ pub enum Ty {
     /// First-class exception instance (`except E as e`). Heap object with a
     /// fixed exception type tag and message; never freed. Not a user class.
     Exception,
+    /// User-defined class instance. `ClassId` indexes [`Module::classes`].
+    /// Layout: header `i64 type_id` then fixed fields (never freed; GC-ready).
+    Class(ClassId),
 }
+
+/// Stable id for a user class in a compiled module (index into `Module::classes`).
+pub type ClassId = u32;
 
 /// Intern a list type: `list_of(Ty::Int)` is `list[int]`.
 pub fn list_of(elem: Ty) -> Ty {
@@ -92,7 +98,7 @@ pub fn set_of(elem: Ty) -> Ty {
 }
 
 /// Total order for union members: None < Bool < Int < Float < Str < List <
-/// Tuple < Dict < Set < File < Closure < Cell < Generator < Exception.
+/// Tuple < Dict < Set < File < Closure < Cell < Generator < Exception < Class.
 /// Nested containers compare recursively. Unions should not nest (flatten first).
 pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -113,6 +119,7 @@ pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
             Ty::Cell(_) => 12,
             Ty::Generator { .. } => 13,
             Ty::Exception => 14,
+            Ty::Class(_) => 15,
         }
     }
     match (a, b) {
@@ -181,6 +188,7 @@ pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
             f1.cmp(f2)
         }
         (Ty::Generator { yield_ty: a }, Ty::Generator { yield_ty: b }) => ty_cmp(a, b),
+        (Ty::Class(a), Ty::Class(b)) => a.cmp(b),
         _ => rank(a).cmp(&rank(b)),
     }
 }
@@ -318,8 +326,23 @@ impl std::fmt::Display for Ty {
             Ty::Cell(inner) => write!(f, "cell[{inner}]"),
             Ty::Generator { yield_ty } => write!(f, "generator[{yield_ty}]"),
             Ty::Exception => write!(f, "exception"),
+            Ty::Class(id) => write!(f, "class#{id}"),
         }
     }
+}
+
+/// Compile-time class layout and method table (closed world).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassInfo {
+    pub id: ClassId,
+    /// Display / debug name (e.g. `Point` or `pkg.Point`).
+    pub name: String,
+    /// Single base class, if any.
+    pub parent: Option<ClassId>,
+    /// Instance fields in layout order (parent fields first, then own).
+    pub fields: Vec<(String, Ty)>,
+    /// Method name → fully-qualified IR function (most specific implementation).
+    pub methods: Vec<(String, String)>,
 }
 
 /// Exception type tags matching the C runtime (`pyrs_raise` / handlers).
@@ -412,6 +435,8 @@ pub struct Module {
     /// Module-level variables (assigned by top-level statements, readable
     /// from any function, writable with `global`). Zero/null-initialized.
     pub globals: Vec<(String, Ty)>,
+    /// User class layouts / method tables (indexed by [`ClassId`]).
+    pub classes: Vec<ClassInfo>,
     /// Name of the function that is the program entry point.
     pub entry: String,
 }
@@ -571,6 +596,13 @@ pub enum Stmt {
         cell: Expr,
         value: Expr,
     },
+    /// `obj.field = value` for a known instance field (layout index).
+    SetField {
+        object: Expr,
+        class_id: ClassId,
+        field_index: u32,
+        value: Expr,
+    },
     /// `yield value` inside a generator function — suspend and produce value.
     Yield(Expr),
     /// `gen.close()` — inject GeneratorExit, run finally, mark done.
@@ -693,6 +725,8 @@ pub enum ExprKind {
     /// `bool_is_int` is true, tag 2 also matches an int check (CPython).
     /// When the union includes `Exception` and `exc_filters` is non-empty, the
     /// Exception member is checked via hierarchy on the payload (not print tag).
+    /// When the union includes `Class` members and `class_filters` is non-empty,
+    /// those members are checked via `pyrs_isinstance_class` on the payload.
     IsInstance {
         value: Box<Expr>,
         type_tags: Vec<i32>,
@@ -700,6 +734,8 @@ pub enum ExprKind {
         /// `ExcType` tags for hierarchy match when the active union member is
         /// `Exception`. Empty if no exception filters were requested.
         exc_filters: Vec<i32>,
+        /// User class ids for hierarchy match when the active member is a Class.
+        class_filters: Vec<ClassId>,
     },
     /// Runtime `isinstance(exc, ExcType)` / tuple of exception types when
     /// `value` is an exception object. Filters are `ExcType` tags; matching
@@ -895,6 +931,38 @@ pub enum ExprKind {
     /// Type on `expr.ty` is `Optional[Y]`: None when the subgen used bare
     /// `return` / fell off the end; `Some(v)` after `return v`.
     GeneratorReturnValue(Box<Expr>),
+    /// Allocate a zeroed instance of `class_id` (header type_id + fields).
+    /// Does not call `__init__` — semantic wraps that separately.
+    NewObject {
+        class_id: ClassId,
+    },
+    /// Load instance field at layout index (0-based into `ClassInfo::fields`).
+    GetField {
+        object: Box<Expr>,
+        class_id: ClassId,
+        field_index: u32,
+    },
+    /// Instance method call. When `virtual` is true, dispatch on runtime
+    /// type_id among `candidates` (pairs of (type_id, ir_func)); otherwise
+    /// call `direct_func` statically. `args` is self then user args.
+    CallMethod {
+        /// Fully-qualified IR function when not virtual.
+        direct_func: String,
+        /// (class_id, ir_func) for each concrete class that may appear;
+        /// empty when not virtual.
+        candidates: Vec<(ClassId, String)>,
+        args: Vec<Expr>,
+        /// When true, load type_id from `args[0]` and switch.
+        virtual_dispatch: bool,
+    },
+    /// `isinstance(obj, Class)` with inheritance: walk parent chain.
+    ClassIsInstance {
+        value: Box<Expr>,
+        /// Target class id (True if value's type is this or a subclass).
+        class_id: ClassId,
+    },
+    /// Default `str(obj)` for an instance: runtime type_id → `"<Name object>"`.
+    ObjectToStr(Box<Expr>),
 }
 
 /// Unary ops from the pure-PyRs `math` module (bodies replaced at lower).

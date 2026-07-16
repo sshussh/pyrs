@@ -171,7 +171,7 @@ impl Parser {
             Token::If => self.parse_if(),
             Token::While => self.parse_while(),
             Token::For => self.parse_for(),
-            Token::Class => Err(self.error("classes are not supported yet")),
+            Token::Class => self.parse_classdef(),
             Token::Import => self.parse_import(),
             Token::From => self.parse_from_import(),
             Token::Try => self.parse_try(),
@@ -522,6 +522,15 @@ impl Parser {
                     span,
                 })
             }
+            ExprKind::Attribute {
+                base,
+                attr,
+                attr_span,
+            } => Ok(AssignTarget::Attr {
+                base: *base,
+                attr,
+                attr_span,
+            }),
             _ => Err(Diagnostic::new(
                 Phase::Parse,
                 "cannot assign to this expression",
@@ -683,13 +692,105 @@ impl Parser {
                 self.expect(Token::RBracket, "to close 'Optional[...]'")?;
                 Ok(intern_type_union(&[inner, TypeName::None]))
             }
+            // User class type annotation (`Point`, `Animal`, …).
+            Token::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(TypeName::Class(Box::leak(name.into_boxed_str())))
+            }
             other => Err(self.error(format!(
                 "expected a type ('int', 'float', 'bool', 'str', 'file', 'list[...]', \
-                 'tuple[...]', 'dict[...]', 'set[...]', 'Optional[T]', or 'None') {}, found {}",
+                 'tuple[...]', 'dict[...]', 'set[...]', 'Optional[T]', a class name, \
+                 or 'None') {}, found {}",
                 context,
                 other.describe()
             ))),
         }
+    }
+
+    fn parse_classdef(&mut self) -> PResult<Stmt> {
+        let start = self.expect(Token::Class, "")?;
+        let (name, name_span) = self.expect_ident("after 'class'")?;
+        let mut bases = Vec::new();
+        if self.eat(&Token::LParen) {
+            if self.peek() != &Token::RParen {
+                loop {
+                    // `class C(metaclass=M)` / keyword args in the base list.
+                    if matches!(self.peek(), Token::Ident(_)) && self.peek2() == &Token::Eq {
+                        let span = self.peek_span();
+                        return Err(Diagnostic::new(
+                            Phase::Parse,
+                            "metaclasses are not supported yet",
+                            span,
+                        ));
+                    }
+                    let (bname, bspan) = self.expect_ident("as base class")?;
+                    // `Base=...` if `=` appears after a bare name (keyword form).
+                    if self.peek() == &Token::Eq {
+                        return Err(Diagnostic::new(
+                            Phase::Parse,
+                            "metaclasses are not supported yet",
+                            bspan,
+                        ));
+                    }
+                    bases.push((bname, bspan));
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                    if self.peek() == &Token::RParen {
+                        break;
+                    }
+                }
+            }
+            self.expect(Token::RParen, "after base class list")?;
+        }
+        let header_span = start.to(name_span);
+        let body = self.parse_block("class body")?;
+        // Reject decorators/unsupported body forms early when possible:
+        // nested classes, bare expressions other than docstrings, etc.
+        for stmt in &body {
+            match &stmt.kind {
+                StmtKind::FuncDef(_) | StmtKind::Pass => {}
+                StmtKind::ClassDef(_) => {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        "nested classes are not supported yet",
+                        stmt.span,
+                    ));
+                }
+                StmtKind::Assign { .. } => {
+                    // Semantic also rejects; fail early with the same policy:
+                    // fields belong in __init__, not class-body attributes.
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        "class body attributes are not supported yet \
+                         (assign fields in __init__ with self.x = …; methods, \
+                         pass, and docstrings only)",
+                        stmt.span,
+                    ));
+                }
+                StmtKind::ExprStmt(e) if matches!(e.kind, ExprKind::Str(_)) => {
+                    // docstring
+                }
+                _ => {
+                    return Err(Diagnostic::new(
+                        Phase::Parse,
+                        "this statement is not supported in a class body yet \
+                         (methods, pass, and docstrings only)",
+                        stmt.span,
+                    ));
+                }
+            }
+        }
+        Ok(Stmt {
+            kind: StmtKind::ClassDef(ClassDef {
+                name,
+                bases,
+                body,
+                span: header_span,
+            }),
+            span: header_span,
+        })
     }
 
     fn parse_raise(&mut self) -> PResult<Stmt> {
@@ -2023,17 +2124,17 @@ impl Parser {
     }
 
     /// `lambda [params]: expr`
+    ///
+    /// Parameter type annotations are not supported on lambdas: the first `:`
+    /// always starts the body (CPython grammar). Accepting `lambda x: T: …`
+    /// would make bare `lambda x: x + 1` ambiguous once class names are types.
     fn parse_lambda(&mut self, start: Span) -> PResult<Expr> {
         self.expect(Token::Lambda, "")?;
         let mut params: Vec<Param> = Vec::new();
         if self.peek() != &Token::Colon {
             loop {
                 let (pname, pspan) = self.expect_ident("in lambda parameter list")?;
-                let ty = if self.eat(&Token::Colon) {
-                    Some(self.parse_type_name("in lambda parameter annotation")?)
-                } else {
-                    None
-                };
+                // No `:` type annotation (see doc above).
                 let default = if self.eat(&Token::Eq) {
                     Some(self.parse_expr()?)
                 } else {
@@ -2048,7 +2149,7 @@ impl Parser {
                 }
                 params.push(Param {
                     name: pname,
-                    ty,
+                    ty: None,
                     span: pspan,
                     default,
                 });
@@ -2231,6 +2332,10 @@ impl Parser {
             }
             Token::Ident(name) => {
                 self.advance();
+                // `case Class(...):` / `case Class():` — class patterns not supported.
+                if self.peek() == &Token::LParen {
+                    return Err(self.error("class patterns in match/case are not supported yet"));
+                }
                 Ok(Pattern::Capture(name))
             }
             Token::Intlit(v) => {
@@ -2375,6 +2480,9 @@ fn target_span(target: &AssignTarget) -> Span {
         AssignTarget::Name { span, .. } => *span,
         AssignTarget::Index { base, index } => base.span.to(index.span),
         AssignTarget::Starred { span, .. } => *span,
+        AssignTarget::Attr {
+            base, attr_span, ..
+        } => base.span.to(*attr_span),
         AssignTarget::Tuple(items) => {
             let first = items
                 .first()
@@ -2396,6 +2504,12 @@ fn rebase_target_spans(target: &mut AssignTarget, span: Span) {
         AssignTarget::Starred { target, span: s } => {
             *s = span;
             rebase_target_spans(target, span);
+        }
+        AssignTarget::Attr {
+            base, attr_span, ..
+        } => {
+            rebase_spans(base, span);
+            *attr_span = span;
         }
         AssignTarget::Tuple(items) => {
             for t in items {
@@ -3510,6 +3624,52 @@ def f(n: int) -> int:
                 op: BinOp::BitOr,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn parses_classdef_with_base_and_method() {
+        let m = parse_ok(
+            "\
+class Dog(Animal):
+    def speak(self) -> str:
+        return \"woof\"
+",
+        );
+        let StmtKind::ClassDef(c) = &m.body[0].kind else {
+            panic!("expected ClassDef, got {:?}", m.body[0].kind);
+        };
+        assert_eq!(c.name, "Dog");
+        assert_eq!(c.bases.len(), 1);
+        assert_eq!(c.bases[0].0, "Animal");
+        assert!(
+            c.body
+                .iter()
+                .any(|s| matches!(&s.kind, StmtKind::FuncDef(f) if f.name == "speak"))
+        );
+    }
+
+    #[test]
+    fn parses_self_attr_assign() {
+        let m = parse_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+",
+        );
+        let StmtKind::ClassDef(c) = &m.body[0].kind else {
+            panic!("expected ClassDef");
+        };
+        let StmtKind::FuncDef(f) = &c.body[0].kind else {
+            panic!("expected method");
+        };
+        let StmtKind::Assign { targets, .. } = &f.body[0].kind else {
+            panic!("expected assign");
+        };
+        assert!(matches!(
+            &targets[0],
+            AssignTarget::Attr { attr, .. } if attr == "x"
         ));
     }
 
