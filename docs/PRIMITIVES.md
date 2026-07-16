@@ -228,17 +228,18 @@ binary.
 | **4. Core language** | Typing/dynamism, narrowing, kit, generators, … | Can write real libraries without compiler stubs |
 | **5. Modules path** | Already: multi-root + embed | `import` loads stdlib `.py` |
 | **6. Stdlib growth** | **Pure PyRs** modules on the kit | C only for primitive families — after phase 4 (may overlap late core) |
-| **7. Final pair** | **Classes**, then **GC/RC/free** (or reverse) | Owner: these are the **last two** core features |
+| **7. Final core** | **GC/RC/free** (classes shipped v0.19 subset) | GC remains required before 1.0; grow class dynamism carefully |
 | **8. 1.0** | Real-world readiness | GC done + surface/stability bar |
 
 **Explanation:** Do not grow a large stdlib (especially in C) before the
 core language can host pure-PyRs implementations. Do not implement `json`
 logic in C as a substitute for missing types/dynamism.
 
-**Owner priority:** implement **classes** and **garbage collection /
-heap freeing** only after all other planned core-language work. They are
-the final two core features. Never-free is interim until phase 7; GC
-remains required for **1.0**.
+**Owner priority:** **classes** shipped (v0.19 closed-world subset).
+Implement **garbage collection / heap freeing** only after other planned
+core-language work the owner prioritizes — GC is the final major core
+feature. Never-free is interim until phase 7; GC remains required for
+**1.0**.
 
 ---
 

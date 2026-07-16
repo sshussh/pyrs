@@ -26,6 +26,7 @@ machine code through LLVM. There is no interpreter and no VM at runtime —
    - [Lists](#lists)
    - [Control flow](#control-flow)
    - [Functions](#functions)
+   - [Classes](#classes)
    - [Built-in functions](#built-in-functions)
    - [Comments and line continuation](#comments-and-line-continuation)
    - [Files](#files)
@@ -682,6 +683,65 @@ inc = lambda x=0: x + 1
 print(inc(2))  # 3
 ```
 
+### Classes
+
+Closed-world, layout-specialized objects (v0.19). Instances carry a
+`type_id` header (GC-ready); heap objects are still never freed.
+
+```python
+class Point:
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+    def move(self, dx: int, dy: int):
+        self.x = self.x + dx
+        self.y = self.y + dy
+    def sum(self) -> int:
+        return self.x + self.y
+
+p = Point(1, 2)
+p.move(3, 4)
+print(p.sum())              # 10
+print(isinstance(p, Point)) # True
+
+class Animal:
+    def __init__(self, name: str):
+        self.name = name
+    def speak(self) -> str:
+        return "..."
+
+class Dog(Animal):
+    def speak(self) -> str:
+        return "woof"
+
+d = Dog("rex")
+print(d.name, d.speak())    # rex woof
+print(isinstance(d, Animal))  # True
+```
+
+**Supported:**
+
+- `class Name:` / `class Name(Base):` (single base only)
+- Instance methods with `self` (typed as the enclosing class)
+- Fields assigned in `__init__` only (class-body attributes / defaults are
+  not supported yet)
+- Construction `C(...)` → allocate + call most-specific `__init__`
+- Attribute load/store; `self.other_method()`
+- Override + **virtual dispatch** when the static type is a base
+- `isinstance(obj, Class)` with inheritance
+- Class names as type annotations (`def f(p: Point)`)
+- Default `print` / `str` → `<Name object>` (no address; stable vs CPython)
+
+**Not supported yet** (named compile errors): multiple inheritance,
+metaclasses, `__new__`, `__slots__`, bound methods as values
+(`m = obj.m`), `@property` / `@classmethod` / `@staticmethod`, open
+`__dict__` / `__getattr__`, class patterns in `match`, nested classes,
+class decorators, `super()`, class-body attributes, dotted bases
+(`class D(pkg.C)` — import the base first), first-class class objects
+as values (use as constructor/type only), `isinstance` flow narrowing
+to a more-specific subclass for field access, `==` between instances
+(use `is` for identity).
+
 ### Built-in functions
 
 | builtin | accepts | returns |
@@ -1078,8 +1138,9 @@ The phase tag tells you what stage rejected the program: `lex` (bad
 character, bad indentation), `parse` (syntax), `semantic` (names, types,
 return paths), `codegen` (internal — you should never see one; it means a
 compiler bug). Unsupported Python features produce parse/semantic errors
-that name the feature: `classes are not supported yet`,
-`slice steps are not supported yet`, and so on. Compilation stops at the
+that name the feature: `super() is not supported yet`,
+`class patterns in match/case are not supported yet`, and so on.
+Compilation stops at the
 first error.
 
 ## 8. Differences from CPython
@@ -1118,7 +1179,10 @@ deliberate exceptions:
 9. **Memory is never freed** (no GC yet); fine for short-lived programs,
    a known limitation for long-running ones. Explicit `generator.close()`
    still runs `finally` (GeneratorExit); abandoned gens without `close`
-   do not (no GC finalizers yet).
+   do not (no GC finalizers yet). User class instances use a GC-ready
+   `type_id` header but are also never freed.
+9a. **Default object print/str** is `<ClassName object>` without a
+    memory address (CPython prints `<__main__.Name object at 0x…>`).
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
 11. **Narrowing is limited** — `if x is not None:` / `is None` / `not`,
@@ -1135,7 +1199,7 @@ deliberate exceptions:
     checks always read storage tags. No attribute or full SAT-style
     narrowing. Multi-member peels keep a safe storage type for print/tags.
 
-Container notes (v0.18):
+Container notes (v0.19):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`, membership `in`
@@ -1178,7 +1242,8 @@ Hierarchy: OSError children and `except Exception` (not GeneratorExit).
 `except E as e` binds an exception object (`print`/`str`/`if`/`isinstance`).
 No container storage, attrs, or `repr`/`!r` on exception objects yet.
 
-Not implemented yet (clear compile errors): classes, GC / heap freeing,
+Not implemented yet (clear compile errors): full class dynamism (see
+[Classes](#classes) residuals), GC / heap freeing,
 f-string debug form `{x=}` / grouping / types `n`/`c`, unparenthesized
 multi-line expressions inside f-string `{...}` (parenthesize instead),
 same-delimiter triple quotes nested inside an f-string expression,

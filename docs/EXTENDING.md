@@ -154,12 +154,13 @@ Before adding something large, decide *which layer* it belongs to
 | High-level library | `os.path` (pure); interim `math`/`json` stubs | **Later: pure PyRs** under `stdlib/` — not unbounded C |
 
 Do **not** grow the stdlib while the core language is still the priority
-(owner policy: language first, then pure-PyRs libraries). Do **not**
-start **classes** or **GC / heap freeing** until other core work is done
-— they are the **last two** core features (see `PRIMITIVES.md` /
-`AGENTS.md`). Do **not** implement a high-level stdlib feature only in
-`runtime.c` if it could be composed from primitives once the language is
-ready.
+(owner policy: language first, then pure-PyRs libraries). **Classes**
+shipped as a closed-world subset in **v0.19** (see README/GUIDE). Do
+**not** start **GC / heap freeing** until other core work the owner
+prioritizes is done — GC remains the last major core feature before 1.0
+(see `PRIMITIVES.md` / `AGENTS.md`). Do **not** implement a high-level
+stdlib feature only in `runtime.c` if it could be composed from
+primitives once the language is ready.
 
 ---
 

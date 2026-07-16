@@ -38,15 +38,16 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.18)
+## The language (v0.19)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.19.0**, not 1.0) until it is ready for
+milestone after this one is **0.20.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
-**classes** and **GC / heap freeing** are planned as the **last two**
-core features (never-free is interim; GC is still required for 1.0).
-No new stdlib until the language can host pure-PyRs libraries.
+**GC / heap freeing** remains the last major core feature before 1.0
+(never-free is interim; GC is still required for 1.0). Classes ship in
+v0.19 as a closed-world subset (see below). No new stdlib until the
+language can host pure-PyRs libraries.
 
 A statically-typed Python subset:
 
@@ -56,9 +57,23 @@ A statically-typed Python subset:
   (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only;
   list elements and dict values may be Optional/unions; homogeneous
   closures (same params/ret and capture env shape, with or without
-  captures) may be list/tuple elements. Multi-assign joins storage types
+  captures) and user class instances may be list/tuple elements.
+  Multi-assign joins storage types
   (`x = 1; x = "a"` → `int | str`; numeric multi-assign promotes).
-  Bare params may be inferred monomorphically from body usage
+  Bare params may be inferred monomorphically from body usage; class
+  names are valid type annotations (`def f(p: Point)`)
+- **Classes (v0.19):** `class C:` / `class D(C):` with instance methods
+  (`def m(self, …)`), fields assigned in `__init__` only (no class-body
+  attributes), construction `C(...)`, attribute load/store,
+  `self.method()`, single inheritance with override + virtual dispatch
+  when the static type is a base, `isinstance(obj, C)` with inheritance,
+  cross-module `from m import C` / subclassing. Default `print`/`str` is
+  `<Name object>` (no address; runtime type_id). **Not yet:** multiple
+  inheritance, metaclasses, `__new__`/`__slots__`, bound methods as
+  values, `@property`/classmethod/staticmethod, open `__dict__`, class
+  patterns in `match`, nested classes, class decorators, `super()`,
+  class-body attrs, first-class class values, `isinstance` narrowing to
+  subclass fields
 - **Functions:** `def` with optional parameter/return annotations
   (defaults infer param types; bare params inferred from body when unique;
   return type inferred from `return` when omitted), defaults and keyword
@@ -204,7 +219,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.18): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.19): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
@@ -250,8 +265,9 @@ is supported; free captures use cells (late bind; load before assign
 → NameError); nested defaults freeze at def time (escaped free-var
 defaults need literals); lambda params without defaults still need
 annotations or defaults for inference; homogeneous closures in
-containers need matching params/ret/capture-env shape; no classes /
-GC yet.
+containers need matching params/ret/capture-env shape; classes are the
+closed-world subset above (no multi-base / bound methods / open attrs);
+heap objects including class instances are never freed (no GC yet).
 
 Errors come with source snippets:
 
@@ -335,4 +351,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.18.1 && git push origin v0.18.1`.
+Release tags: `git tag v0.19.0 && git push origin v0.19.0`.

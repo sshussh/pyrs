@@ -18,7 +18,7 @@ surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
 0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
 **PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
 use** (not merely because the minor is large). Current milestone:
-**v0.18** / `0.18.1`. Optional release tags: `vX.Y.Z`.
+**v0.19** / `0.19.0`. Optional release tags: `vX.Y.Z`.
 
 ---
 
@@ -332,7 +332,7 @@ programs** link only the object file from the shim plus `runtime.c`.
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.18 subset):**
+**Today (v0.19 subset):**
 
 - Storage type is the join of all RHS types (and annotation); bare
   multi-assign may produce a union (`x = 1; x = "a"` → `int | str`);
@@ -361,6 +361,11 @@ programs** link only the object file from the shim plus `runtime.c`.
   frames (process-global, single-threaded); runtime traps (`pyrs_die`) are
   catchable. `return`/`break`/`continue` pop the frame and run `finally`.
   Named traps only: other prefixes match bare `except:` only.
+- **User classes (v0.19):** closed-world `Ty::Class(ClassId)`; instance
+  header `{ i64 type_id, fields… }`; methods as IR functions
+  `Class.method`; single inheritance + virtual dispatch; field layout
+  specialized; `isinstance` with parent walk; no multi-base, bound-method
+  values, open `__dict__`, or GC free.
 
 **Direction:**
 
@@ -469,10 +474,11 @@ These are product constraints that affect design choices:
 | Typing           | Multi-assign join + bare-param body infer; no full Any | Fuller optional typing + more dynamism                                 |
 | Builtins / kit   | `isinstance`, `any`/`all`, `enumerate`/`zip`/`reversed`, set/dict kit | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
-| Language surface | Subset (see README v0.18); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
-| Product version  | `0.18.1` (and later `0.19.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
+| Language surface | Subset (see README v0.19); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
+| Product version  | `0.19.0` (and later `0.20.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
-Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
+Features explicitly **out of IR/runtime today** (non-exhaustive): full
+CPython class dynamism (v0.19 has closed-world classes),
 advanced match patterns, full `yield from` send/throw forwarding,
 f-string `{x=}` / grouping / `n`/`c`, GC. Prefer compile-time rejection with a
 clear message over silent wrong behavior. `*args`/`**kwargs` on defs and
