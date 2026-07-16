@@ -381,6 +381,7 @@ pub enum ExcType {
     Exception = 15,
     PermissionError = 16,
     IsADirectoryError = 17,
+    AssertionError = 18,
 }
 
 impl ExcType {
@@ -403,6 +404,7 @@ impl ExcType {
             ExcType::Exception => "Exception",
             ExcType::PermissionError => "PermissionError",
             ExcType::IsADirectoryError => "IsADirectoryError",
+            ExcType::AssertionError => "AssertionError",
         }
     }
 
@@ -430,7 +432,7 @@ impl ExcType {
         "ValueError, KeyError, IndexError, ZeroDivisionError, TypeError, \
          RuntimeError, GeneratorExit, OverflowError, EOFError, FileNotFoundError, \
          OSError, NameError, UnboundLocalError, StopIteration, Exception, \
-         PermissionError, IsADirectoryError"
+         PermissionError, IsADirectoryError, AssertionError"
     }
 }
 

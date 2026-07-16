@@ -47,6 +47,7 @@
 #define PYRS_EXC_EXCEPTION 15
 #define PYRS_EXC_PERMISSION 16
 #define PYRS_EXC_ISADIR 17
+#define PYRS_EXC_ASSERT 18
 #define PYRS_EXC_OTHER 99
 
 /* value tags for heterogeneous containers */
@@ -164,6 +165,8 @@ static const char *exc_type_name(int ty) {
         return "PermissionError";
     case PYRS_EXC_ISADIR:
         return "IsADirectoryError";
+    case PYRS_EXC_ASSERT:
+        return "AssertionError";
     default:
         return "Exception";
     }
@@ -221,6 +224,9 @@ static int classify_exc_msg(const char *msg) {
     }
     if (strncmp(msg, "OSError", 7) == 0) {
         return PYRS_EXC_OS;
+    }
+    if (strncmp(msg, "AssertionError", 14) == 0) {
+        return PYRS_EXC_ASSERT;
     }
     /* MemoryError and other untyped traps — bare except / Exception. */
     return PYRS_EXC_OTHER;

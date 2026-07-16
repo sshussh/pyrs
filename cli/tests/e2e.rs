@@ -10251,3 +10251,33 @@ print(str(P(8)))
     assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
+
+#[test]
+fn v021_assert_pass_and_fail() {
+    let src = "assert True\nassert 1 == 1\nprint(\"ok\")\n";
+    let out = run_program("v021_assert_ok", src);
+    assert_eq!(out, "ok\n");
+
+    let (code, err) = run_program_expect_fail("v021_assert_fail", "assert False, \"nope\"\n");
+    assert_ne!(code, 0);
+    assert!(err.contains("AssertionError"), "stderr={err}");
+    assert!(err.contains("nope"), "stderr={err}");
+}
+
+#[test]
+fn v021_assert_catch() {
+    let src = "\
+try:
+    assert False, \"x\"
+except AssertionError as e:
+    print(e)
+";
+    let out = run_program("v021_assert_catch", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}

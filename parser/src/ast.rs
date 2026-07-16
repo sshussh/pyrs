@@ -96,6 +96,7 @@ pub enum ExcType {
     Exception,
     PermissionError,
     IsADirectoryError,
+    AssertionError,
 }
 
 impl ExcType {
@@ -118,6 +119,7 @@ impl ExcType {
             ExcType::Exception => "Exception",
             ExcType::PermissionError => "PermissionError",
             ExcType::IsADirectoryError => "IsADirectoryError",
+            ExcType::AssertionError => "AssertionError",
         }
     }
 
@@ -126,7 +128,7 @@ impl ExcType {
         "ValueError, KeyError, IndexError, ZeroDivisionError, TypeError, \
          RuntimeError, GeneratorExit, OverflowError, EOFError, FileNotFoundError, \
          OSError, NameError, UnboundLocalError, StopIteration, Exception, \
-         PermissionError, IsADirectoryError"
+         PermissionError, IsADirectoryError, AssertionError"
     }
 }
 
@@ -305,6 +307,11 @@ pub enum StmtKind {
     Raise {
         exc: ExcType,
         message: Expr,
+    },
+    /// `assert test` / `assert test, msg` — desugared in semantic to raise AssertionError.
+    Assert {
+        test: Expr,
+        msg: Option<Expr>,
     },
     /// `try` / `except` / `else` / `finally`.
     /// `orelse` is only valid when there is at least one `except` (CPython).

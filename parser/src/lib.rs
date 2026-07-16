@@ -271,6 +271,23 @@ impl Parser {
                     span: start.to(self.peek_span()),
                 })
             }
+            Token::Assert => {
+                self.advance();
+                let test = self.parse_expr()?;
+                let msg = if self.eat(&Token::Comma) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                let end = msg
+                    .as_ref()
+                    .map(|e| e.span)
+                    .unwrap_or(test.span);
+                Ok(Stmt {
+                    kind: StmtKind::Assert { test, msg },
+                    span: start.to(end),
+                })
+            }
             _ => self.parse_assign_or_expr(),
         }
     }
@@ -832,6 +849,7 @@ impl Parser {
             "Exception" => Ok(ExcType::Exception),
             "PermissionError" => Ok(ExcType::PermissionError),
             "IsADirectoryError" => Ok(ExcType::IsADirectoryError),
+            "AssertionError" => Ok(ExcType::AssertionError),
             other => Err(Diagnostic::new(
                 Phase::Parse,
                 format!(
@@ -4285,5 +4303,15 @@ s: set[int] = set()
     fn top_level_script_statements() {
         let m = parse_ok("x = 1\ny = x + 2\nprint(y)\n");
         assert_eq!(m.body.len(), 3);
+    }
+
+    #[test]
+    fn parse_assert() {
+        let m = parse_ok("assert 1\nassert x, \"bad\"\n");
+        assert!(matches!(m.body[0].kind, StmtKind::Assert { msg: None, .. }));
+        assert!(matches!(
+            m.body[1].kind,
+            StmtKind::Assert { msg: Some(_), .. }
+        ));
     }
 }

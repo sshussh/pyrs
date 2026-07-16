@@ -625,6 +625,7 @@ fn ast_exc_to_ir(e: ast::ExcType) -> ir::ExcType {
         ast::ExcType::Exception => ir::ExcType::Exception,
         ast::ExcType::PermissionError => ir::ExcType::PermissionError,
         ast::ExcType::IsADirectoryError => ir::ExcType::IsADirectoryError,
+        ast::ExcType::AssertionError => ir::ExcType::AssertionError,
     }
 }
 
@@ -7988,6 +7989,41 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             });
             Ok(())
         }
+        ast::StmtKind::Assert { test, msg } => {
+            // Desugar: if not test: raise AssertionError(str(msg) or "")
+            let cond = lower_condition(test, ctx)?;
+            let not_cond = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Unary {
+                    op: ir::UnOp::Not,
+                    operand: Box::new(cond),
+                },
+            };
+            let message = if let Some(m) = msg {
+                let m_ir = lower_expr(m, ctx)?;
+                if m_ir.ty == ir::Ty::Str {
+                    m_ir
+                } else {
+                    lower_cast(ast::TypeName::Str, m_ir, m.span)?
+                }
+            } else {
+                ir::Expr {
+                    ty: ir::Ty::Str,
+                    kind: ir::ExprKind::ConstStr(String::new()),
+                }
+            };
+            out.push(ir::Stmt::If {
+                branches: vec![(
+                    not_cond,
+                    vec![ir::Stmt::Raise {
+                        exc: ir::ExcType::AssertionError,
+                        message,
+                    }],
+                )],
+                orelse: vec![],
+            });
+            Ok(())
+        }
         ast::StmtKind::Try {
             body,
             handlers,
@@ -9452,6 +9488,7 @@ fn name_to_exc_type(name: &str, span: Span) -> SResult<ir::ExcType> {
         "Exception" => Ok(ir::ExcType::Exception),
         "PermissionError" => Ok(ir::ExcType::PermissionError),
         "IsADirectoryError" => Ok(ir::ExcType::IsADirectoryError),
+        "AssertionError" => Ok(ir::ExcType::AssertionError),
         _ => Err(err(
             format!(
                 "unsupported exception type '{name}' (supported: {})",
