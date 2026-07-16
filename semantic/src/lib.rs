@@ -2543,6 +2543,13 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
     let mut order: Vec<&ast::FuncDef> = Vec::new();
     for stmt in &module.body {
         if let ast::StmtKind::FuncDef(f) = &stmt.kind {
+            if !f.decorators.is_empty() {
+                return Err(err(
+                    "function decorators are not supported yet \
+                     (class method decorators @staticmethod/@classmethod/@property work)",
+                    f.decorators[0].span,
+                ));
+            }
             if BUILTINS.contains(&f.name.as_str()) {
                 return Err(err(
                     format!("cannot redefine the builtin '{}'", f.name),
@@ -9265,6 +9272,67 @@ fn lower_with(
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
     let item_ir = lower_expr(item, ctx)?;
+
+    // User class context manager: __enter__ / __exit__(self, None, None, None).
+    if let ir::Ty::Class(id) = item_ir.ty {
+        if resolve_method(id, "__enter__").is_none() || resolve_method(id, "__exit__").is_none() {
+            return Err(err(
+                format!(
+                    "'{}' object does not support the context manager protocol \
+                     (need __enter__ and __exit__)",
+                    class_info(id)
+                        .map(|c| c.name)
+                        .unwrap_or_else(|| format!("class#{id}"))
+                ),
+                item.span,
+            ));
+        }
+        let mgr_t = ctx.fresh_temp("with.mgr", item_ir.ty);
+        out.push(ir::Stmt::Assign {
+            name: mgr_t.clone(),
+            value: item_ir,
+        });
+        let mgr = || ir::Expr {
+            ty: ir::Ty::Class(id),
+            kind: ir::ExprKind::Local(mgr_t.clone()),
+        };
+        let entered = lower_instance_method_call(mgr(), id, "__enter__", item.span, &[], ctx)?;
+        if let Some((name, name_span)) = target {
+            let bind = bind_name(name, *name_span, None, entered, item.span, ctx)?;
+            out.push(bind);
+        } else {
+            out.push(ir::Stmt::ExprStmt(entered));
+        }
+        // __exit__(None, None, None) — params typically Any/Optional.
+        let none_ast = |sp: Span| ast::Expr {
+            kind: ast::ExprKind::NoneLit,
+            span: sp,
+        };
+        let exit_args = [
+            none_ast(item.span),
+            none_ast(item.span),
+            none_ast(item.span),
+        ];
+        let exit_call =
+            lower_instance_method_call(mgr(), id, "__exit__", item.span, &exit_args, ctx).map_err(
+                |_| {
+                    err(
+                        "__exit__ must accept three arguments after self \
+                 (use a: Any = None, b: Any = None, c: Any = None)",
+                        item.span,
+                    )
+                },
+            )?;
+        let body_ir = lower_nested_block(body, ctx)?;
+        out.push(ir::Stmt::Try {
+            body: body_ir,
+            handlers: vec![],
+            orelse: vec![],
+            finally: vec![ir::Stmt::ExprStmt(exit_call)],
+        });
+        return Ok(());
+    }
+
     if item_ir.ty != ir::Ty::File {
         return Err(err(
             format!(
@@ -11343,6 +11411,7 @@ fn lower_for(
 /// `for x in obj:` when `obj` is a class with `__iter__` / `__next__`.
 /// Desugars to: `it = obj.__iter__(); while True: try: x = it.__next__(); body
 /// except StopIteration: break`.
+#[allow(clippy::too_many_arguments)]
 fn lower_for_user_iter(
     target: &ast::AssignTarget,
     obj: ir::Expr,
@@ -12930,6 +12999,34 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         } => lower_dict_comp(key, value, generators, expr.span, ctx),
         ast::ExprKind::SetComp { elem, generators } => {
             lower_set_comp(elem, generators, expr.span, ctx)
+        }
+        ast::ExprKind::NamedExpr {
+            target,
+            target_span,
+            value,
+        } => {
+            // `name := value` → assign then yield the value.
+            let v = lower_expr(value, ctx)?;
+            let ty = v.ty;
+            let bind = bind_name(target, *target_span, None, v, value.span, ctx)?;
+            let load = if ctx.binds_global(target) {
+                ir::Expr {
+                    ty,
+                    kind: ir::ExprKind::GlobalLoad(ctx.own_global(target)),
+                }
+            } else {
+                ir::Expr {
+                    ty,
+                    kind: ir::ExprKind::Local(target.clone()),
+                }
+            };
+            Ok(ir::Expr {
+                ty,
+                kind: ir::ExprKind::Block {
+                    stmts: vec![bind],
+                    result: Box::new(load),
+                },
+            })
         }
         ast::ExprKind::Index { base, index } => {
             let base_ir = lower_expr(base, ctx)?;

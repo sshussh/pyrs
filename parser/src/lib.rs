@@ -1371,6 +1371,25 @@ impl Parser {
     // ---- expressions (precedence climbing, lowest first) ----
 
     pub fn parse_expr(&mut self) -> PResult<Expr> {
+        // Assignment expression: `name := value` (walrus).
+        if let Token::Ident(name) = self.peek().clone()
+            && self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::ColonEqual)
+        {
+            let start = self.peek_span();
+            self.advance(); // ident
+            let tspan = start;
+            self.advance(); // :=
+            let value = self.parse_expr()?;
+            let span = start.to(value.span);
+            return Ok(Expr {
+                kind: ExprKind::NamedExpr {
+                    target: name,
+                    target_span: tspan,
+                    value: Box::new(value),
+                },
+                span,
+            });
+        }
         self.parse_or()
     }
 
@@ -3109,6 +3128,7 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
                 }
             }
         }
+        ExprKind::NamedExpr { value, .. } => rebase_spans(value, span),
         ExprKind::DictComp {
             key,
             value,

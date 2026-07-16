@@ -686,7 +686,7 @@ print(inc(2))  # 3
 
 ### Classes
 
-Closed-world, layout-specialized objects (v0.21). Instances carry a
+Closed-world, layout-specialized objects (v0.24). Instances carry a
 `type_id` header (GC-ready); heap objects are still never freed.
 
 ```python

@@ -8566,12 +8566,8 @@ class C(A, B):
 }
 
 #[test]
-fn class_bound_method_extract_is_compile_error() {
-    let dir = TempDir::new("class_bound");
-    let src = dir.0.join("prog.py");
-    fs::write(
-        &src,
-        "\
+fn class_bound_method_extract_works() {
+    let src = "\
 class P:
     def __init__(self):
         self.x = 1
@@ -8580,20 +8576,9 @@ class P:
 p = P()
 f = p.m
 print(f())
-",
-    )
-    .unwrap();
-    let out = Command::new(PYRS)
-        .args(["compile", "-i"])
-        .arg(&src)
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("bound methods as values are not supported yet"),
-        "stderr: {stderr}"
-    );
+";
+    let out = run_program("class_bound", src);
+    assert_eq!(out, "1\n");
 }
 
 #[test]
@@ -8877,11 +8862,11 @@ print(A().m())
 }
 
 #[test]
-fn class_decorator_not_supported() {
+fn free_function_decorator_not_supported() {
     let (_, stderr) =
-        run_program_expect_fail("class_deco", "@property\ndef f(self):\n    return 1\n");
+        run_program_expect_fail("free_deco", "@property\ndef f(self):\n    return 1\n");
     assert!(
-        stderr.contains("decorators") && stderr.contains("not supported yet"),
+        stderr.contains("function decorators") && stderr.contains("not supported yet"),
         "stderr: {stderr}"
     );
 }
@@ -10598,6 +10583,59 @@ if Bag(2):
     print(\"yes2\")
 ";
     let out = run_program("v023_lenbool", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+// --- v0.24: protocols & polish ---
+
+#[test]
+fn v024_walrus() {
+    let src = "\
+if (n := 2 + 3) > 4:
+    print(n)
+xs = [1, 2, 3]
+while (x := len(xs)) > 0:
+    print(x)
+    xs.pop()
+";
+    let out = run_program("v024_walrus", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_with_protocol() {
+    let src = "\
+class CM:
+    def __enter__(self) -> int:
+        print(\"enter\")
+        return 41
+    def __exit__(self, a: Any = None, b: Any = None, c: Any = None) -> None:
+        print(\"exit\")
+with CM() as x:
+    print(x)
+print(\"done\")
+";
+    let out = run_program("v024_with", src);
     let py = std::process::Command::new("python3")
         .arg("-c")
         .arg(src)

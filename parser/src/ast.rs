@@ -570,6 +570,12 @@ pub enum ExprKind {
         params: Vec<Param>,
         body: Box<Expr>,
     },
+    /// Assignment expression `name := value` (walrus operator).
+    NamedExpr {
+        target: String,
+        target_span: Span,
+        value: Box<Expr>,
+    },
     /// `yield value` / bare `yield` (None). Only valid inside functions.
     Yield(Option<Box<Expr>>),
     /// `yield from iterable`.

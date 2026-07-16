@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.23.0)
+## The language (v0.24.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.24.0**, not 1.0) until it is ready for
+milestone after this one is **0.25.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
@@ -117,6 +117,7 @@ A statically-typed Python subset:
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring, list/tuple/set
   membership, dict keys),
+  assignment expressions `name := value` (walrus),
   `is`/`is not` (None checks plus pointer/slot identity for same-type
   heap objects and scalars), bitwise `& | ^ ~ << >>`
   (and augassign) on int/bool; set `|` / `.union` / `|=`,
@@ -239,7 +240,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.23.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.24.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
@@ -382,4 +383,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.23.0 && git push origin v0.23.0`.
+Release tags: `git tag v0.24.0 && git push origin v0.24.0`.

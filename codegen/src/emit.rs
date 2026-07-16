@@ -4279,7 +4279,7 @@ impl Emitter {
                     phi.push_str(&format!("[ {v}, %{b} ]"));
                 }
                 self.line(phi);
-                return t;
+                t
             }
             ExprKind::CallMethod {
                 direct_func,

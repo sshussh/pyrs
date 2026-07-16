@@ -335,6 +335,8 @@ pub enum Token {
     LBrace,
     #[token("}")]
     RBrace,
+    #[token(":=")]
+    ColonEqual,
     #[token(":")]
     Colon,
     #[token(",")]
@@ -463,6 +465,7 @@ fn token_text(token: &Token) -> &'static str {
         Token::LBrace => "{",
         Token::RBrace => "}",
         Token::Colon => ":",
+        Token::ColonEqual => ":=",
         Token::Comma => ",",
         Token::Dot => ".",
         Token::At => "@",
