@@ -314,6 +314,9 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
             max_try_depth_in_expr(dict).max(max_try_depth_in_expr(other))
         }
+        Stmt::ListExtend { list, other } => {
+            max_try_depth_in_expr(list).max(max_try_depth_in_expr(other))
+        }
         _ => 0,
     }
 }
@@ -509,6 +512,9 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
         Stmt::IndexDelete { index: i, .. } => count_yields_in_expr(i),
         Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
             count_yields_in_expr(dict) + count_yields_in_expr(other)
+        }
+        Stmt::ListExtend { list, other } => {
+            count_yields_in_expr(list) + count_yields_in_expr(other)
         }
         _ => 0,
     }
@@ -778,6 +784,7 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_list_index(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_list_clear(ptr)\n");
         out.push_str("declare void @pyrs_list_sort(ptr, i32)\n");
+        out.push_str("declare void @pyrs_list_extend(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
         out.push_str("declare i32 @pyrs_list_eq(ptr, ptr, i32)\n");
@@ -2867,6 +2874,11 @@ impl Emitter {
                     "call void @pyrs_list_sort(ptr {l}, i32 {})",
                     elem_tag(elem)
                 ));
+            }
+            Stmt::ListExtend { list, other } => {
+                let l = self.emit_expr(list);
+                let o = self.emit_expr(other);
+                self.line(format!("call void @pyrs_list_extend(ptr {l}, ptr {o})"));
             }
             Stmt::ListAppendUnchecked { list, value } => {
                 // capacity was guaranteed at allocation: store the slot at

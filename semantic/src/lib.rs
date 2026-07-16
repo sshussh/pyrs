@@ -9285,6 +9285,40 @@ fn lower_method_stmt(
                 ensure_sortable_list_elem(*elem, method_span)?;
                 Ok(ir::Stmt::ListSort { list: base_ir })
             }
+            "extend" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("extend() takes exactly one argument ({} given)", args.len()),
+                        method_span,
+                    ));
+                }
+                let other = lower_expr(&args[0], ctx)?;
+                match other.ty {
+                    ir::Ty::List(other_elem) => {
+                        // Same element type; provisional empty `list[Any]` is allowed
+                        // (CPython extends fine from []).
+                        if *other_elem != *elem && *other_elem != ir::Ty::Any {
+                            return Err(err(
+                                format!(
+                                    "list.extend() element type mismatch: expected \
+                                     list[{elem}], found list[{other_elem}]"
+                                ),
+                                args[0].span,
+                            ));
+                        }
+                        Ok(ir::Stmt::ListExtend {
+                            list: base_ir,
+                            other,
+                        })
+                    }
+                    other_ty => Err(err(
+                        format!(
+                            "list.extend() currently requires a list argument, got {other_ty}"
+                        ),
+                        args[0].span,
+                    )),
+                }
+            }
             // pop / index as statements discard the result
             "pop" => {
                 let pop = lower_list_pop(base_ir, *elem, args, method_span, ctx)?;
@@ -12688,7 +12722,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     // pop returns the removed element
                     "pop" => lower_list_pop(base_ir, *elem, &args, *method_span, ctx),
                     "index" => lower_list_index_of(base_ir, *elem, &args, *method_span, ctx),
-                    "append" | "insert" | "remove" | "clear" | "sort" => Err(err(
+                    "append" | "insert" | "remove" | "clear" | "sort" | "extend" => Err(err(
                         format!(
                             "list.{method}(...) returns None and cannot be used \
                              in an expression"

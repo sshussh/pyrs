@@ -526,6 +526,11 @@ pub enum Stmt {
     ListSort {
         list: Expr,
     },
+    /// `list.extend(other)` — append all elements of another list (same elem ty).
+    ListExtend {
+        list: Expr,
+        other: Expr,
+    },
     /// `dict.clear()`
     DictClear {
         dict: Expr,

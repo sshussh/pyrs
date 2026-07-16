@@ -3084,6 +3084,15 @@ void pyrs_list_push(PyrsList *l, long long slot) {
     l->data[l->len++] = slot;
 }
 
+/* In-place extend: append all slots from src onto dst (same element encoding). */
+void pyrs_list_extend(PyrsList *dst, const PyrsList *src) {
+    check_ref(dst);
+    check_ref(src);
+    for (long long i = 0; i < src->len; i++) {
+        pyrs_list_push(dst, src->data[i]);
+    }
+}
+
 /* new list: a then b (shallow copy of slots) */
 PyrsList *pyrs_list_concat(const PyrsList *a, const PyrsList *b) {
     check_ref(a);

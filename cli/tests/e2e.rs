@@ -10281,3 +10281,22 @@ except AssertionError as e:
     assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
+
+#[test]
+fn v021_list_extend() {
+    let src = "\
+xs = [1, 2]
+xs.extend([3, 4])
+print(xs)
+xs.extend([])
+print(len(xs))
+";
+    let out = run_program("v021_extend", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
