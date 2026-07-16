@@ -277,6 +277,9 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
             index: i, value: v, ..
         } => max_try_depth_in_expr(i).max(max_try_depth_in_expr(v)),
         Stmt::IndexDelete { index: i, .. } => max_try_depth_in_expr(i),
+        Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
+            max_try_depth_in_expr(dict).max(max_try_depth_in_expr(other))
+        }
         _ => 0,
     }
 }
@@ -371,6 +374,8 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         Contains { needle, haystack } => {
             max_try_depth_in_expr(needle).max(max_try_depth_in_expr(haystack))
         }
+        IsInstance { value, .. } => max_try_depth_in_expr(value),
+        SetUnion { left, right } => max_try_depth_in_expr(left).max(max_try_depth_in_expr(right)),
         ListPop { list, index } | ListIndexOf { list, value: index } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
         }
@@ -453,6 +458,9 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
             index: i, value: v, ..
         } => count_yields_in_expr(i) + count_yields_in_expr(v),
         Stmt::IndexDelete { index: i, .. } => count_yields_in_expr(i),
+        Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
+            count_yields_in_expr(dict) + count_yields_in_expr(other)
+        }
         _ => 0,
     }
 }
@@ -535,6 +543,8 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         Contains { needle, haystack } => {
             count_yields_in_expr(needle) + count_yields_in_expr(haystack)
         }
+        IsInstance { value, .. } => count_yields_in_expr(value),
+        SetUnion { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
         ListPop { list, index } | ListIndexOf { list, value: index } => {
             count_yields_in_expr(list) + count_yields_in_expr(index)
         }
@@ -597,6 +607,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_tuple_set(ptr, i64, i64, i32)\n");
         out.push_str("declare i64 @pyrs_tuple_get(ptr, i64)\n");
         out.push_str("declare i32 @pyrs_tuple_eq(ptr, ptr)\n");
+        out.push_str("declare i32 @pyrs_tuple_contains(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_unpack_check(i64, i64)\n");
         out.push_str("declare void @pyrs_unpack_check_min(i64, i64)\n");
         out.push_str("declare ptr @pyrs_cell_new(i64)\n");
@@ -641,6 +652,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_dict_del(ptr, i64, i32)\n");
         out.push_str("declare i32 @pyrs_dict_contains(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_dict_clear(ptr)\n");
+        out.push_str("declare void @pyrs_dict_update(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_dict_pop(ptr, i64, i32, i32, i64, ptr)\n");
         out.push_str("declare ptr @pyrs_dict_keys(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_values(ptr)\n");
@@ -649,6 +661,8 @@ impl Emitter {
         out.push_str("declare void @pyrs_set_add(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_set_remove(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_set_discard(ptr, i64, i32)\n");
+        out.push_str("declare ptr @pyrs_set_union(ptr, ptr)\n");
+        out.push_str("declare void @pyrs_set_update(ptr, ptr)\n");
         out.push_str("declare ptr @malloc(i64)\n");
         out.push_str("declare i32 @pyrs_set_contains(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_set_clear(ptr)\n");
@@ -1791,6 +1805,11 @@ impl Emitter {
                 let d = self.emit_expr(dict);
                 self.line(format!("call void @pyrs_dict_clear(ptr {d})"));
             }
+            Stmt::DictUpdate { dict, other } => {
+                let d = self.emit_expr(dict);
+                let o = self.emit_expr(other);
+                self.line(format!("call void @pyrs_dict_update(ptr {d}, ptr {o})"));
+            }
             Stmt::SetAdd { set, value } => {
                 let s = self.emit_expr(set);
                 let v = self.emit_expr(value);
@@ -1821,6 +1840,11 @@ impl Emitter {
             Stmt::SetClear { set } => {
                 let s = self.emit_expr(set);
                 self.line(format!("call void @pyrs_set_clear(ptr {s})"));
+            }
+            Stmt::SetUpdate { set, other } => {
+                let s = self.emit_expr(set);
+                let o = self.emit_expr(other);
+                self.line(format!("call void @pyrs_set_update(ptr {s}, ptr {o})"));
             }
             Stmt::UnpackCheck { len, expected } => {
                 let n_t = self.emit_expr(len);
@@ -2534,10 +2558,80 @@ impl Emitter {
                             elem_tag(elem)
                         ));
                     }
+                    Ty::Tuple(_) => {
+                        // Heterogeneous: compare only when element tag matches needle.
+                        let slot = self.slot_from_value(&n, needle.ty);
+                        self.line(format!(
+                            "{c} = call i32 @pyrs_tuple_contains(ptr {h}, i64 {slot}, i32 {})",
+                            elem_tag(&needle.ty)
+                        ));
+                    }
                     other => unreachable!("contains on {other:?}"),
                 }
                 let t = self.tmp();
                 self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                t
+            }
+            ExprKind::IsInstance {
+                value,
+                type_tags,
+                bool_is_int,
+            } => {
+                // Locals/unions store `{ i32 member_index, i64 payload }` by value
+                // (not a heap box). Match member_index against members whose
+                // print-tag satisfies any of `type_tags` (list=4 means any list).
+                let v = self.emit_expr(value);
+                let Ty::Union(members) = value.ty else {
+                    // Monomorphic path should have been folded in semantic.
+                    let t = self.tmp();
+                    self.line(format!("{t} = add i1 0, 0"));
+                    return t;
+                };
+                let idx = self.tmp();
+                self.line(format!("{idx} = extractvalue {{ i32, i64 }} {v}, 0"));
+                let mut matching: Vec<usize> = Vec::new();
+                for (i, m) in members.iter().enumerate() {
+                    let ptag = member_print_tag(*m);
+                    let hit = type_tags.iter().any(|&want| {
+                        if want == 4 {
+                            // any list: (ptag % 8) == 4 && ptag >= 0
+                            ptag >= 0 && ptag % 8 == 4
+                        } else if want == 0 && *bool_is_int {
+                            ptag == 0 || ptag == 2 // int or bool
+                        } else {
+                            ptag == want
+                        }
+                    });
+                    if hit {
+                        matching.push(i);
+                    }
+                }
+                if matching.is_empty() {
+                    let f = self.tmp();
+                    self.line(format!("{f} = add i1 0, 0"));
+                    f
+                } else {
+                    let mut acc: Option<String> = None;
+                    for i in matching {
+                        let cmp = self.tmp();
+                        self.line(format!("{cmp} = icmp eq i32 {idx}, {i}"));
+                        acc = Some(match acc {
+                            None => cmp,
+                            Some(prev) => {
+                                let or = self.tmp();
+                                self.line(format!("{or} = or i1 {prev}, {cmp}"));
+                                or
+                            }
+                        });
+                    }
+                    acc.unwrap()
+                }
+            }
+            ExprKind::SetUnion { left, right } => {
+                let l = self.emit_expr(left);
+                let r = self.emit_expr(right);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_set_union(ptr {l}, ptr {r})"));
                 t
             }
             ExprKind::ListPop { list, index } => {
@@ -3464,7 +3558,7 @@ impl Emitter {
     fn emit_try(
         &mut self,
         body: &[Stmt],
-        handlers: &[(Option<ir::ExcType>, Option<String>, Vec<Stmt>)],
+        handlers: &[ir::ExceptHandler],
         orelse: &[Stmt],
         finally: &[Stmt],
     ) {
@@ -3580,10 +3674,29 @@ impl Emitter {
                 None => {
                     self.line(format!("br label %{match_l}"));
                 }
-                Some(exc) => {
+                Some(excs) if excs.is_empty() => {
+                    self.line(format!("br label %{match_l}"));
+                }
+                Some(excs) if excs.len() == 1 => {
                     let cmp = self.tmp();
-                    self.line(format!("{cmp} = icmp eq i32 {ety}, {}", exc.tag()));
+                    self.line(format!("{cmp} = icmp eq i32 {ety}, {}", excs[0].tag()));
                     self.line(format!("br i1 {cmp}, label %{match_l}, label %{nomatch_l}"));
+                }
+                Some(excs) => {
+                    // Multi-type `except (A, B, …):` — OR of equality matches.
+                    let mut acc = String::new();
+                    for (j, exc) in excs.iter().enumerate() {
+                        let cmp = self.tmp();
+                        self.line(format!("{cmp} = icmp eq i32 {ety}, {}", exc.tag()));
+                        if j == 0 {
+                            acc = cmp;
+                        } else {
+                            let or = self.tmp();
+                            self.line(format!("{or} = or i1 {acc}, {cmp}"));
+                            acc = or;
+                        }
+                    }
+                    self.line(format!("br i1 {acc}, label %{match_l}, label %{nomatch_l}"));
                 }
             }
             self.start_block(&match_l);

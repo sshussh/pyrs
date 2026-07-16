@@ -69,6 +69,8 @@ impl std::fmt::Display for TypeName {
 }
 
 /// Exception type name used in `raise` / `except`.
+/// Flat equality match for v1 — no OSError hierarchy (`except OSError` does
+/// not catch `FileNotFoundError`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcType {
     ValueError,
@@ -78,6 +80,13 @@ pub enum ExcType {
     TypeError,
     RuntimeError,
     GeneratorExit,
+    OverflowError,
+    EOFError,
+    FileNotFoundError,
+    OSError,
+    NameError,
+    UnboundLocalError,
+    StopIteration,
 }
 
 impl ExcType {
@@ -90,7 +99,21 @@ impl ExcType {
             ExcType::TypeError => "TypeError",
             ExcType::RuntimeError => "RuntimeError",
             ExcType::GeneratorExit => "GeneratorExit",
+            ExcType::OverflowError => "OverflowError",
+            ExcType::EOFError => "EOFError",
+            ExcType::FileNotFoundError => "FileNotFoundError",
+            ExcType::OSError => "OSError",
+            ExcType::NameError => "NameError",
+            ExcType::UnboundLocalError => "UnboundLocalError",
+            ExcType::StopIteration => "StopIteration",
         }
+    }
+
+    /// All recognized exception type names (for diagnostics).
+    pub fn all_names() -> &'static str {
+        "ValueError, KeyError, IndexError, ZeroDivisionError, TypeError, \
+         RuntimeError, GeneratorExit, OverflowError, EOFError, FileNotFoundError, \
+         OSError, NameError, UnboundLocalError, StopIteration"
     }
 }
 
@@ -318,9 +341,10 @@ pub enum Pattern {
 /// One `except` clause under a `try`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExceptHandler {
-    /// `None` = bare `except:`.
-    pub exc: Option<ExcType>,
-    /// Optional `as name` binding (message string at runtime).
+    /// `None` = bare `except:`. One or more types for `except E:` / `except (A, B):`.
+    pub exc: Option<Vec<ExcType>>,
+    /// Optional `as name` binding (exception **message** string at runtime, not
+    /// an exception instance — PyRs has no exception objects yet).
     pub bind: Option<(String, Span)>,
     pub body: Vec<Stmt>,
 }

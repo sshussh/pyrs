@@ -5,7 +5,8 @@
 //! - `int`, `float`, `bool`, `str`, `list[T]` values; `bool` is assignable
 //!   to `int`, and `int`/`bool` are assignable to `float` (implicit
 //!   promotion casts are inserted).
-//! - a variable's type is fixed by its first assignment and cannot change.
+//! - a local's storage type is the join of all RHS types (and annotation);
+//!   bare multi-assign like `x = 1; x = "a"` yields `int | str`.
 //! - `/` is true division and always produces `float`; `//` and `%` follow
 //!   Python's floored semantics; `**` on ints yields int (a negative
 //!   exponent traps at runtime), on floats yields float.
@@ -89,22 +90,114 @@ fn resolve_type(ty: ast::TypeName) -> ir::Ty {
 }
 
 /// Resolve a parameter's type: explicit annotation, else infer from a
-/// constant/simple default, else diagnostic.
-fn resolve_param_ty(p: &ast::Param) -> SResult<ir::Ty> {
+/// constant/simple default, else `None` (caller may infer from body usage).
+fn resolve_param_ty_opt(p: &ast::Param) -> SResult<Option<ir::Ty>> {
     if let Some(t) = p.ty {
-        return resolve_type_checked(t, p.span);
+        return Ok(Some(resolve_type_checked(t, p.span)?));
     }
     if let Some(d) = &p.default {
-        return infer_ty_from_default(d);
+        return Ok(Some(infer_ty_from_default(d)?));
     }
-    Err(err(
+    Ok(None)
+}
+
+/// Resolve a parameter's type, requiring annotation/default (no body inference).
+fn resolve_param_ty(p: &ast::Param) -> SResult<ir::Ty> {
+    match resolve_param_ty_opt(p)? {
+        Some(t) => Ok(t),
+        None => Err(err(
+            format!(
+                "parameter '{}' is missing a type annotation and has no default to \
+                 infer from (e.g. '{}: int' or '{}: int = 0')",
+                p.name, p.name, p.name
+            ),
+            p.span,
+        )),
+    }
+}
+
+/// Error when bare-param body inference fails.
+fn bare_param_infer_err(p: &ast::Param) -> Diagnostic {
+    err(
         format!(
-            "parameter '{}' is missing a type annotation and has no default to \
-             infer from (e.g. '{}: int' or '{}: int = 0')",
-            p.name, p.name, p.name
+            "parameter '{}' is missing a type annotation; could not infer a unique \
+             type from the function body (add e.g. '{}: int')",
+            p.name, p.name
         ),
         p.span,
-    ))
+    )
+}
+
+/// Resolve all formal params, inferring bare ones monomorphically from body usage.
+fn resolve_params_with_body_infer(
+    formals: &[ast::Param],
+    body: &[ast::Stmt],
+) -> SResult<Vec<ParamSig>> {
+    let mut params = Vec::new();
+    let mut bare_idxs = Vec::new();
+    let mut seen = HashSet::new();
+    for p in formals {
+        if !seen.insert(p.name.clone()) {
+            return Err(err(
+                format!("duplicate parameter name '{}'", p.name),
+                p.span,
+            ));
+        }
+        let ty = match resolve_param_ty_opt(p)? {
+            Some(t) => t,
+            None => {
+                bare_idxs.push(params.len());
+                ir::Ty::Int // placeholder
+            }
+        };
+        if ty == ir::Ty::None {
+            return Err(err(
+                format!("parameter '{}' cannot have type None", p.name),
+                p.span,
+            ));
+        }
+        params.push(ParamSig {
+            name: p.name.clone(),
+            ty,
+            default: p.default.clone(),
+        });
+    }
+    if !bare_idxs.is_empty() {
+        let mut bare_names: HashSet<String> =
+            bare_idxs.iter().map(|&i| params[i].name.clone()).collect();
+        let mut changed = true;
+        let mut rounds = 0;
+        while changed && rounds < 8 {
+            changed = false;
+            rounds += 1;
+            let param_map: HashMap<String, ir::Ty> =
+                params.iter().map(|p| (p.name.clone(), p.ty)).collect();
+            for &i in &bare_idxs {
+                let name = params[i].name.clone();
+                if let Some(ty) = try_infer_param_from_body(&name, body, &param_map, &bare_names) {
+                    if params[i].ty != ty {
+                        params[i].ty = ty;
+                        changed = true;
+                    }
+                    bare_names.remove(&name);
+                }
+            }
+        }
+        for &i in &bare_idxs {
+            if bare_names.contains(&params[i].name) {
+                let param_map: HashMap<String, ir::Ty> =
+                    params.iter().map(|p| (p.name.clone(), p.ty)).collect();
+                if let Some(ty) =
+                    try_infer_param_from_body(&params[i].name, body, &param_map, &HashSet::new())
+                {
+                    params[i].ty = ty;
+                } else {
+                    return Err(bare_param_infer_err(&formals[i]));
+                }
+            }
+        }
+    }
+    Ok(params)
 }
 
 /// Infer a type from a simple default expression (literals and short forms).
@@ -265,6 +358,13 @@ fn ast_exc_to_ir(e: ast::ExcType) -> ir::ExcType {
         ast::ExcType::TypeError => ir::ExcType::TypeError,
         ast::ExcType::RuntimeError => ir::ExcType::RuntimeError,
         ast::ExcType::GeneratorExit => ir::ExcType::GeneratorExit,
+        ast::ExcType::OverflowError => ir::ExcType::OverflowError,
+        ast::ExcType::EOFError => ir::ExcType::EOFError,
+        ast::ExcType::FileNotFoundError => ir::ExcType::FileNotFoundError,
+        ast::ExcType::OSError => ir::ExcType::OSError,
+        ast::ExcType::NameError => ir::ExcType::NameError,
+        ast::ExcType::UnboundLocalError => ir::ExcType::UnboundLocalError,
+        ast::ExcType::StopIteration => ir::ExcType::StopIteration,
     }
 }
 
@@ -510,6 +610,61 @@ fn narrowing_from_condition(
                     other => other,
                 };
                 else_m.insert(name.to_string(), storage_without);
+            }
+        }
+        // `isinstance(x, T)` / `isinstance(x, (T1, T2))` peels union in then-arm.
+        ast::ExprKind::Call {
+            func,
+            args,
+            keywords,
+            kwargs,
+            ..
+        } if func == "isinstance" && keywords.is_empty() && kwargs.is_none() => {
+            if let Ok(plain) = require_plain_args(args, "isinstance", cond.span)
+                && plain.len() == 2
+                && let ast::ExprKind::Name(n) = &plain[0].kind
+            {
+                let name_ty = ctx
+                    .locals
+                    .get(n)
+                    .copied()
+                    .or_else(|| ctx.cell_locals.get(n).copied())
+                    .or_else(|| {
+                        if !ctx.locals.contains_key(n) && !ctx.cell_locals.contains_key(n) {
+                            ctx.globals.get(n).copied()
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(storage_ty) = name_ty
+                    && let Ok(pats) = parse_isinstance_type_arg(plain[1])
+                {
+                    let members = ir::flatten_union_members(storage_ty);
+                    let hit: Vec<ir::Ty> = members
+                        .iter()
+                        .copied()
+                        .filter(|m| pats.iter().any(|p| isinstance_pat_matches(*m, *p)))
+                        .collect();
+                    let miss: Vec<ir::Ty> = members
+                        .iter()
+                        .copied()
+                        .filter(|m| !pats.iter().any(|p| isinstance_pat_matches(*m, *p)))
+                        .collect();
+                    if !hit.is_empty() {
+                        let then_ty = match hit.len() {
+                            1 => hit[0],
+                            _ => ir::union_of(&hit),
+                        };
+                        then_m.insert(n.clone(), then_ty);
+                    }
+                    if !miss.is_empty() {
+                        let else_ty = match miss.len() {
+                            1 => miss[0],
+                            _ => ir::union_of(&miss),
+                        };
+                        else_m.insert(n.clone(), else_ty);
+                    }
+                }
             }
         }
         _ => {}
@@ -817,8 +972,24 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 11] = [
-    "print", "len", "range", "input", "open", "abs", "min", "max", "sum", "sorted", "set",
+const BUILTINS: [&str; 17] = [
+    "print",
+    "len",
+    "range",
+    "input",
+    "open",
+    "abs",
+    "min",
+    "max",
+    "sum",
+    "sorted",
+    "set",
+    "isinstance",
+    "any",
+    "all",
+    "enumerate",
+    "zip",
+    "reversed",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -934,28 +1105,8 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                     f.span,
                 ));
             }
-            let mut params = Vec::new();
-            let mut seen_names = std::collections::HashSet::new();
-            for p in &f.params {
-                let ty = resolve_param_ty(p)?;
-                if ty == ir::Ty::None {
-                    return Err(err(
-                        format!("parameter '{}' cannot have type None", p.name),
-                        p.span,
-                    ));
-                }
-                if !seen_names.insert(p.name.clone()) {
-                    return Err(err(
-                        format!("duplicate parameter name '{}'", p.name),
-                        p.span,
-                    ));
-                }
-                params.push(ParamSig {
-                    name: p.name.clone(),
-                    ty,
-                    default: p.default.clone(),
-                });
-            }
+            let params = resolve_params_with_body_infer(&f.params, &f.body)?;
+            let mut seen_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
             let vararg = if let Some(p) = &f.vararg {
                 let ty = resolve_param_ty(p)?;
                 if ty == ir::Ty::None {
@@ -1256,6 +1407,433 @@ fn try_type_ast_expr(
         },
         ast::ExprKind::Cast { ty, .. } => resolve_type_checked(*ty, e.span).ok(),
         _ => None,
+    }
+}
+
+/// Infer a monomorphic type for bare parameter `name` from body usage.
+/// `bare` are still-unresolved bare params (their placeholders are ignored as
+/// evidence). Returns `None` if unconstrained or conflicting.
+fn try_infer_param_from_body(
+    name: &str,
+    body: &[ast::Stmt],
+    params: &HashMap<String, ir::Ty>,
+    bare: &HashSet<String>,
+) -> Option<ir::Ty> {
+    let mut constraints: Vec<ir::Ty> = Vec::new();
+    collect_param_constraints(name, body, params, bare, &mut constraints);
+    if constraints.is_empty() {
+        return None;
+    }
+    let mut acc = constraints[0];
+    for &t in &constraints[1..] {
+        if t == acc {
+            continue;
+        }
+        let a_num = matches!(acc, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
+        let t_num = matches!(t, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
+        if a_num && t_num {
+            acc = join_types(acc, t);
+        } else if matches!((acc, t), (ir::Ty::List(_), ir::Ty::List(_))) && acc == t {
+            // same list type
+        } else {
+            return None; // conflict
+        }
+    }
+    // Reject pure None / unconstrained union as a param type.
+    if acc == ir::Ty::None || matches!(acc, ir::Ty::Union(_)) {
+        return None;
+    }
+    Some(acc)
+}
+
+fn collect_param_constraints(
+    name: &str,
+    stmts: &[ast::Stmt],
+    params: &HashMap<String, ir::Ty>,
+    bare: &HashSet<String>,
+    out: &mut Vec<ir::Ty>,
+) {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::Return(Some(e))
+            | ast::StmtKind::ExprStmt(e)
+            | ast::StmtKind::Raise { message: e, .. } => {
+                collect_param_constraints_expr(name, e, params, bare, out);
+            }
+            ast::StmtKind::Assign { value, .. } => {
+                collect_param_constraints_expr(name, value, params, bare, out);
+            }
+            ast::StmtKind::AugAssign { target, value, .. } => {
+                if let ast::AssignTarget::Name { name: n, .. } = target
+                    && n == name
+                {
+                    // `x += 1` etc. implies numeric/str depending on RHS.
+                    if let Some(t) = try_type_ast_expr(value, params, &HashMap::new()) {
+                        if !bare.contains(name) || !matches!(t, ir::Ty::Int) {
+                            out.push(t);
+                        } else {
+                            out.push(t); // x += 1 → int
+                        }
+                    } else {
+                        out.push(ir::Ty::Int);
+                    }
+                }
+                collect_param_constraints_expr(name, value, params, bare, out);
+            }
+            ast::StmtKind::If { branches, orelse } => {
+                for (c, b) in branches {
+                    collect_param_constraints_expr(name, c, params, bare, out);
+                    collect_param_constraints(name, b, params, bare, out);
+                }
+                collect_param_constraints(name, orelse, params, bare, out);
+            }
+            ast::StmtKind::While { cond, body, orelse } => {
+                collect_param_constraints_expr(name, cond, params, bare, out);
+                collect_param_constraints(name, body, params, bare, out);
+                collect_param_constraints(name, orelse, params, bare, out);
+            }
+            ast::StmtKind::For {
+                iter, body, orelse, ..
+            } => {
+                collect_param_constraints_expr(name, iter, params, bare, out);
+                collect_param_constraints(name, body, params, bare, out);
+                collect_param_constraints(name, orelse, params, bare, out);
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                collect_param_constraints(name, body, params, bare, out);
+                for h in handlers {
+                    collect_param_constraints(name, &h.body, params, bare, out);
+                }
+                collect_param_constraints(name, orelse, params, bare, out);
+                collect_param_constraints(name, finally, params, bare, out);
+            }
+            ast::StmtKind::With { item, body, .. } => {
+                collect_param_constraints_expr(name, item, params, bare, out);
+                collect_param_constraints(name, body, params, bare, out);
+            }
+            ast::StmtKind::Match { subject, cases } => {
+                collect_param_constraints_expr(name, subject, params, bare, out);
+                for c in cases {
+                    if let Some(g) = &c.guard {
+                        collect_param_constraints_expr(name, g, params, bare, out);
+                    }
+                    collect_param_constraints(name, &c.body, params, bare, out);
+                }
+            }
+            // Nested defs: only scan defaults, not bodies (own scope).
+            _ => {}
+        }
+    }
+}
+
+fn collect_param_constraints_expr(
+    name: &str,
+    e: &ast::Expr,
+    params: &HashMap<String, ir::Ty>,
+    bare: &HashSet<String>,
+    out: &mut Vec<ir::Ty>,
+) {
+    match &e.kind {
+        ast::ExprKind::Binary { op, left, right } => {
+            use ast::BinOp::*;
+            let left_is = matches!(&left.kind, ast::ExprKind::Name(n) if n == name);
+            let right_is = matches!(&right.kind, ast::ExprKind::Name(n) if n == name);
+            if left_is || right_is {
+                let other = if left_is {
+                    right.as_ref()
+                } else {
+                    left.as_ref()
+                };
+                match op {
+                    Add | Sub | Mul | FloorDiv | Mod | Div | Pow | BitAnd | BitOr | BitXor
+                    | LShift | RShift => {
+                        if let Some(ot) = try_type_ast_expr(other, params, &HashMap::new()) {
+                            if bare.contains(name)
+                                && matches!(&other.kind, ast::ExprKind::Name(n) if bare.contains(n))
+                            {
+                                // both bare — weak numeric hint
+                                out.push(ir::Ty::Int);
+                            } else if ot == ir::Ty::Str && *op == Add {
+                                out.push(ir::Ty::Str);
+                            } else if matches!(ot, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float) {
+                                out.push(if matches!(ot, ir::Ty::Float) {
+                                    ir::Ty::Float
+                                } else {
+                                    ir::Ty::Int
+                                });
+                            } else if matches!(ot, ir::Ty::List(_)) && matches!(op, Add | Mul) {
+                                out.push(ot);
+                            } else if ot == ir::Ty::Str && *op == Mul {
+                                out.push(ir::Ty::Str);
+                            } else {
+                                out.push(ot);
+                            }
+                        } else if matches!(
+                            op,
+                            Sub | Mul
+                                | FloorDiv
+                                | Mod
+                                | Div
+                                | Pow
+                                | BitAnd
+                                | BitOr
+                                | BitXor
+                                | LShift
+                                | RShift
+                        ) {
+                            out.push(ir::Ty::Int);
+                        } else {
+                            // bare `x + y` unknown — prefer int
+                            out.push(ir::Ty::Int);
+                        }
+                    }
+                    Lt | LtEq | Gt | GtEq | Eq | NotEq => {
+                        if let Some(ot) = try_type_ast_expr(other, params, &HashMap::new())
+                            && (!bare.contains(name)
+                                || !matches!(&other.kind, ast::ExprKind::Name(n) if bare.contains(n)))
+                        {
+                            out.push(ot);
+                        }
+                    }
+                    In | NotIn => {
+                        if left_is {
+                            // name in haystack → element type of haystack
+                            if let Some(ht) = try_type_ast_expr(right, params, &HashMap::new()) {
+                                match ht {
+                                    ir::Ty::List(e) => out.push(*e),
+                                    ir::Ty::Set(e) => out.push(*e),
+                                    ir::Ty::Dict { key, .. } => out.push(*key),
+                                    ir::Ty::Str => out.push(ir::Ty::Str),
+                                    _ => {}
+                                }
+                            }
+                        } else if right_is {
+                            // needle in name → name is container; weak list[int]
+                            if let Some(nt) = try_type_ast_expr(left, params, &HashMap::new()) {
+                                out.push(ir::list_of(nt));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            collect_param_constraints_expr(name, left, params, bare, out);
+            collect_param_constraints_expr(name, right, params, bare, out);
+        }
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Neg | ast::UnaryOp::Invert,
+            operand,
+        } => {
+            if matches!(&operand.kind, ast::ExprKind::Name(n) if n == name) {
+                out.push(ir::Ty::Int);
+            }
+            collect_param_constraints_expr(name, operand, params, bare, out);
+        }
+        ast::ExprKind::Unary { operand, .. } => {
+            collect_param_constraints_expr(name, operand, params, bare, out);
+        }
+        ast::ExprKind::Call { func, args, .. } => {
+            if (func == "len" || func == "abs" || func == "sum" || func == "sorted")
+                && let Some(ast::PosArg::Pos(ae)) = args.first()
+                && matches!(&ae.kind, ast::ExprKind::Name(n) if n == name)
+            {
+                match func.as_str() {
+                    "len" => {
+                        // Ambiguous container — do not constrain alone.
+                    }
+                    "abs" | "sum" => out.push(ir::Ty::Int),
+                    "sorted" => out.push(ir::list_of(ir::Ty::Int)),
+                    _ => {}
+                }
+            }
+            for a in args {
+                let ae = match a {
+                    ast::PosArg::Pos(e) | ast::PosArg::Star(e) => e,
+                };
+                collect_param_constraints_expr(name, ae, params, bare, out);
+            }
+        }
+        ast::ExprKind::Index { base, index } => {
+            if matches!(&base.kind, ast::ExprKind::Name(n) if n == name) {
+                // name[i] — list or str; prefer list[int] if index is int
+                out.push(ir::list_of(ir::Ty::Int));
+            }
+            if matches!(&index.kind, ast::ExprKind::Name(n) if n == name) {
+                out.push(ir::Ty::Int);
+            }
+            collect_param_constraints_expr(name, base, params, bare, out);
+            collect_param_constraints_expr(name, index, params, bare, out);
+        }
+        ast::ExprKind::MethodCall {
+            base, method, args, ..
+        } => {
+            if matches!(&base.kind, ast::ExprKind::Name(n) if n == name) {
+                match method.as_str() {
+                    "append" | "pop" | "insert" | "remove" | "clear" | "sort" | "index" => {
+                        if let Some(ast::PosArg::Pos(a0)) = args.first() {
+                            if let Some(t) = try_type_ast_expr(a0, params, &HashMap::new()) {
+                                out.push(ir::list_of(t));
+                            } else {
+                                out.push(ir::list_of(ir::Ty::Int));
+                            }
+                        } else {
+                            out.push(ir::list_of(ir::Ty::Int));
+                        }
+                    }
+                    "add" | "discard" => {
+                        if let Some(ast::PosArg::Pos(a0)) = args.first()
+                            && let Some(t) = try_type_ast_expr(a0, params, &HashMap::new())
+                        {
+                            out.push(ir::set_of(t));
+                        }
+                    }
+                    "upper" | "lower" | "strip" | "split" | "startswith" | "endswith" | "find"
+                    | "replace" | "join" => {
+                        out.push(ir::Ty::Str);
+                    }
+                    "keys" | "values" | "items" | "get" | "update" => {}
+                    _ => {}
+                }
+            }
+            collect_param_constraints_expr(name, base, params, bare, out);
+            for a in args {
+                let ae = match a {
+                    ast::PosArg::Pos(e) | ast::PosArg::Star(e) => e,
+                };
+                collect_param_constraints_expr(name, ae, params, bare, out);
+            }
+        }
+        ast::ExprKind::ListLit(items) => {
+            for it in items {
+                let e = match it {
+                    ast::ListElem::Item(e) | ast::ListElem::Star(e) => e,
+                };
+                collect_param_constraints_expr(name, e, params, bare, out);
+            }
+        }
+        ast::ExprKind::TupleLit(items) | ast::ExprKind::SetLit(items) => {
+            for it in items {
+                collect_param_constraints_expr(name, it, params, bare, out);
+            }
+        }
+        ast::ExprKind::DictLit(items) => {
+            for (k, v) in items {
+                collect_param_constraints_expr(name, k, params, bare, out);
+                collect_param_constraints_expr(name, v, params, bare, out);
+            }
+        }
+        ast::ExprKind::Cast { arg, .. } => {
+            collect_param_constraints_expr(name, arg, params, bare, out);
+        }
+        _ => {}
+    }
+}
+
+/// Collect joined storage types for locals assigned in `body`.
+fn collect_joined_local_types(
+    body: &[ast::Stmt],
+    params: &HashMap<String, ir::Ty>,
+    globals: &HashMap<String, ir::Ty>,
+) -> HashMap<String, ir::Ty> {
+    let mut assigns: HashMap<String, ir::Ty> = HashMap::new();
+    let mut annotated: HashSet<String> = HashSet::new();
+    let mut env = params.clone();
+    // Seed with globals for typing RHS that reference them.
+    for (k, v) in globals {
+        env.entry(k.clone()).or_insert(*v);
+    }
+    collect_assign_types_in(body, &mut env, &mut assigns, &mut annotated);
+    assigns
+}
+
+fn collect_assign_types_in(
+    stmts: &[ast::Stmt],
+    env: &mut HashMap<String, ir::Ty>,
+    out: &mut HashMap<String, ir::Ty>,
+    annotated: &mut HashSet<String>,
+) {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::Assign {
+                targets,
+                annotation,
+                value,
+            } => {
+                let rhs_ty = annotation
+                    .as_ref()
+                    .and_then(|t| resolve_type_checked(*t, st.span).ok())
+                    .or_else(|| try_type_ast_expr(value, env, &HashMap::new()));
+                let Some(rhs_ty) = rhs_ty else {
+                    continue;
+                };
+                for t in targets {
+                    if let ast::AssignTarget::Name { name, .. } = t {
+                        // Explicit annotation fixes storage permanently (no join widen).
+                        if let Some(ann) = annotation
+                            && let Ok(ann_ty) = resolve_type_checked(*ann, st.span)
+                        {
+                            out.insert(name.clone(), ann_ty);
+                            env.insert(name.clone(), ann_ty);
+                            annotated.insert(name.clone());
+                            continue;
+                        }
+                        if annotated.contains(name) {
+                            // Keep annotated storage; bind_name will coerce/error.
+                            continue;
+                        }
+                        let storage = match out.get(name).copied() {
+                            Some(prev) => join_types(prev, rhs_ty),
+                            None => rhs_ty,
+                        };
+                        out.insert(name.clone(), storage);
+                        env.insert(name.clone(), storage);
+                    }
+                }
+            }
+            ast::StmtKind::If { branches, orelse } => {
+                for (_, b) in branches {
+                    collect_assign_types_in(b, env, out, annotated);
+                }
+                collect_assign_types_in(orelse, env, out, annotated);
+            }
+            ast::StmtKind::While { body, orelse, .. } | ast::StmtKind::For { body, orelse, .. } => {
+                // for-loop target is int for range; handled when lowering.
+                collect_assign_types_in(body, env, out, annotated);
+                collect_assign_types_in(orelse, env, out, annotated);
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                collect_assign_types_in(body, env, out, annotated);
+                for h in handlers {
+                    // except as e → str
+                    if let Some((n, _)) = &h.bind {
+                        out.entry(n.clone()).or_insert(ir::Ty::Str);
+                        env.insert(n.clone(), ir::Ty::Str);
+                    }
+                    collect_assign_types_in(&h.body, env, out, annotated);
+                }
+                collect_assign_types_in(orelse, env, out, annotated);
+                collect_assign_types_in(finally, env, out, annotated);
+            }
+            ast::StmtKind::With { body, .. } => {
+                collect_assign_types_in(body, env, out, annotated);
+            }
+            ast::StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    collect_assign_types_in(&c.body, env, out, annotated);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2657,8 +3235,9 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
     })
 }
 
-/// Seed module globals from simple top-level assignments (literals / names)
-/// so function bodies can type-check against them before init is lowered.
+/// Seed module globals from top-level assignments (literals / names), joining
+/// multiple assignment types so bare multi-assign yields a union storage type.
+/// Explicit annotations fix storage and are never widened by later bare assigns.
 fn seed_globals_from_script(
     script: &[ast::Stmt],
     globals: &mut HashMap<String, ir::Ty>,
@@ -2673,6 +3252,7 @@ fn seed_globals_from_script(
             format!("{module}.{name}")
         }
     };
+    let mut annotated: HashSet<String> = HashSet::new();
     for st in script {
         if let ast::StmtKind::Assign {
             targets,
@@ -2680,19 +3260,48 @@ fn seed_globals_from_script(
             value,
         } = &st.kind
         {
-            let ty = annotation
-                .as_ref()
-                .and_then(|t| resolve_type_checked(*t, st.span).ok())
-                .or_else(|| seed_ty_from_expr(value));
-            let Some(ty) = ty else {
+            // Annotation wins as the storage type (do not widen past it).
+            if let Some(ann) = annotation {
+                if let Ok(ty) = resolve_type_checked(*ann, st.span) {
+                    for t in targets {
+                        if let ast::AssignTarget::Name { name, .. } = t {
+                            use std::collections::hash_map::Entry;
+                            if let Entry::Vacant(e) = globals.entry(name.clone()) {
+                                e.insert(ty);
+                                globals_order.push((own(name), ty));
+                            }
+                            annotated.insert(name.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some(ty) = seed_ty_from_expr(value) else {
                 continue;
             };
             for t in targets {
                 if let ast::AssignTarget::Name { name, .. } = t {
+                    if annotated.contains(name) {
+                        continue; // keep annotated storage; bind_name will error on bad RHS
+                    }
                     use std::collections::hash_map::Entry;
-                    if let Entry::Vacant(e) = globals.entry(name.clone()) {
-                        e.insert(ty);
-                        globals_order.push((own(name), ty));
+                    match globals.entry(name.clone()) {
+                        Entry::Vacant(e) => {
+                            e.insert(ty);
+                            globals_order.push((own(name), ty));
+                        }
+                        Entry::Occupied(mut e) => {
+                            let joined = join_types(*e.get(), ty);
+                            if joined != *e.get() {
+                                e.insert(joined);
+                                let q = own(name);
+                                if let Some((_, t)) =
+                                    globals_order.iter_mut().find(|(n, _)| n == &q)
+                                {
+                                    *t = joined;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2795,6 +3404,11 @@ struct FnCtx<'a> {
     outer_body_assigned: HashSet<String>,
     /// Nested defs whose body has been fully lowered (vs provisional sig only).
     lowered_nested: HashSet<String>,
+    /// Joined storage types for locals (and module globals when entry) from a
+    /// pre-pass over all assignments. Consulted by `bind_name` so multi-assign
+    /// uses a union/promoted type without pre-allocating locals (which would
+    /// break `global` ordering and late free-cell unbound traps).
+    storage_tys: HashMap<String, ir::Ty>,
 }
 
 impl FnCtx<'_> {
@@ -2913,6 +3527,7 @@ fn lower_function_inner(
         late_bind_tys: HashMap::new(),
         outer_body_assigned: HashSet::new(),
         lowered_nested: HashSet::new(),
+        storage_tys: HashMap::new(),
     };
 
     // Nonlocals declared in nested defs — free captures of these use cells.
@@ -2921,6 +3536,16 @@ fn lower_function_inner(
     ctx.outer_body_assigned = assigned_names_in_stmts(&f.body);
     // Types for late free captures (nested def before assignment).
     ctx.late_bind_tys = infer_late_bind_types(&f.body, &f.params, ctx.globals);
+    // Names declared `global` in this function — do not treat as local storage.
+    let global_decl_names: HashSet<String> = f
+        .body
+        .iter()
+        .filter_map(|st| match &st.kind {
+            ast::StmtKind::Global(names) => Some(names.iter().map(|(n, _)| n.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
 
     // Detect generator functions (contain yield / yield from).
     let is_gen = stmts_have_yield(&f.body);
@@ -2963,28 +3588,105 @@ fn lower_function_inner(
         }
     }
 
-    for p in &f.params {
-        let ty = resolve_param_ty(p)?;
-        if ctx.locals.insert(p.name.clone(), ty).is_some() {
-            return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
+    // Prefer collected/nested signature types (includes bare-param inference).
+    let known_sig = mctx.funcs.get(&f.name).cloned().or({
+        // Nested: look up provisional nested_funcs entry by source name.
+        // When seed_nested was passed, those are already in ctx.nested_funcs
+        // only after assignment — use resolve_params_with_body_infer.
+        None
+    });
+    if let Some(sig) = known_sig {
+        for p in &sig.params {
+            if ctx.locals.insert(p.name.clone(), p.ty).is_some() {
+                return Err(err(format!("duplicate parameter '{}'", p.name), f.span));
+            }
+            params.push((p.name.clone(), p.ty));
         }
-        params.push((p.name.clone(), ty));
+        if let Some(p) = &sig.vararg {
+            let ty = ir::list_of(p.ty);
+            if ctx.locals.insert(p.name.clone(), ty).is_some() {
+                return Err(err(format!("duplicate parameter '{}'", p.name), f.span));
+            }
+            params.push((p.name.clone(), ty));
+        }
+        if let Some(p) = &sig.kwarg {
+            let ty = ir::dict_of(ir::Ty::Str, p.ty);
+            if ctx.locals.insert(p.name.clone(), ty).is_some() {
+                return Err(err(format!("duplicate parameter '{}'", p.name), f.span));
+            }
+            params.push((p.name.clone(), ty));
+        }
+    } else {
+        let formals = resolve_params_with_body_infer(&f.params, &f.body)?;
+        for p in &formals {
+            if ctx.locals.insert(p.name.clone(), p.ty).is_some() {
+                return Err(err(format!("duplicate parameter '{}'", p.name), f.span));
+            }
+            params.push((p.name.clone(), p.ty));
+        }
+        if let Some(p) = &f.vararg {
+            let elem = resolve_param_ty(p)?;
+            let ty = ir::list_of(elem);
+            if ctx.locals.insert(p.name.clone(), ty).is_some() {
+                return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
+            }
+            params.push((p.name.clone(), ty));
+        }
+        if let Some(p) = &f.kwarg {
+            let val = resolve_param_ty(p)?;
+            let ty = ir::dict_of(ir::Ty::Str, val);
+            if ctx.locals.insert(p.name.clone(), ty).is_some() {
+                return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
+            }
+            params.push((p.name.clone(), ty));
+        }
     }
-    if let Some(p) = &f.vararg {
-        let elem = resolve_param_ty(p)?;
-        let ty = ir::list_of(elem);
-        if ctx.locals.insert(p.name.clone(), ty).is_some() {
-            return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
+
+    // Joined storage types for multi-assign (do not pre-allocate locals).
+    {
+        let param_map: HashMap<String, ir::Ty> = params.iter().cloned().collect();
+        let joined = collect_joined_local_types(&f.body, &param_map, ctx.globals);
+        for (name, ty) in joined {
+            if ctx.locals.contains_key(&name) || ctx.cell_locals.contains_key(&name) {
+                continue; // params already typed
+            }
+            if global_decl_names.contains(&name) {
+                // Function `global` name: widen module global if needed; never local.
+                if let Some(existing) = ctx.globals.get(&name).copied() {
+                    let j = join_types(existing, ty);
+                    if j != existing {
+                        let qname = ctx.own_global(&name);
+                        ctx.globals.insert(name.clone(), j);
+                        if let Some((_, t)) =
+                            ctx.globals_order.iter_mut().find(|(n, _)| n == &qname)
+                        {
+                            *t = j;
+                        }
+                    }
+                }
+                continue;
+            }
+            if ctx.is_entry {
+                // Module-level: join into globals map (seed may have first assign only).
+                let qname = ctx.own_global(&name);
+                if let Some(existing) = ctx.globals.get(&name).copied() {
+                    let j = join_types(existing, ty);
+                    if j != existing {
+                        ctx.globals.insert(name.clone(), j);
+                        if let Some((_, t)) =
+                            ctx.globals_order.iter_mut().find(|(n, _)| n == &qname)
+                        {
+                            *t = j;
+                        }
+                    }
+                } else {
+                    ctx.globals.insert(name.clone(), ty);
+                    ctx.globals_order.push((qname, ty));
+                }
+            } else {
+                ctx.storage_tys.insert(name, ty);
+            }
         }
-        params.push((p.name.clone(), ty));
-    }
-    if let Some(p) = &f.kwarg {
-        let val = resolve_param_ty(p)?;
-        let ty = ir::dict_of(ir::Ty::Str, val);
-        if ctx.locals.insert(p.name.clone(), ty).is_some() {
-            return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
-        }
-        params.push((p.name.clone(), ty));
     }
 
     // Box free-captured params / *args / **kwargs at entry (before any branch)
@@ -3364,24 +4066,11 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     if ctx.locals.contains_key(&f.name) {
         return Ok(());
     }
-    let mut params = Vec::new();
-    let mut seen = HashSet::new();
-    for p in &f.params {
-        let ty = resolve_param_ty(p)?;
-        if !seen.insert(p.name.clone()) {
-            return Err(err(
-                format!("duplicate parameter name '{}'", p.name),
-                p.span,
-            ));
-        }
-        params.push(ParamSig {
-            name: p.name.clone(),
-            ty,
-            default: p.default.clone(),
-        });
-    }
+    let params = resolve_params_with_body_infer(&f.params, &f.body)?;
+    let mut seen: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     let vararg = if let Some(p) = &f.vararg {
         let ty = resolve_param_ty(p)?;
+        seen.insert(p.name.clone());
         Some(ParamSig {
             name: p.name.clone(),
             ty,
@@ -3392,6 +4081,7 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     };
     let kwarg = if let Some(p) = &f.kwarg {
         let ty = resolve_param_ty(p)?;
+        seen.insert(p.name.clone());
         Some(ParamSig {
             name: p.name.clone(),
             ty,
@@ -3788,29 +4478,9 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
         ));
     }
 
-    // Build nested signature (params / *args / **kwargs).
-    let mut params = Vec::new();
-    let mut seen = HashSet::new();
-    for p in &f.params {
-        let ty = resolve_param_ty(p)?;
-        if ty == ir::Ty::None {
-            return Err(err(
-                format!("parameter '{}' cannot have type None", p.name),
-                p.span,
-            ));
-        }
-        if !seen.insert(p.name.clone()) {
-            return Err(err(
-                format!("duplicate parameter name '{}'", p.name),
-                p.span,
-            ));
-        }
-        params.push(ParamSig {
-            name: p.name.clone(),
-            ty,
-            default: p.default.clone(),
-        });
-    }
+    // Build nested signature (params / *args / **kwargs) with bare-param infer.
+    let params = resolve_params_with_body_infer(&f.params, &f.body)?;
+    let mut seen: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     let vararg = if let Some(p) = &f.vararg {
         let ty = resolve_param_ty(p)?;
         if !seen.insert(p.name.clone()) {
@@ -5407,7 +6077,11 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     None
                 };
                 let body_h = lower_nested_block(&h.body, ctx)?;
-                handlers_ir.push((h.exc.map(ast_exc_to_ir), name, body_h));
+                let filter = h
+                    .exc
+                    .as_ref()
+                    .map(|ts| ts.iter().copied().map(ast_exc_to_ir).collect::<Vec<_>>());
+                handlers_ir.push((filter, name, body_h));
             }
             let orelse_ir = lower_nested_block(orelse, ctx)?;
             let finally_ir = lower_nested_block(finally, ctx)?;
@@ -6777,9 +7451,10 @@ fn lower_gen_throw_args(
             }
         }
         _ => Err(err(
-            "throw() expects ExcType or ExcType(\"msg\") (supported: ValueError, \
-             KeyError, IndexError, ZeroDivisionError, TypeError, RuntimeError, \
-             GeneratorExit)",
+            format!(
+                "throw() expects ExcType or ExcType(\"msg\") (supported: {})",
+                ir::ExcType::all_names()
+            ),
             args[0].span,
         )),
     }
@@ -6804,11 +7479,17 @@ fn name_to_exc_type(name: &str, span: Span) -> SResult<ir::ExcType> {
         "TypeError" => Ok(ir::ExcType::TypeError),
         "RuntimeError" => Ok(ir::ExcType::RuntimeError),
         "GeneratorExit" => Ok(ir::ExcType::GeneratorExit),
+        "OverflowError" => Ok(ir::ExcType::OverflowError),
+        "EOFError" => Ok(ir::ExcType::EOFError),
+        "FileNotFoundError" => Ok(ir::ExcType::FileNotFoundError),
+        "OSError" => Ok(ir::ExcType::OSError),
+        "NameError" => Ok(ir::ExcType::NameError),
+        "UnboundLocalError" => Ok(ir::ExcType::UnboundLocalError),
+        "StopIteration" => Ok(ir::ExcType::StopIteration),
         _ => Err(err(
             format!(
-                "unsupported exception type '{name}' for throw() (supported: ValueError, \
-                 KeyError, IndexError, ZeroDivisionError, TypeError, RuntimeError, \
-                 GeneratorExit)"
+                "unsupported exception type '{name}' for throw() (supported: {})",
+                ir::ExcType::all_names()
             ),
             span,
         )),
@@ -6841,6 +7522,29 @@ fn lower_dict_method_stmt(
             }
             Ok(ir::Stmt::DictClear { dict: base_ir })
         }
+        "update" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!("update() takes exactly one argument ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let other = lower_expr(&args[0], ctx)?;
+            let expect = ir::dict_of(key_ty, val_ty);
+            if other.ty != expect {
+                return Err(err(
+                    format!(
+                        "dict.update() expects {expect}, found {} (same key/value types required)",
+                        other.ty
+                    ),
+                    args[0].span,
+                ));
+            }
+            Ok(ir::Stmt::DictUpdate {
+                dict: base_ir,
+                other,
+            })
+        }
         "get" | "pop" | "keys" | "values" | "items" => {
             let call = lower_dict_method(base_ir, key_ty, val_ty, method, method_span, args, ctx)?;
             Ok(ir::Stmt::ExprStmt(call))
@@ -6848,7 +7552,7 @@ fn lower_dict_method_stmt(
         _ => Err(err(
             format!(
                 "dict method '{method}' is not supported yet (supported: get, pop, \
-                 keys, values, items, clear)"
+                 keys, values, items, clear, update)"
             ),
             method_span,
         )),
@@ -6918,12 +7622,67 @@ fn lower_set_method_stmt(
             }
             Ok(ir::Stmt::SetClear { set: base_ir })
         }
+        "union" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!("union() takes exactly one argument ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let other = lower_expr(&args[0], ctx)?;
+            let u = lower_set_union(base_ir, other, method_span)?;
+            Ok(ir::Stmt::ExprStmt(u))
+        }
+        "update" => {
+            // In-place union (same as |=).
+            if args.len() != 1 {
+                return Err(err(
+                    format!("update() takes exactly one argument ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            let other = lower_expr(&args[0], ctx)?;
+            let expect = ir::set_of(elem_ty);
+            if other.ty != expect {
+                return Err(err(
+                    format!(
+                        "set.update() expects {expect}, found {} (same element type required)",
+                        other.ty
+                    ),
+                    args[0].span,
+                ));
+            }
+            Ok(ir::Stmt::SetUpdate {
+                set: base_ir,
+                other,
+            })
+        }
         _ => Err(err(
             format!(
                 "set method '{method}' is not supported yet (supported: add, remove, \
-                 discard, clear)"
+                 discard, clear, union, update)"
             ),
             method_span,
+        )),
+    }
+}
+
+fn lower_set_union(l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match (l.ty, r.ty) {
+        (ir::Ty::Set(a), ir::Ty::Set(b)) if a == b => Ok(ir::Expr {
+            ty: ir::set_of(*a),
+            kind: ir::ExprKind::SetUnion {
+                left: Box::new(l),
+                right: Box::new(r),
+            },
+        }),
+        (ir::Ty::Set(a), ir::Ty::Set(b)) => Err(err(
+            format!("set union requires the same element type (set[{a}] vs set[{b}])"),
+            span,
+        )),
+        _ => Err(err(
+            format!("set union requires two sets, found {} and {}", l.ty, r.ty),
+            span,
         )),
     }
 }
@@ -7741,12 +8500,16 @@ fn bind_name(
     // Nonlocal/cell bindings keep their type in `cell_locals`, not `locals`
     // (locals holds `.cell.<name>`). Prefer that so stores coerce into the
     // union/optional element type (ToUnion) instead of the bare RHS type.
+    // `storage_tys` holds joined multi-assign types from the body pre-pass.
     let existing = if is_global {
         ctx.globals.get(name).copied()
     } else if let Some(&t) = ctx.cell_locals.get(name) {
         Some(t)
     } else {
-        ctx.locals.get(name).copied()
+        ctx.locals
+            .get(name)
+            .copied()
+            .or_else(|| ctx.storage_tys.get(name).copied())
     };
 
     let target_ty = match (annotation, existing) {
@@ -7897,6 +8660,23 @@ fn lower_aug_assign(
                 },
             };
             let right = lower_expr(value, ctx)?;
+            // set |= other → in-place update (not a new set assign).
+            if matches!(current_ty, ir::Ty::Set(_)) && op == ast::BinOp::BitOr {
+                if right.ty != current_ty {
+                    return Err(err(
+                        format!(
+                            "set |= requires the same set type on the right, found {}",
+                            right.ty
+                        ),
+                        span,
+                    ));
+                }
+                out.push(ir::Stmt::SetUpdate {
+                    set: left,
+                    other: right,
+                });
+                return Ok(());
+            }
             let combined = lower_binary(op, left, right, span)?;
             let combined = coerce_assign(combined, current_ty, name, span)?;
             out.push(if is_global {
@@ -8655,7 +9435,8 @@ fn coerce_assign(value: ir::Expr, target: ir::Ty, name: &str, span: Span) -> SRe
         Diagnostic::new(
             Phase::Semantic,
             format!(
-                "{}; a variable's type is fixed by its first assignment",
+                "{}; variable '{name}' has storage type {target} (join of its assignments \
+                 and annotation)",
                 e.message
             ),
             e.span,
@@ -9331,17 +10112,30 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     lower_dict_method(base_ir, *key, *value, method, *method_span, &args, ctx)
                 }
                 ir::Ty::Set(_) => match method.as_str() {
-                    "add" | "remove" | "discard" | "clear" => Err(err(
+                    "add" | "remove" | "discard" | "clear" | "update" => Err(err(
                         format!(
                             "set.{method}(...) returns None and cannot be used in an \
                              expression"
                         ),
                         *method_span,
                     )),
+                    "union" => {
+                        if args.len() != 1 {
+                            return Err(err(
+                                format!(
+                                    "union() takes exactly one argument ({} given)",
+                                    args.len()
+                                ),
+                                *method_span,
+                            ));
+                        }
+                        let other = lower_expr(&args[0], ctx)?;
+                        lower_set_union(base_ir, other, *method_span)
+                    }
                     _ => Err(err(
                         format!(
                             "set method '{method}' is not supported yet (supported: add, \
-                             remove, discard, clear)"
+                             remove, discard, clear, union, update)"
                         ),
                         *method_span,
                     )),
@@ -12157,14 +12951,17 @@ fn lower_call(
             func_span,
         ));
     }
-    if let Some(kw) = keywords.first() {
+    if kwargs.is_some() {
+        return Err(err(format!("'{func}()' does not take **kwargs"), span));
+    }
+    // `enumerate(..., start=n)` is the only builtin keyword we accept here.
+    if func != "enumerate"
+        && let Some(kw) = keywords.first()
+    {
         return Err(err(
             format!("'{func}()' does not take keyword arguments"),
             kw.name_span,
         ));
-    }
-    if kwargs.is_some() {
-        return Err(err(format!("'{func}()' does not take **kwargs"), span));
     }
     let plain = require_plain_args(args, func, span)?;
     let args = plain;
@@ -12464,8 +13261,1032 @@ fn lower_call(
                     },
                 })
             }
+            "isinstance" => lower_isinstance(&args, span, ctx),
+            "any" => lower_any_all(true, &args, span, ctx),
+            "all" => lower_any_all(false, &args, span, ctx),
+            "enumerate" => lower_enumerate_expr(&args, keywords, span, ctx),
+            "zip" => lower_zip_expr(&args, span, ctx),
+            "reversed" => lower_reversed_expr(&args, span, ctx),
             _ => Err(err(format!("function '{func}' is not defined"), func_span)),
         }
+    }
+}
+
+/// Type-name patterns accepted by `isinstance(x, T)` / `isinstance(x, (T1, T2))`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IsInstancePat {
+    Int,
+    Float,
+    Bool,
+    Str,
+    List,
+    Tuple,
+    Dict,
+    Set,
+    None,
+}
+
+fn parse_isinstance_type_arg(e: &ast::Expr) -> SResult<Vec<IsInstancePat>> {
+    match &e.kind {
+        ast::ExprKind::Name(n) => Ok(vec![name_to_isinstance_pat(n, e.span)?]),
+        ast::ExprKind::NoneLit => Ok(vec![IsInstancePat::None]),
+        ast::ExprKind::TupleLit(items) => {
+            if items.is_empty() {
+                return Err(err("isinstance() type tuple must be non-empty", e.span));
+            }
+            let mut out = Vec::new();
+            for it in items {
+                out.extend(parse_isinstance_type_arg(it)?);
+            }
+            Ok(out)
+        }
+        // type(None) if written as a call — not supported; require None or name.
+        _ => Err(err(
+            "isinstance() second argument must be a type name (int, float, bool, str, \
+             list, tuple, dict, set, None) or a tuple of those — not a variable or expression",
+            e.span,
+        )),
+    }
+}
+
+fn name_to_isinstance_pat(name: &str, span: Span) -> SResult<IsInstancePat> {
+    match name {
+        "int" => Ok(IsInstancePat::Int),
+        "float" => Ok(IsInstancePat::Float),
+        "bool" => Ok(IsInstancePat::Bool),
+        "str" => Ok(IsInstancePat::Str),
+        "list" => Ok(IsInstancePat::List),
+        "tuple" => Ok(IsInstancePat::Tuple),
+        "dict" => Ok(IsInstancePat::Dict),
+        "set" => Ok(IsInstancePat::Set),
+        "None" => Ok(IsInstancePat::None),
+        _ => Err(err(
+            format!(
+                "isinstance() does not support type '{name}' (supported: int, float, bool, \
+                 str, list, tuple, dict, set, None)"
+            ),
+            span,
+        )),
+    }
+}
+
+fn isinstance_pat_matches(ty: ir::Ty, pat: IsInstancePat) -> bool {
+    match pat {
+        IsInstancePat::Int => matches!(ty, ir::Ty::Int | ir::Ty::Bool), // CPython: bool ⊂ int
+        IsInstancePat::Float => matches!(ty, ir::Ty::Float),
+        IsInstancePat::Bool => matches!(ty, ir::Ty::Bool),
+        IsInstancePat::Str => matches!(ty, ir::Ty::Str),
+        IsInstancePat::List => matches!(ty, ir::Ty::List(_)),
+        IsInstancePat::Tuple => matches!(ty, ir::Ty::Tuple(_)),
+        IsInstancePat::Dict => matches!(ty, ir::Ty::Dict { .. }),
+        IsInstancePat::Set => matches!(ty, ir::Ty::Set(_)),
+        IsInstancePat::None => matches!(ty, ir::Ty::None),
+    }
+}
+
+fn isinstance_pat_tag(pat: IsInstancePat) -> i32 {
+    match pat {
+        IsInstancePat::Int => 0,
+        IsInstancePat::Float => 1,
+        IsInstancePat::Bool => 2,
+        IsInstancePat::Str => 3,
+        IsInstancePat::List => 4, // any list: tag % 8 == 4
+        IsInstancePat::Tuple => 5,
+        IsInstancePat::Dict => 6,
+        IsInstancePat::Set => 7,
+        IsInstancePat::None => -1,
+    }
+}
+
+fn lower_isinstance(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() != 2 {
+        return Err(err(
+            format!(
+                "isinstance() takes exactly 2 arguments ({} given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let value = lower_expr(args[0], ctx)?;
+    // Use storage type (unwrap FromUnion peel) so unions see the full tag set.
+    let value = match value.kind {
+        ir::ExprKind::FromUnion { value: inner } => *inner,
+        _ => value,
+    };
+    let pats = parse_isinstance_type_arg(args[1])?;
+    let bool_is_int = pats.contains(&IsInstancePat::Int);
+
+    // Static fold when monomorphic.
+    if !matches!(value.ty, ir::Ty::Union(_)) {
+        let hit = pats.iter().any(|p| isinstance_pat_matches(value.ty, *p));
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(hit),
+        });
+    }
+
+    // Union: runtime tag test.
+    let type_tags: Vec<i32> = pats.iter().map(|p| isinstance_pat_tag(*p)).collect();
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::IsInstance {
+            value: Box::new(value),
+            type_tags,
+            bool_is_int,
+        },
+    })
+}
+
+/// `any(xs)` / `all(xs)` — list first; also str/tuple/set. Empty any→False, all→True.
+fn lower_any_all(
+    is_any: bool,
+    args: &[&ast::Expr],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let name = if is_any { "any" } else { "all" };
+    if args.len() != 1 {
+        return Err(err(
+            format!("{name}() takes exactly one argument ({} given)", args.len()),
+            span,
+        ));
+    }
+    let seq = lower_expr(args[0], ctx)?;
+    match seq.ty {
+        ir::Ty::List(_) | ir::Ty::Str | ir::Ty::Tuple(_) | ir::Ty::Set(_) => {}
+        other => {
+            return Err(err(
+                format!("{name}() expects a list, str, tuple, or set, found {other}"),
+                args[0].span,
+            ));
+        }
+    }
+    // Desugar to a loop with ToBool.
+    let seq_ty = seq.ty;
+    let seq_t = ctx.fresh_temp(&format!("{name}.seq"), seq_ty);
+    let i_t = ctx.fresh_temp(&format!("{name}.i"), ir::Ty::Int);
+    let acc_t = ctx.fresh_temp(&format!("{name}.acc"), ir::Ty::Bool);
+    let init_acc = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::ConstBool(!is_any), // any→False, all→True
+    };
+    let mut stmts = vec![
+        ir::Stmt::Assign {
+            name: seq_t.clone(),
+            value: seq,
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(0),
+        },
+        ir::Stmt::Assign {
+            name: acc_t.clone(),
+            value: init_acc,
+        },
+    ];
+    // For set: materialize to list.
+    let (iter_ty, iter_expr) = if let ir::Ty::Set(elem) = seq_ty {
+        let list_ty = ir::list_of(*elem);
+        let lt = ctx.fresh_temp(&format!("{name}.els"), list_ty);
+        stmts.push(ir::Stmt::Assign {
+            name: lt.clone(),
+            value: ir::Expr {
+                ty: list_ty,
+                kind: ir::ExprKind::SetToList(Box::new(ir::Expr {
+                    ty: seq_ty,
+                    kind: ir::ExprKind::Local(seq_t.clone()),
+                })),
+            },
+        });
+        (
+            list_ty,
+            ir::Expr {
+                ty: list_ty,
+                kind: ir::ExprKind::Local(lt),
+            },
+        )
+    } else {
+        (
+            seq_ty,
+            ir::Expr {
+                ty: seq_ty,
+                kind: ir::ExprKind::Local(seq_t.clone()),
+            },
+        )
+    };
+    let n_t = ctx.fresh_temp(&format!("{name}.n"), ir::Ty::Int);
+    stmts.push(ir::Stmt::Assign {
+        name: n_t.clone(),
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Len(Box::new(iter_expr.clone())),
+        },
+    });
+    let elem_ty = match iter_ty {
+        ir::Ty::List(e) => *e,
+        ir::Ty::Str => ir::Ty::Str,
+        ir::Ty::Tuple(es) if !es.is_empty() && es.iter().all(|e| e == &es[0]) => es[0],
+        ir::Ty::Tuple(_) => {
+            // Heterogeneous: index returns union of members — use first for ToBool via each.
+            // Use a loose approach: load as... we need per-index. For simplicity,
+            // only homogeneous tuples for any/all for now; hetero → error.
+            return Err(err(
+                format!("{name}() on heterogeneous tuples is not supported yet"),
+                args[0].span,
+            ));
+        }
+        _ => unreachable!(),
+    };
+    let cond = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Binary {
+            op: ir::BinOp::Lt,
+            left: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(i_t.clone()),
+            }),
+            right: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(n_t),
+            }),
+        },
+    };
+    let elem = ir::Expr {
+        ty: elem_ty,
+        kind: ir::ExprKind::Index {
+            base: Box::new(iter_expr),
+            index: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(i_t.clone()),
+            }),
+        },
+    };
+    let truth = to_bool(elem, span)?;
+    let update = if is_any {
+        // if truth: acc = True
+        ir::Stmt::If {
+            branches: vec![(
+                truth,
+                vec![ir::Stmt::Assign {
+                    name: acc_t.clone(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::ConstBool(true),
+                    },
+                }],
+            )],
+            orelse: vec![],
+        }
+    } else {
+        // if not truth: acc = False
+        ir::Stmt::If {
+            branches: vec![(
+                ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::Unary {
+                        op: ir::UnOp::Not,
+                        operand: Box::new(truth),
+                    },
+                },
+                vec![ir::Stmt::Assign {
+                    name: acc_t.clone(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::ConstBool(false),
+                    },
+                }],
+            )],
+            orelse: vec![],
+        }
+    };
+    let step = ir::Stmt::Assign {
+        name: i_t.clone(),
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Local(i_t.clone()),
+                }),
+                right: Box::new(int_const(1)),
+            },
+        },
+    };
+    stmts.push(ir::Stmt::While {
+        cond,
+        body: vec![update],
+        step: vec![step],
+    });
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Local(acc_t),
+            }),
+        },
+    })
+}
+
+fn lower_enumerate_expr(
+    args: &[&ast::Expr],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if !keywords.is_empty() {
+        // Optional start= — support if keyword is start.
+        if keywords.len() == 1 && keywords[0].name == "start" {
+            // handled below
+        } else {
+            return Err(err(
+                "enumerate() only supports the optional start= keyword",
+                keywords[0].name_span,
+            ));
+        }
+    }
+    if args.is_empty() || args.len() > 1 {
+        return Err(err(
+            format!(
+                "enumerate() takes 1 positional argument ({} given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let seq = lower_expr(args[0], ctx)?;
+    let start = if let Some(kw) = keywords.iter().find(|k| k.name == "start") {
+        let s = lower_expr(&kw.value, ctx)?;
+        coerce(s, ir::Ty::Int, kw.value.span, "enumerate start")?
+    } else {
+        int_const(0)
+    };
+    let elem_ty = match seq.ty {
+        ir::Ty::List(e) => *e,
+        ir::Ty::Str => ir::Ty::Str,
+        ir::Ty::Tuple(es) if !es.is_empty() && es.iter().all(|e| e == &es[0]) => es[0],
+        ir::Ty::Tuple(_) => {
+            return Err(err(
+                "enumerate() on heterogeneous tuples is not supported yet",
+                args[0].span,
+            ));
+        }
+        other => {
+            return Err(err(
+                format!("enumerate() expects a list, str, or tuple, found {other}"),
+                args[0].span,
+            ));
+        }
+    };
+    let pair_ty = ir::tuple_of(&[ir::Ty::Int, elem_ty]);
+    let out_ty = ir::list_of(pair_ty);
+    // Materialize list of (i, x).
+    let seq_t = ctx.fresh_temp("enum.seq", seq.ty);
+    let out_t = ctx.fresh_temp("enum.out", out_ty);
+    let i_t = ctx.fresh_temp("enum.i", ir::Ty::Int);
+    let n_t = ctx.fresh_temp("enum.n", ir::Ty::Int);
+    let mut stmts = vec![
+        ir::Stmt::Assign {
+            name: seq_t.clone(),
+            value: seq.clone(),
+        },
+        ir::Stmt::Assign {
+            name: out_t.clone(),
+            value: ir::Expr {
+                ty: out_ty,
+                kind: ir::ExprKind::ListNew {
+                    cap: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                            ty: seq.ty,
+                            kind: ir::ExprKind::Local(seq_t.clone()),
+                        })),
+                    }),
+                },
+            },
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(0),
+        },
+        ir::Stmt::Assign {
+            name: n_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                    ty: seq.ty,
+                    kind: ir::ExprKind::Local(seq_t.clone()),
+                })),
+            },
+        },
+    ];
+    let idx_t = ctx.fresh_temp("enum.idx", ir::Ty::Int);
+    stmts.push(ir::Stmt::Assign {
+        name: idx_t.clone(),
+        value: start,
+    });
+    let cond = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Binary {
+            op: ir::BinOp::Lt,
+            left: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(i_t.clone()),
+            }),
+            right: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(n_t),
+            }),
+        },
+    };
+    let elem = ir::Expr {
+        ty: elem_ty,
+        kind: ir::ExprKind::Index {
+            base: Box::new(ir::Expr {
+                ty: seq.ty,
+                kind: ir::ExprKind::Local(seq_t),
+            }),
+            index: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(i_t.clone()),
+            }),
+        },
+    };
+    let pair = ir::Expr {
+        ty: pair_ty,
+        kind: ir::ExprKind::TupleLit(vec![
+            ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(idx_t.clone()),
+            },
+            elem,
+        ]),
+    };
+    let body = vec![
+        ir::Stmt::ListAppend {
+            list: ir::Expr {
+                ty: out_ty,
+                kind: ir::ExprKind::Local(out_t.clone()),
+            },
+            value: pair,
+        },
+        ir::Stmt::Assign {
+            name: idx_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(idx_t),
+                    }),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+    ];
+    let step = ir::Stmt::Assign {
+        name: i_t.clone(),
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Local(i_t),
+                }),
+                right: Box::new(int_const(1)),
+            },
+        },
+    };
+    stmts.push(ir::Stmt::While {
+        cond,
+        body,
+        step: vec![step],
+    });
+    Ok(ir::Expr {
+        ty: out_ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(ir::Expr {
+                ty: out_ty,
+                kind: ir::ExprKind::Local(out_t),
+            }),
+        },
+    })
+}
+
+fn lower_zip_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() != 2 {
+        return Err(err(
+            format!(
+                "zip() takes exactly 2 arguments in this subset ({} given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let a = lower_expr(args[0], ctx)?;
+    let b = lower_expr(args[1], ctx)?;
+    let elem_a = match a.ty {
+        ir::Ty::List(e) => *e,
+        ir::Ty::Str => ir::Ty::Str,
+        ir::Ty::Tuple(es) if !es.is_empty() && es.iter().all(|e| e == &es[0]) => es[0],
+        other => {
+            return Err(err(
+                format!("zip() expects list/str/homogeneous tuple, found {other}"),
+                args[0].span,
+            ));
+        }
+    };
+    let elem_b = match b.ty {
+        ir::Ty::List(e) => *e,
+        ir::Ty::Str => ir::Ty::Str,
+        ir::Ty::Tuple(es) if !es.is_empty() && es.iter().all(|e| e == &es[0]) => es[0],
+        other => {
+            return Err(err(
+                format!("zip() expects list/str/homogeneous tuple, found {other}"),
+                args[1].span,
+            ));
+        }
+    };
+    let pair_ty = ir::tuple_of(&[elem_a, elem_b]);
+    let out_ty = ir::list_of(pair_ty);
+    let a_t = ctx.fresh_temp("zip.a", a.ty);
+    let b_t = ctx.fresh_temp("zip.b", b.ty);
+    let out_t = ctx.fresh_temp("zip.out", out_ty);
+    let i_t = ctx.fresh_temp("zip.i", ir::Ty::Int);
+    let na = ctx.fresh_temp("zip.na", ir::Ty::Int);
+    let nb = ctx.fresh_temp("zip.nb", ir::Ty::Int);
+    let n_t = ctx.fresh_temp("zip.n", ir::Ty::Int);
+    let mut stmts = vec![
+        ir::Stmt::Assign {
+            name: a_t.clone(),
+            value: a.clone(),
+        },
+        ir::Stmt::Assign {
+            name: b_t.clone(),
+            value: b.clone(),
+        },
+        ir::Stmt::Assign {
+            name: na.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                    ty: a.ty,
+                    kind: ir::ExprKind::Local(a_t.clone()),
+                })),
+            },
+        },
+        ir::Stmt::Assign {
+            name: nb.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                    ty: b.ty,
+                    kind: ir::ExprKind::Local(b_t.clone()),
+                })),
+            },
+        },
+        ir::Stmt::Assign {
+            name: n_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Min {
+                    left: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(na),
+                    }),
+                    right: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(nb),
+                    }),
+                },
+            },
+        },
+        ir::Stmt::Assign {
+            name: out_t.clone(),
+            value: ir::Expr {
+                ty: out_ty,
+                kind: ir::ExprKind::ListNew {
+                    cap: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(n_t.clone()),
+                    }),
+                },
+            },
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(0),
+        },
+    ];
+    let cond = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Binary {
+            op: ir::BinOp::Lt,
+            left: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(i_t.clone()),
+            }),
+            right: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(n_t),
+            }),
+        },
+    };
+    let ea = ir::Expr {
+        ty: elem_a,
+        kind: ir::ExprKind::Index {
+            base: Box::new(ir::Expr {
+                ty: a.ty,
+                kind: ir::ExprKind::Local(a_t),
+            }),
+            index: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(i_t.clone()),
+            }),
+        },
+    };
+    let eb = ir::Expr {
+        ty: elem_b,
+        kind: ir::ExprKind::Index {
+            base: Box::new(ir::Expr {
+                ty: b.ty,
+                kind: ir::ExprKind::Local(b_t),
+            }),
+            index: Box::new(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Local(i_t.clone()),
+            }),
+        },
+    };
+    let body = vec![ir::Stmt::ListAppend {
+        list: ir::Expr {
+            ty: out_ty,
+            kind: ir::ExprKind::Local(out_t.clone()),
+        },
+        value: ir::Expr {
+            ty: pair_ty,
+            kind: ir::ExprKind::TupleLit(vec![ea, eb]),
+        },
+    }];
+    let step = ir::Stmt::Assign {
+        name: i_t.clone(),
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Local(i_t),
+                }),
+                right: Box::new(int_const(1)),
+            },
+        },
+    };
+    stmts.push(ir::Stmt::While {
+        cond,
+        body,
+        step: vec![step],
+    });
+    Ok(ir::Expr {
+        ty: out_ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(ir::Expr {
+                ty: out_ty,
+                kind: ir::ExprKind::Local(out_t),
+            }),
+        },
+    })
+}
+
+fn lower_reversed_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!(
+                "reversed() takes exactly one argument ({} given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let seq = lower_expr(args[0], ctx)?;
+    match seq.ty {
+        ir::Ty::List(elem) => {
+            // Materialize a new list in reverse order.
+            let out_ty = ir::list_of(*elem);
+            let seq_t = ctx.fresh_temp("rev.seq", seq.ty);
+            let out_t = ctx.fresh_temp("rev.out", out_ty);
+            let i_t = ctx.fresh_temp("rev.i", ir::Ty::Int);
+            let n_t = ctx.fresh_temp("rev.n", ir::Ty::Int);
+            let mut stmts = vec![
+                ir::Stmt::Assign {
+                    name: seq_t.clone(),
+                    value: seq.clone(),
+                },
+                ir::Stmt::Assign {
+                    name: n_t.clone(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                            ty: seq.ty,
+                            kind: ir::ExprKind::Local(seq_t.clone()),
+                        })),
+                    },
+                },
+                ir::Stmt::Assign {
+                    name: out_t.clone(),
+                    value: ir::Expr {
+                        ty: out_ty,
+                        kind: ir::ExprKind::ListNew {
+                            cap: Box::new(ir::Expr {
+                                ty: ir::Ty::Int,
+                                kind: ir::ExprKind::Local(n_t.clone()),
+                            }),
+                        },
+                    },
+                },
+                ir::Stmt::Assign {
+                    name: i_t.clone(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Binary {
+                            op: ir::BinOp::Sub,
+                            left: Box::new(ir::Expr {
+                                ty: ir::Ty::Int,
+                                kind: ir::ExprKind::Local(n_t),
+                            }),
+                            right: Box::new(int_const(1)),
+                        },
+                    },
+                },
+            ];
+            let cond = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Ge,
+                    left: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(i_t.clone()),
+                    }),
+                    right: Box::new(int_const(0)),
+                },
+            };
+            let elem_e = ir::Expr {
+                ty: *elem,
+                kind: ir::ExprKind::Index {
+                    base: Box::new(ir::Expr {
+                        ty: seq.ty,
+                        kind: ir::ExprKind::Local(seq_t),
+                    }),
+                    index: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(i_t.clone()),
+                    }),
+                },
+            };
+            let body = vec![ir::Stmt::ListAppend {
+                list: ir::Expr {
+                    ty: out_ty,
+                    kind: ir::ExprKind::Local(out_t.clone()),
+                },
+                value: elem_e,
+            }];
+            let step = ir::Stmt::Assign {
+                name: i_t.clone(),
+                value: ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Sub,
+                        left: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Local(i_t),
+                        }),
+                        right: Box::new(int_const(1)),
+                    },
+                },
+            };
+            stmts.push(ir::Stmt::While {
+                cond,
+                body,
+                step: vec![step],
+            });
+            Ok(ir::Expr {
+                ty: out_ty,
+                kind: ir::ExprKind::Block {
+                    stmts,
+                    result: Box::new(ir::Expr {
+                        ty: out_ty,
+                        kind: ir::ExprKind::Local(out_t),
+                    }),
+                },
+            })
+        }
+        ir::Ty::Str => {
+            // Reverse via slice [::-1] (i64::MIN = missing bound).
+            Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::Slice {
+                    base: Box::new(seq),
+                    lo: Box::new(int_const(i64::MIN)),
+                    hi: Box::new(int_const(i64::MIN)),
+                    step: Box::new(int_const(-1)),
+                },
+            })
+        }
+        ir::Ty::Tuple(es) if !es.is_empty() && es.iter().all(|e| e == &es[0]) => {
+            // Materialize list (document: reversed tuple → list).
+            let elem = es[0];
+            let as_list = ir::Expr {
+                ty: ir::list_of(elem),
+                // Build list by indexing — reuse list path via temp materialize.
+                kind: ir::ExprKind::ListNew {
+                    cap: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Len(Box::new(seq.clone())),
+                    }),
+                },
+            };
+            // Fall through: convert tuple to list then reverse.
+            let list_ty = ir::list_of(elem);
+            let seq_t = ctx.fresh_temp("rev.tup", seq.ty);
+            let list_t = ctx.fresh_temp("rev.list", list_ty);
+            let i_t = ctx.fresh_temp("rev.i", ir::Ty::Int);
+            let n_t = ctx.fresh_temp("rev.n", ir::Ty::Int);
+            let mut stmts = vec![
+                ir::Stmt::Assign {
+                    name: seq_t.clone(),
+                    value: seq.clone(),
+                },
+                ir::Stmt::Assign {
+                    name: n_t.clone(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Len(Box::new(ir::Expr {
+                            ty: seq.ty,
+                            kind: ir::ExprKind::Local(seq_t.clone()),
+                        })),
+                    },
+                },
+                ir::Stmt::Assign {
+                    name: list_t.clone(),
+                    value: as_list,
+                },
+                ir::Stmt::Assign {
+                    name: i_t.clone(),
+                    value: int_const(0),
+                },
+            ];
+            let cond = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Lt,
+                    left: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(i_t.clone()),
+                    }),
+                    right: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(n_t.clone()),
+                    }),
+                },
+            };
+            let body = vec![ir::Stmt::ListAppend {
+                list: ir::Expr {
+                    ty: list_ty,
+                    kind: ir::ExprKind::Local(list_t.clone()),
+                },
+                value: ir::Expr {
+                    ty: elem,
+                    kind: ir::ExprKind::Index {
+                        base: Box::new(ir::Expr {
+                            ty: seq.ty,
+                            kind: ir::ExprKind::Local(seq_t),
+                        }),
+                        index: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Local(i_t.clone()),
+                        }),
+                    },
+                },
+            }];
+            let step = ir::Stmt::Assign {
+                name: i_t.clone(),
+                value: ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Add,
+                        left: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Local(i_t),
+                        }),
+                        right: Box::new(int_const(1)),
+                    },
+                },
+            };
+            stmts.push(ir::Stmt::While {
+                cond,
+                body,
+                step: vec![step],
+            });
+            // Now reverse the list via recursive call-like desugar — index reverse.
+            let out_t = ctx.fresh_temp("rev.out", list_ty);
+            let j_t = ctx.fresh_temp("rev.j", ir::Ty::Int);
+            stmts.push(ir::Stmt::Assign {
+                name: out_t.clone(),
+                value: ir::Expr {
+                    ty: list_ty,
+                    kind: ir::ExprKind::ListNew {
+                        cap: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Local(n_t.clone()),
+                        }),
+                    },
+                },
+            });
+            stmts.push(ir::Stmt::Assign {
+                name: j_t.clone(),
+                value: ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Sub,
+                        left: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Local(n_t),
+                        }),
+                        right: Box::new(int_const(1)),
+                    },
+                },
+            });
+            let cond2 = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Ge,
+                    left: Box::new(ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Local(j_t.clone()),
+                    }),
+                    right: Box::new(int_const(0)),
+                },
+            };
+            let body2 = vec![ir::Stmt::ListAppend {
+                list: ir::Expr {
+                    ty: list_ty,
+                    kind: ir::ExprKind::Local(out_t.clone()),
+                },
+                value: ir::Expr {
+                    ty: elem,
+                    kind: ir::ExprKind::Index {
+                        base: Box::new(ir::Expr {
+                            ty: list_ty,
+                            kind: ir::ExprKind::Local(list_t),
+                        }),
+                        index: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Local(j_t.clone()),
+                        }),
+                    },
+                },
+            }];
+            let step2 = ir::Stmt::Assign {
+                name: j_t.clone(),
+                value: ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Sub,
+                        left: Box::new(ir::Expr {
+                            ty: ir::Ty::Int,
+                            kind: ir::ExprKind::Local(j_t),
+                        }),
+                        right: Box::new(int_const(1)),
+                    },
+                },
+            };
+            stmts.push(ir::Stmt::While {
+                cond: cond2,
+                body: body2,
+                step: vec![step2],
+            });
+            Ok(ir::Expr {
+                ty: list_ty,
+                kind: ir::ExprKind::Block {
+                    stmts,
+                    result: Box::new(ir::Expr {
+                        ty: list_ty,
+                        kind: ir::ExprKind::Local(out_t),
+                    }),
+                },
+            })
+        }
+        other => Err(err(
+            format!("reversed() expects a list, str, or homogeneous tuple, found {other}"),
+            args[0].span,
+        )),
     }
 }
 
@@ -12881,6 +14702,11 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
         return lower_is_none(op, l, r, span);
     }
 
+    // ---- set | (union) before bitwise int ops ----
+    if matches!((l.ty, r.ty), (ir::Ty::Set(_), ir::Ty::Set(_))) && op == ast::BinOp::BitOr {
+        return lower_set_union(l, r, span);
+    }
+
     // ---- string operations ----
     if l.ty == ir::Ty::Str || r.ty == ir::Ty::Str {
         return lower_str_binary(op, l, r, span);
@@ -13109,7 +14935,7 @@ fn comparison_ir_op(op: ast::BinOp) -> ir::BinOp {
     }
 }
 
-/// `needle in haystack` / `not in`: substring, list/set membership, dict keys.
+/// `needle in haystack` / `not in`: substring, list/tuple/set membership, dict keys.
 fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
     let needle = match r.ty {
         ir::Ty::Str => {
@@ -13127,8 +14953,39 @@ fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResu
         ir::Ty::List(elem) => coerce(l, *elem, span, "'in' operand")?,
         ir::Ty::Dict { key, .. } => coerce(l, *key, span, "'in' dict key")?,
         ir::Ty::Set(elem) => coerce(l, *elem, span, "'in' set element")?,
-        ir::Ty::Tuple(_) => {
-            return Err(err("membership test on tuples is not supported yet", span));
+        ir::Ty::Tuple(elems) => {
+            // Homogeneous: coerce to that elem type. Heterogeneous: keep needle
+            // as-is; runtime only compares elements with a matching tag.
+            let mut uniq: Vec<ir::Ty> = Vec::new();
+            for e in elems.iter() {
+                if !uniq.iter().any(|u| u == e) {
+                    uniq.push(*e);
+                }
+            }
+            if uniq.len() == 1 {
+                coerce(l, uniq[0], span, "'in' tuple operand")?
+            } else {
+                // Accept needle if it is comparable to any element type.
+                let ok = uniq.iter().any(|e| {
+                    l.ty == *e
+                        || matches!(
+                            (l.ty, *e),
+                            (ir::Ty::Bool, ir::Ty::Int)
+                                | (ir::Ty::Int, ir::Ty::Float)
+                                | (ir::Ty::Bool, ir::Ty::Float)
+                        )
+                });
+                if !ok && !uniq.is_empty() {
+                    return Err(err(
+                        format!(
+                            "'in' tuple operand type {} is not compatible with any element type",
+                            l.ty
+                        ),
+                        span,
+                    ));
+                }
+                l
+            }
         }
         other => {
             return Err(err(format!("'{other}' does not support 'in'"), span));
@@ -14215,8 +16072,39 @@ print(f(1, b=3))
 
     #[test]
     fn error_variable_changes_type() {
-        let e = analyze_err("x = 1\nx = 2.5\n");
-        assert!(e.message.contains("fixed"), "{}", e.message);
+        // Numeric multi-assign joins (int + float → float storage), so that
+        // path is allowed. Incompatible non-numeric reassign still errors when
+        // the joined storage cannot accept the RHS without a prior join pass
+        // seeing both — here a later bool into a str-only binding.
+        let e = analyze_err(
+            "\
+def f():
+    x: str = \"a\"
+    x = 1
+    return x
+print(f())
+",
+        );
+        assert!(
+            e.message.contains("type mismatch")
+                || e.message.contains("storage type")
+                || e.message.contains("expected str"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn multi_assign_numeric_promotes() {
+        // int then float → float storage (join_types numeric promotion).
+        let m = analyze_ok("x = 1\nx = 2.5\nprint(x)\n");
+        assert!(
+            m.globals
+                .iter()
+                .any(|(n, t)| n == "x" && *t == ir::Ty::Float),
+            "{:?}",
+            m.globals
+        );
     }
 
     #[test]
@@ -14607,9 +16495,98 @@ print(f())
     }
 
     #[test]
-    fn tuple_membership_not_supported_yet() {
-        let e = analyze_err("print(1 in (1, 2))\n");
-        assert!(e.message.contains("not supported yet"), "{}", e.message);
+    fn tuple_membership_lowers() {
+        let m = analyze_ok("print(1 in (1, 2))\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let has = entry.body.iter().any(|s| match s {
+            ir::Stmt::Print(args) => args
+                .iter()
+                .any(|a| matches!(a.kind, ir::ExprKind::Contains { .. })),
+            _ => false,
+        });
+        assert!(
+            has,
+            "expected Contains for tuple membership: {:?}",
+            entry.body
+        );
+    }
+
+    #[test]
+    fn isinstance_bool_is_int() {
+        let m = analyze_ok("print(isinstance(True, int))\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::Print(args) = &entry.body[0] else {
+            panic!("{:?}", entry.body);
+        };
+        assert!(
+            matches!(args[0].kind, ir::ExprKind::ConstBool(true)),
+            "{:?}",
+            args[0]
+        );
+    }
+
+    #[test]
+    fn isinstance_rejects_variable_type() {
+        let e = analyze_err("t = 1\nprint(isinstance(1, t))\n");
+        assert!(
+            e.message.contains("type name")
+                || e.message.contains("not a variable")
+                || e.message.contains("does not support type"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn multi_assign_joins_to_union() {
+        let m = analyze_ok(
+            "\
+def f():
+    x = 1
+    x = \"a\"
+    return x
+print(f())
+",
+        );
+        let f = find_func(&m, "f");
+        // local x should be int|str
+        let x_ty = f.locals.iter().find(|(n, _)| n == "x").map(|(_, t)| *t);
+        assert!(
+            x_ty.is_some_and(|t| matches!(t, ir::Ty::Union(_))),
+            "expected union local, got {x_ty:?} in {:?}",
+            f.locals
+        );
+    }
+
+    #[test]
+    fn bare_param_infers_int() {
+        let m = analyze_ok(
+            "\
+def f(x):
+    return x + 1
+print(f(2))
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Int);
+    }
+
+    #[test]
+    fn raise_new_exc_types() {
+        let m = analyze_ok(
+            "\
+try:
+    raise FileNotFoundError(\"missing\")
+except FileNotFoundError as e:
+    print(e)
+try:
+    raise OverflowError(\"big\")
+except (OverflowError, ValueError):
+    print(\"ov\")
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(entry.body.iter().any(|s| matches!(s, ir::Stmt::Try { .. })));
     }
 
     #[test]

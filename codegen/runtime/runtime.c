@@ -27,7 +27,8 @@
 #include <unistd.h>
 
 /* exception type tags — keep in sync with ir::ExcType; OTHER is catchable
- * only by bare `except:` (not by `except RuntimeError`). */
+ * only by bare `except:` (not by `except RuntimeError`). Flat equality —
+ * no OSError hierarchy (except OSError does not catch FileNotFoundError). */
 #define PYRS_EXC_VALUE 1
 #define PYRS_EXC_KEY 2
 #define PYRS_EXC_INDEX 3
@@ -35,6 +36,13 @@
 #define PYRS_EXC_TYPE 5
 #define PYRS_EXC_RUNTIME 6
 #define PYRS_EXC_GENEXIT 7
+#define PYRS_EXC_OVERFLOW 8
+#define PYRS_EXC_EOF 9
+#define PYRS_EXC_FILENOTFOUND 10
+#define PYRS_EXC_OS 11
+#define PYRS_EXC_NAME 12
+#define PYRS_EXC_UNBOUNDLOCAL 13
+#define PYRS_EXC_STOPITER 14
 #define PYRS_EXC_OTHER 99
 
 /* value tags for heterogeneous containers */
@@ -99,32 +107,70 @@ static const char *exc_type_name(int ty) {
         return "RuntimeError";
     case PYRS_EXC_GENEXIT:
         return "GeneratorExit";
+    case PYRS_EXC_OVERFLOW:
+        return "OverflowError";
+    case PYRS_EXC_EOF:
+        return "EOFError";
+    case PYRS_EXC_FILENOTFOUND:
+        return "FileNotFoundError";
+    case PYRS_EXC_OS:
+        return "OSError";
+    case PYRS_EXC_NAME:
+        return "NameError";
+    case PYRS_EXC_UNBOUNDLOCAL:
+        return "UnboundLocalError";
+    case PYRS_EXC_STOPITER:
+        return "StopIteration";
     default:
         return "Exception";
     }
 }
 
 static int classify_exc_msg(const char *msg) {
-    if (strncmp(msg, "ValueError", 10) == 0) {
-        return PYRS_EXC_VALUE;
-    }
-    if (strncmp(msg, "KeyError", 8) == 0) {
-        return PYRS_EXC_KEY;
-    }
-    if (strncmp(msg, "IndexError", 10) == 0) {
-        return PYRS_EXC_INDEX;
-    }
+    /* Longer / more-specific prefixes first where they share a head. */
     if (strncmp(msg, "ZeroDivisionError", 17) == 0) {
         return PYRS_EXC_ZERODIV;
     }
-    if (strncmp(msg, "TypeError", 9) == 0) {
-        return PYRS_EXC_TYPE;
+    if (strncmp(msg, "UnboundLocalError", 17) == 0) {
+        return PYRS_EXC_UNBOUNDLOCAL;
+    }
+    if (strncmp(msg, "FileNotFoundError", 17) == 0) {
+        return PYRS_EXC_FILENOTFOUND;
+    }
+    if (strncmp(msg, "StopIteration", 13) == 0) {
+        return PYRS_EXC_STOPITER;
+    }
+    if (strncmp(msg, "OverflowError", 13) == 0) {
+        return PYRS_EXC_OVERFLOW;
     }
     if (strncmp(msg, "RuntimeError", 12) == 0) {
         return PYRS_EXC_RUNTIME;
     }
-    /* UnboundLocalError, FileNotFoundError, EOFError, MemoryError, … —
-     * only bare `except:` matches (not RuntimeError). */
+    if (strncmp(msg, "GeneratorExit", 13) == 0) {
+        return PYRS_EXC_GENEXIT;
+    }
+    if (strncmp(msg, "ValueError", 10) == 0) {
+        return PYRS_EXC_VALUE;
+    }
+    if (strncmp(msg, "IndexError", 10) == 0) {
+        return PYRS_EXC_INDEX;
+    }
+    if (strncmp(msg, "TypeError", 9) == 0) {
+        return PYRS_EXC_TYPE;
+    }
+    if (strncmp(msg, "NameError", 9) == 0) {
+        return PYRS_EXC_NAME;
+    }
+    if (strncmp(msg, "KeyError", 8) == 0) {
+        return PYRS_EXC_KEY;
+    }
+    if (strncmp(msg, "EOFError", 8) == 0) {
+        return PYRS_EXC_EOF;
+    }
+    if (strncmp(msg, "OSError", 7) == 0) {
+        return PYRS_EXC_OS;
+    }
+    /* PermissionError, IsADirectoryError, MemoryError, … — bare except only. */
     return PYRS_EXC_OTHER;
 }
 
@@ -3436,6 +3482,17 @@ int pyrs_tuple_eq(const PyrsTuple *a, const PyrsTuple *b) {
     return 1;
 }
 
+/* Membership: only compare elements whose tag matches the needle tag. */
+int pyrs_tuple_contains(const PyrsTuple *t, long long slot, int tag) {
+    check_ref(t);
+    for (long long i = 0; i < t->len; i++) {
+        if (t->tags[i] == tag && slot_eq(t->data[i], slot, tag)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void pyrs_unpack_check(long long got, long long expected) {
     if (got < expected) {
         char buf[128];
@@ -3687,6 +3744,18 @@ void pyrs_dict_clear(PyrsDict *d) {
     memset(d->table, 0, (size_t)d->cap * sizeof(DictSlot));
     d->len = 0;
     d->order_len = 0;
+}
+
+/* Merge all keys from `other` into `d` (overwrite on collision). Same K/V tags. */
+void pyrs_dict_update(PyrsDict *d, const PyrsDict *other) {
+    check_ref(d);
+    check_ref(other);
+    for (long long i = 0; i < other->order_len; i++) {
+        DictSlot *e = &other->table[other->order[i]];
+        if (e->state == 1) {
+            pyrs_dict_set(d, e->key, e->key_tag, e->val, e->val_tag);
+        }
+    }
 }
 
 long long pyrs_dict_pop(PyrsDict *d, long long key, int key_tag, int has_default,
@@ -4049,6 +4118,28 @@ PyrsList *pyrs_set_elements(const PyrsSet *s) {
             pyrs_list_push(r, e->key);
         }
     }
+    return r;
+}
+
+/* In-place union: add every element of `other` into `s`. */
+void pyrs_set_update(PyrsSet *s, const PyrsSet *other) {
+    check_ref(s);
+    check_ref(other);
+    for (long long i = 0; i < other->order_len; i++) {
+        SetSlot *e = &other->table[other->order[i]];
+        if (e->state == 1) {
+            pyrs_set_add(s, e->key, e->key_tag);
+        }
+    }
+}
+
+/* New set = s | other. */
+PyrsSet *pyrs_set_union(const PyrsSet *a, const PyrsSet *b) {
+    check_ref(a);
+    check_ref(b);
+    PyrsSet *r = pyrs_set_new();
+    pyrs_set_update(r, a);
+    pyrs_set_update(r, b);
     return r;
 }
 

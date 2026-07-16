@@ -318,6 +318,8 @@ impl std::fmt::Display for Ty {
 }
 
 /// Exception type tags matching the C runtime (`pyrs_raise` / handlers).
+/// Flat equality match — no OSError hierarchy (`except OSError` does not
+/// catch `FileNotFoundError`). OTHER=99 is catchable only by bare `except:`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcType {
     ValueError = 1,
@@ -328,6 +330,14 @@ pub enum ExcType {
     RuntimeError = 6,
     /// Injected by `generator.close()` (CPython BaseException subclass).
     GeneratorExit = 7,
+    OverflowError = 8,
+    EOFError = 9,
+    FileNotFoundError = 10,
+    OSError = 11,
+    NameError = 12,
+    UnboundLocalError = 13,
+    /// User-level catch; generator protocol still uses exhaustion as Optional.
+    StopIteration = 14,
 }
 
 impl ExcType {
@@ -340,13 +350,30 @@ impl ExcType {
             ExcType::TypeError => "TypeError",
             ExcType::RuntimeError => "RuntimeError",
             ExcType::GeneratorExit => "GeneratorExit",
+            ExcType::OverflowError => "OverflowError",
+            ExcType::EOFError => "EOFError",
+            ExcType::FileNotFoundError => "FileNotFoundError",
+            ExcType::OSError => "OSError",
+            ExcType::NameError => "NameError",
+            ExcType::UnboundLocalError => "UnboundLocalError",
+            ExcType::StopIteration => "StopIteration",
         }
     }
 
     pub fn tag(self) -> i32 {
         self as i32
     }
+
+    pub fn all_names() -> &'static str {
+        "ValueError, KeyError, IndexError, ZeroDivisionError, TypeError, \
+         RuntimeError, GeneratorExit, OverflowError, EOFError, FileNotFoundError, \
+         OSError, NameError, UnboundLocalError, StopIteration"
+    }
 }
+
+/// One `except` clause under a try: filter types (or bare), optional bind name,
+/// body. Multi-type `except (A, B):` is a non-empty filter list.
+pub type ExceptHandler = (Option<Vec<ExcType>>, Option<String>, Vec<Stmt>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
@@ -455,6 +482,16 @@ pub enum Stmt {
     SetClear {
         set: Expr,
     },
+    /// `set |= other` / in-place union; same elem type.
+    SetUpdate {
+        set: Expr,
+        other: Expr,
+    },
+    /// `dict.update(other)` — merge keys from `other` (same K/V types).
+    DictUpdate {
+        dict: Expr,
+        other: Expr,
+    },
     If {
         branches: Vec<(Expr, Vec<Stmt>)>,
         orelse: Vec<Stmt>,
@@ -489,12 +526,12 @@ pub enum Stmt {
         exc: ExcType,
         message: Expr,
     },
-    /// try / except / else / finally. Handlers: (type filter or catch-all,
-    /// optional local name bound to the message str, body). `orelse` runs
-    /// only on normal completion of `body` (not after a handled exception).
+    /// try / except / else / finally. See [`ExceptHandler`].
+    /// `orelse` runs only on normal completion of `body` (not after a handled
+    /// exception).
     Try {
         body: Vec<Stmt>,
-        handlers: Vec<(Option<ExcType>, Option<String>, Vec<Stmt>)>,
+        handlers: Vec<ExceptHandler>,
         orelse: Vec<Stmt>,
         finally: Vec<Stmt>,
     },
@@ -613,11 +650,20 @@ pub enum ExprKind {
         func: StrFn,
         args: Vec<Expr>,
     },
-    /// `needle in haystack`: str-in-str, element-in-list/set, key-in-dict.
+    /// `needle in haystack`: str-in-str, element-in-list/tuple/set, key-in-dict.
     /// The needle is already coerced. Result is Bool.
     Contains {
         needle: Box<Expr>,
         haystack: Box<Expr>,
+    },
+    /// Runtime `isinstance(value, …)` when static fold is impossible (unions).
+    /// `type_tags` are print/member tags: -1=None, 0=int, 1=float, 2=bool,
+    /// 3=str, 4=any list (tag%8==4), 5=tuple, 6=dict, 7=set. When
+    /// `bool_is_int` is true, tag 2 also matches an int check (CPython).
+    IsInstance {
+        value: Box<Expr>,
+        type_tags: Vec<i32>,
+        bool_is_int: bool,
     },
     /// `list.pop(index)`; index defaults to -1 (the last element).
     ListPop {
@@ -645,6 +691,11 @@ pub enum ExprKind {
     SetLit(Vec<Expr>),
     /// Empty set with known element type.
     SetNew,
+    /// `a | b` / `set.union(other)` — new set; same elem type.
+    SetUnion {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// `d.get(key, default)`. Result type is on `expr.ty` (may be
     /// `optional_of(val)` for bare get). On hit the value is converted to
     /// `expr.ty` when needed; on miss the default is used as-is.

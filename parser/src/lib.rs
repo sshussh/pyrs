@@ -707,6 +707,33 @@ impl Parser {
         })
     }
 
+    fn parse_exc_type_name(name: &str, span: Span) -> PResult<ExcType> {
+        match name {
+            "ValueError" => Ok(ExcType::ValueError),
+            "KeyError" => Ok(ExcType::KeyError),
+            "IndexError" => Ok(ExcType::IndexError),
+            "ZeroDivisionError" => Ok(ExcType::ZeroDivisionError),
+            "TypeError" => Ok(ExcType::TypeError),
+            "RuntimeError" => Ok(ExcType::RuntimeError),
+            "GeneratorExit" => Ok(ExcType::GeneratorExit),
+            "OverflowError" => Ok(ExcType::OverflowError),
+            "EOFError" => Ok(ExcType::EOFError),
+            "FileNotFoundError" => Ok(ExcType::FileNotFoundError),
+            "OSError" => Ok(ExcType::OSError),
+            "NameError" => Ok(ExcType::NameError),
+            "UnboundLocalError" => Ok(ExcType::UnboundLocalError),
+            "StopIteration" => Ok(ExcType::StopIteration),
+            other => Err(Diagnostic::new(
+                Phase::Parse,
+                format!(
+                    "unknown exception type '{other}'; supported: {}",
+                    ExcType::all_names()
+                ),
+                span,
+            )),
+        }
+    }
+
     fn parse_exc_type(&mut self, context: &str) -> PResult<(ExcType, Span)> {
         let span = self.peek_span();
         let name = match self.peek().clone() {
@@ -722,26 +749,38 @@ impl Parser {
                 )));
             }
         };
-        let exc = match name.as_str() {
-            "ValueError" => ExcType::ValueError,
-            "KeyError" => ExcType::KeyError,
-            "IndexError" => ExcType::IndexError,
-            "ZeroDivisionError" => ExcType::ZeroDivisionError,
-            "TypeError" => ExcType::TypeError,
-            "RuntimeError" => ExcType::RuntimeError,
-            "GeneratorExit" => ExcType::GeneratorExit,
-            other => {
-                return Err(Diagnostic::new(
-                    Phase::Parse,
-                    format!(
-                        "unknown exception type '{other}'; supported: ValueError, KeyError, \
-                         IndexError, ZeroDivisionError, TypeError, RuntimeError, GeneratorExit"
-                    ),
-                    span,
-                ));
-            }
-        };
+        let exc = Self::parse_exc_type_name(&name, span)?;
         Ok((exc, span))
+    }
+
+    /// Single type or parenthesized multi-type: `E` or `(A, B, …)`.
+    fn parse_except_types(&mut self) -> PResult<Vec<ExcType>> {
+        if self.peek() == &Token::LParen {
+            self.advance();
+            let mut types = Vec::new();
+            if self.peek() == &Token::RParen {
+                return Err(self.error("expected at least one exception type in except (...)"));
+            }
+            loop {
+                let (exc, _) = self.parse_exc_type("in except (...)")?;
+                types.push(exc);
+                if self.eat(&Token::Comma) {
+                    if self.peek() == &Token::RParen {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, "after exception types")?;
+            if types.is_empty() {
+                return Err(self.error("expected at least one exception type in except (...)"));
+            }
+            Ok(types)
+        } else {
+            let (exc, _) = self.parse_exc_type("after 'except'")?;
+            Ok(vec![exc])
+        }
     }
 
     fn parse_try(&mut self) -> PResult<Stmt> {
@@ -753,14 +792,14 @@ impl Parser {
             let (exc, bind) = if self.peek() == &Token::Colon {
                 (None, None)
             } else {
-                let (exc, _) = self.parse_exc_type("after 'except'")?;
+                let types = self.parse_except_types()?;
                 let bind = if self.eat(&Token::As) {
                     let (name, span) = self.expect_ident("after 'as'")?;
                     Some((name, span))
                 } else {
                     None
                 };
-                (Some(exc), bind)
+                (Some(types), bind)
             };
             let handler_body = self.parse_block("'except' body")?;
             handlers.push(ExceptHandler {
@@ -1709,26 +1748,85 @@ impl Parser {
                     span,
                 })
             }
-            // int(x) / float(x) / bool(x) / str(x) casts (file(...) is rejected in semantic)
+            // int(x) / float(x) / bool(x) / str(x) casts; bare names for isinstance.
             Token::Int | Token::Float | Token::Bool | Token::Str | Token::File => {
-                let ty = self.parse_type_name("")?;
-                self.expect(Token::LParen, &format!("after '{ty}' (cast)"))?;
-                let arg = self.parse_expr()?;
-                let close = self.expect(Token::RParen, "after cast argument")?;
+                let name = match self.peek() {
+                    Token::Int => "int",
+                    Token::Float => "float",
+                    Token::Bool => "bool",
+                    Token::Str => "str",
+                    Token::File => "file",
+                    _ => unreachable!(),
+                };
+                // Peek ahead: only consume type keyword after deciding cast vs bare name.
+                if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
+                    let ty = self.parse_type_name("")?;
+                    self.expect(Token::LParen, &format!("after '{ty}' (cast)"))?;
+                    let arg = self.parse_expr()?;
+                    let close = self.expect(Token::RParen, "after cast argument")?;
+                    Ok(Expr {
+                        kind: ExprKind::Cast {
+                            ty,
+                            arg: Box::new(arg),
+                        },
+                        span: span.to(close),
+                    })
+                } else {
+                    self.advance();
+                    Ok(Expr {
+                        kind: ExprKind::Name(name.to_string()),
+                        span,
+                    })
+                }
+            }
+            Token::List => {
+                // bare `list` for isinstance; `list()` still unsupported.
+                if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
+                    return Err(self.error(
+                        "list() is not supported; use a literal like '[]' with a type \
+                         annotation, e.g. 'xs: list[int] = []'",
+                    ));
+                }
+                self.advance();
                 Ok(Expr {
-                    kind: ExprKind::Cast {
-                        ty,
-                        arg: Box::new(arg),
-                    },
-                    span: span.to(close),
+                    kind: ExprKind::Name("list".to_string()),
+                    span,
                 })
             }
-            Token::List => Err(self.error(
-                "list() is not supported; use a literal like '[]' with a type \
-                 annotation, e.g. 'xs: list[int] = []'",
-            )),
-            // `set()` empty constructor (typed via annotation in semantic)
+            Token::Dict => {
+                if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
+                    return Err(self.error(
+                        "dict() is not supported; use a literal like '{}' with a type \
+                         annotation, e.g. 'd: dict[str, int] = {}'",
+                    ));
+                }
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Name("dict".to_string()),
+                    span,
+                })
+            }
+            Token::Tuple => {
+                if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
+                    return Err(
+                        self.error("tuple() is not supported; use a literal like '()' or '(x,)'")
+                    );
+                }
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Name("tuple".to_string()),
+                    span,
+                })
+            }
+            // `set()` empty constructor (typed via annotation in semantic); bare for isinstance
             Token::Set => {
+                if self.tokens.get(self.pos + 1).map(|t| &t.0) != Some(&Token::LParen) {
+                    self.advance();
+                    return Ok(Expr {
+                        kind: ExprKind::Name("set".to_string()),
+                        span,
+                    });
+                }
                 self.advance();
                 self.expect(Token::LParen, "after 'set'")?;
                 let close = self.expect(Token::RParen, "after set() (empty set only)")?;
