@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.17)
+## The language (v0.18)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.18.0**, not 1.0) until it is ready for
+milestone after this one is **0.19.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **classes** and **GC / heap freeing** are planned as the **last two**
@@ -56,10 +56,13 @@ A statically-typed Python subset:
   (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only;
   list elements and dict values may be Optional/unions; homogeneous
   closures (same params/ret and capture env shape, with or without
-  captures) may be list/tuple elements
+  captures) may be list/tuple elements. Multi-assign joins storage types
+  (`x = 1; x = "a"` → `int | str`; numeric multi-assign promotes).
+  Bare params may be inferred monomorphically from body usage
 - **Functions:** `def` with optional parameter/return annotations
-  (defaults infer param types; return type inferred from `return` when
-  omitted), defaults and keyword args, recursion, forward references;
+  (defaults infer param types; bare params inferred from body when unique;
+  return type inferred from `return` when omitted), defaults and keyword
+  args, recursion, forward references;
   pass/return tuples and other containers; nested `def` / `lambda` as
   first-class closures (including in containers and sibling/forward
   nested calls); late free-var binding (`def f(): return n` then
@@ -72,21 +75,26 @@ A statically-typed Python subset:
   sets / generators (including unpack targets `for a, b in xs` and
   `for a, *rest in xs`), `break`/`continue`, assignments (plain, annotated,
   multi-target, unpacking `a, b = t`, augmented — including
-  `xs[i] += v`), `del d[k]`, `return`, `pass`, `raise ExcType("msg")`,
-  `try`/`except`/`else`/`finally` (including inside generators),
+  `xs[i] += v` and `s |= t` for sets), `del d[k]`, `return`, `pass`,
+  `raise ExcType("msg")`, `try`/`except`/`except (A, B)`/`else`/`finally`
+  (including inside generators),
   `match`/`case` (literal, wildcard, capture, or-patterns, guards,
   sequence with optional `*rest`, mapping with optional `**rest`,
   `as` patterns)
 - **Expressions:** full arithmetic including `**`, comparisons with
-  chaining (`0 < x < 10`), `in`/`not in` (substring and membership),
+  chaining (`0 < x < 10`), `in`/`not in` (substring, list/tuple/set
+  membership, dict keys),
   `is`/`is not` (None checks plus pointer/slot identity for same-type
   heap objects and scalars), bitwise `& | ^ ~ << >>`
-  (and augassign) on int/bool, `and`/`or`/`not`
+  (and augassign) on int/bool; set `|` / `.union` / `|=`,
+  `and`/`or`/`not`
   (short-circuit; `and`/`or` return an operand, not always `bool`, and
   may yield a union when operands differ, e.g. `0 or "x"`), casts
   `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, `min()`/`max()`
   (two args or one `list[int|float|bool]`), `sum()` on
-  `list[int]`/`list[float]`, indexing with
+  `list[int]`/`list[float]`, `isinstance(x, T)` / `isinstance(x, (T1,T2))`
+  with flow-sensitive narrowing, `any`/`all`, `enumerate`/`zip`/`reversed`
+  (materialize to lists when used as values), indexing with
   negative indices, full slicing `s[a:b:c]` including `[::-1]` reversal,
   `print(...)` with any mix of values (including tuples/dicts/sets)
 - **f-strings:** `f"x={x}, next={x + 1}"` and multi-line `f"""…"""` /
@@ -120,14 +128,18 @@ A statically-typed Python subset:
   `{}` (needs annotation); get/set, `del d[k]`, `in` on keys, `len`,
   insertion-order key iteration; methods `get` (with default, or bare
   `get(k)` → `Optional[V]` / `None` on miss),
-  `pop`, `keys`/`values`/`items` (return lists), `clear`
+  `pop`, `keys`/`values`/`items` (return lists), `clear`, `update`
 - **Sets:** `set[T]` with `T` in `{int, str}`; nonempty `{a, b}`, empty
-  `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`, `in`, `len`,
-  iteration
-- **Exceptions:** `raise ValueError("msg")` (and KeyError, IndexError,
-  ZeroDivisionError, TypeError, RuntimeError); `try`/`except`/`except
-  Type as e`/`else`/`finally`; uncaught traps print CPython-like messages and
-  exit 1; runtime traps are catchable inside `try`
+  `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`/`union`/`update`,
+  `|` / `|=`, `in`, `len`, iteration
+- **Exceptions:** `raise ExcType("msg")` for ValueError, KeyError,
+  IndexError, ZeroDivisionError, TypeError, RuntimeError, GeneratorExit,
+  OverflowError, EOFError, FileNotFoundError, OSError, NameError,
+  UnboundLocalError, StopIteration; `try`/`except`/`except Type as e` /
+  `except (A, B)`/`else`/`finally`; flat equality match (no OSError
+  hierarchy — `except OSError` does not catch FileNotFoundError);
+  `except … as e` binds the **message str**, not an exception object;
+  uncaught traps print CPython-like messages and exit 1
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
 - **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for
@@ -183,10 +195,10 @@ Python semantics are preserved where it counts:
   `[1, 2, 3]` / `['a', 'b']`; tuples/dicts/sets print like CPython
 - iterating a list re-reads the live length, so appending inside the
   loop behaves like CPython
-- variables use function-wide scoping; a variable's type is fixed by its
-  first assignment
+- variables use function-wide scoping; storage type is the join of all
+  assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.17): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.18): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
@@ -317,4 +329,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.17.0 && git push origin v0.17.0`.
+Release tags: `git tag v0.18.0 && git push origin v0.18.0`.

@@ -153,7 +153,8 @@ are valid Python programs with the same output — the reverse is not true,
 since PyRs rejects unsupported dynamic features (each with a
 "not supported yet" error naming the feature). Parameter annotations are
 optional when a default value is present (the type is inferred from the
-default); bare parameters still need an annotation.
+default); bare parameters may be monomorphically inferred from body usage
+(otherwise an annotation is required).
 
 ### Program structure
 
@@ -236,13 +237,21 @@ n: int = True          # bool is assignable to int: n == 1
 
 ### Variables and assignment
 
-A variable's type is fixed by its first assignment and cannot change:
+A variable's **storage type** is the join of all RHS types (and an
+annotation if present). Bare multi-assign can form a union; numeric
+assigns promote (`int` then `float` → `float`). An annotation fixes
+storage and rejects incompatible RHS:
 
 ```python
 x = 1          # x: int, inferred
-x = 2.5        # error: variable 'x' already has type int
+x = 2.5        # ok: storage becomes float (numeric join)
+
+a = 1
+a = "hi"       # a: int | str
 
 y: float = 1   # annotated; the int promotes to 1.0
+z: str = "a"
+z = 1          # error: cannot assign int to str storage
 ```
 
 All assignment forms:
@@ -1000,16 +1009,20 @@ finally:
 ```
 
 Supported exception types for `raise` / typed `except`: `ValueError`,
-`KeyError`, `IndexError`, `ZeroDivisionError`, `TypeError`, `RuntimeError`.
-Bare `except:` catches all (including traps like `FileNotFoundError` /
-`UnboundLocalError` that are not among the named types). The bound name
-is the message string (not a full exception object). `try`/`except` may
-have an `else` clause (runs only on normal completion of the try body;
-skipped after a handled exception; exceptions raised in `else` are not
-caught by the same `try`'s handlers). `else` requires at least one
-`except` (not `try`/`finally` alone). `return` / `break` / `continue`
-inside `try` run `finally` and pop the catch frame before leaving
-(CPython-compatible).
+`KeyError`, `IndexError`, `ZeroDivisionError`, `TypeError`, `RuntimeError`,
+`GeneratorExit`, `OverflowError`, `EOFError`, `FileNotFoundError`,
+`OSError`, `NameError`, `UnboundLocalError`, `StopIteration`. Matching is
+**flat equality** — there is no OSError hierarchy yet, so
+`except OSError` does **not** catch `FileNotFoundError`. Multi-type
+handlers work: `except (A, B) as e:`. Bare `except:` catches all
+(including traps that remain OTHER, e.g. `PermissionError`). The bound
+name is the **message string** (not a full exception object).
+`try`/`except` may have an `else` clause (runs only on normal completion
+of the try body; skipped after a handled exception; exceptions raised in
+`else` are not caught by the same `try`'s handlers). `else` requires at
+least one `except` (not `try`/`finally` alone). `return` / `break` /
+`continue` inside `try` run `finally` and pop the catch frame before
+leaving (CPython-compatible).
 
 | error | raised by |
 |-------|-----------|
@@ -1074,9 +1087,10 @@ deliberate exceptions:
 2. **`and`/`or` yield an operand** (like CPython), including mixed
    non-numeric pairs typed as a union (e.g. `0 or "x"` → `int | str`).
    Same-type / both-numeric operands keep the previous unify rules.
-3. **Static types.** Variables can't change type; lists are homogeneous
-   (mixed numeric literals coerce to the joined type — `[1, 2.5]` becomes
-   `[1.0, 2.5]`); bare parameters need annotations (defaults may infer).
+3. **Static types with join.** Multi-assign joins storage types (unions /
+   numeric promote); lists are homogeneous (mixed numeric literals coerce
+   to the joined type — `[1, 2.5]` becomes `[1.0, 2.5]`); bare parameters
+   may be body-inferred when monomorphic (defaults may infer).
    Promotions convert the value itself, so `n: int = True` makes `n`
    print as `1` where Python keeps the bool and prints `True` (they still
    compare equal).
@@ -1113,22 +1127,29 @@ deliberate exceptions:
     checks always read storage tags. No attribute or full SAT-style
     narrowing. Multi-member peels keep a safe storage type for print/tags.
 
-Container notes (v0.17):
+Container notes (v0.18):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
-  traps), `len`, unpack, `==`/`!=`, homogeneous `for`; membership `in`
-  and methods are not supported yet. Homogeneous closures (same
-  params/ret and capture env shape) and generators may be tuple/list
-  elements; call via `t[i](args)`.
+  traps), `len`, unpack, `==`/`!=`, homogeneous `for`, membership `in`
+  (compatible element tags only for heterogeneous tuples). Homogeneous
+  closures (same params/ret and capture env shape) and generators may be
+  tuple/list elements; call via `t[i](args)`.
 - **dict:** keys are `int` or `str` only; bare `get(k)` returns
   `Optional[V]` (`None` on miss); `get(k, default)` keeps value type;
-  `keys`/`values`/`items` return lists (not views); insertion-order
-  iteration over keys; mapping match supports `**rest`.
+  `keys`/`values`/`items` return lists (not views); `update(other)` merges
+  same-typed dicts; insertion-order iteration over keys; mapping match
+  supports `**rest`.
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
-  `{}` is always an empty dict.
+  `{}` is always an empty dict; `|` / `.union` / `|=` / `.update` for
+  same element type.
+- **kit builtins:** `isinstance(x, T)` / `isinstance(x, (T1, T2))` with
+  `T` in `{int, float, bool, str, list, tuple, dict, set, None}`
+  (`isinstance(True, int)` is True); peels unions in `if` then-arms.
+  `any`/`all` on list/str/tuple/set; `enumerate`/`zip`/`reversed` for
+  iteration and as values (**materialize to lists** — not lazy iterators).
 - **unions / Optional:** first-class `None`; `T | U` and `Optional[T]`;
   `is`/`is not` with `None` and same-type identity; `|` is bitwise-or in
-  expressions and union in type annotations.
+  expressions (and set union), union in type annotations.
 - **generators:** `yield` / `yield from` (list, tuple, str chars, other
   generators; including inside `finally`; subgen `return` value available
   to yield-from; subgen closed on outer close), try/except/else/finally
@@ -1142,10 +1163,11 @@ Container notes (v0.17):
   generator functions (including lists of gen functions) works;
   homogeneous capturing closures in containers too.
 
-Exception notes: supported types are ValueError, KeyError, IndexError,
-ZeroDivisionError, TypeError, RuntimeError, **GeneratorExit**.
-`except E as e` binds the message `str`, not an exception object. Other
-traps (`EOFError`, `FileNotFoundError`, …) match bare `except:` only.
+Exception notes: supported named types include OverflowError, EOFError,
+FileNotFoundError, OSError, NameError, UnboundLocalError, StopIteration,
+and GeneratorExit (flat match; no OSError hierarchy).
+`except E as e` binds the message `str`, not an exception object.
+Remaining OTHER traps (e.g. PermissionError) match bare `except:` only.
 
 Not implemented yet (clear compile errors): classes, GC / heap freeing,
 f-string debug form `{x=}` / grouping / types `n`/`c`, unparenthesized

@@ -18,7 +18,7 @@ surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
 0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
 **PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
 use** (not merely because the minor is large). Current milestone:
-**v0.17** / `0.17.0`. Optional release tags: `vX.Y.Z`.
+**v0.18** / `0.18.0`. Optional release tags: `vX.Y.Z`.
 
 ---
 
@@ -332,13 +332,15 @@ programs** link only the object file from the shim plus `runtime.c`.
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.17 subset):**
+**Today (v0.18 subset):**
 
-- Static types after first assignment; cannot rebind a name to a
-  different type.
+- Storage type is the join of all RHS types (and annotation); bare
+  multi-assign may produce a union (`x = 1; x = "a"` → `int | str`);
+  numeric multi-assign promotes (int then float → float).
 - Parameter annotations optional when a default is present; bare params
-  still need an annotation. Return annotation optional (inferred from
-  returns when feasible, else “returns nothing”).
+  may be monomorphically inferred from body usage (else require
+  annotation). Return annotation optional (inferred from returns when
+  feasible, else “returns nothing”).
 - Homogeneous lists; empty lists need an annotation
   (`xs: list[int] = []`). Heterogeneous fixed-arity tuples;
   `dict[K,V]` / `set[T]` with `K`/`T` in `{int, str}`.
@@ -464,11 +466,11 @@ These are product constraints that affect design choices:
 | ---------------- | ---------------------------------------------------- | ------------------------------------------------------------------------- |
 | Modules          | Packages, relative imports, namespace pkgs, `import *` | richer package semantics if needed                                      |
 | Memory           | Never free heap strings/lists                        | GC / freeing **before 1.0**                                               |
-| Typing           | Optional params with defaults; fixed types after assign | Fuller optional typing + more dynamism                                 |
-| Builtins / kit   | Growing primitives (`len`, `abs`, str/list methods…) | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
+| Typing           | Multi-assign join + bare-param body infer; no full Any | Fuller optional typing + more dynamism                                 |
+| Builtins / kit   | `isinstance`, `any`/`all`, `enumerate`/`zip`/`reversed`, set/dict kit | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
-| Language surface | Subset (see README v0.17); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
-| Product version  | `0.17.0` (and later `0.18.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
+| Language surface | Subset (see README v0.18); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
+| Product version  | `0.18.0` (and later `0.19.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): classes,
 advanced match patterns, full `yield from` send/throw forwarding,
