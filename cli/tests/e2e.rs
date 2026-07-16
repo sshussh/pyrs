@@ -10322,3 +10322,123 @@ print(len(xs))
     );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
+
+// --- v0.22: container kit ---
+
+#[test]
+fn v022_list_ctor() {
+    let src = "\
+print(list(\"ab\"))
+xs = list([1, 2])
+xs.append(3)
+print(xs)
+";
+    let out = run_program("v022_list_ctor", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v022_tuple_set_dict_ctors() {
+    let src = "\
+t = (1, 2)
+print(tuple(t))
+s = set([1, 2, 2])
+print(1 in s, 3 in s)
+d = dict([(\"a\", 1), (\"b\", 2)])
+print(d[\"a\"], d[\"b\"])
+";
+    let out = run_program("v022_ctors", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v022_list_dict_copy() {
+    let src = "\
+a = [1, 2]
+b = a.copy()
+b.append(3)
+print(a, b)
+d = {\"x\": 1}
+e = d.copy()
+e[\"y\"] = 2
+print(d.get(\"y\"), e[\"y\"])
+";
+    let out = run_program("v022_copy", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v022_set_algebra() {
+    let src = "\
+a = {1, 2, 3}
+b = {2, 3, 4}
+print(sorted(list(a | b)))
+print(sorted(list(a & b)))
+print(sorted(list(a - b)))
+print(sorted(list(a ^ b)))
+";
+    let out = run_program("v022_set_ops", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v022_dict_set_comp() {
+    let src = "\
+d = {x: x * x for x in [1, 2, 3] if x > 1}
+print(d[2], d[3])
+s = {c for c in \"abca\"}
+print(\"a\" in s, \"d\" in s, len(s))
+";
+    let out = run_program("v022_comps", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}

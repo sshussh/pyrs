@@ -9316,6 +9316,18 @@ fn lower_method_stmt(
                     )),
                 }
             }
+            "copy" => {
+                if !args.is_empty() {
+                    return Err(err(
+                        format!("copy() takes no arguments ({} given)", args.len()),
+                        method_span,
+                    ));
+                }
+                Ok(ir::Stmt::ExprStmt(ir::Expr {
+                    ty: ir::list_of(*elem),
+                    kind: ir::ExprKind::ListCopy(Box::new(base_ir)),
+                }))
+            }
             // pop / index as statements discard the result
             "pop" => {
                 let pop = lower_list_pop(base_ir, *elem, args, method_span, ctx)?;
@@ -9667,6 +9679,34 @@ fn lower_set_method_stmt(
             let u = lower_set_union(base_ir, other, method_span)?;
             Ok(ir::Stmt::ExprStmt(u))
         }
+        "intersection" | "difference" | "symmetric_difference" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!(
+                        "{method}() takes exactly one argument ({} given)",
+                        args.len()
+                    ),
+                    method_span,
+                ));
+            }
+            let other = lower_expr(&args[0], ctx)?;
+            let u = match method {
+                "intersection" => {
+                    lower_set_binary_op(base_ir, other, method_span, method, |l, r| {
+                        ir::ExprKind::SetIntersect { left: l, right: r }
+                    })?
+                }
+                "difference" => {
+                    lower_set_binary_op(base_ir, other, method_span, method, |l, r| {
+                        ir::ExprKind::SetDiff { left: l, right: r }
+                    })?
+                }
+                _ => lower_set_binary_op(base_ir, other, method_span, method, |l, r| {
+                    ir::ExprKind::SetSymDiff { left: l, right: r }
+                })?,
+            };
+            Ok(ir::Stmt::ExprStmt(u))
+        }
         "update" => {
             // In-place union (same as |=).
             if args.len() != 1 {
@@ -9694,7 +9734,7 @@ fn lower_set_method_stmt(
         _ => Err(err(
             format!(
                 "set method '{method}' is not supported yet (supported: add, remove, \
-                 discard, clear, union, update)"
+                 discard, clear, union, intersection, difference, symmetric_difference, update)"
             ),
             method_span,
         )),
@@ -9702,22 +9742,178 @@ fn lower_set_method_stmt(
 }
 
 fn lower_set_union(l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    lower_set_binary_op(l, r, span, "union", |left, right| ir::ExprKind::SetUnion {
+        left,
+        right,
+    })
+}
+
+fn lower_set_binary_op(
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    name: &str,
+    kind: impl FnOnce(Box<ir::Expr>, Box<ir::Expr>) -> ir::ExprKind,
+) -> SResult<ir::Expr> {
     match (l.ty, r.ty) {
         (ir::Ty::Set(a), ir::Ty::Set(b)) if a == b => Ok(ir::Expr {
             ty: ir::set_of(*a),
-            kind: ir::ExprKind::SetUnion {
-                left: Box::new(l),
-                right: Box::new(r),
-            },
+            kind: kind(Box::new(l), Box::new(r)),
         }),
         (ir::Ty::Set(a), ir::Ty::Set(b)) => Err(err(
-            format!("set union requires the same element type (set[{a}] vs set[{b}])"),
+            format!("set {name} requires the same element type (set[{a}] vs set[{b}])"),
             span,
         )),
         _ => Err(err(
-            format!("set union requires two sets, found {} and {}", l.ty, r.ty),
+            format!("set {name} requires two sets, found {} and {}", l.ty, r.ty),
             span,
         )),
+    }
+}
+
+/// `list(iterable)` — shallow copy for lists; chars for str; keys for dict;
+/// elements for set; fixed-arity homogeneous tuple → list.
+fn lower_list_ctor(arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match arg.ty {
+        ir::Ty::List(elem) => Ok(ir::Expr {
+            ty: ir::list_of(*elem),
+            kind: ir::ExprKind::ListCopy(Box::new(arg)),
+        }),
+        ir::Ty::Str => Ok(ir::Expr {
+            ty: ir::list_of(ir::Ty::Str),
+            kind: ir::ExprKind::ListFromStr(Box::new(arg)),
+        }),
+        ir::Ty::Set(elem) => Ok(ir::Expr {
+            ty: ir::list_of(*elem),
+            kind: ir::ExprKind::SetToList(Box::new(arg)),
+        }),
+        ir::Ty::Dict { key, .. } => Ok(ir::Expr {
+            ty: ir::list_of(*key),
+            kind: ir::ExprKind::DictKeys(Box::new(arg)),
+        }),
+        ir::Ty::Tuple(elems) => {
+            if elems.is_empty() {
+                return Ok(ir::Expr {
+                    ty: ir::list_of(ir::Ty::Any),
+                    kind: ir::ExprKind::ListLit(vec![]),
+                });
+            }
+            let first = elems[0];
+            if !elems.iter().all(|e| *e == first) {
+                return Err(err(
+                    "tuple() to list requires a homogeneous tuple (or use a list)",
+                    span,
+                ));
+            }
+            // Fixed-arity: index each element into a new list.
+            let n = elems.len();
+            let mut items = Vec::new();
+            for i in 0..n {
+                items.push(ir::Expr {
+                    ty: first,
+                    kind: ir::ExprKind::Index {
+                        base: Box::new(arg.clone()),
+                        index: Box::new(int_const(i as i64)),
+                    },
+                });
+            }
+            Ok(ir::Expr {
+                ty: ir::list_of(first),
+                kind: ir::ExprKind::ListLit(items),
+            })
+        }
+        other => Err(err(format!("list() cannot convert {other} yet"), span)),
+    }
+}
+
+fn lower_set_ctor(arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match arg.ty {
+        ir::Ty::List(elem) => {
+            if !matches!(*elem, ir::Ty::Int | ir::Ty::Str) {
+                return Err(err(
+                    format!(
+                        "set() from list only supports list[int] or list[str], found list[{elem}]"
+                    ),
+                    span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::set_of(*elem),
+                kind: ir::ExprKind::SetFromList {
+                    list: Box::new(arg),
+                    elem: Box::new(*elem),
+                },
+            })
+        }
+        ir::Ty::Str => Ok(ir::Expr {
+            ty: ir::set_of(ir::Ty::Str),
+            kind: ir::ExprKind::SetFromStr(Box::new(arg)),
+        }),
+        ir::Ty::Set(elem) => {
+            // set(s) shallow copy via union with empty is heavy; rebuild from list.
+            let as_list = ir::Expr {
+                ty: ir::list_of(*elem),
+                kind: ir::ExprKind::SetToList(Box::new(arg)),
+            };
+            Ok(ir::Expr {
+                ty: ir::set_of(*elem),
+                kind: ir::ExprKind::SetFromList {
+                    list: Box::new(as_list),
+                    elem: Box::new(*elem),
+                },
+            })
+        }
+        other => Err(err(format!("set() cannot convert {other} yet"), span)),
+    }
+}
+
+fn lower_dict_ctor(arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match arg.ty {
+        ir::Ty::Dict { key, value } => Ok(ir::Expr {
+            ty: ir::dict_of(*key, *value),
+            kind: ir::ExprKind::DictCopy(Box::new(arg)),
+        }),
+        ir::Ty::List(elem) => match *elem {
+            ir::Ty::Tuple(ts) if ts.len() == 2 => {
+                let k = ts[0];
+                let v = ts[1];
+                if !matches!(k, ir::Ty::Int | ir::Ty::Str) {
+                    return Err(err(
+                        format!("dict() keys must be int or str, found {k}"),
+                        span,
+                    ));
+                }
+                Ok(ir::Expr {
+                    ty: ir::dict_of(k, v),
+                    kind: ir::ExprKind::DictFromPairs {
+                        pairs: Box::new(arg),
+                        key: Box::new(k),
+                        value: Box::new(v),
+                    },
+                })
+            }
+            other => Err(err(
+                format!("dict() from list expects list of 2-tuples, found list[{other}]"),
+                span,
+            )),
+        },
+        other => Err(err(format!("dict() cannot convert {other} yet"), span)),
+    }
+}
+
+fn lower_tuple_ctor(arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match arg.ty {
+        ir::Ty::Tuple(_) => {
+            // Identity/copy: re-index into a new TupleLit of same arity.
+            // For now accept identity (same value); CPython tuple(t) is t if already tuple.
+            Ok(arg)
+        }
+        ir::Ty::List(_) => Err(err(
+            "tuple() from dynamic list is not supported yet; use a tuple literal",
+            span,
+        )),
+        ir::Ty::Str => Err(err("tuple() from str is not supported yet", span)),
+        other => Err(err(format!("tuple() cannot convert {other} yet"), span)),
     }
 }
 
@@ -9833,10 +10029,22 @@ fn lower_dict_method(
             "dict.clear() returns None and cannot be used in an expression",
             method_span,
         )),
+        "copy" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("copy() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::dict_of(key_ty, val_ty),
+                kind: ir::ExprKind::DictCopy(Box::new(base_ir)),
+            })
+        }
         _ => Err(err(
             format!(
                 "dict method '{method}' is not supported yet (supported: get, pop, \
-                 keys, values, items, clear)"
+                 keys, values, items, clear, copy)"
             ),
             method_span,
         )),
@@ -12347,6 +12555,14 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         ast::ExprKind::ListComp { elem, generators } => {
             lower_list_comp(elem, generators, expr.span, ctx)
         }
+        ast::ExprKind::DictComp {
+            key,
+            value,
+            generators,
+        } => lower_dict_comp(key, value, generators, expr.span, ctx),
+        ast::ExprKind::SetComp { elem, generators } => {
+            lower_set_comp(elem, generators, expr.span, ctx)
+        }
         ast::ExprKind::Index { base, index } => {
             let base_ir = lower_expr(base, ctx)?;
             match base_ir.ty {
@@ -12719,6 +12935,18 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         ),
                         *method_span,
                     )),
+                    "copy" => {
+                        if !args.is_empty() {
+                            return Err(err(
+                                format!("copy() takes no arguments ({} given)", args.len()),
+                                *method_span,
+                            ));
+                        }
+                        Ok(ir::Expr {
+                            ty: ir::list_of(*elem),
+                            kind: ir::ExprKind::ListCopy(Box::new(base_ir)),
+                        })
+                    }
                     _ => Err(err(
                         format!("'{}' has no method '{method}'", base_ir.ty),
                         *method_span,
@@ -12746,23 +12974,41 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         ),
                         *method_span,
                     )),
-                    "union" => {
+                    "union" | "intersection" | "difference" | "symmetric_difference" => {
                         if args.len() != 1 {
                             return Err(err(
                                 format!(
-                                    "union() takes exactly one argument ({} given)",
+                                    "{method}() takes exactly one argument ({} given)",
                                     args.len()
                                 ),
                                 *method_span,
                             ));
                         }
                         let other = lower_expr(&args[0], ctx)?;
-                        lower_set_union(base_ir, other, *method_span)
+                        match method.as_str() {
+                            "union" => lower_set_union(base_ir, other, *method_span),
+                            "intersection" => {
+                                lower_set_binary_op(base_ir, other, *method_span, method, |l, r| {
+                                    ir::ExprKind::SetIntersect { left: l, right: r }
+                                })
+                            }
+                            "difference" => {
+                                lower_set_binary_op(base_ir, other, *method_span, method, |l, r| {
+                                    ir::ExprKind::SetDiff { left: l, right: r }
+                                })
+                            }
+                            _ => {
+                                lower_set_binary_op(base_ir, other, *method_span, method, |l, r| {
+                                    ir::ExprKind::SetSymDiff { left: l, right: r }
+                                })
+                            }
+                        }
                     }
                     _ => Err(err(
                         format!(
                             "set method '{method}' is not supported yet (supported: add, \
-                             remove, discard, clear, union, update)"
+                             remove, discard, clear, union, intersection, difference, \
+                             symmetric_difference, update)"
                         ),
                         *method_span,
                     )),
@@ -13807,6 +14053,159 @@ fn lower_list_comp(
             stmts,
             result: Box::new(ir::Expr {
                 ty: ir::list_of(elem_ty),
+                kind: ir::ExprKind::Local(res_t),
+            }),
+        },
+    })
+}
+
+/// Shared generator walk for set/dict comprehensions.
+fn lower_comp_levels(
+    generators: &[ast::CompFor],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<(Vec<CompLevel>, usize)> {
+    if generators.is_empty() {
+        return Err(err("internal error: comprehension has no generators", span));
+    }
+    let mut levels: Vec<CompLevel> = Vec::with_capacity(generators.len());
+    let mut renames_pushed = 0usize;
+    for clause in generators {
+        let mut setup = Vec::new();
+        let (cond, step, element, cap) = lower_comp_iter(&clause.iter, false, ctx, &mut setup)?;
+        let (bind, n_renames) = bind_comp_target(&clause.target, element, ctx)?;
+        renames_pushed += n_renames;
+        let mut ifs = Vec::with_capacity(clause.ifs.len());
+        for c in &clause.ifs {
+            ifs.push(lower_condition(c, ctx)?);
+        }
+        levels.push(CompLevel {
+            setup,
+            cond,
+            step,
+            bind,
+            ifs,
+            cap,
+        });
+    }
+    Ok((levels, renames_pushed))
+}
+
+fn nest_comp_body(levels: Vec<CompLevel>, inner_body: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
+    let mut body = inner_body;
+    for level in levels.into_iter().rev() {
+        let mut level_body = level.bind;
+        level_body.extend(wrap_comp_ifs(&level.ifs, body));
+        let while_stmt = ir::Stmt::While {
+            cond: level.cond,
+            body: level_body,
+            step: level.step,
+        };
+        let mut wrapped = level.setup;
+        wrapped.push(while_stmt);
+        body = wrapped;
+    }
+    body
+}
+
+fn lower_set_comp(
+    elem: &ast::Expr,
+    generators: &[ast::CompFor],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let (levels, renames_pushed) = lower_comp_levels(generators, span, ctx)?;
+    let elem_ir = lower_expr(elem, ctx);
+    for _ in 0..renames_pushed {
+        ctx.comp_renames.pop();
+    }
+    let elem_ir = elem_ir?;
+    let elem_ty = elem_of(elem_ir.ty, elem.span)?;
+    if !matches!(elem_ty, ir::Ty::Int | ir::Ty::Str) {
+        return Err(err(
+            format!("set comprehension elements must be int or str, found {elem_ty}"),
+            elem.span,
+        ));
+    }
+    let res_ty = ir::set_of(elem_ty);
+    let res_t = ctx.fresh_temp("setcomp.res", res_ty);
+    let mut stmts = vec![ir::Stmt::Assign {
+        name: res_t.clone(),
+        value: ir::Expr {
+            ty: res_ty,
+            kind: ir::ExprKind::SetNew,
+        },
+    }];
+    let res_local = ir::Expr {
+        ty: res_ty,
+        kind: ir::ExprKind::Local(res_t.clone()),
+    };
+    let add = ir::Stmt::SetAdd {
+        set: res_local,
+        value: elem_ir,
+    };
+    stmts.extend(nest_comp_body(levels, vec![add]));
+    Ok(ir::Expr {
+        ty: res_ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(ir::Expr {
+                ty: res_ty,
+                kind: ir::ExprKind::Local(res_t),
+            }),
+        },
+    })
+}
+
+fn lower_dict_comp(
+    key: &ast::Expr,
+    value: &ast::Expr,
+    generators: &[ast::CompFor],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let (levels, renames_pushed) = lower_comp_levels(generators, span, ctx)?;
+    let key_ir = lower_expr(key, ctx);
+    let val_ir = lower_expr(value, ctx);
+    for _ in 0..renames_pushed {
+        ctx.comp_renames.pop();
+    }
+    let key_ir = key_ir?;
+    let val_ir = val_ir?;
+    let key_ty = key_ir.ty;
+    let val_ty = val_ir.ty;
+    if !matches!(key_ty, ir::Ty::Int | ir::Ty::Str) {
+        return Err(err(
+            format!("dict comprehension keys must be int or str, found {key_ty}"),
+            key.span,
+        ));
+    }
+    let res_ty = ir::dict_of(key_ty, val_ty);
+    let res_t = ctx.fresh_temp("dictcomp.res", res_ty);
+    let mut stmts = vec![ir::Stmt::Assign {
+        name: res_t.clone(),
+        value: ir::Expr {
+            ty: res_ty,
+            kind: ir::ExprKind::DictNew,
+        },
+    }];
+    let res_local = ir::Expr {
+        ty: res_ty,
+        kind: ir::ExprKind::Local(res_t.clone()),
+    };
+    let store = ir::Stmt::IndexAssign {
+        base: res_local,
+        index: key_ir,
+        value: val_ir,
+    };
+    stmts.extend(nest_comp_body(levels, vec![store]));
+    let _ = span;
+    Ok(ir::Expr {
+        ty: res_ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(ir::Expr {
+                ty: res_ty,
                 kind: ir::ExprKind::Local(res_t),
             }),
         },
@@ -15648,11 +16047,64 @@ fn lower_call(
                      in an expression",
                 span,
             )),
-            "set" => Err(err(
-                "set() requires a type annotation on the target, e.g. \
-                 's: set[int] = set()'",
-                span,
-            )),
+            "set" => {
+                if args.is_empty() {
+                    return Err(err(
+                        "set() requires a type annotation on the target, e.g. \
+                         's: set[int] = set()'",
+                        span,
+                    ));
+                }
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("set() takes at most 1 argument ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(args[0], ctx)?;
+                lower_set_ctor(arg, args[0].span)
+            }
+            "list" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!(
+                            "list() takes exactly one argument ({} given); \
+                             empty list() is not supported — use []",
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(args[0], ctx)?;
+                lower_list_ctor(arg, args[0].span)
+            }
+            "dict" => {
+                if args.is_empty() {
+                    return Err(err(
+                        "dict() requires a type annotation on the target, e.g. \
+                         'd: dict[str, int] = {}'",
+                        span,
+                    ));
+                }
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("dict() takes at most 1 argument ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(args[0], ctx)?;
+                lower_dict_ctor(arg, args[0].span)
+            }
+            "tuple" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("tuple() takes exactly one argument ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(args[0], ctx)?;
+                lower_tuple_ctor(arg, args[0].span)
+            }
             "len" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -17604,9 +18056,27 @@ fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult
         return lower_is_none(op, l, r, span);
     }
 
-    // ---- set | (union) before bitwise int ops ----
-    if matches!((l.ty, r.ty), (ir::Ty::Set(_), ir::Ty::Set(_))) && op == ast::BinOp::BitOr {
-        return lower_set_union(l, r, span);
+    // ---- set algebra before bitwise int ops ----
+    if matches!((l.ty, r.ty), (ir::Ty::Set(_), ir::Ty::Set(_))) {
+        match op {
+            ast::BinOp::BitOr => return lower_set_union(l, r, span),
+            ast::BinOp::BitAnd => {
+                return lower_set_binary_op(l, r, span, "intersection", |left, right| {
+                    ir::ExprKind::SetIntersect { left, right }
+                });
+            }
+            ast::BinOp::Sub => {
+                return lower_set_binary_op(l, r, span, "difference", |left, right| {
+                    ir::ExprKind::SetDiff { left, right }
+                });
+            }
+            ast::BinOp::BitXor => {
+                return lower_set_binary_op(l, r, span, "symmetric_difference", |left, right| {
+                    ir::ExprKind::SetSymDiff { left, right }
+                });
+            }
+            _ => {}
+        }
     }
 
     // ---- string operations ----

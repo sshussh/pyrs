@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.21.0)
+## The language (v0.22.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.22.0**, not 1.0) until it is ready for
+milestone after this one is **0.23.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
@@ -153,8 +153,8 @@ A statically-typed Python subset:
   and do not leak — and faster than the equivalent loop when length is
   knowable: results are pre-sized and appends inlined),
   indexing (read/write), slicing (copies, like Python),
-  `append`/`pop`/`insert`/`remove`/`index`/`clear`/`sort`/`extend` (homogeneous
-  list arg), `sorted()`,
+  `append`/`pop`/`insert`/`remove`/`index`/`clear`/`sort`/`extend`/`copy` (homogeneous
+  list arg), `list(iterable)`, `sorted()`,
   `+`/`*` (concat / repeat), `==`/`!=`, `in`, `len`, iteration;
   assignment aliases like Python
 - **Tuples:** fixed-arity, heterogeneous; literals `(a, b)`, `(a,)`,
@@ -163,10 +163,10 @@ A statically-typed Python subset:
   `{}` (needs annotation); get/set, `del d[k]`, `in` on keys, `len`,
   insertion-order key iteration; methods `get` (with default, or bare
   `get(k)` → `Optional[V]` / `None` on miss),
-  `pop`, `keys`/`values`/`items` (return lists), `clear`, `update`
+  `pop`, `keys`/`values`/`items` (return lists), `clear`, `update`, `copy`, `dict(pairs)`, dict comps
 - **Sets:** `set[T]` with `T` in `{int, str}`; nonempty `{a, b}`, empty
-  `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`/`union`/`update`,
-  `|` / `|=`, `in`, `len`, iteration
+  `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`/`union`/`intersection`/`difference`/`symmetric_difference`/`update`,
+  `|` / `&` / `-` / `^` / `|=`, `set(iterable)`, set comps, `in`, `len`, iteration
 - **Exceptions:** `raise ExcType("msg")` for ValueError, KeyError,
   IndexError, ZeroDivisionError, TypeError, RuntimeError, GeneratorExit,
   OverflowError, EOFError, FileNotFoundError, OSError, PermissionError,
@@ -240,7 +240,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.21.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.22.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
@@ -383,4 +383,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.21.0 && git push origin v0.21.0`.
+Release tags: `git tag v0.22.0 && git push origin v0.22.0`.

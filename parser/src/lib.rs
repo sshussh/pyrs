@@ -1904,12 +1904,22 @@ impl Parser {
                 }
             }
             Token::List => {
-                // bare `list` for isinstance; `list()` still unsupported.
+                // bare `list` for isinstance; `list(iterable)` as a call.
                 if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
-                    return Err(self.error(
-                        "list() is not supported; use a literal like '[]' with a type \
-                         annotation, e.g. 'xs: list[int] = []'",
-                    ));
+                    self.advance();
+                    self.expect(Token::LParen, "after 'list'")?;
+                    let (args, keywords, kwargs) = self.parse_call_args()?;
+                    let close = self.expect(Token::RParen, "after list() arguments")?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call {
+                            func: "list".to_string(),
+                            func_span: span,
+                            args,
+                            keywords,
+                            kwargs: kwargs.map(Box::new),
+                        },
+                        span: span.to(close),
+                    });
                 }
                 self.advance();
                 Ok(Expr {
@@ -1919,10 +1929,20 @@ impl Parser {
             }
             Token::Dict => {
                 if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
-                    return Err(self.error(
-                        "dict() is not supported; use a literal like '{}' with a type \
-                         annotation, e.g. 'd: dict[str, int] = {}'",
-                    ));
+                    self.advance();
+                    self.expect(Token::LParen, "after 'dict'")?;
+                    let (args, keywords, kwargs) = self.parse_call_args()?;
+                    let close = self.expect(Token::RParen, "after dict() arguments")?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call {
+                            func: "dict".to_string(),
+                            func_span: span,
+                            args,
+                            keywords,
+                            kwargs: kwargs.map(Box::new),
+                        },
+                        span: span.to(close),
+                    });
                 }
                 self.advance();
                 Ok(Expr {
@@ -1932,9 +1952,20 @@ impl Parser {
             }
             Token::Tuple => {
                 if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
-                    return Err(
-                        self.error("tuple() is not supported; use a literal like '()' or '(x,)'")
-                    );
+                    self.advance();
+                    self.expect(Token::LParen, "after 'tuple'")?;
+                    let (args, keywords, kwargs) = self.parse_call_args()?;
+                    let close = self.expect(Token::RParen, "after tuple() arguments")?;
+                    return Ok(Expr {
+                        kind: ExprKind::Call {
+                            func: "tuple".to_string(),
+                            func_span: span,
+                            args,
+                            keywords,
+                            kwargs: kwargs.map(Box::new),
+                        },
+                        span: span.to(close),
+                    });
                 }
                 self.advance();
                 Ok(Expr {
@@ -1942,7 +1973,8 @@ impl Parser {
                     span,
                 })
             }
-            // `set()` empty constructor (typed via annotation in semantic); bare for isinstance
+            // `set()` empty constructor (typed via annotation); `set(iterable)` ctor;
+            // bare name for isinstance.
             Token::Set => {
                 if self.tokens.get(self.pos + 1).map(|t| &t.0) != Some(&Token::LParen) {
                     self.advance();
@@ -1953,14 +1985,15 @@ impl Parser {
                 }
                 self.advance();
                 self.expect(Token::LParen, "after 'set'")?;
-                let close = self.expect(Token::RParen, "after set() (empty set only)")?;
+                let (args, keywords, kwargs) = self.parse_call_args()?;
+                let close = self.expect(Token::RParen, "after set() arguments")?;
                 Ok(Expr {
                     kind: ExprKind::Call {
                         func: "set".to_string(),
                         func_span: span,
-                        args: vec![],
-                        keywords: vec![],
-                        kwargs: None,
+                        args,
+                        keywords,
+                        kwargs: kwargs.map(Box::new),
                     },
                     span: span.to(close),
                 })
@@ -2091,8 +2124,36 @@ impl Parser {
                 }
                 let first = self.parse_expr()?;
                 if self.eat(&Token::Colon) {
-                    // dict: `{k: v, ...}`
+                    // dict: `{k: v, ...}` or `{k: v for ...}`
                     let first_v = self.parse_expr()?;
+                    if self.eat(&Token::For) {
+                        let mut generators = Vec::new();
+                        loop {
+                            let target_expr = self.parse_target_tuple_or_expr()?;
+                            let target = self.expr_to_target(target_expr)?;
+                            self.expect(Token::In, "after the comprehension target")?;
+                            let iter = self.parse_expr()?;
+                            let mut ifs = Vec::new();
+                            while self.eat(&Token::If) {
+                                ifs.push(self.parse_expr()?);
+                            }
+                            generators.push(CompFor { target, iter, ifs });
+                            if self.eat(&Token::For) {
+                                continue;
+                            }
+                            break;
+                        }
+                        let close =
+                            self.expect(Token::RBrace, "to close the dict comprehension")?;
+                        return Ok(Expr {
+                            kind: ExprKind::DictComp {
+                                key: Box::new(first),
+                                value: Box::new(first_v),
+                                generators,
+                            },
+                            span: span.to(close),
+                        });
+                    }
                     let mut items = vec![(first, first_v)];
                     while self.eat(&Token::Comma) {
                         if self.peek() == &Token::RBrace {
@@ -2106,6 +2167,32 @@ impl Parser {
                     let close = self.expect(Token::RBrace, "to close the dict literal")?;
                     Ok(Expr {
                         kind: ExprKind::DictLit(items),
+                        span: span.to(close),
+                    })
+                } else if self.eat(&Token::For) {
+                    // set comprehension: `{x for ...}`
+                    let mut generators = Vec::new();
+                    loop {
+                        let target_expr = self.parse_target_tuple_or_expr()?;
+                        let target = self.expr_to_target(target_expr)?;
+                        self.expect(Token::In, "after the comprehension target")?;
+                        let iter = self.parse_expr()?;
+                        let mut ifs = Vec::new();
+                        while self.eat(&Token::If) {
+                            ifs.push(self.parse_expr()?);
+                        }
+                        generators.push(CompFor { target, iter, ifs });
+                        if self.eat(&Token::For) {
+                            continue;
+                        }
+                        break;
+                    }
+                    let close = self.expect(Token::RBrace, "to close the set comprehension")?;
+                    Ok(Expr {
+                        kind: ExprKind::SetComp {
+                            elem: Box::new(first),
+                            generators,
+                        },
                         span: span.to(close),
                     })
                 } else {
@@ -2970,8 +3057,23 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
                 rebase_spans(v, span);
             }
         }
-        ExprKind::ListComp { elem, generators } => {
+        ExprKind::ListComp { elem, generators } | ExprKind::SetComp { elem, generators } => {
             rebase_spans(elem, span);
+            for g in generators {
+                rebase_target_spans(&mut g.target, span);
+                rebase_spans(&mut g.iter, span);
+                for c in &mut g.ifs {
+                    rebase_spans(c, span);
+                }
+            }
+        }
+        ExprKind::DictComp {
+            key,
+            value,
+            generators,
+        } => {
+            rebase_spans(key, span);
+            rebase_spans(value, span);
             for g in generators {
                 rebase_target_spans(&mut g.target, span);
                 rebase_spans(&mut g.iter, span);

@@ -802,6 +802,41 @@ pub enum ExprKind {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// `a & b` / `set.intersection(other)`.
+    SetIntersect {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// `a - b` / `set.difference(other)`.
+    SetDiff {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// `a ^ b` / `set.symmetric_difference(other)`.
+    SetSymDiff {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// Shallow copy of a list (`list.copy()` / `list(xs)` when xs is a list).
+    ListCopy(Box<Expr>),
+    /// `list(s)` for a str → list of 1-char strings.
+    ListFromStr(Box<Expr>),
+    /// Shallow copy of a dict (`dict.copy()`).
+    DictCopy(Box<Expr>),
+    /// `set(xs)` from a homogeneous list of int/str.
+    SetFromList {
+        list: Box<Expr>,
+        /// Element type tag for runtime.
+        elem: Box<Ty>,
+    },
+    /// `set(s)` from a str → set of 1-char strings.
+    SetFromStr(Box<Expr>),
+    /// `dict(pairs)` where pairs is `list[tuple[K, V]]`.
+    DictFromPairs {
+        pairs: Box<Expr>,
+        key: Box<Ty>,
+        value: Box<Ty>,
+    },
     /// `d.get(key, default)`. Result type is on `expr.ty` (may be
     /// `optional_of(val)` for bare get). On hit the value is converted to
     /// `expr.ty` when needed; on miss the default is used as-is.

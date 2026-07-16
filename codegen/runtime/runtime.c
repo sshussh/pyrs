@@ -4382,6 +4382,118 @@ PyrsSet *pyrs_set_union(const PyrsSet *a, const PyrsSet *b) {
     return r;
 }
 
+/* New set = a & b. */
+PyrsSet *pyrs_set_intersect(const PyrsSet *a, const PyrsSet *b) {
+    check_ref(a);
+    check_ref(b);
+    PyrsSet *r = pyrs_set_new();
+    for (long long i = 0; i < a->order_len; i++) {
+        SetSlot *e = &a->table[a->order[i]];
+        if (e->state == 1 && pyrs_set_contains(b, e->key, e->key_tag)) {
+            pyrs_set_add(r, e->key, e->key_tag);
+        }
+    }
+    return r;
+}
+
+/* New set = a - b. */
+PyrsSet *pyrs_set_diff(const PyrsSet *a, const PyrsSet *b) {
+    check_ref(a);
+    check_ref(b);
+    PyrsSet *r = pyrs_set_new();
+    for (long long i = 0; i < a->order_len; i++) {
+        SetSlot *e = &a->table[a->order[i]];
+        if (e->state == 1 && !pyrs_set_contains(b, e->key, e->key_tag)) {
+            pyrs_set_add(r, e->key, e->key_tag);
+        }
+    }
+    return r;
+}
+
+/* New set = a ^ b. */
+PyrsSet *pyrs_set_symdiff(const PyrsSet *a, const PyrsSet *b) {
+    check_ref(a);
+    check_ref(b);
+    PyrsSet *r = pyrs_set_new();
+    for (long long i = 0; i < a->order_len; i++) {
+        SetSlot *e = &a->table[a->order[i]];
+        if (e->state == 1 && !pyrs_set_contains(b, e->key, e->key_tag)) {
+            pyrs_set_add(r, e->key, e->key_tag);
+        }
+    }
+    for (long long i = 0; i < b->order_len; i++) {
+        SetSlot *e = &b->table[b->order[i]];
+        if (e->state == 1 && !pyrs_set_contains(a, e->key, e->key_tag)) {
+            pyrs_set_add(r, e->key, e->key_tag);
+        }
+    }
+    return r;
+}
+
+/* Shallow list copy (new list, same slots). */
+PyrsList *pyrs_list_copy(const PyrsList *src) {
+    check_ref(src);
+    PyrsList *r = pyrs_list_new(src->len);
+    if (src->len > 0) {
+        memcpy(r->data, src->data, (size_t)src->len * sizeof(long long));
+        r->len = src->len;
+    }
+    return r;
+}
+
+/* list(str) → list of 1-char PyrsStr. */
+PyrsList *pyrs_list_from_str(const PyrsStr *s) {
+    check_ref(s);
+    PyrsList *r = pyrs_list_new(s->len);
+    for (long long i = 0; i < s->len; i++) {
+        pyrs_list_push(r, (long long)(uintptr_t)str_sub(s, i, 1));
+    }
+    return r;
+}
+
+/* set(list) — list slots already tagged as int/str keys. */
+PyrsSet *pyrs_set_from_list(const PyrsList *xs, int key_tag) {
+    check_ref(xs);
+    PyrsSet *r = pyrs_set_new();
+    for (long long i = 0; i < xs->len; i++) {
+        pyrs_set_add(r, xs->data[i], key_tag);
+    }
+    return r;
+}
+
+/* set(str) → set of 1-char strings. */
+PyrsSet *pyrs_set_from_str(const PyrsStr *s) {
+    check_ref(s);
+    PyrsSet *r = pyrs_set_new();
+    for (long long i = 0; i < s->len; i++) {
+        pyrs_set_add(r, (long long)(uintptr_t)str_sub(s, i, 1), TAG_STR);
+    }
+    return r;
+}
+
+/* Shallow dict copy. */
+PyrsDict *pyrs_dict_copy(const PyrsDict *d) {
+    check_ref(d);
+    PyrsDict *r = pyrs_dict_new();
+    pyrs_dict_update(r, d);
+    return r;
+}
+
+/* dict(list of 2-tuples) — each element is a PyrsTuple* of length 2. */
+PyrsDict *pyrs_dict_from_pairs(const PyrsList *pairs, int key_tag, int val_tag) {
+    check_ref(pairs);
+    PyrsDict *d = pyrs_dict_new();
+    for (long long i = 0; i < pairs->len; i++) {
+        PyrsTuple *t = (PyrsTuple *)(uintptr_t)pairs->data[i];
+        check_ref(t);
+        if (t->len != 2) {
+            pyrs_die("ValueError: dictionary update sequence element has length other than 2");
+        }
+        pyrs_dict_set(d, t->data[0], key_tag, t->data[1], val_tag);
+    }
+    return d;
+}
+
 /* ---- os ---- */
 
 

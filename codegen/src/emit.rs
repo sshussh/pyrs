@@ -354,6 +354,10 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | DictValues(operand)
         | DictItems(operand)
         | SetToList(operand)
+        | ListCopy(operand)
+        | ListFromStr(operand)
+        | DictCopy(operand)
+        | SetFromStr(operand)
         | Sum(operand)
         | MinList(operand)
         | MaxList(operand)
@@ -422,7 +426,14 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         CallMethod { args, .. } => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
         NewObject { .. } => 0,
         ObjectToStr(operand) => max_try_depth_in_expr(operand),
-        SetUnion { left, right } => max_try_depth_in_expr(left).max(max_try_depth_in_expr(right)),
+        SetUnion { left, right }
+        | SetIntersect { left, right }
+        | SetDiff { left, right }
+        | SetSymDiff { left, right } => {
+            max_try_depth_in_expr(left).max(max_try_depth_in_expr(right))
+        }
+        SetFromList { list, .. } => max_try_depth_in_expr(list),
+        DictFromPairs { pairs, .. } => max_try_depth_in_expr(pairs),
         ListPop { list, index } | ListIndexOf { list, value: index } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
         }
@@ -553,6 +564,10 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | DictValues(operand)
         | DictItems(operand)
         | SetToList(operand)
+        | ListCopy(operand)
+        | ListFromStr(operand)
+        | DictCopy(operand)
+        | SetFromStr(operand)
         | Sum(operand)
         | MinList(operand)
         | MaxList(operand)
@@ -609,7 +624,12 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         CallMethod { args, .. } => args.iter().map(count_yields_in_expr).sum(),
         NewObject { .. } => 0,
         ObjectToStr(operand) => count_yields_in_expr(operand),
-        SetUnion { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
+        SetUnion { left, right }
+        | SetIntersect { left, right }
+        | SetDiff { left, right }
+        | SetSymDiff { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
+        SetFromList { list, .. } => count_yields_in_expr(list),
+        DictFromPairs { pairs, .. } => count_yields_in_expr(pairs),
         ListPop { list, index } | ListIndexOf { list, value: index } => {
             count_yields_in_expr(list) + count_yields_in_expr(index)
         }
@@ -734,11 +754,18 @@ impl Emitter {
         out.push_str("declare void @pyrs_set_remove(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_set_discard(ptr, i64, i32)\n");
         out.push_str("declare ptr @pyrs_set_union(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_set_intersect(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_set_diff(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_set_symdiff(ptr, ptr)\n");
         out.push_str("declare void @pyrs_set_update(ptr, ptr)\n");
         out.push_str("declare ptr @malloc(i64)\n");
         out.push_str("declare i32 @pyrs_set_contains(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_set_clear(ptr)\n");
         out.push_str("declare ptr @pyrs_set_elements(ptr)\n");
+        out.push_str("declare ptr @pyrs_set_from_list(ptr, i32)\n");
+        out.push_str("declare ptr @pyrs_set_from_str(ptr)\n");
+        out.push_str("declare ptr @pyrs_dict_copy(ptr)\n");
+        out.push_str("declare ptr @pyrs_dict_from_pairs(ptr, i32, i32)\n");
         out.push_str("declare ptr @pyrs_str_concat(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_repeat(ptr, i64)\n");
         out.push_str("declare i32 @pyrs_str_cmp(ptr, ptr)\n");
@@ -785,6 +812,8 @@ impl Emitter {
         out.push_str("declare void @pyrs_list_clear(ptr)\n");
         out.push_str("declare void @pyrs_list_sort(ptr, i32)\n");
         out.push_str("declare void @pyrs_list_extend(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_list_copy(ptr)\n");
+        out.push_str("declare ptr @pyrs_list_from_str(ptr)\n");
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
         out.push_str("declare i32 @pyrs_list_eq(ptr, ptr, i32)\n");
@@ -3539,6 +3568,31 @@ impl Emitter {
                 self.line(format!("{t} = call ptr @pyrs_set_union(ptr {l}, ptr {r})"));
                 t
             }
+            ExprKind::SetIntersect { left, right } => {
+                let l = self.emit_expr(left);
+                let r = self.emit_expr(right);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_set_intersect(ptr {l}, ptr {r})"
+                ));
+                t
+            }
+            ExprKind::SetDiff { left, right } => {
+                let l = self.emit_expr(left);
+                let r = self.emit_expr(right);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_set_diff(ptr {l}, ptr {r})"));
+                t
+            }
+            ExprKind::SetSymDiff { left, right } => {
+                let l = self.emit_expr(left);
+                let r = self.emit_expr(right);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_set_symdiff(ptr {l}, ptr {r})"
+                ));
+                t
+            }
             ExprKind::ListPop { list, index } => {
                 let l = self.emit_expr(list);
                 let i_t = self.emit_expr(index);
@@ -4357,6 +4411,49 @@ impl Emitter {
                 let v = self.emit_expr(s);
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_set_elements(ptr {v})"));
+                t
+            }
+            ExprKind::ListCopy(list) => {
+                let v = self.emit_expr(list);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_list_copy(ptr {v})"));
+                t
+            }
+            ExprKind::ListFromStr(s) => {
+                let v = self.emit_expr(s);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_list_from_str(ptr {v})"));
+                t
+            }
+            ExprKind::DictCopy(d) => {
+                let v = self.emit_expr(d);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_dict_copy(ptr {v})"));
+                t
+            }
+            ExprKind::SetFromList { list, elem } => {
+                let v = self.emit_expr(list);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_set_from_list(ptr {v}, i32 {})",
+                    elem_tag(elem)
+                ));
+                t
+            }
+            ExprKind::SetFromStr(s) => {
+                let v = self.emit_expr(s);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_set_from_str(ptr {v})"));
+                t
+            }
+            ExprKind::DictFromPairs { pairs, key, value } => {
+                let v = self.emit_expr(pairs);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_dict_from_pairs(ptr {v}, i32 {}, i32 {})",
+                    elem_tag(key),
+                    elem_tag(value)
+                ));
                 t
             }
         }

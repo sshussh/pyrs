@@ -573,6 +573,17 @@ pub enum ExprKind {
         elem: Box<Expr>,
         generators: Vec<CompFor>,
     },
+    /// `{k: v for ...}` dict comprehension.
+    DictComp {
+        key: Box<Expr>,
+        value: Box<Expr>,
+        generators: Vec<CompFor>,
+    },
+    /// `{x for ...}` set comprehension.
+    SetComp {
+        elem: Box<Expr>,
+        generators: Vec<CompFor>,
+    },
     /// `int(x)`, `float(x)`, `bool(x)`, `str(x)`
     Cast {
         ty: TypeName,
