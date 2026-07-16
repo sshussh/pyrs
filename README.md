@@ -38,16 +38,17 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.20.1)
+## The language (v0.21.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.21.0**, not 1.0) until it is ready for
+milestone after this one is **0.22.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
 (never-free is interim; GC is still required for 1.0). Classes remain a
-closed-world subset with stronger typing/dynamism in v0.20 (see below).
-No new stdlib until the language can host pure-PyRs libraries.
+closed-world subset (v0.21 adds `__str__`/`__repr__`, zero-arg `super()`,
+and more kit — see below). No new stdlib until the language can host
+pure-PyRs libraries.
 
 A statically-typed Python subset:
 
@@ -68,26 +69,29 @@ A statically-typed Python subset:
   unannotated empty `[]` with no append/insert defaults to **`list[Any]`**;
   class names are valid type annotations (`def f(p: Point)`); annotations
   still **fix** storage when present (not silently widened)
-- **Classes (v0.20):** `class C:` / `class D(C):` with instance methods
+- **Classes (v0.21):** `class C:` / `class D(C):` with instance methods
   (`def m(self, …)`), fields assigned in `__init__` only (no class-body
   attributes), construction `C(...)`, attribute load/store,
   `self.method()`, single inheritance with override + virtual dispatch
-  when the static type is a base, `isinstance(obj, C)` with inheritance,
-  **`isinstance` flow narrowing to a more-specific subclass** (subclass
-  fields/methods after peel; mid-expression `isinstance(x, B) and x.b`),
-  subclass assignable where a base is expected (params, returns, list
-  append of `list[Base]`, unions containing the base), cross-module
-  `from m import C` / subclassing. Default `print`/`str` is
-  `<Name object>` (no address; runtime type_id). **Not yet:** multiple
-  inheritance, metaclasses, `__new__`/`__slots__`, bound methods as
-  values, `@property`/classmethod/staticmethod, open `__dict__`, class
-  patterns in `match`, nested classes, class decorators, `super()`,
-  class-body attrs, first-class class values; mixed non-numeric list
-  **literals** need a union annotation (empty `[]` + mixed appends join;
-  common fields on class unions are readable; exclusive subclass fields
-  after multi-class `isinstance` use a **runtime type_id switch** —
-  AttributeError when the live instance lacks the field; method calls on
-  bare `Any` and open setattr remain unsupported)
+  when the static type is a base, **zero-arg `super().m(...)`** (static
+  parent call; cooperative `super().__init__`), `isinstance(obj, C)` with
+  inheritance, **`isinstance` flow narrowing to a more-specific subclass**
+  (subclass fields/methods after peel; mid-expression `isinstance(x, B)
+  and x.b`), subclass assignable where a base is expected (params,
+  returns, list append of `list[Base]`, unions containing the base),
+  cross-module `from m import C` / subclassing. **`__str__` / `__repr__`**
+  (must return `str`): used by `print`/`str()` with virtual dispatch when
+  present; default remains `<Name object>` (no address; runtime type_id).
+  **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`,
+  bound methods as values, `@property`/classmethod/staticmethod, open
+  `__dict__`, class patterns in `match`, nested classes, class decorators,
+  two-arg `super()`, class-body attrs, first-class class values; mixed
+  non-numeric list **literals** need a union annotation (empty `[]` +
+  mixed appends join; common fields on class unions are readable;
+  exclusive subclass fields after multi-class `isinstance` use a
+  **runtime type_id switch** — AttributeError when the live instance
+  lacks the field; method calls on bare `Any` and open setattr remain
+  unsupported)
 - **Functions:** `def` with optional parameter/return annotations
   (defaults infer param types; bare params inferred from body when unique;
   return type inferred from `return` when omitted), defaults and keyword
@@ -105,7 +109,8 @@ A statically-typed Python subset:
   `for a, *rest in xs`), `break`/`continue`, assignments (plain, annotated,
   multi-target, unpacking `a, b = t`, augmented — including
   `xs[i] += v` and `s |= t` for sets), `del d[k]`, `return`, `pass`,
-  `raise ExcType("msg")`, `try`/`except`/`except (A, B)`/`else`/`finally`
+  `raise ExcType("msg")`, `assert test` / `assert test, msg`
+  (`AssertionError`), `try`/`except`/`except (A, B)`/`else`/`finally`
   (including inside generators),
   `match`/`case` (literal, wildcard, capture, or-patterns, guards,
   sequence with optional `*rest`, mapping with optional `**rest`,
@@ -148,7 +153,8 @@ A statically-typed Python subset:
   and do not leak — and faster than the equivalent loop when length is
   knowable: results are pre-sized and appends inlined),
   indexing (read/write), slicing (copies, like Python),
-  `append`/`pop`/`insert`/`remove`/`index`/`clear`/`sort`, `sorted()`,
+  `append`/`pop`/`insert`/`remove`/`index`/`clear`/`sort`/`extend` (homogeneous
+  list arg), `sorted()`,
   `+`/`*` (concat / repeat), `==`/`!=`, `in`, `len`, iteration;
   assignment aliases like Python
 - **Tuples:** fixed-arity, heterogeneous; literals `(a, b)`, `(a,)`,
@@ -165,7 +171,8 @@ A statically-typed Python subset:
   IndexError, ZeroDivisionError, TypeError, RuntimeError, GeneratorExit,
   OverflowError, EOFError, FileNotFoundError, OSError, PermissionError,
   IsADirectoryError, NameError, UnboundLocalError, StopIteration,
-  Exception; `try`/`except`/`except Type as e` / `except (A, B)`/`else`/
+  Exception, **AssertionError** (`assert test` / `assert test, msg`);
+  `try`/`except`/`except Type as e` / `except (A, B)`/`else`/
   `finally`; CPython-like hierarchy match (`except OSError` catches
   `FileNotFoundError`/`PermissionError`/`IsADirectoryError`; `except
   Exception` catches normal exceptions but not `GeneratorExit`);
@@ -233,7 +240,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.20.1): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.21.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
@@ -376,4 +383,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.20.1 && git push origin v0.20.1`.
+Release tags: `git tag v0.21.0 && git push origin v0.21.0`.

@@ -279,10 +279,7 @@ impl Parser {
                 } else {
                     None
                 };
-                let end = msg
-                    .as_ref()
-                    .map(|e| e.span)
-                    .unwrap_or(test.span);
+                let end = msg.as_ref().map(|e| e.span).unwrap_or(test.span);
                 Ok(Stmt {
                     kind: StmtKind::Assert { test, msg },
                     span: start.to(end),

@@ -8869,7 +8869,9 @@ print(A().m())
     let (_, stderr) = run_program_expect_fail("v021_super_nobase", src);
     assert!(
         stderr.contains("super()")
-            && (stderr.contains("no base") || stderr.contains("no parent") || stderr.contains("base class")),
+            && (stderr.contains("no base")
+                || stderr.contains("no parent")
+                || stderr.contains("base class")),
         "stderr: {stderr}"
     );
 }
@@ -10189,7 +10191,11 @@ print(str(P(4)))
         .arg(src)
         .output()
         .expect("python3");
-    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
@@ -10212,7 +10218,11 @@ show(B())
         .arg(src)
         .output()
         .unwrap();
-    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
@@ -10248,7 +10258,11 @@ print(str(P(8)))
         .arg(src)
         .output()
         .unwrap();
-    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
@@ -10278,7 +10292,11 @@ except AssertionError as e:
         .arg(src)
         .output()
         .unwrap();
-    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
@@ -10297,6 +10315,10 @@ print(len(xs))
         .arg(src)
         .output()
         .unwrap();
-    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }

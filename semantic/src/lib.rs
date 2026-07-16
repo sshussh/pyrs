@@ -230,10 +230,7 @@ fn lower_class_to_str(value: ir::Expr, class_id: ir::ClassId, span: Span) -> SRe
     } else {
         Ok(ir::Expr {
             ty: ir::Ty::Str,
-            kind: ir::ExprKind::Call {
-                func: direct,
-                args,
-            },
+            kind: ir::ExprKind::Call { func: direct, args },
         })
     }
 }
@@ -5402,6 +5399,8 @@ fn lower_function_with_class(
 
 /// `capture_params`: leading params for nested functions (free vars), already typed.
 /// `seed_nested`: sibling (and self) nested functions visible for calls.
+/// `current_class`: owning class when lowering an instance method (for `super()`).
+#[allow(clippy::too_many_arguments)]
 fn lower_function_inner(
     f: &ast::FuncDef,
     mctx: &ModuleCtx,
@@ -9312,9 +9311,7 @@ fn lower_method_stmt(
                         })
                     }
                     other_ty => Err(err(
-                        format!(
-                            "list.extend() currently requires a list argument, got {other_ty}"
-                        ),
+                        format!("list.extend() currently requires a list argument, got {other_ty}"),
                         args[0].span,
                     )),
                 }
@@ -11856,26 +11853,19 @@ fn lower_super_method_call(
     args: &[ast::Expr],
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    let class_id = ctx.current_class.ok_or_else(|| {
+    let class_id = ctx
+        .current_class
+        .ok_or_else(|| err("super() outside of a method is not supported", method_span))?;
+    let parent_id = class_info(class_id).and_then(|i| i.parent).ok_or_else(|| {
         err(
-            "super() outside of a method is not supported",
+            "super() requires a base class (this class has no parent)",
             method_span,
         )
     })?;
-    let parent_id = class_info(class_id)
-        .and_then(|i| i.parent)
-        .ok_or_else(|| {
-            err(
-                "super() requires a base class (this class has no parent)",
-                method_span,
-            )
-        })?;
-    let self_name = ctx.self_param.clone().ok_or_else(|| {
-        err(
-            "super() outside of a method is not supported",
-            method_span,
-        )
-    })?;
+    let self_name = ctx
+        .self_param
+        .clone()
+        .ok_or_else(|| err("super() outside of a method is not supported", method_span))?;
 
     let direct = resolve_method(parent_id, method).ok_or_else(|| {
         err(

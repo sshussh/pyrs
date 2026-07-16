@@ -686,7 +686,7 @@ print(inc(2))  # 3
 
 ### Classes
 
-Closed-world, layout-specialized objects (v0.20). Instances carry a
+Closed-world, layout-specialized objects (v0.21). Instances carry a
 `type_id` header (GC-ready); heap objects are still never freed.
 
 ```python
@@ -736,13 +736,16 @@ print(isinstance(d, Animal))  # True
 - Subclass where a base is expected: params, returns, `list[Base].append`,
   assignment into a union that includes the base
 - Class names as type annotations (`def f(p: Point)`)
-- Default `print` / `str` → `<Name object>` (no address; stable vs CPython)
+- **`__str__` / `__repr__`** (must return `str`): used by `print` and
+  `str()` with virtual dispatch; fallback is still `<Name object>`
+- **Zero-arg `super().method(...)`** including `super().__init__(…)`
+  (static call of the parent implementation with the same `self`)
 
 **Not supported yet** (named compile errors): multiple inheritance,
 metaclasses, `__new__`, `__slots__`, bound methods as values
 (`m = obj.m`), `@property` / `@classmethod` / `@staticmethod`, open
 `__dict__` / `__getattr__`, class patterns in `match`, nested classes,
-class decorators, `super()`, class-body attributes, dotted bases
+class decorators, two-arg `super()`, class-body attributes, dotted bases
 (`class D(pkg.C)` — import the base first), first-class class objects
 as values (use as constructor/type only), `==` between instances
 (use `is` for identity). Mixed non-numeric **list literals** still error
@@ -1151,7 +1154,7 @@ The phase tag tells you what stage rejected the program: `lex` (bad
 character, bad indentation), `parse` (syntax), `semantic` (names, types,
 return paths), `codegen` (internal — you should never see one; it means a
 compiler bug). Unsupported Python features produce parse/semantic errors
-that name the feature: `super() is not supported yet`,
+that name the feature: `two-arg super() is not supported yet`,
 `class patterns in match/case are not supported yet`, and so on.
 Compilation stops at the
 first error.
