@@ -163,6 +163,81 @@ fn subclasses_of(base: ir::ClassId) -> Vec<ir::ClassId> {
     })
 }
 
+/// Resolve the dunder used for `str(obj)` / default print of a class instance:
+/// prefer `__str__`, else `__repr__` (CPython). Returns method name if present
+/// on the class or any parent.
+fn resolve_str_dunder(class_id: ir::ClassId) -> Option<&'static str> {
+    if resolve_method(class_id, "__str__").is_some() {
+        Some("__str__")
+    } else if resolve_method(class_id, "__repr__").is_some() {
+        Some("__repr__")
+    } else {
+        None
+    }
+}
+
+/// Call `__str__` / `__repr__` on a class instance (virtual when subclasses
+/// override), or fall back to [`ir::ExprKind::ObjectToStr`] (`"<Name object>"`).
+fn lower_class_to_str(value: ir::Expr, class_id: ir::ClassId, span: Span) -> SResult<ir::Expr> {
+    let Some(method) = resolve_str_dunder(class_id) else {
+        return Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::ObjectToStr(Box::new(value)),
+        });
+    };
+    let direct = resolve_method(class_id, method).expect("resolve_str_dunder checked");
+    let sig = method_sig_lookup(&direct).ok_or_else(|| {
+        err(
+            format!("internal error: missing signature for method '{method}'"),
+            span,
+        )
+    })?;
+    if sig.ret != ir::Ty::Str {
+        return Err(err(format!("{method} must return str"), span));
+    }
+    // User params after self must be empty for str/repr protocol.
+    if sig.params.len() != 1 {
+        return Err(err(
+            format!("{method} must take only self (no extra parameters)"),
+            span,
+        ));
+    }
+
+    let mut candidates: Vec<(ir::ClassId, String)> = Vec::new();
+    let mut unique_funcs: HashSet<String> = HashSet::new();
+    for sid in subclasses_of(class_id) {
+        if let Some(func) = resolve_method(sid, method) {
+            unique_funcs.insert(func.clone());
+            candidates.push((sid, func));
+        }
+    }
+    // Prefer __str__ on a subclass even if static type only has __repr__;
+    // when the resolved dunder name differs per class, still virtualize on
+    // the chosen method name from the static type (matches closed-world
+    // resolve_method MRO for each candidate's own method of that name).
+    let virtual_dispatch = unique_funcs.len() > 1;
+    let args = vec![value];
+    if virtual_dispatch {
+        Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::CallMethod {
+                direct_func: direct,
+                candidates,
+                args,
+                virtual_dispatch: true,
+            },
+        })
+    } else {
+        Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::Call {
+                func: direct,
+                args,
+            },
+        })
+    }
+}
+
 /// IR function name for a method defined on a class in `module`.
 fn method_ir_name(module: &str, is_root: bool, class_name: &str, method: &str) -> String {
     if is_root || module == ENTRY_NAME {
@@ -2181,6 +2256,19 @@ fn method_func_sig(
                  (returning a non-None value is not supported)",
                 f.span,
             ));
+        }
+    } else if f.name == "__str__" || f.name == "__repr__" {
+        // Protocol methods must return str (reject at definition time).
+        if f.ret.is_none() {
+            // Infer from body when possible; still require Str.
+            let param_map: HashMap<String, ir::Ty> =
+                params.iter().map(|p| (p.name.clone(), p.ty)).collect();
+            if let Some(ty) = try_infer_ret_from_ast_body(&f.body, &param_map, &HashMap::new()) {
+                ret = ty;
+            }
+        }
+        if ret != ir::Ty::Str {
+            return Err(err(format!("{} must return str", f.name), f.span));
         }
     } else if f.ret.is_none() {
         // Pre-infer unannotated returns from body (same as free functions).
@@ -7952,6 +8040,16 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     if a.ty == ir::Ty::File {
                         return Err(err("file objects cannot be printed yet", arg.span));
                     }
+                    // Honor class `__str__` / `__repr__` for print (CPython).
+                    let a = if let ir::Ty::Class(id) = a.ty {
+                        if resolve_str_dunder(id).is_some() {
+                            lower_class_to_str(a, id, arg.span)?
+                        } else {
+                            a
+                        }
+                    } else {
+                        a
+                    };
                     // None, unions, tuples/dicts/sets/lists/scalars are printable
                     lowered_args.push(a);
                 }
@@ -16917,10 +17015,7 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
                 ty: ir::Ty::Str,
                 kind: ir::ExprKind::ExcToStr(Box::new(value)),
             }),
-            ir::Ty::Class(_) => Ok(ir::Expr {
-                ty: ir::Ty::Str,
-                kind: ir::ExprKind::ObjectToStr(Box::new(value)),
-            }),
+            ir::Ty::Class(id) => lower_class_to_str(value, id, span),
             other => Err(err(format!("str() cannot convert {other} yet"), span)),
         },
         ast::TypeName::List(_) => Err(err("list(...) conversions are not supported", span)),

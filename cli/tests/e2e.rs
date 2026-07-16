@@ -10131,3 +10131,85 @@ for x in xs:
     let out = run_program("v0201_class_union_print", src);
     assert_eq!(out, "<Dog object>\n<Cat object>\n");
 }
+
+// --- v0.21: class usability ---
+
+#[test]
+fn v021_str_dunder_print() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __str__(self) -> str:
+        return f\"P({self.x})\"
+print(P(3))
+print(str(P(4)))
+";
+    let out = run_program("v021_str_dunder", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v021_str_dunder_virtual() {
+    let src = "\
+class A:
+    def __str__(self) -> str:
+        return \"A\"
+class B(A):
+    def __str__(self) -> str:
+        return \"B\"
+def show(x: A):
+    print(x)
+show(B())
+";
+    let out = run_program("v021_str_virt", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v021_str_dunder_must_return_str() {
+    let src = "\
+class P:
+    def __str__(self) -> int:
+        return 1
+print(P())
+";
+    let (_, stderr) = run_program_expect_fail("v021_str_bad", src);
+    assert!(
+        stderr.contains("__str__ must return str"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn v021_repr_fallback_for_str() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __repr__(self) -> str:
+        return f\"P({self.x})\"
+print(P(9))
+print(str(P(8)))
+";
+    let out = run_program("v021_repr_fb", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(py.status.success(), "{}", String::from_utf8_lossy(&py.stderr));
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
