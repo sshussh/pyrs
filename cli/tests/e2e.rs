@@ -277,7 +277,8 @@ print(div(1, 0))
 fn type_error_is_reported_with_source_snippet() {
     let dir = TempDir::new("typeerr");
     let src = dir.0.join("prog.py");
-    fs::write(&src, "x = 1\nx = 2.5\n").unwrap();
+    // Annotation fixes storage; assigning int into str is a type error.
+    fs::write(&src, "x: str = \"a\"\nx = 1\n").unwrap();
     let out = Command::new(PYRS)
         .args(["compile", "-i"])
         .arg(&src)
@@ -2728,14 +2729,17 @@ fn diagnostics_point_at_the_right_file() {
         &[
             (
                 "helper.py",
-                "def broken(n: int) -> int:\n    x = 1\n    x = 2.5\n    return n\n",
+                "def broken(n: int) -> int:\n    x: str = \"a\"\n    x = 1\n    return n\n",
             ),
             ("main.py", "import helper\nprint(helper.broken(3))\n"),
         ],
         "main.py",
     );
     assert!(stderr.contains("helper.py:3"), "stderr: {stderr}");
-    assert!(stderr.contains("type mismatch"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("type mismatch") || stderr.contains("storage type"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -8022,5 +8026,196 @@ print([1, 2] * 2)
         .output()
         .expect("python3");
     assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn tier1_isinstance_and_narrowing() {
+    let src = "\
+print(isinstance(True, int))
+print(isinstance(1, (str, int)))
+print(isinstance(\"a\", int))
+x: int | str = 1
+if isinstance(x, int):
+    print(x + 1)
+else:
+    print(\"no\")
+y: int | str = \"hi\"
+if isinstance(y, str):
+    print(y)
+";
+    let out = run_program("tier1_isinstance", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn tier1_container_kit() {
+    // PyRs materializes enumerate/zip/reversed as lists (not lazy iterators), so
+    // expression `print(enumerate(...))` is compared via list(...) under CPython.
+    let src = "\
+empty: list[int] = []
+print(any(empty))
+print(all(empty))
+print(any([0, 1]))
+print(all([1, 2]))
+print(all([1, 0]))
+print(any(\"\"))
+print(all(\"ab\"))
+for i, x in enumerate([10, 20]):
+    print(i)
+    print(x)
+print(enumerate([10, 20]))
+for a, b in zip([1, 2], [3, 4, 5]):
+    print(a)
+    print(b)
+print(zip([1, 2], [3, 4, 5]))
+print(reversed([1, 2, 3]))
+print(reversed(\"ab\"))
+print(1 in (1, \"a\", 2))
+print(\"a\" in (1, \"a\", 2))
+print(3 in (1, 2))
+s: set[int] = {1, 2}
+t: set[int] = {2, 3}
+print(s | t)
+u = s.union(t)
+print(u)
+s2: set[int] = {1}
+s2 |= {2}
+print(s2)
+d: dict[str, int] = {\"a\": 1}
+d.update({\"b\": 2})
+print(d[\"a\"])
+print(d[\"b\"])
+";
+    // CPython mirror with list() around materializing builtins.
+    let py_src = "\
+empty = []
+print(any(empty))
+print(all(empty))
+print(any([0, 1]))
+print(all([1, 2]))
+print(all([1, 0]))
+print(any(\"\"))
+print(all(\"ab\"))
+for i, x in enumerate([10, 20]):
+    print(i)
+    print(x)
+print(list(enumerate([10, 20])))
+for a, b in zip([1, 2], [3, 4, 5]):
+    print(a)
+    print(b)
+print(list(zip([1, 2], [3, 4, 5])))
+print(list(reversed([1, 2, 3])))
+print(''.join(reversed(\"ab\")))
+print(1 in (1, \"a\", 2))
+print(\"a\" in (1, \"a\", 2))
+print(3 in (1, 2))
+s = {1, 2}
+t = {2, 3}
+print(s | t)
+u = s.union(t)
+print(u)
+s2 = {1}
+s2 |= {2}
+print(s2)
+d = {\"a\": 1}
+d.update({\"b\": 2})
+print(d[\"a\"])
+print(d[\"b\"])
+";
+    let out = run_program("tier1_containers", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(py_src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn tier1_typing_join_and_bare_param() {
+    let src = "\
+def f():
+    x = 1
+    x = \"a\"
+    return x
+print(f())
+def g(x):
+    return x + 1
+print(g(2))
+x = 1
+x = 2.5
+print(x)
+";
+    let out = run_program("tier1_typing", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn tier1_richer_exceptions() {
+    let src = "\
+try:
+    raise FileNotFoundError(\"missing\")
+except FileNotFoundError as e:
+    print(e)
+try:
+    raise OverflowError(\"big\")
+except (OverflowError, ValueError) as e:
+    print(e)
+try:
+    raise EOFError(\"eof\")
+except EOFError as e:
+    print(e)
+try:
+    raise NameError(\"n\")
+except NameError as e:
+    print(e)
+try:
+    raise OSError(\"os\")
+except OSError as e:
+    print(e)
+try:
+    open(\"/no/such/file_pyrs_tier1_xyz\")
+except FileNotFoundError:
+    print(\"caught fnf\")
+except OSError:
+    print(\"caught os\")
+";
+    let out = run_program("tier1_exc", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
