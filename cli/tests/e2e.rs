@@ -10442,3 +10442,171 @@ print(\"a\" in s, \"d\" in s, len(s))
     );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
+
+// --- v0.23: class kit depth ---
+
+#[test]
+fn v023_staticmethod() {
+    let src = "\
+class M:
+    @staticmethod
+    def add(a: int, b: int) -> int:
+        return a + b
+print(M.add(2, 3))
+m = M()
+print(m.add(4, 5))
+";
+    let out = run_program("v023_static", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v023_classmethod_make() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    @classmethod
+    def one(cls) -> P:
+        return cls(1)
+print(P.one().x)
+";
+    let out = run_program("v023_classm", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v023_property_read() {
+    let src = "\
+class C:
+    def __init__(self, x: int):
+        self._x = x
+    @property
+    def x(self) -> int:
+        return self._x
+c = C(7)
+print(c.x)
+";
+    let out = run_program("v023_prop", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v023_bound_method_value() {
+    let src = "\
+class C:
+    def __init__(self, x: int):
+        self.x = x
+    def add(self, y: int) -> int:
+        return self.x + y
+c = C(10)
+f = c.add
+print(f(3))
+";
+    let out = run_program("v023_bound", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v023_user_iter() {
+    let src = "\
+class Counter:
+    def __init__(self, n: int):
+        self.n = n
+        self.i = 0
+    def __iter__(self) -> Counter:
+        return self
+    def __next__(self) -> int:
+        if self.i >= self.n:
+            raise StopIteration(\"\")
+        v = self.i
+        self.i = self.i + 1
+        return v
+for x in Counter(3):
+    print(x)
+";
+    let out = run_program("v023_iter", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v023_len_bool_dunder() {
+    let src = "\
+class Bag:
+    def __init__(self, n: int):
+        self.n = n
+    def __len__(self) -> int:
+        return self.n
+    def __bool__(self) -> bool:
+        return self.n > 0
+print(len(Bag(3)))
+if Bag(0):
+    print(\"yes\")
+else:
+    print(\"no\")
+if Bag(2):
+    print(\"yes2\")
+";
+    let out = run_program("v023_lenbool", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}

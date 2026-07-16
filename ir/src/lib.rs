@@ -69,12 +69,40 @@ pub enum Ty {
     /// User-defined class instance. `ClassId` indexes [`Module::classes`].
     /// Layout: header `i64 type_id` then fixed fields (never freed; GC-ready).
     Class(ClassId),
+    /// Bound method value (`obj.method` without call). Heap `{ ptr object }`;
+    /// call supplies user args after the captured self. `func` is the IR
+    /// method name for static dispatch (virtual when `virtual` is true —
+    /// codegen switches on the object's type_id).
+    BoundMethod {
+        class_id: ClassId,
+        params: &'static [Ty],
+        ret: &'static Ty,
+        func: &'static str,
+        is_virtual: bool,
+    },
     /// Limited dynamic value (annotation `Any`). LLVM `i64` holding a heap
     /// box `{ i32 print_tag, i64 payload }` — the same encoding as union
     /// elements in containers. Not full CPython dynamism: no open attrs,
     /// method calls on bare Any are limited; coerce to concrete types with
     /// a runtime TypeError check when the tag does not match.
     Any,
+}
+
+/// Intern a bound-method type.
+pub fn bound_method_of(
+    class_id: ClassId,
+    params: &[Ty],
+    ret: Ty,
+    func: &str,
+    virtual_dispatch: bool,
+) -> Ty {
+    Ty::BoundMethod {
+        class_id,
+        params: Box::leak(params.to_vec().into_boxed_slice()),
+        ret: Box::leak(Box::new(ret)),
+        func: Box::leak(func.to_string().into_boxed_str()),
+        is_virtual: virtual_dispatch,
+    }
 }
 
 /// Stable id for a user class in a compiled module (index into `Module::classes`).
@@ -127,7 +155,8 @@ pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
             Ty::Generator { .. } => 13,
             Ty::Exception => 14,
             Ty::Class(_) => 15,
-            Ty::Any => 16,
+            Ty::BoundMethod { .. } => 16,
+            Ty::Any => 17,
         }
     }
     match (a, b) {
@@ -335,6 +364,16 @@ impl std::fmt::Display for Ty {
             Ty::Generator { yield_ty } => write!(f, "generator[{yield_ty}]"),
             Ty::Exception => write!(f, "exception"),
             Ty::Class(id) => write!(f, "class#{id}"),
+            Ty::BoundMethod { params, ret, .. } => {
+                write!(f, "bound_method[(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{p}")?;
+                }
+                write!(f, ") -> {ret}]")
+            }
             Ty::Any => write!(f, "Any"),
         }
     }
@@ -1024,6 +1063,24 @@ pub enum ExprKind {
         candidates: Vec<(ClassId, String)>,
         args: Vec<Expr>,
         /// When true, load type_id from `args[0]` and switch.
+        virtual_dispatch: bool,
+    },
+    /// `obj.method` as a first-class bound-method value.
+    BindMethod {
+        object: Box<Expr>,
+        class_id: ClassId,
+        method: String,
+        direct_func: String,
+        candidates: Vec<(ClassId, String)>,
+        virtual_dispatch: bool,
+    },
+    /// Call a bound-method value with user args (self from the binding).
+    CallBoundMethod {
+        bound: Box<Expr>,
+        args: Vec<Expr>,
+        /// IR metadata mirrored from the bound type for codegen.
+        direct_func: String,
+        candidates: Vec<(ClassId, String)>,
         virtual_dispatch: bool,
     },
     /// `isinstance(obj, Class)` with inheritance: walk parent chain.

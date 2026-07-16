@@ -743,9 +743,9 @@ print(isinstance(d, Animal))  # True
 
 **Not supported yet** (named compile errors): multiple inheritance,
 metaclasses, `__new__`, `__slots__`, bound methods as values
-(`m = obj.m`), `@property` / `@classmethod` / `@staticmethod`, open
+(`m = obj.m` now works for instance methods), open
 `__dict__` / `__getattr__`, class patterns in `match`, nested classes,
-class decorators, two-arg `super()`, class-body attributes, dotted bases
+class decorators, stacked custom decorators, two-arg `super()`, class-body attributes, dotted bases
 (`class D(pkg.C)` — import the base first), first-class class objects
 as values (use as constructor/type only), `==` between instances
 (use `is` for identity). Mixed non-numeric **list literals** still error

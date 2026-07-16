@@ -341,6 +341,8 @@ pub enum Token {
     Comma,
     #[token(".")]
     Dot,
+    #[token("@")]
+    At,
     #[token("->")]
     Arrow,
     /// `|` — type unions (`int | None`) and bitwise-or expressions.
@@ -463,6 +465,7 @@ fn token_text(token: &Token) -> &'static str {
         Token::Colon => ":",
         Token::Comma => ",",
         Token::Dot => ".",
+        Token::At => "@",
         Token::Arrow => "->",
         Token::Pipe => "|",
         _ => "?",
@@ -619,13 +622,7 @@ impl<'a> Iterator for Lexer<'a> {
                     } else if slice.starts_with("\"\"\"") || slice.starts_with("'''") {
                         "unterminated triple-quoted string literal".to_string()
                     } else {
-                        if slice == "@" {
-                            "decorators (@property / @classmethod / @staticmethod / \
-                             class decorators) are not supported yet"
-                                .to_string()
-                        } else {
-                            format!("unexpected character {:?}", slice)
-                        }
+                        format!("unexpected character {:?}", slice)
                     };
                     return Some(Err(Diagnostic::new(Phase::Lex, message, span)));
                 }

@@ -49,7 +49,8 @@ fn lty(ty: Ty) -> &'static str {
         | Ty::Cell(_)
         | Ty::Generator { .. }
         | Ty::Exception
-        | Ty::Class(_) => "ptr",
+        | Ty::Class(_)
+        | Ty::BoundMethod { .. } => "ptr",
         // Value-level None (expression); not the void function return.
         Ty::None => "i8",
         Ty::Union(_) => "{ i32, i64 }",
@@ -89,8 +90,8 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Set(_) => 7,
         // Any is always a heap box {print_tag, payload}; reuse union list tag.
         Ty::Union(_) | Ty::Any => 8,
-        // Closures / generators as list/dict values (pointer slots).
-        Ty::Closure { .. } => 9,
+        // Closures / generators / bound methods as list/dict values (pointer slots).
+        Ty::Closure { .. } | Ty::BoundMethod { .. } => 9,
         Ty::Generator { .. } => 10,
         // Exception objects: union-box print tag only (not list/dict elements).
         Ty::Exception => 11,
@@ -424,6 +425,13 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | GetField { object: value, .. }
         | GetFieldPartial { object: value, .. } => max_try_depth_in_expr(value),
         CallMethod { args, .. } => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
+        BindMethod { object, .. } => max_try_depth_in_expr(object),
+        CallBoundMethod { bound, args, .. } => args
+            .iter()
+            .map(max_try_depth_in_expr)
+            .max()
+            .unwrap_or(0)
+            .max(max_try_depth_in_expr(bound)),
         NewObject { .. } => 0,
         ObjectToStr(operand) => max_try_depth_in_expr(operand),
         SetUnion { left, right }
@@ -622,6 +630,10 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | GetField { object: value, .. }
         | GetFieldPartial { object: value, .. } => count_yields_in_expr(value),
         CallMethod { args, .. } => args.iter().map(count_yields_in_expr).sum(),
+        BindMethod { object, .. } => count_yields_in_expr(object),
+        CallBoundMethod { bound, args, .. } => {
+            count_yields_in_expr(bound) + args.iter().map(count_yields_in_expr).sum::<i64>()
+        }
         NewObject { .. } => 0,
         ObjectToStr(operand) => count_yields_in_expr(operand),
         SetUnion { left, right }
@@ -949,6 +961,7 @@ impl Emitter {
                 | Ty::Set(_)
                 | Ty::File
                 | Ty::Closure { .. }
+                | Ty::BoundMethod { .. }
                 | Ty::Cell(_)
                 | Ty::Generator { .. }
                 | Ty::Exception
@@ -1426,6 +1439,7 @@ impl Emitter {
             | Ty::Set(_)
             | Ty::File
             | Ty::Closure { .. }
+            | Ty::BoundMethod { .. }
             | Ty::Cell(_)
             | Ty::Generator { .. }
             | Ty::Exception
@@ -1485,6 +1499,7 @@ impl Emitter {
             | Ty::Set(_)
             | Ty::File
             | Ty::Closure { .. }
+            | Ty::BoundMethod { .. }
             | Ty::Cell(_)
             | Ty::Generator { .. }
             | Ty::Exception
@@ -1793,7 +1808,7 @@ impl Emitter {
             Ty::Tuple(_) => src == 5,
             Ty::Dict { .. } => src == 6,
             Ty::Set(_) => src == 7,
-            Ty::Closure { .. } => src == 9,
+            Ty::Closure { .. } | Ty::BoundMethod { .. } => src == 9,
             Ty::Generator { .. } => src == 10,
             Ty::Exception => src == 11,
             Ty::Class(_) => src >= 13 && (src - 13) % 8 == 0,
@@ -2261,7 +2276,7 @@ impl Emitter {
             Ty::Tuple(_) => self.line(format!("call void @pyrs_print_tuple(ptr {v})")),
             Ty::Dict { .. } => self.line(format!("call void @pyrs_print_dict(ptr {v})")),
             Ty::Set(_) => self.line(format!("call void @pyrs_print_set(ptr {v})")),
-            Ty::Closure { .. } => {
+            Ty::Closure { .. } | Ty::BoundMethod { .. } => {
                 let s = self.intern_string("<function>");
                 self.line(format!("call void @pyrs_print_str(ptr {s})"));
             }
@@ -2349,6 +2364,7 @@ impl Emitter {
                 | Ty::Set(_)
                 | Ty::File
                 | Ty::Closure { .. }
+                | Ty::BoundMethod { .. }
                 | Ty::Cell(_)
                 | Ty::Generator { .. }
                 | Ty::Exception
@@ -4139,6 +4155,7 @@ impl Emitter {
                         | Ty::Set(_)
                         | Ty::File
                         | Ty::Closure { .. }
+                        | Ty::BoundMethod { .. }
                         | Ty::Cell(_)
                         | Ty::Generator { .. }
                         | Ty::Exception
@@ -4176,6 +4193,93 @@ impl Emitter {
             } => {
                 let obj = self.emit_expr(object);
                 self.emit_get_field_partial(&obj, candidates, attr, expr.ty)
+            }
+            ExprKind::BindMethod { object, .. } => {
+                // Heap box: { ptr object } (method resolved from type at call).
+                let obj = self.emit_expr(object);
+                let box_p = self.tmp();
+                self.line(format!("{box_p} = call ptr @malloc(i64 8)"));
+                let fp = self.tmp();
+                self.line(format!(
+                    "{fp} = getelementptr inbounds {{ ptr }}, ptr {box_p}, i32 0, i32 0"
+                ));
+                self.line(format!("store ptr {obj}, ptr {fp}"));
+                box_p
+            }
+            ExprKind::CallBoundMethod {
+                bound,
+                args,
+                direct_func,
+                candidates,
+                virtual_dispatch,
+            } => {
+                let b = self.emit_expr(bound);
+                let fp = self.tmp();
+                self.line(format!(
+                    "{fp} = getelementptr inbounds {{ ptr }}, ptr {b}, i32 0, i32 0"
+                ));
+                let self_ptr = self.tmp();
+                self.line(format!("{self_ptr} = load ptr, ptr {fp}"));
+                let mut arg_vals = vec![(self_ptr, Ty::Class(0))]; // class id unused for lty
+                // Prefer object's actual class type from bound ty when available.
+                if let Ty::BoundMethod { class_id, .. } = bound.ty {
+                    arg_vals[0].1 = Ty::Class(class_id);
+                }
+                for a in args {
+                    arg_vals.push((self.emit_expr(a), a.ty));
+                }
+                if !*virtual_dispatch || candidates.len() <= 1 {
+                    return self.emit_direct_method_call(direct_func, &arg_vals, expr.ty);
+                }
+                let tid_p = self.tmp();
+                let self_obj = &arg_vals[0].0;
+                self.line(format!(
+                    "{tid_p} = getelementptr inbounds {{ i64 }}, ptr {self_obj}, i32 0, i32 0"
+                ));
+                let tid = self.tmp();
+                self.line(format!("{tid} = load i64, ptr {tid_p}"));
+                let end_l = self.fresh_block("bm.end");
+                let default_l = self.fresh_block("bm.def");
+                let mut cases = String::new();
+                let mut blocks = Vec::new();
+                for (cid, func) in candidates {
+                    let bl = self.fresh_block(&format!("bm.{}", cid));
+                    cases.push_str(&format!(" i64 {}, label %{bl}", *cid as i64));
+                    blocks.push((bl, func.clone()));
+                }
+                self.line(format!("switch i64 {tid}, label %{default_l} [{cases} ]"));
+                let ret_void = expr.ty == Ty::None;
+                let mut phi_preds = Vec::new();
+                for (bl, func) in &blocks {
+                    self.start_block(bl);
+                    let r = self.emit_direct_method_call(func, &arg_vals, expr.ty);
+                    let cblk = self.cur_block.clone();
+                    if !ret_void {
+                        phi_preds.push((r, cblk));
+                    }
+                    self.line(format!("br label %{end_l}"));
+                }
+                self.start_block(&default_l);
+                let rdef = self.emit_direct_method_call(direct_func, &arg_vals, expr.ty);
+                let dblk = self.cur_block.clone();
+                if !ret_void {
+                    phi_preds.push((rdef, dblk));
+                }
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&end_l);
+                if ret_void {
+                    return "0".to_string();
+                }
+                let t = self.tmp();
+                let mut phi = format!("{t} = phi {} ", lty(expr.ty));
+                for (i, (v, b)) in phi_preds.iter().enumerate() {
+                    if i > 0 {
+                        phi.push_str(", ");
+                    }
+                    phi.push_str(&format!("[ {v}, %{b} ]"));
+                }
+                self.line(phi);
+                return t;
             }
             ExprKind::CallMethod {
                 direct_func,

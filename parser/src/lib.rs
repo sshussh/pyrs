@@ -166,6 +166,25 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        // Leading decorators: `@deco` lines then `def` (class methods / free funcs).
+        if self.peek() == &Token::At {
+            let decorators = self.parse_decorators()?;
+            match self.peek() {
+                Token::Def => {
+                    let mut stmt = self.parse_funcdef()?;
+                    if let StmtKind::FuncDef(ref mut f) = stmt.kind {
+                        f.decorators = decorators;
+                    }
+                    return Ok(stmt);
+                }
+                Token::Class => {
+                    return Err(self.error("class decorators are not supported yet"));
+                }
+                _ => {
+                    return Err(self.error("decorators must be followed by a function definition"));
+                }
+            }
+        }
         match self.peek() {
             Token::Def => self.parse_funcdef(),
             Token::If => self.parse_if(),
@@ -184,6 +203,28 @@ impl Parser {
                 Ok(stmt)
             }
         }
+    }
+
+    /// One or more `@name` lines (name only; no `@deco(args)` yet).
+    fn parse_decorators(&mut self) -> PResult<Vec<Decorator>> {
+        let mut out = Vec::new();
+        while self.peek() == &Token::At {
+            let at_span = self.advance().1;
+            let (name, nspan) = self.expect_ident("after '@'")?;
+            // Require end of line (no `@deco(args)`).
+            if self.peek() == &Token::LParen {
+                return Err(self.error(
+                    "decorator arguments are not supported yet; use a bare name \
+                     like @staticmethod",
+                ));
+            }
+            out.push(Decorator {
+                name,
+                span: at_span.to(nspan),
+            });
+            self.expect_stmt_end()?;
+        }
+        Ok(out)
     }
 
     fn parse_simple_stmt(&mut self) -> PResult<Stmt> {
@@ -1096,6 +1137,7 @@ impl Parser {
                 ret,
                 body,
                 span: header_span,
+                decorators: Vec::new(),
             }),
             span: header_span,
         })

@@ -40,6 +40,17 @@ thread_local! {
     static CLOSURE_DEFAULTS: RefCell<ClosureDefaultsMap> = RefCell::new(HashMap::new());
 }
 
+/// How a class method is bound (decorators).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MethodKind {
+    #[default]
+    Instance,
+    Static,
+    Class,
+    /// Read-only `@property` — attribute load calls the zero-arg method.
+    Property,
+}
+
 /// Classes registered for the program currently being analyzed.
 /// Keys are always `(module, short_name)` — never last-wins bare short names.
 #[derive(Default, Clone)]
@@ -53,6 +64,10 @@ struct ClassEnv {
     current_module: String,
     /// All method signatures by fully-qualified IR name (cross-module).
     method_sigs: HashMap<String, FuncSig>,
+    /// IR method name → kind (static / class / property / instance).
+    method_kinds: HashMap<String, MethodKind>,
+    /// `(class_id, attr)` → IR func for `@property` getters.
+    properties: HashMap<(ir::ClassId, String), String>,
 }
 
 thread_local! {
@@ -114,6 +129,66 @@ fn register_method_sig(ir_name: &str, sig: FuncSig) {
     with_class_env_mut(|e| {
         e.method_sigs.insert(ir_name.to_string(), sig);
     });
+}
+
+fn register_method_kind(ir_name: &str, kind: MethodKind) {
+    with_class_env_mut(|e| {
+        e.method_kinds.insert(ir_name.to_string(), kind);
+    });
+}
+
+fn method_kind_lookup(ir_name: &str) -> MethodKind {
+    with_class_env(|e| {
+        e.method_kinds
+            .get(ir_name)
+            .copied()
+            .unwrap_or(MethodKind::Instance)
+    })
+}
+
+fn register_property(class_id: ir::ClassId, name: &str, ir_name: &str) {
+    with_class_env_mut(|e| {
+        e.properties
+            .insert((class_id, name.to_string()), ir_name.to_string());
+    });
+}
+
+fn resolve_property(class_id: ir::ClassId, name: &str) -> Option<String> {
+    with_class_env(|e| {
+        let mut cur = Some(class_id);
+        while let Some(id) = cur {
+            if let Some(func) = e.properties.get(&(id, name.to_string())) {
+                return Some(func.clone());
+            }
+            let info = e.infos.get(id as usize)?;
+            cur = info.parent;
+        }
+        None
+    })
+}
+
+fn method_kind_from_decorators(decorators: &[ast::Decorator], span: Span) -> SResult<MethodKind> {
+    if decorators.is_empty() {
+        return Ok(MethodKind::Instance);
+    }
+    if decorators.len() > 1 {
+        return Err(err(
+            "stacked method decorators are not supported yet",
+            decorators[1].span,
+        ));
+    }
+    match decorators[0].name.as_str() {
+        "staticmethod" => Ok(MethodKind::Static),
+        "classmethod" => Ok(MethodKind::Class),
+        "property" => Ok(MethodKind::Property),
+        other => Err(err(
+            format!(
+                "method decorator '@{other}' is not supported yet \
+                 (supported: @staticmethod, @classmethod, @property)"
+            ),
+            decorators[0].span.to(span),
+        )),
+    }
 }
 
 fn class_is_subclass_in(env: &ClassEnv, child: ir::ClassId, parent: ir::ClassId) -> bool {
@@ -1157,6 +1232,7 @@ fn lower_lambda(
         ret: None,
         body: vec![body_stmt],
         span,
+        decorators: Vec::new(),
     };
     lower_nested_func_def(&fd, ctx)?;
     // Patch ret type from the lowered IR return (actual body type).
@@ -2201,21 +2277,50 @@ fn method_func_sig(
     class_id: ir::ClassId,
     class_short_name: &str,
     f: &ast::FuncDef,
+    kind: MethodKind,
 ) -> SResult<FuncSig> {
-    if f.params.is_empty() {
-        return Err(err(
-            format!("instance method '{}' must have a 'self' parameter", f.name),
-            f.span,
-        ));
-    }
-    // First param is always the instance (annotation optional / overridden).
     let mut formals = f.params.clone();
-    formals[0].ty = Some(ast::TypeName::Class(Box::leak(
-        class_short_name.to_string().into_boxed_str(),
-    )));
-    // Resolve params but force self type (in case lookup used a different class).
-    let mut params = resolve_params_with_body_infer(&formals, &f.body)?;
-    params[0].ty = ir::Ty::Class(class_id);
+    let mut params;
+    match kind {
+        MethodKind::Static => {
+            // No implicit self — all params are user params.
+            params = resolve_params_with_body_infer(&formals, &f.body)?;
+        }
+        MethodKind::Class => {
+            if formals.is_empty() {
+                return Err(err(
+                    format!("classmethod '{}' must have a 'cls' parameter", f.name),
+                    f.span,
+                ));
+            }
+            // First param is the class marker (typed as the class for construct).
+            formals[0].ty = Some(ast::TypeName::Class(Box::leak(
+                class_short_name.to_string().into_boxed_str(),
+            )));
+            params = resolve_params_with_body_infer(&formals, &f.body)?;
+            params[0].ty = ir::Ty::Class(class_id);
+        }
+        MethodKind::Instance | MethodKind::Property => {
+            if formals.is_empty() {
+                return Err(err(
+                    format!("instance method '{}' must have a 'self' parameter", f.name),
+                    f.span,
+                ));
+            }
+            // First param is always the instance (annotation optional / overridden).
+            formals[0].ty = Some(ast::TypeName::Class(Box::leak(
+                class_short_name.to_string().into_boxed_str(),
+            )));
+            params = resolve_params_with_body_infer(&formals, &f.body)?;
+            params[0].ty = ir::Ty::Class(class_id);
+            if kind == MethodKind::Property && params.len() != 1 {
+                return Err(err(
+                    format!("@property '{}' must take only self", f.name),
+                    f.span,
+                ));
+            }
+        }
+    }
 
     let vararg = if let Some(p) = &f.vararg {
         let ty = resolve_param_ty(p)?;
@@ -4779,8 +4884,15 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
             classes_here.insert(c.name.clone(), class_id);
             for cm in &c.methods {
                 let ir_name = method_ir_name(&c.module, c.is_root, &c.name, &cm.def.name);
-                let sig = method_func_sig(class_id, &c.name, cm.def).map_err(|d| d.with_file(i))?;
+                let kind = method_kind_from_decorators(&cm.def.decorators, cm.def.span)
+                    .map_err(|d| d.with_file(i))?;
+                let sig =
+                    method_func_sig(class_id, &c.name, cm.def, kind).map_err(|d| d.with_file(i))?;
                 register_method_sig(&ir_name, sig.clone());
+                register_method_kind(&ir_name, kind);
+                if kind == MethodKind::Property {
+                    register_property(class_id, &cm.def.name, &ir_name);
+                }
                 methods.push((ir_name.clone(), class_id, cm.def));
                 funcs.insert(ir_name, sig);
             }
@@ -5061,6 +5173,7 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
                 ret: None,
                 body: script,
                 span: Span::default(),
+                decorators: Vec::new(),
             };
             let (mut f, nested) =
                 lower_function(&init_def, &mctx, &mut globals, &mut globals_order, true)
@@ -5310,6 +5423,9 @@ struct FnCtx<'a> {
     current_class: Option<ir::ClassId>,
     /// Name of the `self` parameter of the current instance method (if any).
     self_param: Option<String>,
+    /// When lowering a `@classmethod`, `(cls_param_name, class_id)` so
+    /// `cls(...)` constructs that class.
+    classmethod_cls: Option<(String, ir::ClassId)>,
 }
 
 impl FnCtx<'_> {
@@ -5412,8 +5528,25 @@ fn lower_function_inner(
     current_class: Option<ir::ClassId>,
 ) -> SResult<(ir::Function, Vec<ir::Function>)> {
     let mut params = Vec::new();
-    let self_param = if current_class.is_some() {
+    // Detect @classmethod via registered kind when this is a method IR name.
+    let is_classmethod =
+        current_class.is_some() && method_kind_lookup(&f.name) == MethodKind::Class;
+    let self_param = if current_class.is_some() && !is_classmethod {
+        // Instance / property methods use self for super().
         f.params.first().map(|p| p.name.clone())
+    } else {
+        None
+    };
+    let classmethod_cls = if is_classmethod {
+        current_class.map(|cid| {
+            (
+                f.params
+                    .first()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "cls".into()),
+                cid,
+            )
+        })
     } else {
         None
     };
@@ -5452,6 +5585,7 @@ fn lower_function_inner(
         storage_tys: HashMap::new(),
         current_class,
         self_param,
+        classmethod_cls,
     };
 
     // Nonlocals declared in nested defs — free captures of these use cells.
@@ -6607,6 +6741,7 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
         ret: f.ret,
         body: f.body.clone(),
         span: f.span,
+        decorators: f.decorators.clone(),
     };
 
     let uses_env = capture_is_cell.iter().any(|b| *b);
@@ -8617,7 +8752,7 @@ fn lower_pattern_match(
             })
         }
         ast::Pattern::Bool(b) => {
-            let left = to_bool(subject.clone(), span)?;
+            let left = to_bool_default(subject.clone(), span)?;
             Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::Binary {
@@ -11198,8 +11333,115 @@ fn lower_for(
         ir::Ty::Generator { yield_ty } => {
             lower_for_generator(target, seq, *yield_ty, body, orelse, ctx, out)
         }
+        ir::Ty::Class(id) if resolve_method(id, "__iter__").is_some() => {
+            lower_for_user_iter(target, seq, id, body, orelse, iter.span, ctx, out)
+        }
         other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
     }
+}
+
+/// `for x in obj:` when `obj` is a class with `__iter__` / `__next__`.
+/// Desugars to: `it = obj.__iter__(); while True: try: x = it.__next__(); body
+/// except StopIteration: break`.
+fn lower_for_user_iter(
+    target: &ast::AssignTarget,
+    obj: ir::Expr,
+    class_id: ir::ClassId,
+    body: &[ast::Stmt],
+    orelse: &[ast::Stmt],
+    span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    // it = obj.__iter__()
+    let it_call = lower_instance_method_call(obj, class_id, "__iter__", span, &[], ctx)?;
+    let it_ty = it_call.ty;
+    let ir::Ty::Class(it_id) = it_ty else {
+        return Err(err(
+            format!("__iter__ must return a class instance, found {it_ty}"),
+            span,
+        ));
+    };
+    if resolve_method(it_id, "__next__").is_none() {
+        return Err(err("iterator from __iter__ must define __next__", span));
+    }
+    let it_t = ctx.fresh_temp("for.it", it_ty);
+    out.push(ir::Stmt::Assign {
+        name: it_t.clone(),
+        value: it_call,
+    });
+    let it_local = ir::Expr {
+        ty: it_ty,
+        kind: ir::ExprKind::Local(it_t),
+    };
+
+    // Infer yield type from __next__ return.
+    let next_func = resolve_method(it_id, "__next__").unwrap();
+    let next_sig = method_sig_lookup(&next_func)
+        .ok_or_else(|| err("internal error: missing signature for __next__", span))?;
+    let yield_ty = next_sig.ret;
+    if yield_ty == ir::Ty::None {
+        return Err(err("__next__ must return a non-None value type", span));
+    }
+
+    let more_t = ctx.fresh_temp("for.imore", ir::Ty::Bool);
+    out.push(ir::Stmt::Assign {
+        name: more_t.clone(),
+        value: ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(true),
+        },
+    });
+
+    // next value temp (fresh_temp registers the local).
+    let nxt_t = ctx.fresh_temp("for.inext", yield_ty);
+    // Bind target to establish type before body.
+    let entry_ref = ctx.type_refinements.clone();
+    let dummy = ir::Expr {
+        ty: yield_ty,
+        kind: ir::ExprKind::Local(nxt_t.clone()),
+    };
+    let bind = bind_for_target(target, dummy, ctx)?;
+    ctx.loop_depth += 1;
+    let user_body = lower_nested_block(body, ctx)?;
+    ctx.loop_depth -= 1;
+    restore_refinements_after_for(ctx, entry_ref, target, body, orelse);
+
+    // try: nxt = it.__next__(); bind; body
+    // except StopIteration: more = False
+    let next_call = lower_instance_method_call(it_local, it_id, "__next__", span, &[], ctx)?;
+    let try_body = {
+        let mut b = vec![ir::Stmt::Assign {
+            name: nxt_t.clone(),
+            value: next_call,
+        }];
+        b.extend(bind);
+        b.extend(user_body);
+        b
+    };
+    let handler = (
+        Some(vec![ir::ExcType::StopIteration]),
+        None,
+        vec![ir::Stmt::Assign {
+            name: more_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::ConstBool(false),
+            },
+        }],
+    );
+    let loop_body = vec![ir::Stmt::Try {
+        body: try_body,
+        handlers: vec![handler],
+        orelse: vec![],
+        finally: vec![],
+    }];
+    let more_local = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Local(more_t),
+    };
+    push_loop_with_else(more_local, loop_body, vec![], orelse, ctx, out)?;
+    Ok(())
 }
 
 /// `for x in gen:` via GeneratorNext → optional yield|None until None.
@@ -11470,7 +11712,7 @@ fn lower_for_file(
     let entry_ref = ctx.type_refinements.clone();
     let bind = bind_for_target(target, line_local.clone(), ctx)?;
 
-    let truthy = to_bool(line_local, tspan)?;
+    let truthy = to_bool(line_local, tspan, ctx)?;
     let not_line = ir::Expr {
         ty: ir::Ty::Bool,
         kind: ir::ExprKind::Unary {
@@ -11857,6 +12099,7 @@ fn can_box_as_any(ty: ir::Ty) -> bool {
         | ir::Ty::Dict { .. }
         | ir::Ty::Set(_)
         | ir::Ty::Closure { .. }
+        | ir::Ty::BoundMethod { .. }
         | ir::Ty::Generator { .. }
         | ir::Ty::Exception
         | ir::Ty::Class(_)
@@ -12241,18 +12484,7 @@ fn lower_instance_method_call(
             method_span,
         )
     })?;
-
-    // Virtual dispatch when subclasses may override.
-    let subs = subclasses_of(class_id);
-    let mut candidates: Vec<(ir::ClassId, String)> = Vec::new();
-    let mut unique_funcs: HashSet<String> = HashSet::new();
-    for sid in &subs {
-        if let Some(func) = resolve_method(*sid, method) {
-            unique_funcs.insert(func.clone());
-            candidates.push((*sid, func));
-        }
-    }
-    let virtual_dispatch = unique_funcs.len() > 1;
+    let kind = method_kind_lookup(&direct);
 
     // Signature from the static method (self + user params); cross-module ok.
     let sig = ctx
@@ -12275,10 +12507,50 @@ fn lower_instance_method_call(
                 method_span,
             )
         })?;
+
+    let pos: Vec<ast::PosArg> = args.iter().map(|e| ast::PosArg::Pos(e.clone())).collect();
+
+    // @staticmethod: no self; ignore instance (CPython still allows instance call).
+    if kind == MethodKind::Static {
+        return lower_call_with_sig(method, direct, &sig, &pos, &[], None, method_span, ctx, &[]);
+    }
+
+    // @classmethod on instance: pass the instance's class (static type for now).
+    if kind == MethodKind::Class {
+        let cls_token = ir::Expr {
+            ty: ir::Ty::Class(class_id),
+            // Reuse instance pointer as cls marker (construct uses class_id only).
+            kind: base_ir.kind.clone(),
+        };
+        let user_sig = method_user_sig(&sig);
+        return lower_call_with_sig(
+            method,
+            direct,
+            &user_sig,
+            &pos,
+            &[],
+            None,
+            method_span,
+            ctx,
+            &[cls_token],
+        );
+    }
+
+    // Virtual dispatch when subclasses may override.
+    let subs = subclasses_of(class_id);
+    let mut candidates: Vec<(ir::ClassId, String)> = Vec::new();
+    let mut unique_funcs: HashSet<String> = HashSet::new();
+    for sid in &subs {
+        if let Some(func) = resolve_method(*sid, method) {
+            unique_funcs.insert(func.clone());
+            candidates.push((*sid, func));
+        }
+    }
+    let virtual_dispatch = unique_funcs.len() > 1;
+
     // Match user args against params after `self`; prepend self via extra_leading.
     let user_sig = method_user_sig(&sig);
 
-    let pos: Vec<ast::PosArg> = args.iter().map(|e| ast::PosArg::Pos(e.clone())).collect();
     let lowered = lower_call_with_sig(
         method,
         direct.clone(),
@@ -12309,6 +12581,66 @@ fn lower_instance_method_call(
         });
     }
     Ok(lowered)
+}
+
+/// `ClassName.method(...)` for staticmethod / classmethod.
+fn lower_class_name_method_call(
+    class_id: ir::ClassId,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let direct = resolve_method(class_id, method).ok_or_else(|| {
+        err(
+            format!(
+                "type object '{}' has no attribute '{method}'",
+                class_info(class_id)
+                    .map(|c| c.name)
+                    .unwrap_or_else(|| format!("class#{class_id}"))
+            ),
+            method_span,
+        )
+    })?;
+    let kind = method_kind_lookup(&direct);
+    let sig = method_sig_lookup(&direct)
+        .or_else(|| ctx.mctx.funcs.get(&direct).cloned())
+        .ok_or_else(|| {
+            err(
+                format!("internal error: missing signature for method '{method}'"),
+                method_span,
+            )
+        })?;
+    let pos: Vec<ast::PosArg> = args.iter().map(|e| ast::PosArg::Pos(e.clone())).collect();
+    match kind {
+        MethodKind::Static => {
+            lower_call_with_sig(method, direct, &sig, &pos, &[], None, method_span, ctx, &[])
+        }
+        MethodKind::Class => {
+            // Pass an uninitialized object as the cls token (only used for
+            // type; body `cls(...)` is rewritten via classmethod_cls).
+            let cls_marker = ir::Expr {
+                ty: ir::Ty::Class(class_id),
+                kind: ir::ExprKind::NewObject { class_id },
+            };
+            let user_sig = method_user_sig(&sig);
+            lower_call_with_sig(
+                method,
+                direct,
+                &user_sig,
+                &pos,
+                &[],
+                None,
+                method_span,
+                ctx,
+                &[cls_marker],
+            )
+        }
+        MethodKind::Instance | MethodKind::Property => Err(err(
+            format!("instance method '{method}' must be called on an instance, not the class"),
+            method_span,
+        )),
+    }
 }
 
 /// Numeric-only promotion of `value` into concrete `target` (no unions).
@@ -12342,10 +12674,11 @@ fn coerce_numeric_into(value: ir::Expr, target: ir::Ty) -> SResult<ir::Expr> {
 /// Lower an expression used as a condition; applies truthiness.
 fn lower_condition(cond: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     let lowered = lower_expr(cond, ctx)?;
-    to_bool(lowered, cond.span)
+    to_bool(lowered, cond.span, ctx)
 }
 
-fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
+/// Truthiness without class dunders (match patterns / any/all).
+fn to_bool_default(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
     match value.ty {
         ir::Ty::Bool => Ok(value),
         ir::Ty::None
@@ -12367,6 +12700,41 @@ fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
             format!("a value of type {other} cannot be used as a condition"),
             span,
         )),
+    }
+}
+
+fn to_bool(value: ir::Expr, span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    match value.ty {
+        ir::Ty::Bool => Ok(value),
+        ir::Ty::Class(id) => {
+            // Prefer __bool__, else __len__ != 0, else default True (non-null instance).
+            if resolve_method(id, "__bool__").is_some() {
+                let call = lower_instance_method_call(value, id, "__bool__", span, &[], ctx)?;
+                if call.ty != ir::Ty::Bool {
+                    return Err(err("__bool__ must return bool", span));
+                }
+                return Ok(call);
+            }
+            if resolve_method(id, "__len__").is_some() {
+                let call = lower_instance_method_call(value, id, "__len__", span, &[], ctx)?;
+                if call.ty != ir::Ty::Int {
+                    return Err(err("__len__ must return int", span));
+                }
+                return Ok(ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Ne,
+                        left: Box::new(call),
+                        right: Box::new(int_const(0)),
+                    },
+                });
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::ToBool(Box::new(value)),
+            })
+        }
+        _ => to_bool_default(value, span),
     }
 }
 
@@ -12809,6 +13177,10 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         },
                     });
                 }
+                // @property: attribute load → zero-arg method call.
+                if resolve_property(id, attr).is_some() {
+                    return lower_instance_method_call(base_ir, id, attr, *attr_span, &[], ctx);
+                }
                 if let Some((field_index, field_ty)) = field_index(id, attr) {
                     return Ok(ir::Expr {
                         ty: field_ty,
@@ -12819,15 +13191,53 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         },
                     });
                 }
-                // Method name without call — bound methods not first-class yet.
-                if resolve_method(id, attr).is_some() {
-                    return Err(err(
-                        format!(
-                            "bound methods as values are not supported yet \
-                             (call '{attr}(...)' on the instance instead)"
-                        ),
-                        *attr_span,
-                    ));
+                // Method name without call → bound-method value.
+                if let Some(direct) = resolve_method(id, attr) {
+                    let kind = method_kind_lookup(&direct);
+                    if matches!(kind, MethodKind::Static | MethodKind::Class) {
+                        let what = match kind {
+                            MethodKind::Static => "staticmethod",
+                            MethodKind::Class => "classmethod",
+                            _ => "method",
+                        };
+                        return Err(err(
+                            format!(
+                                "taking a reference to {what} '{attr}' is not supported yet; \
+                                 call it directly"
+                            ),
+                            *attr_span,
+                        ));
+                    }
+                    let sig = method_sig_lookup(&direct).ok_or_else(|| {
+                        err(
+                            format!("internal error: missing signature for '{attr}'"),
+                            *attr_span,
+                        )
+                    })?;
+                    let user_params: Vec<ir::Ty> =
+                        sig.params.iter().skip(1).map(|p| p.ty).collect();
+                    let mut candidates: Vec<(ir::ClassId, String)> = Vec::new();
+                    let mut unique: HashSet<String> = HashSet::new();
+                    for sid in subclasses_of(id) {
+                        if let Some(func) = resolve_method(sid, attr) {
+                            unique.insert(func.clone());
+                            candidates.push((sid, func));
+                        }
+                    }
+                    let virtual_dispatch = unique.len() > 1;
+                    let bm_ty =
+                        ir::bound_method_of(id, &user_params, sig.ret, &direct, virtual_dispatch);
+                    return Ok(ir::Expr {
+                        ty: bm_ty,
+                        kind: ir::ExprKind::BindMethod {
+                            object: Box::new(base_ir),
+                            class_id: id,
+                            method: attr.clone(),
+                            direct_func: direct,
+                            candidates,
+                            virtual_dispatch,
+                        },
+                    });
                 }
                 return Err(err(
                     format!(
@@ -12917,6 +13327,12 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             // `super().m(...)` — static parent method call (before lowering base).
             if is_zero_arg_super(base) {
                 return lower_super_method_call(method, *method_span, &args, ctx);
+            }
+            // `ClassName.static_or_class_method(...)` before lowering base as value.
+            if let ast::ExprKind::Name(cls_name) = &base.kind
+                && let Some(class_id) = lookup_class(cls_name)
+            {
+                return lower_class_name_method_call(class_id, method, *method_span, &args, ctx);
             }
             let base_ir = lower_expr(base, ctx)?;
             // User class instance method
@@ -13129,7 +13545,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             let value = lower_expr(operand, ctx)?;
             match op {
                 ast::UnaryOp::Not => {
-                    let value = to_bool(value, operand.span)?;
+                    let value = to_bool(value, operand.span, ctx)?;
                     Ok(ir::Expr {
                         ty: ir::Ty::Bool,
                         kind: ir::ExprKind::Unary {
@@ -15797,6 +16213,12 @@ fn lower_call(
             span,
         ));
     }
+    // Inside @classmethod: `cls(...)` constructs the owning class.
+    if let Some((cls_name, class_id)) = ctx.classmethod_cls.clone()
+        && func == cls_name
+    {
+        return lower_class_construct(class_id, func, args, keywords, kwargs, span, ctx);
+    }
     // Class construction: `Point(1, 2)` → allocate + `__init__`.
     // Bare name in current module, or imported class binding.
     if let Some(class_id) = lookup_class(func) {
@@ -15916,6 +16338,73 @@ fn lower_call(
             }
         };
         return lower_call_closure_value(&clos_expr, args, keywords, kwargs, span, ctx);
+    }
+    // Bound method value: `f = obj.m; f(args)`
+    if let Some(ty) = closure_ty
+        && let ir::Ty::BoundMethod {
+            params,
+            ret,
+            func: direct,
+            is_virtual: virt,
+            class_id,
+        } = ty
+    {
+        let bound = if ctx.locals.contains_key(func) {
+            ir::Expr {
+                ty,
+                kind: ir::ExprKind::Local(func.to_string()),
+            }
+        } else {
+            ir::Expr {
+                ty,
+                kind: ir::ExprKind::GlobalLoad(ctx.own_global(func)),
+            }
+        };
+        let plain = require_plain_args(args, "bound method", span)?;
+        if plain.len() != params.len() {
+            return Err(err(
+                format!(
+                    "bound method takes {} argument(s) ({} given)",
+                    params.len(),
+                    plain.len()
+                ),
+                span,
+            ));
+        }
+        if !keywords.is_empty() || kwargs.is_some() {
+            return Err(err(
+                "keyword arguments on bound methods are not supported yet",
+                span,
+            ));
+        }
+        let mut arg_irs = Vec::new();
+        for (i, a) in plain.iter().enumerate() {
+            let v = lower_expr(a, ctx)?;
+            arg_irs.push(coerce(v, params[i], a.span, "bound method argument")?);
+        }
+        let mut candidates = Vec::new();
+        if virt {
+            for sid in subclasses_of(class_id) {
+                // method short name is the last segment of direct... use resolve from class
+                if let Some(info) = class_info(class_id) {
+                    let mname = direct.rsplit('.').next().unwrap_or(direct);
+                    if let Some(func) = resolve_method(sid, mname) {
+                        candidates.push((sid, func));
+                    }
+                    let _ = info;
+                }
+            }
+        }
+        return Ok(ir::Expr {
+            ty: *ret,
+            kind: ir::ExprKind::CallBoundMethod {
+                bound: Box::new(bound),
+                args: arg_irs,
+                direct_func: direct.to_string(),
+                candidates,
+                virtual_dispatch: virt,
+            },
+        });
     }
     // a function defined in this module
     if ctx.funcs().contains_key(func) {
@@ -16113,6 +16602,20 @@ fn lower_call(
                     ));
                 }
                 let arg = lower_expr(args[0], ctx)?;
+                if let ir::Ty::Class(id) = arg.ty {
+                    if resolve_method(id, "__len__").is_some() {
+                        let call =
+                            lower_instance_method_call(arg, id, "__len__", args[0].span, &[], ctx)?;
+                        if call.ty != ir::Ty::Int {
+                            return Err(err("__len__ must return int", args[0].span));
+                        }
+                        return Ok(call);
+                    }
+                    return Err(err(
+                        format!("object of type '{}' has no len()", arg.ty),
+                        args[0].span,
+                    ));
+                }
                 if !matches!(
                     arg.ty,
                     ir::Ty::Str
@@ -16843,7 +17346,7 @@ fn lower_any_all(
             }),
         },
     };
-    let truth = to_bool(elem, span)?;
+    let truth = to_bool_default(elem, span)?;
     let update = if is_any {
         // if truth: acc = True
         ir::Stmt::If {

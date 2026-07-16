@@ -161,6 +161,13 @@ pub struct Keyword {
     pub value: Expr,
 }
 
+/// Decorator on a function: bare name only (`@staticmethod`, `@deco`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Decorator {
+    pub name: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDef {
     pub name: String,
@@ -174,6 +181,8 @@ pub struct FuncDef {
     pub body: Vec<Stmt>,
     /// Span of the `def name(...)` header, for diagnostics.
     pub span: Span,
+    /// Decorators applied above the def (`@staticmethod`, `@property`, …).
+    pub decorators: Vec<Decorator>,
 }
 
 /// `class Name[(Base, ...)]:` body.
