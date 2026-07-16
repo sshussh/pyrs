@@ -63,6 +63,9 @@ pub enum Ty {
     Generator {
         yield_ty: &'static Ty,
     },
+    /// First-class exception instance (`except E as e`). Heap object with a
+    /// fixed exception type tag and message; never freed. Not a user class.
+    Exception,
 }
 
 /// Intern a list type: `list_of(Ty::Int)` is `list[int]`.
@@ -89,8 +92,8 @@ pub fn set_of(elem: Ty) -> Ty {
 }
 
 /// Total order for union members: None < Bool < Int < Float < Str < List <
-/// Tuple < Dict < Set < File < Closure < Cell < Generator. Nested containers
-/// compare recursively. Unions should not nest (flatten first).
+/// Tuple < Dict < Set < File < Closure < Cell < Generator < Exception.
+/// Nested containers compare recursively. Unions should not nest (flatten first).
 pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     fn rank(t: &Ty) -> u8 {
@@ -109,6 +112,7 @@ pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
             Ty::Closure { .. } => 11,
             Ty::Cell(_) => 12,
             Ty::Generator { .. } => 13,
+            Ty::Exception => 14,
         }
     }
     match (a, b) {
@@ -313,13 +317,15 @@ impl std::fmt::Display for Ty {
             }
             Ty::Cell(inner) => write!(f, "cell[{inner}]"),
             Ty::Generator { yield_ty } => write!(f, "generator[{yield_ty}]"),
+            Ty::Exception => write!(f, "exception"),
         }
     }
 }
 
 /// Exception type tags matching the C runtime (`pyrs_raise` / handlers).
-/// Flat equality match — no OSError hierarchy (`except OSError` does not
-/// catch `FileNotFoundError`). OTHER=99 is catchable only by bare `except:`.
+/// Matching uses CPython-like subclass checks for `Exception` and `OSError`
+/// (see `ExcType::matches_raised` / `pyrs_exc_matches`). OTHER=99 is catchable
+/// by bare `except:` and by `except Exception:`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcType {
     ValueError = 1,
@@ -328,7 +334,8 @@ pub enum ExcType {
     ZeroDivisionError = 4,
     TypeError = 5,
     RuntimeError = 6,
-    /// Injected by `generator.close()` (CPython BaseException subclass).
+    /// Injected by `generator.close()` (CPython BaseException subclass only —
+    /// not under Exception).
     GeneratorExit = 7,
     OverflowError = 8,
     EOFError = 9,
@@ -338,6 +345,10 @@ pub enum ExcType {
     UnboundLocalError = 13,
     /// User-level catch; generator protocol still uses exhaustion as Optional.
     StopIteration = 14,
+    /// Base of the Exception hierarchy (not GeneratorExit).
+    Exception = 15,
+    PermissionError = 16,
+    IsADirectoryError = 17,
 }
 
 impl ExcType {
@@ -357,6 +368,9 @@ impl ExcType {
             ExcType::NameError => "NameError",
             ExcType::UnboundLocalError => "UnboundLocalError",
             ExcType::StopIteration => "StopIteration",
+            ExcType::Exception => "Exception",
+            ExcType::PermissionError => "PermissionError",
+            ExcType::IsADirectoryError => "IsADirectoryError",
         }
     }
 
@@ -364,10 +378,27 @@ impl ExcType {
         self as i32
     }
 
+    /// Whether a handler filtering on `self` catches a raised exception of
+    /// type `raised` (CPython subclass rules for Exception / OSError).
+    pub fn matches_raised(self, raised: ExcType) -> bool {
+        if self == raised {
+            return true;
+        }
+        match self {
+            ExcType::Exception => raised != ExcType::GeneratorExit,
+            ExcType::OSError => matches!(
+                raised,
+                ExcType::FileNotFoundError | ExcType::PermissionError | ExcType::IsADirectoryError
+            ),
+            _ => false,
+        }
+    }
+
     pub fn all_names() -> &'static str {
         "ValueError, KeyError, IndexError, ZeroDivisionError, TypeError, \
          RuntimeError, GeneratorExit, OverflowError, EOFError, FileNotFoundError, \
-         OSError, NameError, UnboundLocalError, StopIteration"
+         OSError, NameError, UnboundLocalError, StopIteration, Exception, \
+         PermissionError, IsADirectoryError"
     }
 }
 
@@ -660,11 +691,25 @@ pub enum ExprKind {
     /// `type_tags` are print/member tags: -1=None, 0=int, 1=float, 2=bool,
     /// 3=str, 4=any list (tag%8==4), 5=tuple, 6=dict, 7=set. When
     /// `bool_is_int` is true, tag 2 also matches an int check (CPython).
+    /// When the union includes `Exception` and `exc_filters` is non-empty, the
+    /// Exception member is checked via hierarchy on the payload (not print tag).
     IsInstance {
         value: Box<Expr>,
         type_tags: Vec<i32>,
         bool_is_int: bool,
+        /// `ExcType` tags for hierarchy match when the active union member is
+        /// `Exception`. Empty if no exception filters were requested.
+        exc_filters: Vec<i32>,
     },
+    /// Runtime `isinstance(exc, ExcType)` / tuple of exception types when
+    /// `value` is an exception object. Filters are `ExcType` tags; matching
+    /// uses the OSError / Exception hierarchy (`pyrs_exc_matches`).
+    ExcIsInstance {
+        value: Box<Expr>,
+        filters: Vec<i32>,
+    },
+    /// `str(exc)` for an exception object → message body.
+    ExcToStr(Box<Expr>),
     /// `list.pop(index)`; index defaults to -1 (the last element).
     ListPop {
         list: Box<Expr>,
@@ -1026,4 +1071,39 @@ pub enum StrFn {
     IsUpper,
     /// `s.islower()` -> bool (ASCII: >=1 letter, all letters lower)
     IsLower,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExcType;
+
+    #[test]
+    fn matches_raised_equality() {
+        assert!(ExcType::ValueError.matches_raised(ExcType::ValueError));
+        assert!(!ExcType::ValueError.matches_raised(ExcType::KeyError));
+        assert!(ExcType::OSError.matches_raised(ExcType::OSError));
+        assert!(ExcType::Exception.matches_raised(ExcType::Exception));
+    }
+
+    #[test]
+    fn matches_raised_oserror_hierarchy() {
+        assert!(ExcType::OSError.matches_raised(ExcType::FileNotFoundError));
+        assert!(ExcType::OSError.matches_raised(ExcType::PermissionError));
+        assert!(ExcType::OSError.matches_raised(ExcType::IsADirectoryError));
+        assert!(!ExcType::OSError.matches_raised(ExcType::ValueError));
+        assert!(!ExcType::OSError.matches_raised(ExcType::Exception));
+        assert!(!ExcType::FileNotFoundError.matches_raised(ExcType::OSError));
+    }
+
+    #[test]
+    fn matches_raised_exception_base() {
+        assert!(ExcType::Exception.matches_raised(ExcType::ValueError));
+        assert!(ExcType::Exception.matches_raised(ExcType::OSError));
+        assert!(ExcType::Exception.matches_raised(ExcType::FileNotFoundError));
+        assert!(ExcType::Exception.matches_raised(ExcType::StopIteration));
+        // GeneratorExit is BaseException-only in CPython.
+        assert!(!ExcType::Exception.matches_raised(ExcType::GeneratorExit));
+        assert!(ExcType::GeneratorExit.matches_raised(ExcType::GeneratorExit));
+        assert!(!ExcType::GeneratorExit.matches_raised(ExcType::Exception));
+    }
 }

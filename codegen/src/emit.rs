@@ -46,7 +46,8 @@ fn lty(ty: Ty) -> &'static str {
         | Ty::File
         | Ty::Closure { .. }
         | Ty::Cell(_)
-        | Ty::Generator { .. } => "ptr",
+        | Ty::Generator { .. }
+        | Ty::Exception => "ptr",
         // Value-level None (expression); not the void function return.
         Ty::None => "i8",
         Ty::Union(_) => "{ i32, i64 }",
@@ -88,6 +89,8 @@ fn elem_tag(ty: &Ty) -> u32 {
         // Closures / generators as list/dict values (pointer slots).
         Ty::Closure { .. } => 9,
         Ty::Generator { .. } => 10,
+        // Exception objects: union-box print tag only (not list/dict elements).
+        Ty::Exception => 11,
         Ty::File | Ty::None | Ty::Cell(_) => {
             unreachable!("no print tag for {ty:?}")
         }
@@ -302,6 +305,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | IntToStr(operand)
         | FloatToStr(operand)
         | BoolToStr(operand)
+        | ExcToStr(operand)
         | StrRepr(operand)
         | StrAscii(operand)
         | IsNone { value: operand, .. }
@@ -374,7 +378,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         Contains { needle, haystack } => {
             max_try_depth_in_expr(needle).max(max_try_depth_in_expr(haystack))
         }
-        IsInstance { value, .. } => max_try_depth_in_expr(value),
+        IsInstance { value, .. } | ExcIsInstance { value, .. } => max_try_depth_in_expr(value),
         SetUnion { left, right } => max_try_depth_in_expr(left).max(max_try_depth_in_expr(right)),
         ListPop { list, index } | ListIndexOf { list, value: index } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
@@ -483,6 +487,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | IntToStr(operand)
         | FloatToStr(operand)
         | BoolToStr(operand)
+        | ExcToStr(operand)
         | StrRepr(operand)
         | StrAscii(operand)
         | IsNone { value: operand, .. }
@@ -543,7 +548,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         Contains { needle, haystack } => {
             count_yields_in_expr(needle) + count_yields_in_expr(haystack)
         }
-        IsInstance { value, .. } => count_yields_in_expr(value),
+        IsInstance { value, .. } | ExcIsInstance { value, .. } => count_yields_in_expr(value),
         SetUnion { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
         ListPop { list, index } | ListIndexOf { list, value: index } => {
             count_yields_in_expr(list) + count_yields_in_expr(index)
@@ -602,6 +607,11 @@ impl Emitter {
         out.push_str("declare void @pyrs_try_pop()\n");
         out.push_str("declare i32 @pyrs_exc_type()\n");
         out.push_str("declare ptr @pyrs_exc_message()\n");
+        out.push_str("declare ptr @pyrs_exc_object()\n");
+        out.push_str("declare void @pyrs_print_exc(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_from_exc(ptr)\n");
+        out.push_str("declare i32 @pyrs_exc_matches(i32, i32)\n");
+        out.push_str("declare i32 @pyrs_exc_isinstance(ptr, i32)\n");
         out.push_str("declare void @pyrs_exc_clear()\n");
         out.push_str("declare ptr @pyrs_tuple_new(i64)\n");
         out.push_str("declare void @pyrs_tuple_set(ptr, i64, i64, i32)\n");
@@ -799,7 +809,8 @@ impl Emitter {
                 | Ty::File
                 | Ty::Closure { .. }
                 | Ty::Cell(_)
-                | Ty::Generator { .. } => "null".to_string(),
+                | Ty::Generator { .. }
+                | Ty::Exception => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
                 _ => "0".to_string(),
             };
@@ -1264,7 +1275,8 @@ impl Emitter {
             | Ty::File
             | Ty::Closure { .. }
             | Ty::Cell(_)
-            | Ty::Generator { .. } => {
+            | Ty::Generator { .. }
+            | Ty::Exception => {
                 let t = self.tmp();
                 self.line(format!("{t} = ptrtoint ptr {value} to i64"));
                 t
@@ -1321,7 +1333,8 @@ impl Emitter {
             | Ty::File
             | Ty::Closure { .. }
             | Ty::Cell(_)
-            | Ty::Generator { .. } => {
+            | Ty::Generator { .. }
+            | Ty::Exception => {
                 let t = self.tmp();
                 self.line(format!("{t} = inttoptr i64 {slot} to ptr"));
                 t
@@ -1509,6 +1522,7 @@ impl Emitter {
                 self.line(format!("call void @pyrs_print_bool(i32 {ext})"));
             }
             Ty::Str => self.line(format!("call void @pyrs_print_str(ptr {v})")),
+            Ty::Exception => self.line(format!("call void @pyrs_print_exc(ptr {v})")),
             Ty::List(elem) => self.line(format!(
                 "call void @pyrs_print_list(ptr {v}, i32 {})",
                 elem_tag(elem)
@@ -1594,7 +1608,8 @@ impl Emitter {
                 | Ty::File
                 | Ty::Closure { .. }
                 | Ty::Cell(_)
-                | Ty::Generator { .. } => "null".to_string(),
+                | Ty::Generator { .. }
+                | Ty::Exception => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
                 _ => "0".to_string(),
             };
@@ -2576,10 +2591,12 @@ impl Emitter {
                 value,
                 type_tags,
                 bool_is_int,
+                exc_filters,
             } => {
                 // Locals/unions store `{ i32 member_index, i64 payload }` by value
                 // (not a heap box). Match member_index against members whose
                 // print-tag satisfies any of `type_tags` (list=4 means any list).
+                // Exception members use hierarchy filters on the payload.
                 let v = self.emit_expr(value);
                 let Ty::Union(members) = value.ty else {
                     // Monomorphic path should have been folded in semantic.
@@ -2589,8 +2606,15 @@ impl Emitter {
                 };
                 let idx = self.tmp();
                 self.line(format!("{idx} = extractvalue {{ i32, i64 }} {v}, 0"));
+                let payload = self.tmp();
+                self.line(format!("{payload} = extractvalue {{ i32, i64 }} {v}, 1"));
                 let mut matching: Vec<usize> = Vec::new();
+                let mut exc_member: Option<usize> = None;
                 for (i, m) in members.iter().enumerate() {
+                    if *m == Ty::Exception {
+                        exc_member = Some(i);
+                        continue; // never match Exception via print tags alone
+                    }
                     let ptag = member_print_tag(*m);
                     let hit = type_tags.iter().any(|&want| {
                         if want == 4 {
@@ -2606,16 +2630,39 @@ impl Emitter {
                         matching.push(i);
                     }
                 }
-                if matching.is_empty() {
-                    let f = self.tmp();
-                    self.line(format!("{f} = add i1 0, 0"));
-                    f
-                } else {
-                    let mut acc: Option<String> = None;
-                    for i in matching {
+                let mut acc: Option<String> = None;
+                for i in matching {
+                    let cmp = self.tmp();
+                    self.line(format!("{cmp} = icmp eq i32 {idx}, {i}"));
+                    acc = Some(match acc {
+                        None => cmp,
+                        Some(prev) => {
+                            let or = self.tmp();
+                            self.line(format!("{or} = or i1 {prev}, {cmp}"));
+                            or
+                        }
+                    });
+                }
+                // Exception member: only load/check hierarchy when active.
+                if let (Some(ei), true) = (exc_member, !exc_filters.is_empty()) {
+                    let is_exc = self.tmp();
+                    self.line(format!("{is_exc} = icmp eq i32 {idx}, {ei}"));
+                    let yes_l = self.fresh_block("isinstance.exc.yes");
+                    let no_l = self.fresh_block("isinstance.exc.no");
+                    let end_l = self.fresh_block("isinstance.exc.end");
+                    self.line(format!("br i1 {is_exc}, label %{yes_l}, label %{no_l}"));
+
+                    self.start_block(&yes_l);
+                    let exc_ptr = self.value_from_slot(&payload, Ty::Exception);
+                    let mut exc_hit: Option<String> = None;
+                    for &f in exc_filters {
+                        let m = self.tmp();
+                        self.line(format!(
+                            "{m} = call i32 @pyrs_exc_isinstance(ptr {exc_ptr}, i32 {f})"
+                        ));
                         let cmp = self.tmp();
-                        self.line(format!("{cmp} = icmp eq i32 {idx}, {i}"));
-                        acc = Some(match acc {
+                        self.line(format!("{cmp} = icmp ne i32 {m}, 0"));
+                        exc_hit = Some(match exc_hit {
                             None => cmp,
                             Some(prev) => {
                                 let or = self.tmp();
@@ -2624,7 +2671,35 @@ impl Emitter {
                             }
                         });
                     }
-                    acc.unwrap()
+                    let yes_v = exc_hit.unwrap();
+                    let yes_pred = self.cur_block.clone();
+                    self.line(format!("br label %{end_l}"));
+
+                    self.start_block(&no_l);
+                    let no_pred = self.cur_block.clone();
+                    self.line(format!("br label %{end_l}"));
+
+                    self.start_block(&end_l);
+                    let exc_ok = self.tmp();
+                    self.line(format!(
+                        "{exc_ok} = phi i1 [ {yes_v}, %{yes_pred} ], [ false, %{no_pred} ]"
+                    ));
+                    acc = Some(match acc {
+                        None => exc_ok,
+                        Some(prev) => {
+                            let or = self.tmp();
+                            self.line(format!("{or} = or i1 {prev}, {exc_ok}"));
+                            or
+                        }
+                    });
+                }
+                match acc {
+                    Some(a) => a,
+                    None => {
+                        let f = self.tmp();
+                        self.line(format!("{f} = add i1 0, 0"));
+                        f
+                    }
                 }
             }
             ExprKind::SetUnion { left, right } => {
@@ -2860,6 +2935,37 @@ impl Emitter {
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_str_from_bool(i32 {ext})"));
                 t
+            }
+            ExprKind::ExcToStr(inner) => {
+                let v = self.emit_expr(inner);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_str_from_exc(ptr {v})"));
+                t
+            }
+            ExprKind::ExcIsInstance { value, filters } => {
+                let v = self.emit_expr(value);
+                if filters.is_empty() {
+                    let t = self.tmp();
+                    self.line(format!("{t} = add i1 0, 0"));
+                    return t;
+                }
+                let mut acc = String::new();
+                for (j, &f) in filters.iter().enumerate() {
+                    let m = self.tmp();
+                    self.line(format!(
+                        "{m} = call i32 @pyrs_exc_isinstance(ptr {v}, i32 {f})"
+                    ));
+                    let cmp = self.tmp();
+                    self.line(format!("{cmp} = icmp ne i32 {m}, 0"));
+                    if j == 0 {
+                        acc = cmp;
+                    } else {
+                        let or = self.tmp();
+                        self.line(format!("{or} = or i1 {acc}, {cmp}"));
+                        acc = or;
+                    }
+                }
+                acc
             }
             ExprKind::ToBool(inner) => {
                 let v = self.emit_expr(inner);
@@ -3678,16 +3784,27 @@ impl Emitter {
                     self.line(format!("br label %{match_l}"));
                 }
                 Some(excs) if excs.len() == 1 => {
+                    // Hierarchy: OSError catches FileNotFoundError, etc.
+                    let m = self.tmp();
+                    self.line(format!(
+                        "{m} = call i32 @pyrs_exc_matches(i32 {}, i32 {ety})",
+                        excs[0].tag()
+                    ));
                     let cmp = self.tmp();
-                    self.line(format!("{cmp} = icmp eq i32 {ety}, {}", excs[0].tag()));
+                    self.line(format!("{cmp} = icmp ne i32 {m}, 0"));
                     self.line(format!("br i1 {cmp}, label %{match_l}, label %{nomatch_l}"));
                 }
                 Some(excs) => {
-                    // Multi-type `except (A, B, …):` — OR of equality matches.
+                    // Multi-type `except (A, B, …):` — OR of hierarchy matches.
                     let mut acc = String::new();
                     for (j, exc) in excs.iter().enumerate() {
+                        let m = self.tmp();
+                        self.line(format!(
+                            "{m} = call i32 @pyrs_exc_matches(i32 {}, i32 {ety})",
+                            exc.tag()
+                        ));
                         let cmp = self.tmp();
-                        self.line(format!("{cmp} = icmp eq i32 {ety}, {}", exc.tag()));
+                        self.line(format!("{cmp} = icmp ne i32 {m}, 0"));
                         if j == 0 {
                             acc = cmp;
                         } else {
@@ -3701,20 +3818,21 @@ impl Emitter {
             }
             self.start_block(&match_l);
             if let Some(name) = bind {
-                let msg = self.tmp();
-                self.line(format!("{msg} = call ptr @pyrs_exc_message()"));
+                // Bind a first-class exception object (type tag + message).
+                let obj = self.tmp();
+                self.line(format!("{obj} = call ptr @pyrs_exc_object()"));
                 // Generators store locals in the frame, not `%v.*` allocas.
                 if let (Some(frame), Some(idx)) = (
                     self.gen_frame.clone(),
                     self.gen_local_index.get(name).copied(),
                 ) {
                     let slot = self.tmp();
-                    self.line(format!("{slot} = ptrtoint ptr {msg} to i64"));
+                    self.line(format!("{slot} = ptrtoint ptr {obj} to i64"));
                     self.line(format!(
                         "call void @pyrs_gen_set_local(ptr {frame}, i64 {idx}, i64 {slot})"
                     ));
                 } else {
-                    self.line(format!("store ptr {msg}, ptr %v.{name}"));
+                    self.line(format!("store ptr {obj}, ptr %v.{name}"));
                 }
             }
             self.line("call void @pyrs_exc_clear()");
@@ -4212,6 +4330,11 @@ impl Emitter {
                 let t = self.tmp();
                 self.line(format!("{t} = icmp ne i64 {len}, 0"));
                 t
+            }
+            // Exception instances are always truthy (CPython BaseException).
+            Ty::Exception => {
+                let _ = v;
+                "true".to_string()
             }
             Ty::Union(members) => {
                 // If tag is None → false; else truthiness of active member payload.

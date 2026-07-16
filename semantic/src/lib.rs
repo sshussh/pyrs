@@ -284,6 +284,9 @@ fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
             if v == ir::Ty::File {
                 return Err(err("dict values cannot be file", span));
             }
+            if v == ir::Ty::Exception {
+                return Err(err("dict values cannot be exception objects", span));
+            }
             Ok(ir::dict_of(k, v))
         }
         ast::TypeName::Set(e) => {
@@ -296,13 +299,20 @@ fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
             if elem == ir::Ty::File {
                 return Err(err("list elements cannot be file", span));
             }
+            if elem == ir::Ty::Exception {
+                return Err(err("list elements cannot be exception objects", span));
+            }
             Ok(ir::list_of(elem))
         }
         ast::TypeName::Tuple(elems) => {
             let mut ts = Vec::with_capacity(elems.len());
             for e in elems {
                 let t = resolve_type_checked(*e, span)?;
-                if t == ir::Ty::None || matches!(t, ir::Ty::Union(_)) || t == ir::Ty::File {
+                if t == ir::Ty::None
+                    || matches!(t, ir::Ty::Union(_))
+                    || t == ir::Ty::File
+                    || t == ir::Ty::Exception
+                {
                     return Err(err(
                         format!("tuple elements of type {t} are not supported"),
                         span,
@@ -329,9 +339,25 @@ fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
 fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Ty> {
     match ty {
         ir::Ty::File => Err(err("files cannot be stored in lists yet", span)),
+        ir::Ty::Exception => Err(err("exception objects cannot be stored in lists yet", span)),
         // Pure None list elements are allowed only as part of a union annotation
         // path; a bare None elem type is rejected when building untyped lists.
         other => Ok(other),
+    }
+}
+
+/// Reject exception objects as container elements (no print-slot encoding yet).
+fn reject_exception_container_elem(ty: ir::Ty, span: Span, what: &str) -> SResult<()> {
+    match ty {
+        ir::Ty::Exception => Err(err(
+            format!("exception objects cannot be stored in {what} yet"),
+            span,
+        )),
+        ir::Ty::Union(ms) if ms.contains(&ir::Ty::Exception) => Err(err(
+            format!("unions containing exception objects cannot be stored in {what} yet"),
+            span,
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -365,6 +391,9 @@ fn ast_exc_to_ir(e: ast::ExcType) -> ir::ExcType {
         ast::ExcType::NameError => ir::ExcType::NameError,
         ast::ExcType::UnboundLocalError => ir::ExcType::UnboundLocalError,
         ast::ExcType::StopIteration => ir::ExcType::StopIteration,
+        ast::ExcType::Exception => ir::ExcType::Exception,
+        ast::ExcType::PermissionError => ir::ExcType::PermissionError,
+        ast::ExcType::IsADirectoryError => ir::ExcType::IsADirectoryError,
     }
 }
 
@@ -1814,10 +1843,10 @@ fn collect_assign_types_in(
             } => {
                 collect_assign_types_in(body, env, out, annotated);
                 for h in handlers {
-                    // except as e → str
+                    // except as e → exception object
                     if let Some((n, _)) = &h.bind {
-                        out.entry(n.clone()).or_insert(ir::Ty::Str);
-                        env.insert(n.clone(), ir::Ty::Str);
+                        out.entry(n.clone()).or_insert(ir::Ty::Exception);
+                        env.insert(n.clone(), ir::Ty::Exception);
                     }
                     collect_assign_types_in(&h.body, env, out, annotated);
                 }
@@ -6058,19 +6087,19 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     // always a function local (even in the entry function), so
                     // codegen can store to %v.<name>
                     if let Some(existing) = ctx.locals.get(n) {
-                        if *existing != ir::Ty::Str {
+                        if *existing != ir::Ty::Exception {
                             ctx.try_depth -= 1;
                             return Err(err(
                                 format!(
                                     "type mismatch in assignment to '{n}': expected \
-                                     {existing}, found str"
+                                     {existing}, found exception"
                                 ),
                                 *span,
                             ));
                         }
                     } else {
-                        ctx.locals.insert(n.clone(), ir::Ty::Str);
-                        ctx.locals_order.push((n.clone(), ir::Ty::Str));
+                        ctx.locals.insert(n.clone(), ir::Ty::Exception);
+                        ctx.locals_order.push((n.clone(), ir::Ty::Exception));
                     }
                     Some(n.clone())
                 } else {
@@ -7486,9 +7515,12 @@ fn name_to_exc_type(name: &str, span: Span) -> SResult<ir::ExcType> {
         "NameError" => Ok(ir::ExcType::NameError),
         "UnboundLocalError" => Ok(ir::ExcType::UnboundLocalError),
         "StopIteration" => Ok(ir::ExcType::StopIteration),
+        "Exception" => Ok(ir::ExcType::Exception),
+        "PermissionError" => Ok(ir::ExcType::PermissionError),
+        "IsADirectoryError" => Ok(ir::ExcType::IsADirectoryError),
         _ => Err(err(
             format!(
-                "unsupported exception type '{name}' for throw() (supported: {})",
+                "unsupported exception type '{name}' (supported: {})",
                 ir::ExcType::all_names()
             ),
             span,
@@ -9618,7 +9650,8 @@ fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
         | ir::Ty::Tuple(_)
         | ir::Ty::Dict { .. }
         | ir::Ty::Set(_)
-        | ir::Ty::Union(_) => Ok(ir::Expr {
+        | ir::Ty::Union(_)
+        | ir::Ty::Exception => Ok(ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::ToBool(Box::new(value)),
         }),
@@ -11283,6 +11316,7 @@ fn lower_list_lit(
             elem_of(ty, span)?
         }
     };
+    reject_exception_container_elem(elem, span, "lists")?;
 
     if !has_star {
         let mut coerced = Vec::new();
@@ -11370,11 +11404,17 @@ fn lower_tuple_lit(
     let mut lowered = Vec::new();
     for item in items {
         let e = lower_expr(item, ctx)?;
-        if e.ty == ir::Ty::None || e.ty == ir::Ty::File {
+        if e.ty == ir::Ty::None || e.ty == ir::Ty::File || e.ty == ir::Ty::Exception {
             return Err(err(format!("tuple elements cannot be {}", e.ty), item.span));
         }
         if matches!(e.ty, ir::Ty::Cell(_)) {
             return Err(err(format!("tuple elements cannot be {}", e.ty), item.span));
+        }
+        if matches!(e.ty, ir::Ty::Union(ms) if ms.contains(&ir::Ty::Exception)) {
+            return Err(err(
+                "tuple elements cannot be unions containing exception objects",
+                item.span,
+            ));
         }
         lowered.push((e, item.span));
     }
@@ -11462,12 +11502,13 @@ fn lower_dict_lit(
         }
     };
     check_hashable_key(key_ty, span, "dict")?;
-    if val_ty == ir::Ty::File {
+    if val_ty == ir::Ty::File || val_ty == ir::Ty::Exception {
         return Err(err(
             format!("dict values of type {val_ty} are not supported"),
             span,
         ));
     }
+    reject_exception_container_elem(val_ty, span, "dicts")?;
     let mut out_pairs = Vec::new();
     for (kr, kspan, vr, vspan) in pairs {
         let k = coerce(kr, key_ty, kspan, "dict key")?;
@@ -13284,6 +13325,8 @@ enum IsInstancePat {
     Dict,
     Set,
     None,
+    /// Exception hierarchy type (`ValueError`, `OSError`, `Exception`, …).
+    Exc(ir::ExcType),
 }
 
 fn parse_isinstance_type_arg(e: &ast::Expr) -> SResult<Vec<IsInstancePat>> {
@@ -13303,7 +13346,8 @@ fn parse_isinstance_type_arg(e: &ast::Expr) -> SResult<Vec<IsInstancePat>> {
         // type(None) if written as a call — not supported; require None or name.
         _ => Err(err(
             "isinstance() second argument must be a type name (int, float, bool, str, \
-             list, tuple, dict, set, None) or a tuple of those — not a variable or expression",
+             list, tuple, dict, set, None, or an exception type) or a tuple of those \
+             — not a variable or expression",
             e.span,
         )),
     }
@@ -13320,13 +13364,17 @@ fn name_to_isinstance_pat(name: &str, span: Span) -> SResult<IsInstancePat> {
         "dict" => Ok(IsInstancePat::Dict),
         "set" => Ok(IsInstancePat::Set),
         "None" => Ok(IsInstancePat::None),
-        _ => Err(err(
-            format!(
-                "isinstance() does not support type '{name}' (supported: int, float, bool, \
-                 str, list, tuple, dict, set, None)"
-            ),
-            span,
-        )),
+        // Exception types: ValueError, OSError, Exception, GeneratorExit, …
+        other => match name_to_exc_type(other, span) {
+            Ok(t) => Ok(IsInstancePat::Exc(t)),
+            Err(_) => Err(err(
+                format!(
+                    "isinstance() does not support type '{name}' (supported: int, float, bool, \
+                     str, list, tuple, dict, set, None, and exception types)"
+                ),
+                span,
+            )),
+        },
     }
 }
 
@@ -13341,20 +13389,23 @@ fn isinstance_pat_matches(ty: ir::Ty, pat: IsInstancePat) -> bool {
         IsInstancePat::Dict => matches!(ty, ir::Ty::Dict { .. }),
         IsInstancePat::Set => matches!(ty, ir::Ty::Set(_)),
         IsInstancePat::None => matches!(ty, ir::Ty::None),
+        // Exception instances always need a runtime type-tag check.
+        IsInstancePat::Exc(_) => false,
     }
 }
 
-fn isinstance_pat_tag(pat: IsInstancePat) -> i32 {
+fn isinstance_pat_tag(pat: IsInstancePat) -> Option<i32> {
     match pat {
-        IsInstancePat::Int => 0,
-        IsInstancePat::Float => 1,
-        IsInstancePat::Bool => 2,
-        IsInstancePat::Str => 3,
-        IsInstancePat::List => 4, // any list: tag % 8 == 4
-        IsInstancePat::Tuple => 5,
-        IsInstancePat::Dict => 6,
-        IsInstancePat::Set => 7,
-        IsInstancePat::None => -1,
+        IsInstancePat::Int => Some(0),
+        IsInstancePat::Float => Some(1),
+        IsInstancePat::Bool => Some(2),
+        IsInstancePat::Str => Some(3),
+        IsInstancePat::List => Some(4), // any list: tag % 8 == 4
+        IsInstancePat::Tuple => Some(5),
+        IsInstancePat::Dict => Some(6),
+        IsInstancePat::Set => Some(7),
+        IsInstancePat::None => Some(-1),
+        IsInstancePat::Exc(_) => None,
     }
 }
 
@@ -13375,25 +13426,75 @@ fn lower_isinstance(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult
         _ => value,
     };
     let pats = parse_isinstance_type_arg(args[1])?;
-    let bool_is_int = pats.contains(&IsInstancePat::Int);
+    let exc_filters: Vec<i32> = pats
+        .iter()
+        .filter_map(|p| match p {
+            IsInstancePat::Exc(t) => Some(t.tag()),
+            _ => None,
+        })
+        .collect();
+    let value_pats: Vec<IsInstancePat> = pats
+        .iter()
+        .copied()
+        .filter(|p| !matches!(p, IsInstancePat::Exc(_)))
+        .collect();
+    let bool_is_int = value_pats.contains(&IsInstancePat::Int);
 
-    // Static fold when monomorphic.
+    // Exception objects: runtime hierarchy check (tag lives inside the object).
+    if value.ty == ir::Ty::Exception {
+        if exc_filters.is_empty() {
+            // isinstance(exc, int) etc. is always false.
+            return Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::ConstBool(false),
+            });
+        }
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ExcIsInstance {
+                value: Box::new(value),
+                filters: exc_filters,
+            },
+        });
+    }
+
+    // Static fold when monomorphic (non-exception).
     if !matches!(value.ty, ir::Ty::Union(_)) {
-        let hit = pats.iter().any(|p| isinstance_pat_matches(value.ty, *p));
+        // Non-exception values are never instances of exception types.
+        let hit = value_pats
+            .iter()
+            .any(|p| isinstance_pat_matches(value.ty, *p));
         return Ok(ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::ConstBool(hit),
         });
     }
 
-    // Union: runtime tag test.
-    let type_tags: Vec<i32> = pats.iter().map(|p| isinstance_pat_tag(*p)).collect();
+    // Union: runtime member-index test; Exception member uses hierarchy filters.
+    let type_tags: Vec<i32> = value_pats
+        .iter()
+        .filter_map(|p| isinstance_pat_tag(*p))
+        .collect();
+    let has_exc_member = matches!(value.ty, ir::Ty::Union(ms) if ms.contains(&ir::Ty::Exception));
+    let exc_filters = if has_exc_member {
+        exc_filters
+    } else {
+        // No Exception member → exception-type filters never match.
+        Vec::new()
+    };
+    if type_tags.is_empty() && exc_filters.is_empty() {
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(false),
+        });
+    }
     Ok(ir::Expr {
         ty: ir::Ty::Bool,
         kind: ir::ExprKind::IsInstance {
             value: Box::new(value),
             type_tags,
             bool_is_int,
+            exc_filters,
         },
     })
 }
@@ -14330,7 +14431,8 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             | ir::Ty::List(_)
             | ir::Ty::Tuple(_)
             | ir::Ty::Dict { .. }
-            | ir::Ty::Set(_) => Ok(ir::Expr {
+            | ir::Ty::Set(_)
+            | ir::Ty::Exception => Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::ToBool(Box::new(value)),
             }),
@@ -14349,6 +14451,10 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             ir::Ty::Bool => Ok(ir::Expr {
                 ty: ir::Ty::Str,
                 kind: ir::ExprKind::BoolToStr(Box::new(value)),
+            }),
+            ir::Ty::Exception => Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::ExcToStr(Box::new(value)),
             }),
             other => Err(err(format!("str() cannot convert {other} yet"), span)),
         },
@@ -14665,6 +14771,7 @@ fn lower_is_none(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
                     | ir::Ty::Closure { .. }
                     | ir::Ty::Generator { .. }
                     | ir::Ty::Cell(_)
+                    | ir::Ty::Exception
             );
             if !ptr_like
                 && !matches!(
@@ -16442,6 +16549,95 @@ finally:
         );
         let entry = find_func(&m, ENTRY_NAME);
         assert!(entry.body.iter().any(|s| matches!(s, ir::Stmt::Try { .. })));
+        // `as e` binds a first-class exception object, not str.
+        let e_ty = entry.locals.iter().find(|(n, _)| n == "e").map(|(_, t)| *t);
+        assert_eq!(e_ty, Some(ir::Ty::Exception), "locals: {:?}", entry.locals);
+    }
+
+    #[test]
+    fn except_exception_and_isinstance_lower() {
+        let m = analyze_ok(
+            "\
+try:
+    raise FileNotFoundError(\"x\")
+except OSError as e:
+    print(isinstance(e, OSError))
+    print(str(e))
+try:
+    raise ValueError(\"v\")
+except Exception:
+    print(\"ok\")
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(entry.body.iter().any(|s| matches!(s, ir::Stmt::Try { .. })));
+        fn walk_expr(e: &ir::Expr, f: &mut dyn FnMut(&ir::Expr)) {
+            f(e);
+            match &e.kind {
+                ir::ExprKind::ExcIsInstance { value, .. }
+                | ir::ExprKind::ExcToStr(value)
+                | ir::ExprKind::ToBool(value) => walk_expr(value, f),
+                ir::ExprKind::IsInstance { value, .. } => walk_expr(value, f),
+                _ => {}
+            }
+        }
+        fn walk_stmt(s: &ir::Stmt, f: &mut dyn FnMut(&ir::Expr)) {
+            match s {
+                ir::Stmt::Print(args) => {
+                    for a in args {
+                        walk_expr(a, f);
+                    }
+                }
+                ir::Stmt::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finally,
+                } => {
+                    for st in body.iter().chain(orelse).chain(finally) {
+                        walk_stmt(st, f);
+                    }
+                    for (_, _, hb) in handlers {
+                        for st in hb {
+                            walk_stmt(st, f);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut saw_exc_isinstance = false;
+        let mut saw_exc_to_str = false;
+        for s in &entry.body {
+            walk_stmt(s, &mut |e| match &e.kind {
+                ir::ExprKind::ExcIsInstance { .. } => saw_exc_isinstance = true,
+                ir::ExprKind::ExcToStr(_) => saw_exc_to_str = true,
+                _ => {}
+            });
+        }
+        assert!(
+            saw_exc_isinstance,
+            "expected ExcIsInstance in {:?}",
+            entry.body
+        );
+        assert!(saw_exc_to_str, "expected ExcToStr in {:?}", entry.body);
+    }
+
+    #[test]
+    fn exception_in_list_is_error() {
+        let e = analyze_err(
+            "\
+try:
+    raise ValueError(\"x\")
+except ValueError as e:
+    xs = [e]
+",
+        );
+        assert!(
+            e.message.contains("exception") && e.message.contains("list"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

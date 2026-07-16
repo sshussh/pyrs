@@ -69,8 +69,8 @@ impl std::fmt::Display for TypeName {
 }
 
 /// Exception type name used in `raise` / `except`.
-/// Flat equality match for v1 — no OSError hierarchy (`except OSError` does
-/// not catch `FileNotFoundError`).
+/// Matching uses CPython-like subclass checks for `Exception` and `OSError`
+/// (e.g. `except OSError` catches `FileNotFoundError`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcType {
     ValueError,
@@ -87,6 +87,9 @@ pub enum ExcType {
     NameError,
     UnboundLocalError,
     StopIteration,
+    Exception,
+    PermissionError,
+    IsADirectoryError,
 }
 
 impl ExcType {
@@ -106,6 +109,9 @@ impl ExcType {
             ExcType::NameError => "NameError",
             ExcType::UnboundLocalError => "UnboundLocalError",
             ExcType::StopIteration => "StopIteration",
+            ExcType::Exception => "Exception",
+            ExcType::PermissionError => "PermissionError",
+            ExcType::IsADirectoryError => "IsADirectoryError",
         }
     }
 
@@ -113,7 +119,8 @@ impl ExcType {
     pub fn all_names() -> &'static str {
         "ValueError, KeyError, IndexError, ZeroDivisionError, TypeError, \
          RuntimeError, GeneratorExit, OverflowError, EOFError, FileNotFoundError, \
-         OSError, NameError, UnboundLocalError, StopIteration"
+         OSError, NameError, UnboundLocalError, StopIteration, Exception, \
+         PermissionError, IsADirectoryError"
     }
 }
 
@@ -343,8 +350,7 @@ pub enum Pattern {
 pub struct ExceptHandler {
     /// `None` = bare `except:`. One or more types for `except E:` / `except (A, B):`.
     pub exc: Option<Vec<ExcType>>,
-    /// Optional `as name` binding (exception **message** string at runtime, not
-    /// an exception instance — PyRs has no exception objects yet).
+    /// Optional `as name` binding (exception **object** at runtime).
     pub bind: Option<(String, Span)>,
     pub body: Vec<Stmt>,
 }

@@ -26,9 +26,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* exception type tags — keep in sync with ir::ExcType; OTHER is catchable
- * only by bare `except:` (not by `except RuntimeError`). Flat equality —
- * no OSError hierarchy (except OSError does not catch FileNotFoundError). */
+/* exception type tags — keep in sync with ir::ExcType. Matching uses
+ * CPython-like subclass checks via pyrs_exc_matches (Exception base,
+ * OSError hierarchy). OTHER is catchable by bare `except:` and by
+ * `except Exception:` (not by leaf types like RuntimeError). */
 #define PYRS_EXC_VALUE 1
 #define PYRS_EXC_KEY 2
 #define PYRS_EXC_INDEX 3
@@ -43,6 +44,9 @@
 #define PYRS_EXC_NAME 12
 #define PYRS_EXC_UNBOUNDLOCAL 13
 #define PYRS_EXC_STOPITER 14
+#define PYRS_EXC_EXCEPTION 15
+#define PYRS_EXC_PERMISSION 16
+#define PYRS_EXC_ISADIR 17
 #define PYRS_EXC_OTHER 99
 
 /* value tags for heterogeneous containers */
@@ -65,6 +69,12 @@ typedef struct {
     long long len;
     char data[];
 } PyrsStr;
+
+/* First-class exception instance bound by `except E as e`. Never freed. */
+typedef struct {
+    int type_tag;
+    PyrsStr *msg;
+} PyrsExc;
 
 /* stable header; data grows by reallocation */
 typedef struct {
@@ -121,6 +131,12 @@ static const char *exc_type_name(int ty) {
         return "UnboundLocalError";
     case PYRS_EXC_STOPITER:
         return "StopIteration";
+    case PYRS_EXC_EXCEPTION:
+        return "Exception";
+    case PYRS_EXC_PERMISSION:
+        return "PermissionError";
+    case PYRS_EXC_ISADIR:
+        return "IsADirectoryError";
     default:
         return "Exception";
     }
@@ -134,8 +150,14 @@ static int classify_exc_msg(const char *msg) {
     if (strncmp(msg, "UnboundLocalError", 17) == 0) {
         return PYRS_EXC_UNBOUNDLOCAL;
     }
+    if (strncmp(msg, "IsADirectoryError", 17) == 0) {
+        return PYRS_EXC_ISADIR;
+    }
     if (strncmp(msg, "FileNotFoundError", 17) == 0) {
         return PYRS_EXC_FILENOTFOUND;
+    }
+    if (strncmp(msg, "PermissionError", 15) == 0) {
+        return PYRS_EXC_PERMISSION;
     }
     if (strncmp(msg, "StopIteration", 13) == 0) {
         return PYRS_EXC_STOPITER;
@@ -158,6 +180,9 @@ static int classify_exc_msg(const char *msg) {
     if (strncmp(msg, "TypeError", 9) == 0) {
         return PYRS_EXC_TYPE;
     }
+    if (strncmp(msg, "Exception", 9) == 0) {
+        return PYRS_EXC_EXCEPTION;
+    }
     if (strncmp(msg, "NameError", 9) == 0) {
         return PYRS_EXC_NAME;
     }
@@ -170,8 +195,26 @@ static int classify_exc_msg(const char *msg) {
     if (strncmp(msg, "OSError", 7) == 0) {
         return PYRS_EXC_OS;
     }
-    /* PermissionError, IsADirectoryError, MemoryError, … — bare except only. */
+    /* MemoryError and other untyped traps — bare except / Exception. */
     return PYRS_EXC_OTHER;
+}
+
+/* CPython-like subclass check for except filters / isinstance(exc, T). */
+int pyrs_exc_matches(int filter, int actual) {
+    if (filter == actual) {
+        return 1;
+    }
+    /* Exception catches everything under Exception, not GeneratorExit
+     * (BaseException-only) and not an empty/unset tag. */
+    if (filter == PYRS_EXC_EXCEPTION) {
+        return actual != PYRS_EXC_GENEXIT && actual != 0;
+    }
+    /* OSError catches FileNotFoundError / PermissionError / IsADirectoryError. */
+    if (filter == PYRS_EXC_OS) {
+        return actual == PYRS_EXC_FILENOTFOUND || actual == PYRS_EXC_PERMISSION ||
+               actual == PYRS_EXC_ISADIR;
+    }
+    return 0;
 }
 
 /* strip "Type: " prefix for the bound exception message */
@@ -248,6 +291,40 @@ PyrsStr *pyrs_exc_message(void) {
     s->len = (long long)n;
     memcpy(s->data, body, n + 1);
     return s;
+}
+
+/* Build a first-class exception object from the active pending exception. */
+PyrsExc *pyrs_exc_object(void) {
+    PyrsExc *e = xmalloc(sizeof(PyrsExc));
+    e->type_tag = g_exc_type;
+    e->msg = pyrs_exc_message();
+    return e;
+}
+
+/* print(e) / str(e) → message body only (CPython). */
+void pyrs_print_exc(PyrsExc *e) {
+    if (e == NULL || e->msg == NULL) {
+        return;
+    }
+    fwrite(e->msg->data, 1, (size_t)e->msg->len, stdout);
+}
+
+PyrsStr *pyrs_str_from_exc(PyrsExc *e) {
+    if (e == NULL || e->msg == NULL) {
+        PyrsStr *s = xmalloc(sizeof(long long) + 1);
+        s->len = 0;
+        s->data[0] = '\0';
+        return s;
+    }
+    return e->msg;
+}
+
+/* isinstance(exc, filter_tag) with hierarchy. */
+int pyrs_exc_isinstance(PyrsExc *e, int filter) {
+    if (e == NULL) {
+        return 0;
+    }
+    return pyrs_exc_matches(filter, e->type_tag);
 }
 
 void pyrs_exc_clear(void) {

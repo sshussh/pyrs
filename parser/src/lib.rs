@@ -723,6 +723,9 @@ impl Parser {
             "NameError" => Ok(ExcType::NameError),
             "UnboundLocalError" => Ok(ExcType::UnboundLocalError),
             "StopIteration" => Ok(ExcType::StopIteration),
+            "Exception" => Ok(ExcType::Exception),
+            "PermissionError" => Ok(ExcType::PermissionError),
+            "IsADirectoryError" => Ok(ExcType::IsADirectoryError),
             other => Err(Diagnostic::new(
                 Phase::Parse,
                 format!(
