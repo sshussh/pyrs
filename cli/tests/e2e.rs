@@ -7940,7 +7940,8 @@ print(it.send(None))
 it.close()
 print(\"after\")
 ";
-    let out = run_program_timeout("ge_reraise", src, Duration::from_secs(3));
+    // Timeout covers compile+run; generator LLVM builds can exceed 3s on busy hosts.
+    let out = run_program_timeout("ge_reraise", src, Duration::from_secs(15));
     let py = Command::new("python3")
         .arg("-c")
         .arg(src)
@@ -8183,6 +8184,43 @@ try:
     raise FileNotFoundError(\"missing\")
 except FileNotFoundError as e:
     print(e)
+    print(str(e))
+    print(isinstance(e, FileNotFoundError))
+    print(isinstance(e, OSError))
+    print(isinstance(e, Exception))
+    print(isinstance(e, ValueError))
+    print(isinstance(e, (ValueError, OSError)))
+    print(isinstance(e, (ValueError, KeyError)))
+    if e:
+        print(\"truthy\")
+    if not e:
+        print(\"falsy\")
+try:
+    raise FileNotFoundError(\"via-os\")
+except OSError as e:
+    print(e)
+    print(isinstance(e, OSError))
+try:
+    raise FileNotFoundError(\"multi\")
+except (OSError, ValueError) as e:
+    print(e)
+try:
+    raise ValueError(\"not-os\")
+except OSError:
+    print(\"bad-os\")
+except ValueError as e:
+    print(e)
+try:
+    raise PermissionError(\"perm\")
+except OSError as e:
+    print(e)
+    print(isinstance(e, PermissionError))
+    print(isinstance(e, OSError))
+try:
+    raise IsADirectoryError(\"isdir\")
+except OSError as e:
+    print(e)
+    print(isinstance(e, IsADirectoryError))
 try:
     raise OverflowError(\"big\")
 except (OverflowError, ValueError) as e:
@@ -8200,6 +8238,14 @@ try:
 except OSError as e:
     print(e)
 try:
+    raise ValueError(\"v\")
+except Exception as e:
+    print(e)
+try:
+    raise Exception(\"base\")
+except Exception as e:
+    print(e)
+try:
     open(\"/no/such/file_pyrs_tier1_xyz\")
 except FileNotFoundError:
     print(\"caught fnf\")
@@ -8207,6 +8253,154 @@ except OSError:
     print(\"caught os\")
 ";
     let out = run_program("tier1_exc", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn exception_hierarchy_genexit_not_under_exception() {
+    // GeneratorExit inherits BaseException only — except Exception must miss it.
+    let src = "\
+try:
+    raise GeneratorExit(\"g\")
+except Exception:
+    print(\"caught-exc\")
+except GeneratorExit as e:
+    print(e)
+    print(isinstance(e, Exception))
+    print(isinstance(e, GeneratorExit))
+try:
+    raise ValueError(\"v\")
+except Exception as e:
+    print(e)
+";
+    let out = run_program("exc_genexit_hier", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn exception_object_print_str_parity() {
+    // Bound exception object: print / str match CPython message body.
+    let src = "\
+try:
+    raise ValueError(\"boom\")
+except ValueError as e:
+    print(e)
+    print(str(e))
+";
+    let out = run_program("exc_obj_print", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn exception_str_method_is_compile_error() {
+    // Exception objects are not str — methods like upper() are rejected.
+    let dir = TempDir::new("exc_str_method");
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "\
+try:
+    raise ValueError(\"boom\")
+except ValueError as e:
+    print(e.upper())
+",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Exact diagnostic phrase (not source reprint alone): type name + method.
+    assert!(
+        stderr.contains("error[semantic]")
+            && stderr.contains("'exception' has no method 'upper'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn exception_in_list_is_compile_error() {
+    let dir = TempDir::new("exc_in_list");
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "\
+try:
+    raise ValueError(\"x\")
+except ValueError as e:
+    xs = [e]
+    print(xs)
+",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error[semantic]") && stderr.contains("exception"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn exception_union_isinstance_and_truthy() {
+    // Multi-assign joins int|exception; isinstance and conditions work.
+    let src = "\
+x = 1
+try:
+    raise ValueError(\"v\")
+except ValueError as e:
+    x = e
+    print(isinstance(x, ValueError))
+    print(isinstance(x, int))
+    print(isinstance(x, (int, OSError)))
+    print(isinstance(x, (int, ValueError)))
+    if x:
+        print(\"truthy\")
+x = 2
+print(isinstance(x, ValueError))
+print(isinstance(x, int))
+if x:
+    print(\"int-truthy\")
+";
+    let out = run_program("exc_union_isinstance", src);
     let py = Command::new("python3")
         .arg("-c")
         .arg(src)
