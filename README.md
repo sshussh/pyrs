@@ -38,42 +38,56 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.19)
+## The language (v0.20.1)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.20.0**, not 1.0) until it is ready for
+milestone after this one is **0.21.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
-(never-free is interim; GC is still required for 1.0). Classes ship in
-v0.19 as a closed-world subset (see below). No new stdlib until the
-language can host pure-PyRs libraries.
+(never-free is interim; GC is still required for 1.0). Classes remain a
+closed-world subset with stronger typing/dynamism in v0.20 (see below).
+No new stdlib until the language can host pure-PyRs libraries.
 
 A statically-typed Python subset:
 
 - **Types:** `int` (arbitrary precision; tagged small / heap limbs), `float` (f64), `bool`, `str`, `None`,
-  unions (`int | None`, `str | int | None`), `Optional[T]`, `list[T]`,
+  unions (`int | None`, `str | int | None`), `Optional[T]`, limited
+  **`Any`** (dynamic slot box; concrete↔Any coerces with a runtime
+  TypeError check — not full CPython dynamism), `list[T]`,
   `tuple[T1, T2, …]`, `dict[K, V]`, `set[T]` — including nested lists
   (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only;
-  list elements and dict values may be Optional/unions; homogeneous
+  list elements and dict values may be Optional/unions/`Any`; homogeneous
   closures (same params/ret and capture env shape, with or without
   captures) and user class instances may be list/tuple elements.
   Multi-assign joins storage types
   (`x = 1; x = "a"` → `int | str`; numeric multi-assign promotes).
-  Bare params may be inferred monomorphically from body usage; class
-  names are valid type annotations (`def f(p: Point)`)
-- **Classes (v0.19):** `class C:` / `class D(C):` with instance methods
+  Bare params may be inferred monomorphically from body usage
+  (arithmetic, comparisons, methods, indexing, `isinstance` branches);
+  empty `xs = []` followed by `xs.append(v)` / `insert` fixes `list[T]`;
+  unannotated empty `[]` with no append/insert defaults to **`list[Any]`**;
+  class names are valid type annotations (`def f(p: Point)`); annotations
+  still **fix** storage when present (not silently widened)
+- **Classes (v0.20):** `class C:` / `class D(C):` with instance methods
   (`def m(self, …)`), fields assigned in `__init__` only (no class-body
   attributes), construction `C(...)`, attribute load/store,
   `self.method()`, single inheritance with override + virtual dispatch
   when the static type is a base, `isinstance(obj, C)` with inheritance,
-  cross-module `from m import C` / subclassing. Default `print`/`str` is
+  **`isinstance` flow narrowing to a more-specific subclass** (subclass
+  fields/methods after peel; mid-expression `isinstance(x, B) and x.b`),
+  subclass assignable where a base is expected (params, returns, list
+  append of `list[Base]`, unions containing the base), cross-module
+  `from m import C` / subclassing. Default `print`/`str` is
   `<Name object>` (no address; runtime type_id). **Not yet:** multiple
   inheritance, metaclasses, `__new__`/`__slots__`, bound methods as
   values, `@property`/classmethod/staticmethod, open `__dict__`, class
   patterns in `match`, nested classes, class decorators, `super()`,
-  class-body attrs, first-class class values, `isinstance` narrowing to
-  subclass fields
+  class-body attrs, first-class class values; mixed non-numeric list
+  **literals** need a union annotation (empty `[]` + mixed appends join;
+  common fields on class unions are readable; exclusive subclass fields
+  after multi-class `isinstance` use a **runtime type_id switch** —
+  AttributeError when the live instance lacks the field; method calls on
+  bare `Any` and open setattr remain unsupported)
 - **Functions:** `def` with optional parameter/return annotations
   (defaults infer param types; bare params inferred from body when unique;
   return type inferred from `return` when omitted), defaults and keyword
@@ -219,7 +233,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.19): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.20.1): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
@@ -227,16 +241,27 @@ not the int `1`); iterable `min`/`max` is only for
 `list[int|float|bool]` (empty list → ValueError like CPython),
 control-flow narrowing covers `is None` / `is not None` (and `not`,
 `and`/`or` body peels and **mid-expression** refine of
-`x is not None and x > 0` / `x is None or x < 0`) on locals, cells, and
-module Optionals (free reads, no `global` required) in `if`/`while` /
-match guards (not full SAT / attribute narrowing); post-loop / post-if
-rebinds clear stale peels; `is`/`is not` works with `None` and same-type
-identity (heap pointers, scalar slots, float bitcast — not CPython int
-interning); `x ** e` with a *dynamic* negative int exponent traps (a
-constant like `2 ** -1` works and gives float), int↔float comparisons
-convert the int to float (exactness loss past 2^53), list literals
-coerce mixed numerics to one element type, `nan in [nan]` is False
-(IEEE equality), str methods use ASCII case/whitespace rules, heap
+`x is not None and x > 0` / `x is None or x < 0`) **and** `isinstance`
+peels (unions, Optional, and class base → subclass for field access)
+on locals, cells, and module Optionals (free reads, no `global` required)
+in `if`/`while` / match guards (not full SAT / open attribute narrowing);
+post-loop / post-if rebinds clear stale peels; multi-member peels keep a
+safe storage type for print/tags; bare-param inference is monomorphic only
+(conflicting uses still need annotations; multi-type `isinstance(x, (int,
+float))` and container `isinstance(x, list)` do not bare-infer); empty
+lists without append/insert default to `list[Any]` (append/insert still
+specialize); multi-class `isinstance` peels allow shared layout fields and
+runtime exclusive-field access (AttributeError when missing); limited
+`Any` only (no open setattr / bare-Any methods / full gradual typing);
+`and`-chain peels compose left-to-right;
+`is`/`is not` works
+with `None` and same-type identity (heap pointers, scalar slots, float
+bitcast — not CPython int interning); `x ** e` with a *dynamic* negative
+int exponent traps (a constant like `2 ** -1` works and gives float),
+int↔float comparisons convert the int to float (exactness loss past 2^53),
+list literals coerce mixed numerics to one element type (mixed non-numeric
+literal elements still error unless annotated as a union), `nan in [nan]`
+is False (IEEE equality), str methods use ASCII case/whitespace rules, heap
 memory is never freed, files support text modes "r"/"w"/"a" only, no
 multi-path split namespace packages, no `from sys import *`, a package
 importing itself by name, or treating modules as first-class values
@@ -351,4 +376,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.19.0 && git push origin v0.19.0`.
+Release tags: `git tag v0.20.1 && git push origin v0.20.1`.

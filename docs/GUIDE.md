@@ -155,7 +155,8 @@ since PyRs rejects unsupported dynamic features (each with a
 "not supported yet" error naming the feature). Parameter annotations are
 optional when a default value is present (the type is inferred from the
 default); bare parameters may be monomorphically inferred from body usage
-(otherwise an annotation is required).
+(arithmetic, comparisons, methods, indexing, `isinstance` branches —
+otherwise an annotation is required).
 
 ### Program structure
 
@@ -260,7 +261,7 @@ All assignment forms:
 ```python
 name = expr                # plain
 a = b = expr               # multi-target; RHS once, assign right-to-left
-name: type = expr          # annotated (required for empty lists)
+name: type = expr          # annotated (empty [] defaults to list[Any]; append/insert specialize)
 name += expr               # augmented: += -= *= /= //= %= **=
 xs[i] = expr               # list element
 xs[i] += expr              # augmented element (base and index evaluate once)
@@ -685,7 +686,7 @@ print(inc(2))  # 3
 
 ### Classes
 
-Closed-world, layout-specialized objects (v0.19). Instances carry a
+Closed-world, layout-specialized objects (v0.20). Instances carry a
 `type_id` header (GC-ready); heap objects are still never freed.
 
 ```python
@@ -729,6 +730,11 @@ print(isinstance(d, Animal))  # True
 - Attribute load/store; `self.other_method()`
 - Override + **virtual dispatch** when the static type is a base
 - `isinstance(obj, Class)` with inheritance
+- **`isinstance` flow narrowing** to a more-specific subclass (then-arm
+  uses subclass fields/methods; complementary else keeps the base;
+  mid-expression `isinstance(x, B) and x.attr` refines the RHS of `and`)
+- Subclass where a base is expected: params, returns, `list[Base].append`,
+  assignment into a union that includes the base
 - Class names as type annotations (`def f(p: Point)`)
 - Default `print` / `str` → `<Name object>` (no address; stable vs CPython)
 
@@ -738,9 +744,16 @@ metaclasses, `__new__`, `__slots__`, bound methods as values
 `__dict__` / `__getattr__`, class patterns in `match`, nested classes,
 class decorators, `super()`, class-body attributes, dotted bases
 (`class D(pkg.C)` — import the base first), first-class class objects
-as values (use as constructor/type only), `isinstance` flow narrowing
-to a more-specific subclass for field access, `==` between instances
-(use `is` for identity).
+as values (use as constructor/type only), `==` between instances
+(use `is` for identity). Mixed non-numeric **list literals** still error
+unless annotated (`xs: list[Dog | Cat] = [Dog(), Cat()]`). Empty
+`xs = []` plus later appends (including free-var appends in nested
+defs) join element types; unannotated empty lists with no append/insert
+default to `list[Any]`. Fields shared across a class union (same
+offset/type, including parent fields after `isinstance(x, (B, C))`)
+are readable. Exclusive subclass-only fields after a multi-class peel
+use a runtime `type_id` switch (AttributeError when the live instance
+lacks the field).
 
 ### Built-in functions
 
@@ -1159,10 +1172,18 @@ deliberate exceptions:
 3. **Static types with join.** Multi-assign joins storage types (unions /
    numeric promote); lists are homogeneous (mixed numeric literals coerce
    to the joined type — `[1, 2.5]` becomes `[1.0, 2.5]`); bare parameters
-   may be body-inferred when monomorphic (defaults may infer).
-   Promotions convert the value itself, so `n: int = True` makes `n`
-   print as `1` where Python keeps the bool and prints `True` (they still
-   compare equal).
+   may be body-inferred when monomorphic (defaults may infer; also
+   single-type `isinstance` / methods / indexing — multi-type
+   `isinstance(x, (int, float))` or container `isinstance(x, list)` still
+   need an annotation); empty `xs = []` plus later `append`/`insert`
+   (same body or free-var nested def) fixes `list[T]` (joined if appends
+   differ; annotation still fixes storage when present). Class unions
+   expose fields shared at the same layout offset; multi-class
+   `isinstance` peels use that for parent fields. `and`-chain peels compose
+   left-to-right (more-specific `isinstance` is kept across `is not None` /
+   further peels). Promotions
+   convert the value itself, so `n: int = True` makes `n` print as `1`
+   where Python keeps the bool and prints `True` (they still compare equal).
 4. **`x ** e` with a dynamic negative int exponent traps** at runtime
    (constant exponents like `2 ** -1` correctly give a float).
 5. **int↔float comparisons convert the int to float**, losing exactness
@@ -1186,20 +1207,24 @@ deliberate exceptions:
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
 11. **Narrowing is limited** — `if x is not None:` / `is None` / `not`,
-    and simple `and`/`or` chains of those checks for **then/else body**
-    refinements and **mid-expression** refine (e.g. `x is not None and
-    x > 0` types `x` as non-None on the RHS of `and`; `x is None or
-    x < 0` types the RHS of `or` under the else-peel), on **function
-    locals, cell/`nonlocal` names, and free module Optionals** (no
-    `global` required for reads) in `if`/`while`/`elif`/`else` and match
-    guards. Complementary else-arms and early `return` in a then-arm
-    refine fallthrough. Assigning a concrete member re-refines in the
-    branch; fallthrough after a rebind clears disagreeing peels. After a
-    `while` without `break`, the condition's complement applies. `is None`
-    checks always read storage tags. No attribute or full SAT-style
-    narrowing. Multi-member peels keep a safe storage type for print/tags.
+    `isinstance(x, T)` / `isinstance(x, (T1, T2))` (unions, Optional, and
+    class base → subclass for field access), and simple `and`/`or` chains
+    of those checks for **then/else body** refinements and **mid-expression**
+    refine (e.g. `x is not None and x > 0`, `isinstance(x, B) and x.b`).
+    **`and` peels compose left-to-right** (right peels see left refinements,
+    so `isinstance(x, C) and isinstance(x, B)` keeps `C`;
+    `isinstance(x, B) and x is not None` keeps `B`). On **function locals,
+    cell/`nonlocal` names, and free module Optionals** (no `global` required
+    for reads) in `if`/`while`/`elif`/`else` and match guards. Complementary
+    else-arms and early `return` in a then-arm refine fallthrough. Assigning
+    a concrete member or subclass re-refines in the branch; assigning the
+    base clears a subclass peel. Fallthrough after a rebind clears
+    disagreeing peels. After a `while` without `break`, the condition's
+    complement applies. `is None` checks always read storage tags. No open
+    attribute or full SAT-style narrowing. Multi-member peels keep a safe
+    storage type for print/tags.
 
-Container notes (v0.19):
+Container notes (v0.20.1):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, homogeneous `for`, membership `in`
@@ -1214,9 +1239,18 @@ Container notes (v0.19):
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
   `{}` is always an empty dict; `|` / `.union` / `|=` / `.update` for
   same element type.
+- **Any (limited):** annotation `Any` / `list[Any]` etc. Values are
+  heap-boxed print-tag + payload (same as container union slots).
+  Concrete → Any and Any → concrete coerce at the boundary (runtime
+  TypeError on wrong tag; class targets accept subclasses). `bool(x)` /
+  `if x:` use runtime truthiness for all container tags (empty `list[Any]`
+  / `list[str]` / … are falsy). `list[Any]` equality treats `True == 1`
+  like CPython. Not full gradual typing: no open setattr, no method
+  calls on bare Any, no `isinstance` peel from pure Any yet.
 - **kit builtins:** `isinstance(x, T)` / `isinstance(x, (T1, T2))` with
-  `T` in `{int, float, bool, str, list, tuple, dict, set, None}`
-  (`isinstance(True, int)` is True); peels unions in `if` then-arms.
+  `T` in `{int, float, bool, str, list, tuple, dict, set, None}` plus
+  class and exception type names (`isinstance(True, int)` is True); peels
+  unions and class bases in `if` then/else arms and mid-expression `and`.
   `any`/`all` on list/str/tuple/set; `enumerate`/`zip`/`reversed` for
   iteration and as values (**materialize to lists** — not lazy iterators).
 - **unions / Optional:** first-class `None`; `T | U` and `Optional[T]`;
