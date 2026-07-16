@@ -36,7 +36,7 @@ pub fn emit_llvm_ir(module: &Module) -> String {
 /// unions are `{ i32, i64 }`. Function returns of `None` use [`lty_ret`].
 fn lty(ty: Ty) -> &'static str {
     match ty {
-        Ty::Int => "i64",
+        Ty::Int | Ty::Any => "i64",
         Ty::Float => "double",
         Ty::Bool => "i1",
         Ty::Str => "ptr",
@@ -87,7 +87,8 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Tuple(_) => 5,
         Ty::Dict { .. } => 6,
         Ty::Set(_) => 7,
-        Ty::Union(_) => 8,
+        // Any is always a heap box {print_tag, payload}; reuse union list tag.
+        Ty::Union(_) | Ty::Any => 8,
         // Closures / generators as list/dict values (pointer slots).
         Ty::Closure { .. } => 9,
         Ty::Generator { .. } => 10,
@@ -214,6 +215,10 @@ struct Emitter {
     gen_fin_stack: Vec<FinallyScope>,
     /// Class layouts for field GEP / isinstance parent walk.
     classes: Vec<ClassInfo>,
+    /// Alloca storage types for locals/params (load/store ABI). Expression
+    /// peels may retype a `Local` to a semantic subtype/union without changing
+    /// the alloca (e.g. `Class(A)` → `Class(B)|Class(C)` for isinstance).
+    local_storage: HashMap<String, Ty>,
 }
 
 impl Default for Emitter {
@@ -240,6 +245,7 @@ impl Default for Emitter {
             gen_try_pool_next: 0,
             gen_fin_stack: Vec::new(),
             classes: Vec::new(),
+            local_storage: HashMap::new(),
         }
     }
 }
@@ -339,6 +345,8 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | GeneratorReturnValue(operand)
         | FromUnion { value: operand, .. }
         | ToUnion { value: operand, .. }
+        | ToAny { value: operand }
+        | FromAny { value: operand }
         | DictKeys(operand)
         | DictValues(operand)
         | DictItems(operand)
@@ -406,7 +414,8 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         IsInstance { value, .. }
         | ExcIsInstance { value, .. }
         | ClassIsInstance { value, .. }
-        | GetField { object: value, .. } => max_try_depth_in_expr(value),
+        | GetField { object: value, .. }
+        | GetFieldPartial { object: value, .. } => max_try_depth_in_expr(value),
         CallMethod { args, .. } => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
         NewObject { .. } => 0,
         ObjectToStr(operand) => max_try_depth_in_expr(operand),
@@ -532,6 +541,8 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | GeneratorReturnValue(operand)
         | FromUnion { value: operand, .. }
         | ToUnion { value: operand, .. }
+        | ToAny { value: operand }
+        | FromAny { value: operand }
         | DictKeys(operand)
         | DictValues(operand)
         | DictItems(operand)
@@ -587,7 +598,8 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         IsInstance { value, .. }
         | ExcIsInstance { value, .. }
         | ClassIsInstance { value, .. }
-        | GetField { object: value, .. } => count_yields_in_expr(value),
+        | GetField { object: value, .. }
+        | GetFieldPartial { object: value, .. } => count_yields_in_expr(value),
         CallMethod { args, .. } => args.iter().map(count_yields_in_expr).sum(),
         NewObject { .. } => 0,
         ObjectToStr(operand) => count_yields_in_expr(operand),
@@ -634,6 +646,8 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_tuple(ptr)\n");
         out.push_str("declare void @pyrs_print_dict(ptr)\n");
         out.push_str("declare void @pyrs_print_set(ptr)\n");
+        out.push_str("declare void @pyrs_print_any(i64)\n");
+        out.push_str("declare i32 @pyrs_any_truth(i64)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
@@ -904,6 +918,7 @@ impl Emitter {
                 | Ty::Exception
                 | Ty::Class(_) => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
+                // Any / None / etc.: zero i64 (null box for Any)
                 _ => "0".to_string(),
             };
             self.global_defs.push_str(&format!(
@@ -1353,7 +1368,7 @@ impl Emitter {
 
     fn slot_from_value(&mut self, value: &str, ty: Ty) -> String {
         match ty {
-            Ty::Int => value.to_string(),
+            Ty::Int | Ty::Any => value.to_string(),
             Ty::Float => {
                 let t = self.tmp();
                 self.line(format!("{t} = bitcast double {value} to i64"));
@@ -1415,7 +1430,7 @@ impl Emitter {
 
     fn value_from_slot(&mut self, slot: &str, ty: Ty) -> String {
         match ty {
-            Ty::Int => slot.to_string(),
+            Ty::Int | Ty::Any => slot.to_string(),
             Ty::Float => {
                 let t = self.tmp();
                 self.line(format!("{t} = bitcast i64 {slot} to double"));
@@ -1614,6 +1629,556 @@ impl Emitter {
         u1
     }
 
+    /// Box a concrete/union value into `Ty::Any` (heap `{print_tag, payload}` as i64).
+    fn emit_to_any(&mut self, value: &str, value_ty: Ty) -> String {
+        if value_ty == Ty::Any {
+            return value.to_string();
+        }
+        // Reuse container-union boxing: slot_from_value for Union already builds
+        // a heap box; for concrete types, build the box with print_tag + payload.
+        if let Ty::Union(members) = value_ty {
+            return self.slot_from_value(value, Ty::Union(members));
+        }
+        let print_tag = member_print_tag(value_ty);
+        let payload = self.slot_from_value(value, value_ty);
+        let box_p = self.tmp();
+        self.line(format!("{box_p} = call ptr @malloc(i64 16)"));
+        let tag_p = self.tmp();
+        self.line(format!(
+            "{tag_p} = getelementptr inbounds {{ i32, i64 }}, ptr {box_p}, i32 0, i32 0"
+        ));
+        self.line(format!("store i32 {print_tag}, ptr {tag_p}"));
+        let pay_p = self.tmp();
+        self.line(format!(
+            "{pay_p} = getelementptr inbounds {{ i32, i64 }}, ptr {box_p}, i32 0, i32 1"
+        ));
+        self.line(format!("store i64 {payload}, ptr {pay_p}"));
+        let slot = self.tmp();
+        self.line(format!("{slot} = ptrtoint ptr {box_p} to i64"));
+        slot
+    }
+
+    /// Load print_tag + payload from an Any i64 slot. Null slot → tag -1 (None).
+    fn emit_any_unpack(&mut self, any_slot: &str) -> (String, String) {
+        let is_null = self.tmp();
+        self.line(format!("{is_null} = icmp eq i64 {any_slot}, 0"));
+        let end_l = self.fresh_block("any.unpack.end");
+        let null_l = self.fresh_block("any.unpack.null");
+        let box_l = self.fresh_block("any.unpack.box");
+        self.line(format!("br i1 {is_null}, label %{null_l}, label %{box_l}"));
+        self.start_block(&null_l);
+        let npred = self.cur_block.clone();
+        self.line(format!("br label %{end_l}"));
+        self.start_block(&box_l);
+        let box_p = self.tmp();
+        self.line(format!("{box_p} = inttoptr i64 {any_slot} to ptr"));
+        let tag_p = self.tmp();
+        self.line(format!(
+            "{tag_p} = getelementptr inbounds {{ i32, i64 }}, ptr {box_p}, i32 0, i32 0"
+        ));
+        let tag_v = self.tmp();
+        self.line(format!("{tag_v} = load i32, ptr {tag_p}"));
+        let pay_p = self.tmp();
+        self.line(format!(
+            "{pay_p} = getelementptr inbounds {{ i32, i64 }}, ptr {box_p}, i32 0, i32 1"
+        ));
+        let pay_v = self.tmp();
+        self.line(format!("{pay_v} = load i64, ptr {pay_p}"));
+        let bpred = self.cur_block.clone();
+        self.line(format!("br label %{end_l}"));
+        self.start_block(&end_l);
+        let print_tag = self.tmp();
+        self.line(format!(
+            "{print_tag} = phi i32 [ -1, %{npred} ], [ {tag_v}, %{bpred} ]"
+        ));
+        let payload = self.tmp();
+        self.line(format!(
+            "{payload} = phi i64 [ 0, %{npred} ], [ {pay_v}, %{bpred} ]"
+        ));
+        (print_tag, payload)
+    }
+
+    /// Convert a boxed payload (slot bits) from `src_tag` into `target` value.
+    /// Caller has already checked that the tag is acceptable for `target`.
+    fn emit_payload_as(&mut self, payload: &str, src_tag: i32, target: Ty) -> String {
+        match target {
+            Ty::Int => {
+                if src_tag == 2 {
+                    // bool payload 0/1 → tagged small int
+                    let t = self.tmp();
+                    self.line(format!("{t} = icmp ne i64 {payload}, 0"));
+                    let r = self.tmp();
+                    self.line(format!("{r} = select i1 {t}, i64 3, i64 1"));
+                    r
+                } else {
+                    payload.to_string()
+                }
+            }
+            Ty::Float => {
+                if src_tag == 1 {
+                    self.value_from_slot(payload, Ty::Float)
+                } else if src_tag == 2 {
+                    let as_int = self.tmp();
+                    self.line(format!("{as_int} = icmp ne i64 {payload}, 0"));
+                    let tagged = self.tmp();
+                    self.line(format!("{tagged} = select i1 {as_int}, i64 3, i64 1"));
+                    let t = self.tmp();
+                    self.line(format!(
+                        "{t} = call double @pyrs_int_to_float(i64 {tagged})"
+                    ));
+                    t
+                } else {
+                    // int payload
+                    let t = self.tmp();
+                    self.line(format!(
+                        "{t} = call double @pyrs_int_to_float(i64 {payload})"
+                    ));
+                    t
+                }
+            }
+            Ty::Bool => {
+                let t = self.tmp();
+                self.line(format!("{t} = trunc i64 {payload} to i1"));
+                t
+            }
+            other => self.value_from_slot(payload, other),
+        }
+    }
+
+    /// Whether print_tag `src` can satisfy target type (with promotions).
+    fn from_any_tag_ok(src: i32, target: Ty) -> bool {
+        match target {
+            Ty::Int => src == 0 || src == 2, // int or bool
+            Ty::Float => src == 0 || src == 1 || src == 2,
+            Ty::Bool => src == 2,
+            Ty::None => src == -1,
+            Ty::Str => src == 3,
+            Ty::List(_) => src == member_print_tag(target),
+            Ty::Tuple(_) => src == 5,
+            Ty::Dict { .. } => src == 6,
+            Ty::Set(_) => src == 7,
+            Ty::Closure { .. } => src == 9,
+            Ty::Generator { .. } => src == 10,
+            Ty::Exception => src == 11,
+            Ty::Class(_) => src >= 13 && (src - 13) % 8 == 0,
+            Ty::Any => true,
+            Ty::Union(_) | Ty::File | Ty::Cell(_) => false,
+        }
+    }
+
+    /// Unbox `Ty::Any` to a concrete target type with a runtime tag check.
+    fn emit_from_any(&mut self, any_slot: &str, target: Ty) -> String {
+        if target == Ty::Any {
+            return any_slot.to_string();
+        }
+        let (print_tag, payload) = self.emit_any_unpack(any_slot);
+
+        // Target is a union: match active print_tag to a member (with promotions).
+        if let Ty::Union(members) = target {
+            let end_l = self.fresh_block("fromany.union.end");
+            let bad_l = self.fresh_block("fromany.union.bad");
+            let mut cases = String::new();
+            let mut blocks: Vec<(String, usize, i32)> = Vec::new();
+            // Collect all acceptable (print_tag → member_idx, src_tag) pairs.
+            // Prefer exact member tags; also allow bool→int / int→float into members.
+            let mut seen_tags: std::collections::HashSet<i32> = std::collections::HashSet::new();
+            for (mi, m) in members.iter().enumerate() {
+                if let Ty::Class(want) = *m {
+                    for sid in 0..self.classes.len() as u32 {
+                        let mut cur = sid;
+                        let mut is_sub = cur == want;
+                        while !is_sub {
+                            let Some(info) = self.classes.get(cur as usize) else {
+                                break;
+                            };
+                            match info.parent {
+                                Some(p) if p == want => {
+                                    is_sub = true;
+                                    break;
+                                }
+                                Some(p) => cur = p,
+                                None => break,
+                            }
+                        }
+                        if !is_sub {
+                            continue;
+                        }
+                        let ptag = member_print_tag(Ty::Class(sid));
+                        if seen_tags.insert(ptag) {
+                            let bl = self.fresh_block(&format!("fromany.u.{mi}.c{sid}"));
+                            cases.push_str(&format!(" i32 {ptag}, label %{bl}"));
+                            blocks.push((bl, mi, ptag));
+                        }
+                    }
+                    continue;
+                }
+                // Exact and promoted tags for this member.
+                let candidates: Vec<i32> = match *m {
+                    Ty::Int => vec![0, 2],
+                    Ty::Float => vec![0, 1, 2],
+                    Ty::Bool => vec![2],
+                    Ty::None => vec![-1],
+                    other => vec![member_print_tag(other)],
+                };
+                for ptag in candidates {
+                    if !Self::from_any_tag_ok(ptag, *m) {
+                        continue;
+                    }
+                    if seen_tags.insert(ptag) {
+                        let bl = self.fresh_block(&format!("fromany.u.{mi}.t{ptag}"));
+                        cases.push_str(&format!(" i32 {ptag}, label %{bl}"));
+                        blocks.push((bl, mi, ptag));
+                    }
+                }
+            }
+            self.line(format!("switch i32 {print_tag}, label %{bad_l} [{cases} ]"));
+            let mut phi_args = Vec::new();
+            for (bl, mi, src_tag) in &blocks {
+                self.start_block(bl);
+                let m = members[*mi];
+                let val = self.emit_payload_as(&payload, *src_tag, m);
+                let slot = self.slot_from_value(&val, m);
+                let u0 = self.tmp();
+                self.line(format!(
+                    "{u0} = insertvalue {{ i32, i64 }} undef, i32 {}, 0",
+                    *mi as i32
+                ));
+                let u1 = self.tmp();
+                self.line(format!(
+                    "{u1} = insertvalue {{ i32, i64 }} {u0}, i64 {slot}, 1"
+                ));
+                let pred = self.cur_block.clone();
+                self.line(format!("br label %{end_l}"));
+                phi_args.push((u1, pred));
+            }
+            self.start_block(&bad_l);
+            self.emit_die(&format!(
+                "TypeError: expected {target}, got incompatible dynamic value"
+            ));
+            self.start_block(&end_l);
+            let t = self.tmp();
+            let parts: Vec<String> = phi_args
+                .iter()
+                .map(|(v, b)| format!("[ {v}, %{b} ]"))
+                .collect();
+            self.line(format!("{t} = phi {{ i32, i64 }} {}", parts.join(", ")));
+            return t;
+        }
+
+        // Class targets: accept base and any subclass print tags (13+8*id).
+        if let Ty::Class(want) = target {
+            let end_l = self.fresh_block("fromany.class.end");
+            let bad_l = self.fresh_block("fromany.class.bad");
+            let mut ok_blocks = Vec::new();
+            let mut cases = String::new();
+            let class_name = self
+                .classes
+                .get(want as usize)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("class#{want}"));
+            for sid in 0..self.classes.len() as u32 {
+                let mut cur = sid;
+                let mut is_sub = cur == want;
+                while !is_sub {
+                    let Some(info) = self.classes.get(cur as usize) else {
+                        break;
+                    };
+                    match info.parent {
+                        Some(p) if p == want => {
+                            is_sub = true;
+                            break;
+                        }
+                        Some(p) => cur = p,
+                        None => break,
+                    }
+                }
+                if !is_sub {
+                    continue;
+                }
+                let ptag = member_print_tag(Ty::Class(sid));
+                let bl = self.fresh_block(&format!("fromany.class.{sid}"));
+                cases.push_str(&format!(" i32 {ptag}, label %{bl}"));
+                ok_blocks.push(bl);
+            }
+            self.line(format!("switch i32 {print_tag}, label %{bad_l} [{cases} ]"));
+            for bl in &ok_blocks {
+                self.start_block(bl);
+                self.line(format!("br label %{end_l}"));
+            }
+            self.start_block(&bad_l);
+            self.emit_die(&format!(
+                "TypeError: expected {class_name}, got incompatible dynamic value"
+            ));
+            self.start_block(&end_l);
+            return self.value_from_slot(&payload, target);
+        }
+
+        // Scalar / container: exact or promoted tags.
+        let end_l = self.fresh_block("fromany.end");
+        let bad_l = self.fresh_block("fromany.bad");
+        let mut cases = String::new();
+        let mut ok_blocks: Vec<(String, i32)> = Vec::new();
+        let accept: Vec<i32> = match target {
+            Ty::Int => vec![0, 2],
+            Ty::Float => vec![0, 1, 2],
+            Ty::Bool => vec![2],
+            Ty::None => vec![-1],
+            // list[Any] only: exact TAG_UNION list encoding (elem_tag Any = 8).
+            // Monomorphic lists keep raw slots and must not be retyped as list[Any].
+            other => vec![member_print_tag(other)],
+        };
+        for ptag in &accept {
+            let bl = self.fresh_block(&format!("fromany.ok.{ptag}"));
+            cases.push_str(&format!(" i32 {ptag}, label %{bl}"));
+            ok_blocks.push((bl, *ptag));
+        }
+        self.line(format!("switch i32 {print_tag}, label %{bad_l} [{cases} ]"));
+        let mut phi_args = Vec::new();
+        for (bl, src_tag) in &ok_blocks {
+            self.start_block(bl);
+            let val = self.emit_payload_as(&payload, *src_tag, target);
+            let pred = self.cur_block.clone();
+            self.line(format!("br label %{end_l}"));
+            phi_args.push((val, pred));
+        }
+        self.start_block(&bad_l);
+        self.emit_die(&format!(
+            "TypeError: expected {target}, got incompatible dynamic value"
+        ));
+        self.start_block(&end_l);
+        let t = self.tmp();
+        let parts: Vec<String> = phi_args
+            .iter()
+            .map(|(v, b)| format!("[ {v}, %{b} ]"))
+            .collect();
+        self.line(format!("{t} = phi {} {}", lty(target), parts.join(", ")));
+        t
+    }
+
+    /// `isinstance` on a dynamic Any value: match box print_tag / class payload.
+    fn emit_isinstance_any(
+        &mut self,
+        any_slot: &str,
+        type_tags: &[i32],
+        bool_is_int: bool,
+        exc_filters: &[i32],
+        class_filters: &[u32],
+    ) -> String {
+        let (print_tag, payload) = self.emit_any_unpack(any_slot);
+        let mut acc: Option<String> = None;
+        for &want in type_tags {
+            let cmp = self.tmp();
+            if want == 4 {
+                // any list: (tag % 8) == 4 && tag >= 4
+                let ge = self.tmp();
+                self.line(format!("{ge} = icmp sge i32 {print_tag}, 4"));
+                let rem = self.tmp();
+                self.line(format!("{rem} = srem i32 {print_tag}, 8"));
+                let eq4 = self.tmp();
+                self.line(format!("{eq4} = icmp eq i32 {rem}, 4"));
+                self.line(format!("{cmp} = and i1 {ge}, {eq4}"));
+            } else if want == 0 && bool_is_int {
+                let is_int = self.tmp();
+                let is_bool = self.tmp();
+                self.line(format!("{is_int} = icmp eq i32 {print_tag}, 0"));
+                self.line(format!("{is_bool} = icmp eq i32 {print_tag}, 2"));
+                self.line(format!("{cmp} = or i1 {is_int}, {is_bool}"));
+            } else {
+                self.line(format!("{cmp} = icmp eq i32 {print_tag}, {want}"));
+            }
+            acc = Some(match acc {
+                None => cmp,
+                Some(prev) => {
+                    let or = self.tmp();
+                    self.line(format!("{or} = or i1 {prev}, {cmp}"));
+                    or
+                }
+            });
+        }
+        // Class filters: if print_tag is a class tag, check hierarchy on payload ptr.
+        if !class_filters.is_empty() {
+            let is_class = self.tmp();
+            // tag >= 13 && (tag - 13) % 8 == 0
+            let ge = self.tmp();
+            self.line(format!("{ge} = icmp sge i32 {print_tag}, 13"));
+            let sub = self.tmp();
+            self.line(format!("{sub} = sub i32 {print_tag}, 13"));
+            let rem = self.tmp();
+            self.line(format!("{rem} = srem i32 {sub}, 8"));
+            let eq0 = self.tmp();
+            self.line(format!("{eq0} = icmp eq i32 {rem}, 0"));
+            self.line(format!("{is_class} = and i1 {ge}, {eq0}"));
+            let yes_l = self.fresh_block("isinstance.any.class.yes");
+            let no_l = self.fresh_block("isinstance.any.class.no");
+            let end_l = self.fresh_block("isinstance.any.class.end");
+            self.line(format!("br i1 {is_class}, label %{yes_l}, label %{no_l}"));
+            self.start_block(&yes_l);
+            let obj = self.tmp();
+            self.line(format!("{obj} = inttoptr i64 {payload} to ptr"));
+            let n = self.classes.len() as i64;
+            let mut class_hit: Option<String> = None;
+            for &cid in class_filters {
+                let m = self.tmp();
+                self.line(format!(
+                    "{m} = call i32 @pyrs_isinstance_class(ptr {obj}, i64 {}, ptr @pyrs_class_parents, i64 {n})",
+                    cid as i64
+                ));
+                let cmp = self.tmp();
+                self.line(format!("{cmp} = icmp ne i32 {m}, 0"));
+                class_hit = Some(match class_hit {
+                    None => cmp,
+                    Some(prev) => {
+                        let or = self.tmp();
+                        self.line(format!("{or} = or i1 {prev}, {cmp}"));
+                        or
+                    }
+                });
+            }
+            let ch = class_hit.unwrap_or_else(|| "false".to_string());
+            let ypred = self.cur_block.clone();
+            self.line(format!("br label %{end_l}"));
+            self.start_block(&no_l);
+            let npred = self.cur_block.clone();
+            self.line(format!("br label %{end_l}"));
+            self.start_block(&end_l);
+            let class_res = self.tmp();
+            self.line(format!(
+                "{class_res} = phi i1 [ {ch}, %{ypred} ], [ false, %{npred} ]"
+            ));
+            acc = Some(match acc {
+                None => class_res,
+                Some(prev) => {
+                    let or = self.tmp();
+                    self.line(format!("{or} = or i1 {prev}, {class_res}"));
+                    or
+                }
+            });
+        }
+        // Exception filters on Any: if tag 11, check hierarchy.
+        if !exc_filters.is_empty() {
+            let is_exc = self.tmp();
+            self.line(format!("{is_exc} = icmp eq i32 {print_tag}, 11"));
+            let yes_l = self.fresh_block("isinstance.any.exc.yes");
+            let no_l = self.fresh_block("isinstance.any.exc.no");
+            let end_l = self.fresh_block("isinstance.any.exc.end");
+            self.line(format!("br i1 {is_exc}, label %{yes_l}, label %{no_l}"));
+            self.start_block(&yes_l);
+            let exc_ptr = self.tmp();
+            self.line(format!("{exc_ptr} = inttoptr i64 {payload} to ptr"));
+            let mut exc_hit: Option<String> = None;
+            for &f in exc_filters {
+                let m = self.tmp();
+                self.line(format!(
+                    "{m} = call i32 @pyrs_exc_isinstance(ptr {exc_ptr}, i32 {f})"
+                ));
+                let cmp = self.tmp();
+                self.line(format!("{cmp} = icmp ne i32 {m}, 0"));
+                exc_hit = Some(match exc_hit {
+                    None => cmp,
+                    Some(prev) => {
+                        let or = self.tmp();
+                        self.line(format!("{or} = or i1 {prev}, {cmp}"));
+                        or
+                    }
+                });
+            }
+            let eh = exc_hit.unwrap_or_else(|| "false".to_string());
+            let ypred = self.cur_block.clone();
+            self.line(format!("br label %{end_l}"));
+            self.start_block(&no_l);
+            let npred = self.cur_block.clone();
+            self.line(format!("br label %{end_l}"));
+            self.start_block(&end_l);
+            let exc_res = self.tmp();
+            self.line(format!(
+                "{exc_res} = phi i1 [ {eh}, %{ypred} ], [ false, %{npred} ]"
+            ));
+            acc = Some(match acc {
+                None => exc_res,
+                Some(prev) => {
+                    let or = self.tmp();
+                    self.line(format!("{or} = or i1 {prev}, {exc_res}"));
+                    or
+                }
+            });
+        }
+        acc.unwrap_or_else(|| "false".to_string())
+    }
+
+    /// Runtime type_id switch for exclusive subclass fields.
+    fn emit_get_field_partial(
+        &mut self,
+        obj: &str,
+        candidates: &[(u32, u32)],
+        attr: &str,
+        field_ty: Ty,
+    ) -> String {
+        let tid_p = self.tmp();
+        self.line(format!(
+            "{tid_p} = getelementptr inbounds {{ i64 }}, ptr {obj}, i32 0, i32 0"
+        ));
+        let tid = self.tmp();
+        self.line(format!("{tid} = load i64, ptr {tid_p}"));
+        let end_l = self.fresh_block("gfp.end");
+        let default_l = self.fresh_block("gfp.def");
+        let cand_set: std::collections::HashSet<u32> = candidates.iter().map(|(c, _)| *c).collect();
+        let mut cases = String::new();
+        let mut ok_blocks: Vec<(String, u32, u32)> = Vec::new();
+        let mut err_blocks: Vec<(String, String)> = Vec::new();
+        for (cid, fidx) in candidates {
+            let bl = self.fresh_block(&format!("gfp.{cid}"));
+            cases.push_str(&format!(" i64 {}, label %{bl}", *cid as i64));
+            ok_blocks.push((bl, *cid, *fidx));
+        }
+        let err_classes: Vec<(u32, String)> = self
+            .classes
+            .iter()
+            .filter(|c| !cand_set.contains(&c.id))
+            .map(|c| (c.id, c.name.clone()))
+            .collect();
+        for (cid, name) in err_classes {
+            let bl = self.fresh_block(&format!("gfp.err.{cid}"));
+            cases.push_str(&format!(" i64 {}, label %{bl}", cid as i64));
+            err_blocks.push((bl, name));
+        }
+        self.line(format!("switch i64 {tid}, label %{default_l} [{cases} ]"));
+        let mut phi_args = Vec::new();
+        for (bl, cid, fidx) in &ok_blocks {
+            self.start_block(bl);
+            let info = self
+                .classes
+                .get(*cid as usize)
+                .expect("GetFieldPartial class");
+            let sty = class_struct_ty(info);
+            let idx = *fidx as i32 + 1;
+            let fp = self.tmp();
+            self.line(format!(
+                "{fp} = getelementptr inbounds {sty}, ptr {obj}, i32 0, i32 {idx}"
+            ));
+            let val = self.tmp();
+            self.line(format!("{val} = load {}, ptr {fp}", lty(field_ty)));
+            let pred = self.cur_block.clone();
+            self.line(format!("br label %{end_l}"));
+            phi_args.push((val, pred));
+        }
+        for (bl, name) in &err_blocks {
+            self.start_block(bl);
+            self.emit_die(&format!(
+                "AttributeError: '{name}' object has no attribute '{attr}'"
+            ));
+        }
+        self.start_block(&default_l);
+        self.emit_die(&format!("AttributeError: object has no attribute '{attr}'"));
+        self.start_block(&end_l);
+        let t = self.tmp();
+        let parts: Vec<String> = phi_args
+            .iter()
+            .map(|(v, b)| format!("[ {v}, %{b} ]"))
+            .collect();
+        self.line(format!("{t} = phi {} {}", lty(field_ty), parts.join(", ")));
+        t
+    }
+
     /// Call a mangled method/function with already-emitted arg values.
     fn emit_direct_method_call(
         &mut self,
@@ -1697,6 +2262,10 @@ impl Emitter {
                 self.line(format!("br label %{end_l}"));
                 self.start_block(&end_l);
             }
+            Ty::Any => {
+                // Any is a heap box {print_tag, payload}; print via TAG_UNION path.
+                self.line(format!("call void @pyrs_print_any(i64 {v})"));
+            }
             Ty::File => unreachable!("semantic rejects file print"),
         }
     }
@@ -1715,6 +2284,13 @@ impl Emitter {
         self.tries.clear();
         self.fn_ret = func.ret;
         self.try_ret_ptr = None;
+        self.local_storage.clear();
+        for (name, ty) in &func.params {
+            self.local_storage.insert(name.clone(), *ty);
+        }
+        for (name, ty) in &func.locals {
+            self.local_storage.insert(name.clone(), *ty);
+        }
 
         self.start_block("entry");
         // spill params into allocas so assignment to params just works
@@ -1793,6 +2369,13 @@ impl Emitter {
         self.gen_local_index.clear();
         self.gen_fin_stack.clear();
         self.gen_yield_ty = func.yield_ty.unwrap_or(Ty::Int);
+        self.local_storage.clear();
+        for (name, ty) in &func.params {
+            self.local_storage.insert(name.clone(), *ty);
+        }
+        for (name, ty) in &func.locals {
+            self.local_storage.insert(name.clone(), *ty);
+        }
 
         // Frame layout: params first, then locals
         let mut idx = 0i64;
@@ -2490,9 +3073,21 @@ impl Emitter {
                 let v = self.emit_expr(value);
                 self.emit_to_union(&v, value.ty, expr.ty)
             }
+            ExprKind::ToAny { value } => {
+                let v = self.emit_expr(value);
+                self.emit_to_any(&v, value.ty)
+            }
+            ExprKind::FromAny { value } => {
+                let v = self.emit_expr(value);
+                self.emit_from_any(&v, expr.ty)
+            }
             ExprKind::IsNone { value, not } => self.emit_is_none(value, *not),
             ExprKind::IsIdentity { left, right, not } => self.emit_is_identity(left, right, *not),
             ExprKind::Local(name) => {
+                // Load the alloca/frame storage type. Semantic peels may retype
+                // `expr.ty` (e.g. Class multi-subclass peel) without a different
+                // LLVM ABI for class pointers.
+                let storage = self.local_storage.get(name).copied().unwrap_or(expr.ty);
                 if let (Some(frame), Some(idx)) = (
                     self.gen_frame.clone(),
                     self.gen_local_index.get(name).copied(),
@@ -2501,10 +3096,10 @@ impl Emitter {
                     self.line(format!(
                         "{slot} = call i64 @pyrs_gen_get_local(ptr {frame}, i64 {idx})"
                     ));
-                    self.value_from_slot(&slot, expr.ty)
+                    self.value_from_slot(&slot, storage)
                 } else {
                     let t = self.tmp();
-                    self.line(format!("{t} = load {}, ptr %v.{name}", lty(expr.ty)));
+                    self.line(format!("{t} = load {}, ptr %v.{name}", lty(storage)));
                     t
                 }
             }
@@ -2746,11 +3341,21 @@ impl Emitter {
                 exc_filters,
                 class_filters,
             } => {
+                let v = self.emit_expr(value);
+                // Dynamic Any: match box print_tag (and class hierarchy on payload).
+                if value.ty == Ty::Any {
+                    return self.emit_isinstance_any(
+                        &v,
+                        type_tags,
+                        *bool_is_int,
+                        exc_filters,
+                        class_filters,
+                    );
+                }
                 // Locals/unions store `{ i32 member_index, i64 payload }` by value
                 // (not a heap box). Match member_index against members whose
                 // print-tag satisfies any of `type_tags` (list=4 means any list).
                 // Exception/Class members use hierarchy filters on the payload.
-                let v = self.emit_expr(value);
                 let Ty::Union(members) = value.ty else {
                     // Monomorphic path should have been folded in semantic.
                     let t = self.tmp();
@@ -3459,7 +4064,7 @@ impl Emitter {
                         Ty::Int => "1".to_string(), // tagged small 0
                         Ty::Float => fconst(0.0),
                         Ty::Bool => "false".to_string(),
-                        Ty::None => "0".to_string(),
+                        Ty::None | Ty::Any => "0".to_string(),
                         Ty::Union(_) => "zeroinitializer".to_string(),
                         Ty::Str
                         | Ty::List(_)
@@ -3497,6 +4102,14 @@ impl Emitter {
                 let t = self.tmp();
                 self.line(format!("{t} = load {}, ptr {fp}", lty(fty)));
                 t
+            }
+            ExprKind::GetFieldPartial {
+                object,
+                candidates,
+                attr,
+            } => {
+                let obj = self.emit_expr(object);
+                self.emit_get_field_partial(&obj, candidates, attr, expr.ty)
             }
             ExprKind::CallMethod {
                 direct_func,
@@ -4620,12 +5233,13 @@ impl Emitter {
         let r = self.emit_expr(right);
         let t = self.tmp();
         match left.ty {
-            Ty::Int | Ty::Bool => {
+            Ty::Int | Ty::Bool | Ty::Any => {
                 let pred = if not { "ne" } else { "eq" };
                 // bool is i1; zext both for a uniform compare when mixed — types match.
                 if left.ty == Ty::Bool {
                     self.line(format!("{t} = icmp {pred} i1 {l}, {r}"));
                 } else {
+                    // Int and Any are both i64 slots (Any is boxed heap ptr bits).
                     self.line(format!("{t} = icmp {pred} i64 {l}, {r}"));
                 }
             }
@@ -4702,6 +5316,15 @@ impl Emitter {
             Ty::Exception | Ty::Class(_) => {
                 let _ = v;
                 "true".to_string()
+            }
+            // Any: runtime covers all list tags (4+8*k including list[str]/list[Any]),
+            // empty containers, null/None, nested union boxes.
+            Ty::Any => {
+                let c = self.tmp();
+                self.line(format!("{c} = call i32 @pyrs_any_truth(i64 {v})"));
+                let t = self.tmp();
+                self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                t
             }
             Ty::Union(members) => {
                 // If tag is None → false; else truthiness of active member payload.

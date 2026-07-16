@@ -69,6 +69,12 @@ pub enum Ty {
     /// User-defined class instance. `ClassId` indexes [`Module::classes`].
     /// Layout: header `i64 type_id` then fixed fields (never freed; GC-ready).
     Class(ClassId),
+    /// Limited dynamic value (annotation `Any`). LLVM `i64` holding a heap
+    /// box `{ i32 print_tag, i64 payload }` — the same encoding as union
+    /// elements in containers. Not full CPython dynamism: no open attrs,
+    /// method calls on bare Any are limited; coerce to concrete types with
+    /// a runtime TypeError check when the tag does not match.
+    Any,
 }
 
 /// Stable id for a user class in a compiled module (index into `Module::classes`).
@@ -98,8 +104,9 @@ pub fn set_of(elem: Ty) -> Ty {
 }
 
 /// Total order for union members: None < Bool < Int < Float < Str < List <
-/// Tuple < Dict < Set < File < Closure < Cell < Generator < Exception < Class.
-/// Nested containers compare recursively. Unions should not nest (flatten first).
+/// Tuple < Dict < Set < File < Closure < Cell < Generator < Exception < Class
+/// < Any. Nested containers compare recursively. Unions should not nest
+/// (flatten first).
 pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     fn rank(t: &Ty) -> u8 {
@@ -120,6 +127,7 @@ pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
             Ty::Generator { .. } => 13,
             Ty::Exception => 14,
             Ty::Class(_) => 15,
+            Ty::Any => 16,
         }
     }
     match (a, b) {
@@ -327,6 +335,7 @@ impl std::fmt::Display for Ty {
             Ty::Generator { yield_ty } => write!(f, "generator[{yield_ty}]"),
             Ty::Exception => write!(f, "exception"),
             Ty::Class(id) => write!(f, "class#{id}"),
+            Ty::Any => write!(f, "Any"),
         }
     }
 }
@@ -640,6 +649,15 @@ pub enum ExprKind {
     FromUnion {
         value: Box<Expr>,
     },
+    /// Box a concrete (or union) value into [`Ty::Any`] (heap print_tag + payload).
+    ToAny {
+        value: Box<Expr>,
+    },
+    /// Unbox [`Ty::Any`] to a concrete type (`expr.ty`) with a runtime tag check
+    /// (TypeError on mismatch). Class targets accept subclasses via type_id.
+    FromAny {
+        value: Box<Expr>,
+    },
     /// `value is None` / `value is not None`. Result is Bool.
     IsNone {
         value: Box<Expr>,
@@ -941,6 +959,17 @@ pub enum ExprKind {
         object: Box<Expr>,
         class_id: ClassId,
         field_index: u32,
+    },
+    /// Load a field that exists only on a subset of possible runtime classes
+    /// (e.g. after `isinstance(x, (B, C))` and `x.b` where only `B` has `b`).
+    /// Codegen switches on `type_id`: matching candidates GEP-load; others
+    /// raise AttributeError. `candidates` are `(class_id, field_index)` pairs
+    /// for every closed-world concrete class that has the field.
+    GetFieldPartial {
+        object: Box<Expr>,
+        candidates: Vec<(ClassId, u32)>,
+        /// Attribute name for AttributeError messages.
+        attr: String,
     },
     /// Instance method call. When `virtual` is true, dispatch on runtime
     /// type_id among `candidates` (pairs of (type_id, ir_func)); otherwise

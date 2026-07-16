@@ -1683,6 +1683,10 @@ static void print_slot(long long slot, int tag) {
         pyrs_print_set((const PyrsSet *)(uintptr_t)slot);
         break;
     case TAG_UNION: {
+        if (slot == 0) {
+            fputs("None", stdout);
+            break;
+        }
         const PyrsUnionBox *u = (const PyrsUnionBox *)(uintptr_t)slot;
         if (u->print_tag < 0) {
             fputs("None", stdout);
@@ -1711,6 +1715,82 @@ static void print_slot(long long slot, int tag) {
         }
         break;
     }
+}
+
+/* Print a dynamic Any value (heap box {print_tag, payload} as i64).
+ * Top-level print: null → None; str uses content (not repr); other tags
+ * via print_slot. List/container printing still uses repr for str elems. */
+void pyrs_print_any(long long slot) {
+    if (slot == 0) {
+        fputs("None", stdout);
+        return;
+    }
+    const PyrsUnionBox *u = (const PyrsUnionBox *)(uintptr_t)slot;
+    if (u->print_tag < 0) {
+        fputs("None", stdout);
+    } else if (u->print_tag == TAG_STR) {
+        pyrs_print_str((const PyrsStr *)(uintptr_t)u->payload);
+    } else {
+        print_slot(u->payload, u->print_tag);
+    }
+}
+
+/* Truthiness of a boxed print_tag + payload (CPython rules). */
+static int any_truth_tag(int tag, long long payload) {
+    if (tag < 0) {
+        return 0; /* None */
+    }
+    if (tag == TAG_INT) {
+        return pyrs_int_truth(payload);
+    }
+    if (tag == TAG_FLOAT) {
+        double d;
+        memcpy(&d, &payload, sizeof d);
+        /* Python: 0.0 falsy; NaN truthy (une vs 0.0). */
+        return d != 0.0;
+    }
+    if (tag == TAG_BOOL) {
+        return payload != 0;
+    }
+    if (tag == TAG_STR) {
+        const PyrsStr *s = (const PyrsStr *)(uintptr_t)payload;
+        return s != NULL && s->len != 0;
+    }
+    if (tag == TAG_TUPLE || tag == TAG_DICT || tag == TAG_SET) {
+        /* shared leading i64 length */
+        const long long *hdr = (const long long *)(uintptr_t)payload;
+        return hdr != NULL && hdr[0] != 0;
+    }
+    if (tag == TAG_UNION) {
+        /* Nested union/Any box */
+        if (payload == 0) {
+            return 0;
+        }
+        const PyrsUnionBox *inner = (const PyrsUnionBox *)(uintptr_t)payload;
+        return any_truth_tag(inner->print_tag, inner->payload);
+    }
+    /* Nested list: 4 + 8 * elem_tag (includes list[Any] = 4+8*8 = 68) */
+    if (tag >= 4 && ((tag - 4) % 8) == 0) {
+        const long long *hdr = (const long long *)(uintptr_t)payload;
+        return hdr != NULL && hdr[0] != 0;
+    }
+    /* Closure / generator / exception / class instance: truthy when non-null. */
+    if (tag == TAG_CLOSURE || tag == TAG_GENERATOR || tag == 11 /* exception */) {
+        return payload != 0;
+    }
+    if (tag >= TAG_CLASS_BASE && ((tag - TAG_CLASS_BASE) % 8) == 0) {
+        return payload != 0;
+    }
+    return 1;
+}
+
+/* bool(any_value) / `if any_value:` — 1 truthy, 0 falsy. Null slot → falsy. */
+int pyrs_any_truth(long long slot) {
+    if (slot == 0) {
+        return 0;
+    }
+    const PyrsUnionBox *u = (const PyrsUnionBox *)(uintptr_t)slot;
+    return any_truth_tag(u->print_tag, u->payload);
 }
 
 /* element tags match codegen: 0=int 1=float 2=bool 3=str; nested list 4+8*t;
@@ -3093,6 +3173,37 @@ static int slot_eq(long long a, long long b, int tag) {
     }
     if (tag == TAG_SET) {
         return pyrs_set_eq((const PyrsSet *)(uintptr_t)a, (const PyrsSet *)(uintptr_t)b);
+    }
+    /* list[Any] / union boxes: recursive eq on boxed print_tag + payload.
+     * CPython: True == 1, so bool and int boxes compare numerically. */
+    if (tag == TAG_UNION) {
+        if (a == 0 && b == 0) {
+            return 1;
+        }
+        if (a == 0 || b == 0) {
+            return 0;
+        }
+        const PyrsUnionBox *ua = (const PyrsUnionBox *)(uintptr_t)a;
+        const PyrsUnionBox *ub = (const PyrsUnionBox *)(uintptr_t)b;
+        if (ua->print_tag < 0 && ub->print_tag < 0) {
+            return 1; /* both None */
+        }
+        if (ua->print_tag == ub->print_tag) {
+            if (ua->print_tag < 0) {
+                return 1;
+            }
+            return slot_eq(ua->payload, ub->payload, ua->print_tag);
+        }
+        /* Cross-tag: bool ↔ int (True == 1). Bool payload is 0/1; int is tagged. */
+        if (ua->print_tag == TAG_BOOL && ub->print_tag == TAG_INT) {
+            long long bi = ua->payload ? 3 : 1; /* tagged small 1 or 0 */
+            return pyrs_int_eq(bi, ub->payload);
+        }
+        if (ua->print_tag == TAG_INT && ub->print_tag == TAG_BOOL) {
+            long long bi = ub->payload ? 3 : 1;
+            return pyrs_int_eq(ua->payload, bi);
+        }
+        return 0;
     }
     if (tag >= 4 && ((tag - 4) % 8) == 0) {
         /* nested list: slots are list pointers; inner tag = (tag-4)/8 */

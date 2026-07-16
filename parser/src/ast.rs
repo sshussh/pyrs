@@ -30,6 +30,8 @@ pub enum TypeName {
     Union(&'static [TypeName]),
     /// User class type annotation (`def f(p: Point)`). Resolved in semantic.
     Class(&'static str),
+    /// Limited dynamic type (`x: Any`). Resolved to `ir::Ty::Any`.
+    Any,
 }
 
 impl std::fmt::Display for TypeName {
@@ -67,6 +69,7 @@ impl std::fmt::Display for TypeName {
                 Ok(())
             }
             TypeName::Class(name) => write!(f, "{name}"),
+            TypeName::Any => write!(f, "Any"),
         }
     }
 }

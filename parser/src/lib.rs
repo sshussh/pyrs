@@ -692,6 +692,11 @@ impl Parser {
                 self.expect(Token::RBracket, "to close 'Optional[...]'")?;
                 Ok(intern_type_union(&[inner, TypeName::None]))
             }
+            // Limited dynamic type (`Any`).
+            Token::Ident(name) if name == "Any" => {
+                self.advance();
+                Ok(TypeName::Any)
+            }
             // User class type annotation (`Point`, `Animal`, …).
             Token::Ident(name) => {
                 let name = name.clone();
@@ -700,8 +705,8 @@ impl Parser {
             }
             other => Err(self.error(format!(
                 "expected a type ('int', 'float', 'bool', 'str', 'file', 'list[...]', \
-                 'tuple[...]', 'dict[...]', 'set[...]', 'Optional[T]', a class name, \
-                 or 'None') {}, found {}",
+                 'tuple[...]', 'dict[...]', 'set[...]', 'Optional[T]', 'Any', a class \
+                 name, or 'None') {}, found {}",
                 context,
                 other.describe()
             ))),

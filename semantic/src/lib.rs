@@ -214,6 +214,7 @@ fn resolve_type(ty: ast::TypeName) -> ir::Ty {
         ast::TypeName::Bool => ir::Ty::Bool,
         ast::TypeName::Str => ir::Ty::Str,
         ast::TypeName::File => ir::Ty::File,
+        ast::TypeName::Any => ir::Ty::Any,
         ast::TypeName::List(e) => ir::list_of(resolve_type(*e)),
         ast::TypeName::Tuple(elems) => {
             let ts: Vec<ir::Ty> = elems.iter().copied().map(resolve_type).collect();
@@ -366,11 +367,7 @@ fn infer_ty_from_default(expr: &ast::Expr) -> SResult<ir::Ty> {
             op: ast::UnaryOp::Not,
             ..
         } => Ok(ir::Ty::Bool),
-        ast::ExprKind::ListLit(items) if items.is_empty() => Err(err(
-            "cannot infer type of default []; annotate the parameter \
-             (e.g. 'xs: list[int] = []')",
-            expr.span,
-        )),
+        ast::ExprKind::ListLit(items) if items.is_empty() => Ok(ir::list_of(ir::Ty::Any)),
         ast::ExprKind::ListLit(items) => {
             let mut elem: Option<ir::Ty> = None;
             for it in items {
@@ -661,13 +658,224 @@ fn make_closure_expr(info: &NestedFnInfo, span: Span, ctx: &mut FnCtx) -> SResul
     })
 }
 
-fn extract_union_member(value: ir::Expr, member: ir::Ty, _span: Span) -> SResult<ir::Expr> {
-    Ok(ir::Expr {
-        ty: member,
-        kind: ir::ExprKind::FromUnion {
-            value: Box::new(value),
-        },
-    })
+/// Apply a flow refinement to a loaded name.
+///
+/// - Union storage → concrete member: `FromUnion` peel.
+/// - Union storage → subclass of a class member: extract the base class
+///   member, then retype to the subclass (same pointer; layout prefix).
+/// - Monomorphic class storage → subclass: retype the load (isinstance peel).
+/// - Multi-member peels keep storage (tags unsafe to rematerialize).
+fn apply_type_refinement(base: ir::Expr, storage: ir::Ty, nty: ir::Ty) -> ir::Expr {
+    if nty == storage {
+        return base;
+    }
+    // Class base → more specific subclass (isinstance).
+    if let (ir::Ty::Class(src), ir::Ty::Class(dst)) = (storage, nty)
+        && class_is_subclass(dst, src)
+    {
+        return ir::Expr {
+            ty: nty,
+            kind: base.kind,
+        };
+    }
+    // Class base → union of subclasses (isinstance(x, (B, C))): keep the
+    // Class ABI (ptr). Attribute lowering consults the refinement map for
+    // common fields; retyping Local to Union would make codegen load
+    // `{i32,i64}` from a `ptr` alloca.
+    if matches!(storage, ir::Ty::Union(_)) && !matches!(nty, ir::Ty::Union(_)) {
+        let members = ir::flatten_union_members(storage);
+        // Exact member peel.
+        if members.contains(&nty) {
+            return ir::Expr {
+                ty: nty,
+                kind: ir::ExprKind::FromUnion {
+                    value: Box::new(base),
+                },
+            };
+        }
+        // isinstance subclass peel: storage has Class(base), refine to Class(sub).
+        if let ir::Ty::Class(want) = nty {
+            for m in members {
+                if let ir::Ty::Class(got) = m
+                    && class_is_subclass(want, got)
+                {
+                    let extracted = ir::Expr {
+                        ty: m,
+                        kind: ir::ExprKind::FromUnion {
+                            value: Box::new(base),
+                        },
+                    };
+                    return ir::Expr {
+                        ty: nty,
+                        kind: extracted.kind,
+                    };
+                }
+            }
+        }
+        // Multi-member / unknown peel: keep storage type.
+        return base;
+    }
+    // Multi-member peels (class or scalar): keep storage. Member-index tags
+    // must not be rematerialized — retyping a subset (A|B|C → B|C) renumbers
+    // indices and blanks/mis-prints or segfaults. Exclusive class fields and
+    // common fields consult `type_refinements` / `exclusive_class_field`, not
+    // a retyped load ABI.
+    let _ = nty;
+    base
+}
+
+/// If `ty` is a union of classes that all share `attr` at the same index/type,
+/// return `(representative_class_id, field_index, field_ty)`.
+fn common_class_field(ty: ir::Ty, attr: &str) -> Option<(ir::ClassId, u32, ir::Ty)> {
+    let members = ir::flatten_union_members(ty);
+    if members.is_empty() || !members.iter().all(|m| matches!(m, ir::Ty::Class(_))) {
+        return None;
+    }
+    let mut found: Option<(ir::ClassId, u32, ir::Ty)> = None;
+    for m in members {
+        let ir::Ty::Class(id) = m else {
+            return None;
+        };
+        let (idx, fty) = field_index(id, attr)?;
+        match found {
+            None => found = Some((id, idx, fty)),
+            Some((_, pi, pt)) if pi == idx && pt == fty => {}
+            _ => return None,
+        }
+    }
+    found
+}
+
+/// Field access that exists on a *subset* of a class union (or on classes with
+/// differing layout indices). Returns closed-world `(class_id, field_index)`
+/// candidates that have `attr` at a uniform field type, for a runtime type_id
+/// switch. `None` when no refined class has the field or types disagree.
+fn exclusive_class_field(ty: ir::Ty, attr: &str) -> Option<(Vec<(ir::ClassId, u32)>, ir::Ty)> {
+    let members = ir::flatten_union_members(ty);
+    if members.is_empty() || !members.iter().all(|m| matches!(m, ir::Ty::Class(_))) {
+        return None;
+    }
+    let mut candidates: Vec<(ir::ClassId, u32)> = Vec::new();
+    let mut field_ty: Option<ir::Ty> = None;
+    // Expand each refined class to every closed-world subclass that may appear
+    // at runtime after isinstance(x, (B, C)) (type_id is the most specific).
+    let mut seen: HashSet<ir::ClassId> = HashSet::new();
+    for m in members {
+        let ir::Ty::Class(id) = m else {
+            return None;
+        };
+        for sid in subclasses_of(id) {
+            if !seen.insert(sid) {
+                continue;
+            }
+            if let Some((idx, fty)) = field_index(sid, attr) {
+                match field_ty {
+                    None => field_ty = Some(fty),
+                    Some(prev) if prev == fty => {}
+                    Some(_) => return None, // incompatible field types
+                }
+                candidates.push((sid, idx));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    Some((candidates, field_ty.expect("candidates non-empty")))
+}
+
+/// Per-member `isinstance` peel: `(then_ty, else_ty)` — either side may be
+/// absent when that arm is impossible for this storage member.
+///
+/// Class members are special: `isinstance(x, Sub)` when `x` is statically a
+/// base class peels then-arm to `Sub` and keeps the base in the else-arm.
+fn isinstance_peel_member(m: ir::Ty, pats: &[IsInstancePat]) -> (Option<ir::Ty>, Option<ir::Ty>) {
+    let class_wants: Vec<ir::ClassId> = pats
+        .iter()
+        .filter_map(|p| match p {
+            IsInstancePat::Class(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+
+    if let ir::Ty::Class(got) = m {
+        if class_wants.is_empty() {
+            // isinstance(obj, int) etc. — never true for user instances.
+            let hit = pats.iter().any(|p| isinstance_pat_matches(m, *p));
+            return if hit {
+                (Some(m), None)
+            } else {
+                (None, Some(m))
+            };
+        }
+        // got <: want → always True; keep the more-specific static type.
+        if class_wants.iter().any(|&w| class_is_subclass(got, w)) {
+            return (Some(m), None);
+        }
+        // want <: got → runtime check; then peels to want(s), else keeps base.
+        let then_ids: Vec<ir::ClassId> = class_wants
+            .iter()
+            .copied()
+            .filter(|&w| class_is_subclass(w, got))
+            .collect();
+        if !then_ids.is_empty() {
+            let then_tys: Vec<ir::Ty> = then_ids.into_iter().map(ir::Ty::Class).collect();
+            let then_ty = match then_tys.len() {
+                1 => then_tys[0],
+                _ => ir::union_of(&then_tys),
+            };
+            return (Some(then_ty), Some(m));
+        }
+        // Unrelated class patterns.
+        return (None, Some(m));
+    }
+
+    // All exception instances share Ty::Exception — cannot peel subtypes.
+    if m == ir::Ty::Exception {
+        let has_exc = pats.iter().any(|p| matches!(p, IsInstancePat::Exc(_)));
+        return if has_exc {
+            (Some(m), Some(m))
+        } else {
+            (None, Some(m))
+        };
+    }
+
+    let hit = pats.iter().any(|p| isinstance_pat_matches(m, *p));
+    if hit {
+        (Some(m), None)
+    } else {
+        (None, Some(m))
+    }
+}
+
+/// Look up storage type of a local/cell/module name (not refinements).
+fn name_storage_ty(name: &str, ctx: &FnCtx) -> Option<ir::Ty> {
+    ctx.locals
+        .get(name)
+        .copied()
+        .or_else(|| ctx.cell_locals.get(name).copied())
+        .or_else(|| {
+            // Module Optionals: free reads (no `global` needed) and explicit
+            // `global` / entry use GlobalLoad.
+            if !ctx.locals.contains_key(name) && !ctx.cell_locals.contains_key(name) {
+                ctx.globals.get(name).copied()
+            } else {
+                None
+            }
+        })
+}
+
+/// Effective type of `name` under an active refinement overlay (and-chain mid
+/// peels), falling back to `ctx.type_refinements` then storage.
+fn name_refined_ty(name: &str, ctx: &FnCtx, active: &HashMap<String, ir::Ty>) -> Option<ir::Ty> {
+    let storage = name_storage_ty(name, ctx)?;
+    Some(
+        active
+            .get(name)
+            .copied()
+            .or_else(|| ctx.type_refinements.get(name).copied())
+            .unwrap_or(storage),
+    )
 }
 
 /// Flow-sensitive narrowing for `x is None` / `x is not None` / `not (x is None)`.
@@ -677,6 +885,18 @@ fn narrowing_from_condition(
     cond: &ast::Expr,
     ctx: &FnCtx,
 ) -> (HashMap<String, ir::Ty>, HashMap<String, ir::Ty>) {
+    // Seed active peels with current refinements so nested and/or compose.
+    narrowing_from_condition_with(cond, ctx, &ctx.type_refinements)
+}
+
+/// Like [`narrowing_from_condition`], but peels are computed relative to
+/// `active` (left-arm peels of an `and` chain, etc.). Right-arm peels thus see
+/// more-specific left refinements instead of wiping them with storage.
+fn narrowing_from_condition_with(
+    cond: &ast::Expr,
+    ctx: &FnCtx,
+    active: &HashMap<String, ir::Ty>,
+) -> (HashMap<String, ir::Ty>, HashMap<String, ir::Ty>) {
     let mut then_m = HashMap::new();
     let mut else_m = HashMap::new();
     match &cond.kind {
@@ -684,32 +904,49 @@ fn narrowing_from_condition(
             op: ast::UnaryOp::Not,
             operand,
         } => {
-            let (t, e) = narrowing_from_condition(operand, ctx);
+            let (t, e) = narrowing_from_condition_with(operand, ctx, active);
             return (e, t);
         }
-        // `A and B`: then sees both then-refs; else is not a simple complement
-        // (A may be true and B false), so only then-refs are applied.
+        // `A and B`: then sees left peels, then right peels computed *under*
+        // left (so `isinstance(x, B) and x is not None` keeps B; chained
+        // isinstance keeps the more specific class). Else is not a simple
+        // complement (A may be true and B false).
         ast::ExprKind::Binary {
             op: ast::BinOp::And,
             left,
             right,
         } => {
-            let (lt, _) = narrowing_from_condition(left, ctx);
-            let (rt, _) = narrowing_from_condition(right, ctx);
-            then_m.extend(lt);
-            then_m.extend(rt);
+            let (lt, _) = narrowing_from_condition_with(left, ctx, active);
+            let mut active_right = active.clone();
+            for (k, v) in &lt {
+                active_right.insert(k.clone(), *v);
+            }
+            let (rt, _) = narrowing_from_condition_with(right, ctx, &active_right);
+            // Start with left peels; right overwrites only when it mentions a
+            // name (and was computed under left, so stays at least as specific).
+            then_m = lt;
+            for (k, v) in rt {
+                then_m.insert(k, v);
+            }
             return (then_m, else_m);
         }
-        // `A or B`: else sees both else-refs (both failed); then is mixed.
+        // `A or B`: else sees both else-refs (both failed). Compose right's
+        // else peels under left's else peels for the same sequential reason.
         ast::ExprKind::Binary {
             op: ast::BinOp::Or,
             left,
             right,
         } => {
-            let (_, le) = narrowing_from_condition(left, ctx);
-            let (_, re) = narrowing_from_condition(right, ctx);
-            else_m.extend(le);
-            else_m.extend(re);
+            let (_, le) = narrowing_from_condition_with(left, ctx, active);
+            let mut active_else = active.clone();
+            for (k, v) in &le {
+                active_else.insert(k.clone(), *v);
+            }
+            let (_, re) = narrowing_from_condition_with(right, ctx, &active_else);
+            else_m = le;
+            for (k, v) in re {
+                else_m.insert(k, v);
+            }
             return (then_m, else_m);
         }
         ast::ExprKind::Binary {
@@ -719,47 +956,19 @@ fn narrowing_from_condition(
         } => {
             let not = matches!(op, ast::BinOp::IsNot);
             let (name, name_ty) = match (&left.kind, &right.kind) {
-                (ast::ExprKind::Name(n), ast::ExprKind::NoneLit) => (
-                    n.as_str(),
-                    ctx.locals
-                        .get(n)
-                        .copied()
-                        .or_else(|| ctx.cell_locals.get(n).copied())
-                        .or_else(|| {
-                            // Module Optionals: free reads (no `global` needed)
-                            // and explicit `global` / entry use GlobalLoad.
-                            if !ctx.locals.contains_key(n) && !ctx.cell_locals.contains_key(n) {
-                                ctx.globals.get(n).copied()
-                            } else {
-                                None
-                            }
-                        }),
-                ),
-                (ast::ExprKind::NoneLit, ast::ExprKind::Name(n)) => (
-                    n.as_str(),
-                    ctx.locals
-                        .get(n)
-                        .copied()
-                        .or_else(|| ctx.cell_locals.get(n).copied())
-                        .or_else(|| {
-                            if !ctx.locals.contains_key(n) && !ctx.cell_locals.contains_key(n) {
-                                ctx.globals.get(n).copied()
-                            } else {
-                                None
-                            }
-                        }),
-                ),
+                (ast::ExprKind::Name(n), ast::ExprKind::NoneLit) => {
+                    (n.as_str(), name_storage_ty(n, ctx))
+                }
+                (ast::ExprKind::NoneLit, ast::ExprKind::Name(n)) => {
+                    (n.as_str(), name_storage_ty(n, ctx))
+                }
                 _ => return (then_m, else_m),
             };
             let Some(storage_ty) = name_ty else {
                 return (then_m, else_m);
             };
-            // Prefer an active refinement when present (nested checks).
-            let ty = ctx
-                .type_refinements
-                .get(name)
-                .copied()
-                .unwrap_or(storage_ty);
+            // Prefer active overlay (and-chain left peels), then outer refinements.
+            let ty = name_refined_ty(name, ctx, active).unwrap_or(storage_ty);
             let without_none = match ty {
                 ir::Ty::Union(ms) => {
                     let rest: Vec<ir::Ty> =
@@ -800,7 +1009,8 @@ fn narrowing_from_condition(
                 else_m.insert(name.to_string(), storage_without);
             }
         }
-        // `isinstance(x, T)` / `isinstance(x, (T1, T2))` peels union in then-arm.
+        // `isinstance(x, T)` / `isinstance(x, (T1, T2))` peels unions and class
+        // bases (subclass → then-arm; complementary miss → else-arm).
         ast::ExprKind::Call {
             func,
             args,
@@ -811,47 +1021,36 @@ fn narrowing_from_condition(
             if let Ok(plain) = require_plain_args(args, "isinstance", cond.span)
                 && plain.len() == 2
                 && let ast::ExprKind::Name(n) = &plain[0].kind
+                && let Some(storage_ty) = name_storage_ty(n, ctx)
+                && let Ok(pats) = parse_isinstance_type_arg(plain[1])
             {
-                let name_ty = ctx
-                    .locals
-                    .get(n)
-                    .copied()
-                    .or_else(|| ctx.cell_locals.get(n).copied())
-                    .or_else(|| {
-                        if !ctx.locals.contains_key(n) && !ctx.cell_locals.contains_key(n) {
-                            ctx.globals.get(n).copied()
-                        } else {
-                            None
-                        }
-                    });
-                if let Some(storage_ty) = name_ty
-                    && let Ok(pats) = parse_isinstance_type_arg(plain[1])
-                {
-                    let members = ir::flatten_union_members(storage_ty);
-                    let hit: Vec<ir::Ty> = members
-                        .iter()
-                        .copied()
-                        .filter(|m| pats.iter().any(|p| isinstance_pat_matches(*m, *p)))
-                        .collect();
-                    let miss: Vec<ir::Ty> = members
-                        .iter()
-                        .copied()
-                        .filter(|m| !pats.iter().any(|p| isinstance_pat_matches(*m, *p)))
-                        .collect();
-                    if !hit.is_empty() {
-                        let then_ty = match hit.len() {
-                            1 => hit[0],
-                            _ => ir::union_of(&hit),
-                        };
-                        then_m.insert(n.clone(), then_ty);
+                // Prefer active overlay (and-chain left peels), then outer.
+                let ty = name_refined_ty(n, ctx, active).unwrap_or(storage_ty);
+                let members = ir::flatten_union_members(ty);
+                let mut hit: Vec<ir::Ty> = Vec::new();
+                let mut miss: Vec<ir::Ty> = Vec::new();
+                for m in members {
+                    let (t, e) = isinstance_peel_member(m, &pats);
+                    if let Some(t) = t {
+                        hit.push(t);
                     }
-                    if !miss.is_empty() {
-                        let else_ty = match miss.len() {
-                            1 => miss[0],
-                            _ => ir::union_of(&miss),
-                        };
-                        else_m.insert(n.clone(), else_ty);
+                    if let Some(e) = e {
+                        miss.push(e);
                     }
+                }
+                if !hit.is_empty() {
+                    let then_ty = match hit.len() {
+                        1 => hit[0],
+                        _ => ir::union_of(&hit),
+                    };
+                    then_m.insert(n.clone(), then_ty);
+                }
+                if !miss.is_empty() {
+                    let else_ty = match miss.len() {
+                        1 => miss[0],
+                        _ => ir::union_of(&miss),
+                    };
+                    else_m.insert(n.clone(), else_ty);
                 }
             }
         }
@@ -2548,6 +2747,15 @@ fn try_infer_param_from_body(
             acc = join_types(acc, t);
         } else if matches!((acc, t), (ir::Ty::List(_), ir::Ty::List(_))) && acc == t {
             // same list type
+        } else if let (ir::Ty::Class(a), ir::Ty::Class(b)) = (acc, t) {
+            // Prefer the common base when one is a subclass of the other.
+            if class_is_subclass(a, b) {
+                acc = t;
+            } else if class_is_subclass(b, a) {
+                // keep acc (base or equal)
+            } else {
+                return None; // unrelated classes
+            }
         } else {
             return None; // conflict
         }
@@ -2764,6 +2972,28 @@ fn collect_param_constraints_expr(
                     _ => {}
                 }
             }
+            // `isinstance(x, T)` / `isinstance(x, (T1, T2))` constrains bare `x`.
+            // Multi-type tuples become one union constraint (monomorphic infer
+            // rejects unions → annotate). Container patterns (list/…) are skipped
+            // as too ambiguous without an element type.
+            if func == "isinstance"
+                && let Some(ast::PosArg::Pos(val)) = args.first()
+                && matches!(&val.kind, ast::ExprKind::Name(n) if n == name)
+                && let Some(ast::PosArg::Pos(ty_arg)) = args.get(1)
+                && let Ok(pats) = parse_isinstance_type_arg(ty_arg)
+            {
+                let mut tys: Vec<ir::Ty> = Vec::new();
+                for p in pats {
+                    if let Some(t) = isinstance_pat_to_ty(p) {
+                        tys.push(t);
+                    }
+                }
+                match tys.len() {
+                    0 => {}
+                    1 => out.push(tys[0]),
+                    _ => out.push(ir::union_of(&tys)),
+                }
+            }
             for a in args {
                 let ae = match a {
                     ast::PosArg::Pos(e) | ast::PosArg::Star(e) => e,
@@ -2861,7 +3091,319 @@ fn collect_joined_local_types(
         env.entry(k.clone()).or_insert(*v);
     }
     collect_assign_types_in(body, &mut env, &mut assigns, &mut annotated);
+    // Empty `xs = []` followed by `xs.append(v)` (or insert) fixes list[T].
+    fill_empty_list_types_from_appends(body, &env, &mut assigns, &annotated);
     assigns
+}
+
+/// Names assigned an empty list literal (`xs = []`) somewhere in `body`.
+fn collect_empty_list_assign_names(stmts: &[ast::Stmt], out: &mut HashSet<String>) {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::Assign {
+                targets,
+                annotation: None,
+                value,
+            } => {
+                if matches!(&value.kind, ast::ExprKind::ListLit(items) if items.is_empty()) {
+                    for t in targets {
+                        if let ast::AssignTarget::Name { name, .. } = t {
+                            out.insert(name.clone());
+                        }
+                    }
+                }
+            }
+            ast::StmtKind::If { branches, orelse } => {
+                for (_, b) in branches {
+                    collect_empty_list_assign_names(b, out);
+                }
+                collect_empty_list_assign_names(orelse, out);
+            }
+            ast::StmtKind::While { body, orelse, .. } | ast::StmtKind::For { body, orelse, .. } => {
+                collect_empty_list_assign_names(body, out);
+                collect_empty_list_assign_names(orelse, out);
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                collect_empty_list_assign_names(body, out);
+                for h in handlers {
+                    collect_empty_list_assign_names(&h.body, out);
+                }
+                collect_empty_list_assign_names(orelse, out);
+                collect_empty_list_assign_names(finally, out);
+            }
+            ast::StmtKind::With { body, .. } => collect_empty_list_assign_names(body, out),
+            ast::StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    collect_empty_list_assign_names(&c.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect element-type hints from `name.append(v)` / `name.insert(i, v)`.
+fn collect_list_append_elem_hints(
+    stmts: &[ast::Stmt],
+    env: &HashMap<String, ir::Ty>,
+    out: &mut HashMap<String, ir::Ty>,
+) {
+    collect_list_append_elem_hints_scoped(stmts, env, out, &HashSet::new());
+}
+
+/// `shadowed`: names assigned in an enclosing nested-def scope (block free-var
+/// appends from filling outer empty lists when the nested function rebinds the name).
+fn collect_list_append_elem_hints_scoped(
+    stmts: &[ast::Stmt],
+    env: &HashMap<String, ir::Ty>,
+    out: &mut HashMap<String, ir::Ty>,
+    shadowed: &HashSet<String>,
+) {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::ExprStmt(e)
+            | ast::StmtKind::Return(Some(e))
+            | ast::StmtKind::Raise { message: e, .. } => {
+                collect_list_append_elem_hints_expr(e, env, out, shadowed);
+            }
+            ast::StmtKind::Assign { value, .. } => {
+                collect_list_append_elem_hints_expr(value, env, out, shadowed);
+            }
+            ast::StmtKind::AugAssign { value, .. } => {
+                collect_list_append_elem_hints_expr(value, env, out, shadowed);
+            }
+            ast::StmtKind::If { branches, orelse } => {
+                for (c, b) in branches {
+                    collect_list_append_elem_hints_expr(c, env, out, shadowed);
+                    collect_list_append_elem_hints_scoped(b, env, out, shadowed);
+                }
+                collect_list_append_elem_hints_scoped(orelse, env, out, shadowed);
+            }
+            ast::StmtKind::While { cond, body, orelse } => {
+                collect_list_append_elem_hints_expr(cond, env, out, shadowed);
+                collect_list_append_elem_hints_scoped(body, env, out, shadowed);
+                collect_list_append_elem_hints_scoped(orelse, env, out, shadowed);
+            }
+            ast::StmtKind::For {
+                iter, body, orelse, ..
+            } => {
+                collect_list_append_elem_hints_expr(iter, env, out, shadowed);
+                collect_list_append_elem_hints_scoped(body, env, out, shadowed);
+                collect_list_append_elem_hints_scoped(orelse, env, out, shadowed);
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                collect_list_append_elem_hints_scoped(body, env, out, shadowed);
+                for h in handlers {
+                    collect_list_append_elem_hints_scoped(&h.body, env, out, shadowed);
+                }
+                collect_list_append_elem_hints_scoped(orelse, env, out, shadowed);
+                collect_list_append_elem_hints_scoped(finally, env, out, shadowed);
+            }
+            ast::StmtKind::With { item, body, .. } => {
+                collect_list_append_elem_hints_expr(item, env, out, shadowed);
+                collect_list_append_elem_hints_scoped(body, env, out, shadowed);
+            }
+            ast::StmtKind::Match { subject, cases } => {
+                collect_list_append_elem_hints_expr(subject, env, out, shadowed);
+                for c in cases {
+                    if let Some(g) = &c.guard {
+                        collect_list_append_elem_hints_expr(g, env, out, shadowed);
+                    }
+                    collect_list_append_elem_hints_scoped(&c.body, env, out, shadowed);
+                }
+            }
+            // Nested def: free-var `xs.append` fills outer `xs = []`; local rebinds
+            // of `xs` are shadowed and do not affect the outer empty list.
+            ast::StmtKind::FuncDef(f) => {
+                let nested_assigned = assigned_names_in_stmts(&f.body);
+                let mut child_shadow = shadowed.clone();
+                child_shadow.extend(nested_assigned);
+                // Params of the nested def type append args like `xs.append(x)`.
+                let mut child_env = env.clone();
+                for p in &f.params {
+                    if let Ok(ty) = resolve_param_ty(p) {
+                        child_env.insert(p.name.clone(), ty);
+                    }
+                }
+                if let Some(va) = &f.vararg
+                    && let Ok(ty) = resolve_param_ty(va)
+                {
+                    child_env.insert(va.name.clone(), ir::list_of(ty));
+                }
+                collect_list_append_elem_hints_scoped(&f.body, &child_env, out, &child_shadow);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_list_append_elem_hints_expr(
+    e: &ast::Expr,
+    env: &HashMap<String, ir::Ty>,
+    out: &mut HashMap<String, ir::Ty>,
+    shadowed: &HashSet<String>,
+) {
+    match &e.kind {
+        ast::ExprKind::MethodCall {
+            base, method, args, ..
+        } => {
+            if let ast::ExprKind::Name(n) = &base.kind
+                && !shadowed.contains(n)
+            {
+                let elem_hint = match method.as_str() {
+                    "append" => {
+                        if let Some(ast::PosArg::Pos(a0)) = args.first() {
+                            try_type_ast_expr(a0, env, &HashMap::new())
+                        } else {
+                            None
+                        }
+                    }
+                    "insert" => {
+                        if let Some(ast::PosArg::Pos(a1)) = args.get(1) {
+                            try_type_ast_expr(a1, env, &HashMap::new())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(elem) = elem_hint {
+                    match out.get(n).copied() {
+                        None => {
+                            out.insert(n.clone(), elem);
+                        }
+                        Some(prev) if prev != elem => {
+                            let j = join_types(prev, elem);
+                            out.insert(n.clone(), j);
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            collect_list_append_elem_hints_expr(base, env, out, shadowed);
+            for a in args {
+                let ae = match a {
+                    ast::PosArg::Pos(e) | ast::PosArg::Star(e) => e,
+                };
+                collect_list_append_elem_hints_expr(ae, env, out, shadowed);
+            }
+        }
+        ast::ExprKind::Binary { left, right, .. } => {
+            collect_list_append_elem_hints_expr(left, env, out, shadowed);
+            collect_list_append_elem_hints_expr(right, env, out, shadowed);
+        }
+        ast::ExprKind::Compare { first, rest } => {
+            collect_list_append_elem_hints_expr(first, env, out, shadowed);
+            for (_, r) in rest {
+                collect_list_append_elem_hints_expr(r, env, out, shadowed);
+            }
+        }
+        ast::ExprKind::Unary { operand, .. } | ast::ExprKind::Cast { arg: operand, .. } => {
+            collect_list_append_elem_hints_expr(operand, env, out, shadowed);
+        }
+        ast::ExprKind::Call { args, .. } => {
+            for a in args {
+                let ae = match a {
+                    ast::PosArg::Pos(e) | ast::PosArg::Star(e) => e,
+                };
+                collect_list_append_elem_hints_expr(ae, env, out, shadowed);
+            }
+        }
+        ast::ExprKind::Index { base, index } => {
+            collect_list_append_elem_hints_expr(base, env, out, shadowed);
+            collect_list_append_elem_hints_expr(index, env, out, shadowed);
+        }
+        ast::ExprKind::ListLit(items) => {
+            for it in items {
+                let e = match it {
+                    ast::ListElem::Item(e) | ast::ListElem::Star(e) => e,
+                };
+                collect_list_append_elem_hints_expr(e, env, out, shadowed);
+            }
+        }
+        ast::ExprKind::TupleLit(items) | ast::ExprKind::SetLit(items) => {
+            for it in items {
+                collect_list_append_elem_hints_expr(it, env, out, shadowed);
+            }
+        }
+        ast::ExprKind::DictLit(items) => {
+            for (k, v) in items {
+                collect_list_append_elem_hints_expr(k, env, out, shadowed);
+                collect_list_append_elem_hints_expr(v, env, out, shadowed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// When `xs = []` has no annotation, fix `list[T]` from later `xs.append`/`insert`.
+/// Remaining empty lists with no elem hint default to `list[Any]`.
+fn fill_empty_list_types_from_appends(
+    body: &[ast::Stmt],
+    env: &HashMap<String, ir::Ty>,
+    assigns: &mut HashMap<String, ir::Ty>,
+    annotated: &HashSet<String>,
+) {
+    let mut empty: HashSet<String> = HashSet::new();
+    collect_empty_list_assign_names(body, &mut empty);
+    if empty.is_empty() {
+        return;
+    }
+    let mut hints: HashMap<String, ir::Ty> = HashMap::new();
+    collect_list_append_elem_hints(body, env, &mut hints);
+    for name in empty {
+        if annotated.contains(&name) {
+            continue;
+        }
+        if let Some(elem) = hints.get(&name).copied() {
+            // Reject pure None as sole elem type (same as bare param).
+            if elem == ir::Ty::None {
+                // Fall through to list[Any] default below.
+            } else {
+                let list_ty = ir::list_of(elem);
+                match assigns.get(&name).copied() {
+                    None => {
+                        assigns.insert(name.clone(), list_ty);
+                    }
+                    Some(prev) if prev == list_ty => {}
+                    // Specialize provisional list[Any] (empty-list default / seed)
+                    // to a concrete list[T] from append/insert hints.
+                    Some(ir::Ty::List(e)) if *e == ir::Ty::Any => {
+                        assigns.insert(name.clone(), list_ty);
+                    }
+                    Some(ir::Ty::List(_)) => {
+                        // Already a more specific list from another assign — keep.
+                    }
+                    Some(prev) => {
+                        assigns.insert(name.clone(), join_types(prev, list_ty));
+                    }
+                }
+                continue;
+            }
+        }
+        // No usable append/insert hint: default empty list to list[Any].
+        match assigns.get(&name).copied() {
+            None => {
+                assigns.insert(name, ir::list_of(ir::Ty::Any));
+            }
+            Some(ir::Ty::List(_)) => {
+                // Already specialized or joined as a list.
+            }
+            Some(prev) => {
+                assigns.insert(name, join_types(prev, ir::list_of(ir::Ty::Any)));
+            }
+        }
+    }
 }
 
 fn collect_assign_types_in(
@@ -4561,6 +5103,9 @@ fn seed_ty_from_expr(e: &ast::Expr) -> Option<ir::Ty> {
         ast::ExprKind::Bool(_) => Some(ir::Ty::Bool),
         ast::ExprKind::Str(_) | ast::ExprKind::JoinedStr(_) => Some(ir::Ty::Str),
         ast::ExprKind::NoneLit => Some(ir::Ty::None),
+        // Module-level empty lists: pre-seed as list[Any] so nested free reads
+        // (before entry init runs) resolve the name.
+        ast::ExprKind::ListLit(items) if items.is_empty() => Some(ir::list_of(ir::Ty::Any)),
         ast::ExprKind::Unary {
             op: ast::UnaryOp::Neg | ast::UnaryOp::Invert,
             operand,
@@ -9366,18 +9911,45 @@ fn lower_assign(
         Some(t) => Some(resolve_type_checked(t, value.span)?),
         Option::None => Option::None,
     };
-    // Propagate expected types into empty / typed literals
-    let lowered = match (&value.kind, ann_ty) {
-        (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem))) => {
+    // Storage type from multi-assign / empty-list-from-append pre-pass. Only
+    // used as expected type for *empty* container literals (so `xs = []` then
+    // `xs.append(1)` types as list[int]). Non-empty literals must keep strict
+    // element joining — a pre-pass `join_types` union must not loosen them.
+    let storage_hint = if ann_ty.is_none() {
+        match target {
+            ast::AssignTarget::Name { name, .. } => {
+                ctx.storage_tys.get(name).copied().or_else(|| {
+                    if ctx.binds_global(name) {
+                        ctx.globals.get(name).copied()
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let expected = ann_ty.or(storage_hint);
+    // Propagate expected types into empty / annotated container literals
+    let lowered = match (&value.kind, expected) {
+        (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem)))
+            if ann_ty.is_some() || items.is_empty() =>
+        {
             lower_list_lit(items, Some(*elem), value.span, ctx)?
         }
-        (ast::ExprKind::DictLit(items), Some(ir::Ty::Dict { key, value: val })) => {
+        (ast::ExprKind::DictLit(items), Some(ir::Ty::Dict { key, value: val }))
+            if ann_ty.is_some() || items.is_empty() =>
+        {
             lower_dict_lit(items, Some((*key, *val)), value.span, ctx)?
         }
-        (ast::ExprKind::SetLit(items), Some(ir::Ty::Set(elem))) => {
+        (ast::ExprKind::SetLit(items), Some(ir::Ty::Set(elem)))
+            if ann_ty.is_some() || items.is_empty() =>
+        {
             lower_set_lit(items, Some(*elem), value.span, ctx)?
         }
-        (ast::ExprKind::TupleLit(items), Some(ir::Ty::Tuple(elems))) => {
+        (ast::ExprKind::TupleLit(items), Some(ir::Ty::Tuple(elems))) if ann_ty.is_some() => {
             lower_tuple_lit(items, Some(elems), value.span, ctx)?
         }
         (
@@ -9869,12 +10441,19 @@ fn bind_name(
     let value_expr = coerce_assign(value_ir, target_ty, name, value_span)?;
 
     // Assignment kills prior refinements; re-refine when RHS is a concrete
-    // member of a union target (e.g. `x = x + 1` after `is not None`).
+    // member of a union target (e.g. `x = x + 1` after `is not None`), or a
+    // more-specific subclass of monomorphic class storage (after isinstance).
     ctx.type_refinements.remove(name);
     if matches!(target_ty, ir::Ty::Union(_))
         && let Some(member) = refined_member_after_assign(rhs_ty, target_ty)
     {
         ctx.type_refinements.insert(name.to_string(), member);
+    } else if let (ir::Ty::Class(dst), ir::Ty::Class(src)) = (target_ty, rhs_ty)
+        && class_is_subclass(src, dst)
+        && src != dst
+    {
+        // `x: A = B()` after peel → refine back to B for subclass fields.
+        ctx.type_refinements.insert(name.to_string(), rhs_ty);
     }
 
     if is_global {
@@ -9940,6 +10519,10 @@ fn refined_member_after_assign(rhs: ir::Ty, target: ir::Ty) -> Option<ir::Ty> {
             (ir::Ty::Bool, ir::Ty::Int)
             | (ir::Ty::Bool, ir::Ty::Float)
             | (ir::Ty::Int, ir::Ty::Float) => return Some(m),
+            // Subclass into a Class(base) union member → refine to the subclass.
+            (ir::Ty::Class(src), ir::Ty::Class(dst)) if class_is_subclass(src, dst) => {
+                return Some(rhs);
+            }
             _ => {}
         }
     }
@@ -10853,10 +11436,66 @@ fn union_is_subset(src: ir::Ty, dst: ir::Ty) -> bool {
     src_ms.iter().all(|m| dst_ms.iter().any(|d| d == m))
 }
 
+/// Whether `ty` can be boxed into [`ir::Ty::Any`] (has a print-tag encoding).
+fn can_box_as_any(ty: ir::Ty) -> bool {
+    match ty {
+        ir::Ty::Int
+        | ir::Ty::Float
+        | ir::Ty::Bool
+        | ir::Ty::Str
+        | ir::Ty::None
+        | ir::Ty::List(_)
+        | ir::Ty::Tuple(_)
+        | ir::Ty::Dict { .. }
+        | ir::Ty::Set(_)
+        | ir::Ty::Closure { .. }
+        | ir::Ty::Generator { .. }
+        | ir::Ty::Exception
+        | ir::Ty::Class(_)
+        | ir::Ty::Union(_)
+        | ir::Ty::Any => true,
+        ir::Ty::File | ir::Ty::Cell(_) => false,
+    }
+}
+
 /// Insert implicit promotion casts (`bool → int → float`), union wraps, or fail.
 fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir::Expr> {
     if value.ty == target {
         return Ok(value);
+    }
+    // Concrete → Any (dynamic box).
+    if target == ir::Ty::Any {
+        if !can_box_as_any(value.ty) {
+            return Err(err(
+                format!("type mismatch in {what}: cannot store {} in Any", value.ty),
+                span,
+            ));
+        }
+        return Ok(ir::Expr {
+            ty: ir::Ty::Any,
+            kind: ir::ExprKind::ToAny {
+                value: Box::new(value),
+            },
+        });
+    }
+    // Any → concrete (runtime tag check).
+    if value.ty == ir::Ty::Any {
+        if !can_box_as_any(target) {
+            return Err(err(
+                format!(
+                    "type mismatch in {what}: cannot extract {} from Any",
+                    target
+                ),
+                span,
+            ));
+        }
+        // Nested Any is identity (handled by equality above).
+        return Ok(ir::Expr {
+            ty: target,
+            kind: ir::ExprKind::FromAny {
+                value: Box::new(value),
+            },
+        });
     }
     // Concrete numeric promotions
     match (value.ty, target) {
@@ -10895,7 +11534,8 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
         if ir::flatten_union_members(target).contains(&value.ty) {
             return Ok(to_union(value, target));
         }
-        // Promote into a numeric member (e.g. bool → int|None)
+        // Promote into a numeric member (e.g. bool → int|None) or subclass →
+        // base class member (Dog into Animal|int).
         for m in ir::flatten_union_members(target) {
             if m == value.ty {
                 return Ok(to_union(value, target));
@@ -10903,6 +11543,15 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
             // try numeric promotion into this member only
             if let Ok(promoted) = coerce_numeric_into(value.clone(), m) {
                 return Ok(to_union(promoted, target));
+            }
+            if let (ir::Ty::Class(src), ir::Ty::Class(dst)) = (value.ty, m)
+                && class_is_subclass(src, dst)
+            {
+                let as_base = ir::Expr {
+                    ty: m,
+                    kind: value.kind.clone(),
+                };
+                return Ok(to_union(as_base, target));
             }
         }
         return Err(err(
@@ -11205,7 +11854,8 @@ fn to_bool(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
         | ir::Ty::Set(_)
         | ir::Ty::Union(_)
         | ir::Ty::Exception
-        | ir::Ty::Class(_) => Ok(ir::Expr {
+        | ir::Ty::Class(_)
+        | ir::Ty::Any => Ok(ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::ToBool(Box::new(value)),
         }),
@@ -11262,9 +11912,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 // First-class nested function → MakeClosure
                 return make_closure_expr(&info, expr.span, ctx);
             }
-            // Type refinement (narrowing): only peel a *single* concrete member
-            // via FromUnion. Multi-member refined unions keep storage type
-            // (retyping Local without remapping tags is unsafe).
+            // Type refinement (narrowing): FromUnion for concrete union members;
+            // class base → subclass retype after isinstance; multi-member peels
+            // keep storage (tags unsafe to rematerialize).
             if let Some(nty) = ctx.type_refinements.get(name).copied() {
                 if let Some(inner) = ctx.cell_locals.get(name).copied() {
                     let cell = ir::Expr {
@@ -11275,27 +11925,14 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         ty: inner,
                         kind: ir::ExprKind::CellLoad(Box::new(cell)),
                     };
-                    if nty != inner
-                        && matches!(inner, ir::Ty::Union(_))
-                        && !matches!(nty, ir::Ty::Union(_))
-                    {
-                        return extract_union_member(loaded, nty, expr.span);
-                    }
-                    return Ok(loaded);
+                    return Ok(apply_type_refinement(loaded, inner, nty));
                 }
                 if let Some(ty) = ctx.locals.get(name) {
                     let base = ir::Expr {
                         ty: *ty,
                         kind: ir::ExprKind::Local(name.clone()),
                     };
-                    if nty != *ty
-                        && matches!(ty, ir::Ty::Union(_))
-                        && !matches!(nty, ir::Ty::Union(_))
-                    {
-                        return extract_union_member(base, nty, expr.span);
-                    }
-                    // Multi-member peel: keep storage union type.
-                    return Ok(base);
+                    return Ok(apply_type_refinement(base, *ty, nty));
                 }
                 // Module-level / global name under a refinement peel.
                 if let Some(ty) = ctx.globals.get(name) {
@@ -11303,13 +11940,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         ty: *ty,
                         kind: ir::ExprKind::GlobalLoad(ctx.own_global(name)),
                     };
-                    if nty != *ty
-                        && matches!(ty, ir::Ty::Union(_))
-                        && !matches!(nty, ir::Ty::Union(_))
-                    {
-                        return extract_union_member(base, nty, expr.span);
-                    }
-                    return Ok(base);
+                    return Ok(apply_type_refinement(base, *ty, nty));
                 }
             }
             if let Some(inner) = ctx.cell_locals.get(name).copied() {
@@ -11632,9 +12263,40 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     *attr_span,
                 ));
             }
-            // Instance field load: `obj.x`
+            // Instance field load: `obj.x` (or common/exclusive field on a class union).
             let base_ir = lower_expr(base, ctx)?;
             if let ir::Ty::Class(id) = base_ir.ty {
+                // isinstance multi-peel keeps Class ABI; field may only exist
+                // on refined subclasses (or on the shared base layout).
+                let refine_ty = match &base.kind {
+                    ast::ExprKind::Name(n) => ctx.type_refinements.get(n).copied(),
+                    _ => None,
+                };
+                if let Some(rty) = refine_ty
+                    && let Some((class_id, field_index, field_ty)) = common_class_field(rty, attr)
+                {
+                    return Ok(ir::Expr {
+                        ty: field_ty,
+                        kind: ir::ExprKind::GetField {
+                            object: Box::new(base_ir),
+                            class_id,
+                            field_index,
+                        },
+                    });
+                }
+                // Exclusive field after multi-class isinstance peel: runtime type_id switch.
+                if let Some(rty) = refine_ty
+                    && let Some((candidates, field_ty)) = exclusive_class_field(rty, attr)
+                {
+                    return Ok(ir::Expr {
+                        ty: field_ty,
+                        kind: ir::ExprKind::GetFieldPartial {
+                            object: Box::new(base_ir),
+                            candidates,
+                            attr: attr.clone(),
+                        },
+                    });
+                }
                 if let Some((field_index, field_ty)) = field_index(id, attr) {
                     return Ok(ir::Expr {
                         ty: field_ty,
@@ -11664,6 +12326,41 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     ),
                     *attr_span,
                 ));
+            }
+            // True union ABI (e.g. list[Dog|Cat] elements) with a shared field.
+            if let Some((class_id, field_index, field_ty)) = common_class_field(base_ir.ty, attr) {
+                let obj = ir::Expr {
+                    ty: ir::Ty::Class(class_id),
+                    kind: ir::ExprKind::FromUnion {
+                        value: Box::new(base_ir),
+                    },
+                };
+                return Ok(ir::Expr {
+                    ty: field_ty,
+                    kind: ir::ExprKind::GetField {
+                        object: Box::new(obj),
+                        class_id,
+                        field_index,
+                    },
+                });
+            }
+            // Exclusive field on a true class-union value.
+            if let Some((candidates, field_ty)) = exclusive_class_field(base_ir.ty, attr) {
+                let rep = candidates[0].0;
+                let obj = ir::Expr {
+                    ty: ir::Ty::Class(rep),
+                    kind: ir::ExprKind::FromUnion {
+                        value: Box::new(base_ir),
+                    },
+                };
+                return Ok(ir::Expr {
+                    ty: field_ty,
+                    kind: ir::ExprKind::GetFieldPartial {
+                        object: Box::new(obj),
+                        candidates,
+                        attr: attr.clone(),
+                    },
+                });
             }
             Err(err(
                 "attribute access is only supported for instance fields, 'sys.argv', \
@@ -12823,13 +13520,9 @@ fn lower_list_lit(
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     if items.is_empty() {
-        let elem = expected.ok_or_else(|| {
-            err(
-                "cannot infer the element type of an empty list; annotate the \
-                 variable, e.g. 'xs: list[int] = []'",
-                span,
-            )
-        })?;
+        // Unannotated empty lists default to list[Any]; annotations / storage
+        // hints / append-inference supply a more specific elem type.
+        let elem = expected.unwrap_or(ir::Ty::Any);
         return Ok(ir::Expr {
             ty: ir::list_of(elem),
             kind: ir::ExprKind::ListLit(vec![]),
@@ -13197,6 +13890,7 @@ fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
     }
     match (a, b) {
         _ if a == b => Some(a),
+        (ir::Ty::Any, _) | (_, ir::Ty::Any) => Some(ir::Ty::Any),
         (ir::Ty::Float, ir::Ty::Int)
         | (ir::Ty::Int, ir::Ty::Float)
         | (ir::Ty::Float, ir::Ty::Bool)
@@ -15038,6 +15732,25 @@ fn isinstance_pat_matches(ty: ir::Ty, pat: IsInstancePat) -> bool {
     }
 }
 
+/// Map an `isinstance` type pattern to a storage type for bare-param inference.
+/// Containers (`list`/`tuple`/`dict`/`set`) are skipped — no element type.
+/// Multi-pat tuples are joined by the caller into a union (not float-promoted).
+fn isinstance_pat_to_ty(pat: IsInstancePat) -> Option<ir::Ty> {
+    match pat {
+        IsInstancePat::Int => Some(ir::Ty::Int),
+        IsInstancePat::Float => Some(ir::Ty::Float),
+        IsInstancePat::Bool => Some(ir::Ty::Bool),
+        IsInstancePat::Str => Some(ir::Ty::Str),
+        IsInstancePat::List
+        | IsInstancePat::Tuple
+        | IsInstancePat::Dict
+        | IsInstancePat::Set
+        | IsInstancePat::None => None,
+        IsInstancePat::Exc(_) => Some(ir::Ty::Exception),
+        IsInstancePat::Class(id) => Some(ir::Ty::Class(id)),
+    }
+}
+
 fn isinstance_pat_tag(pat: IsInstancePat) -> Option<i32> {
     match pat {
         IsInstancePat::Int => Some(0),
@@ -15105,6 +15818,30 @@ fn lower_isinstance(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult
             kind: ir::ExprKind::ExcIsInstance {
                 value: Box::new(value),
                 filters: exc_filters,
+            },
+        });
+    }
+
+    // Dynamic Any: runtime print-tag / class-id check (no static fold).
+    if value.ty == ir::Ty::Any {
+        let type_tags: Vec<i32> = value_pats
+            .iter()
+            .filter_map(|p| isinstance_pat_tag(*p))
+            .collect();
+        if type_tags.is_empty() && exc_filters.is_empty() && class_filters.is_empty() {
+            return Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::ConstBool(false),
+            });
+        }
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::IsInstance {
+                value: Box::new(value),
+                type_tags,
+                bool_is_int,
+                exc_filters,
+                class_filters,
             },
         });
     }
@@ -16155,7 +16892,8 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             | ir::Ty::Dict { .. }
             | ir::Ty::Set(_)
             | ir::Ty::Exception
-            | ir::Ty::Class(_) => Ok(ir::Expr {
+            | ir::Ty::Class(_)
+            | ir::Ty::Any => Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::ToBool(Box::new(value)),
             }),
@@ -16205,6 +16943,11 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             "class types are not a conversion (construct with ClassName(...))",
             span,
         )),
+        ast::TypeName::Any => {
+            // `Any(x)` is not a real CPython builtin; allow as annotation-style
+            // cast helper: coerce value into dynamic Any.
+            coerce(value, ir::Ty::Any, span, "Any(...) cast")
+        }
     }
 }
 
@@ -16378,10 +17121,24 @@ fn unify_numeric(
 }
 
 /// Join two types for `and`/`or`: equal → that type; both numeric → promote;
-/// otherwise flatten into a union of all atomic members.
+/// either side `Any` → `Any`; provisional `list[Any]` yields to a more specific
+/// `list[T]`; otherwise flatten into a union of all atomic members.
 fn join_types(a: ir::Ty, b: ir::Ty) -> ir::Ty {
     if a == b {
         return a;
+    }
+    if a == ir::Ty::Any || b == ir::Ty::Any {
+        return ir::Ty::Any;
+    }
+    // Empty-list default `list[Any]` is provisional: join with `list[T]` → `list[T]`.
+    match (a, b) {
+        (ir::Ty::List(e), ir::Ty::List(f)) if *e == ir::Ty::Any => {
+            return ir::list_of(*f);
+        }
+        (ir::Ty::List(e), ir::Ty::List(f)) if *f == ir::Ty::Any => {
+            return ir::list_of(*e);
+        }
+        _ => {}
     }
     let a_num = matches!(a, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
     let b_num = matches!(b, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
@@ -17507,10 +18264,93 @@ print(f())
     }
 
     #[test]
-    fn empty_list_needs_annotation() {
-        let e = analyze_err("xs = []\n");
-        assert!(e.message.contains("annotate"), "{}", e.message);
+    fn empty_list_defaults_to_list_any() {
+        let m = analyze_ok("xs = []\nprint(len(xs))\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        // First global assign is xs = [] with list[Any].
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!("expected GlobalAssign, got {:?}", entry.body[0]);
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Any));
         analyze_ok("xs: list[int] = []\n");
+    }
+
+    #[test]
+    fn any_annotation_and_coerce() {
+        let m = analyze_ok(
+            "\
+x: Any = 1
+y: int = x
+print(y)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(entry.body.iter().any(|s| matches!(
+            s,
+            ir::Stmt::GlobalAssign { name, value, .. }
+                if name == "x" && value.ty == ir::Ty::Any
+        )));
+    }
+
+    #[test]
+    fn exclusive_field_after_multi_isinstance() {
+        let m = analyze_ok(
+            "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(A):
+    def __init__(self):
+        self.a = 1
+        self.c = 3
+def f(x: A):
+    if isinstance(x, (B, C)):
+        return x.b
+    return 0
+print(f(B()))
+",
+        );
+        let f = find_func(&m, "f");
+        // Body should contain GetFieldPartial for exclusive .b
+        fn has_partial(stmts: &[ir::Stmt]) -> bool {
+            for s in stmts {
+                match s {
+                    ir::Stmt::Return(Some(e))
+                    | ir::Stmt::ExprStmt(e)
+                    | ir::Stmt::Assign { value: e, .. } => {
+                        if expr_has_partial(e) {
+                            return true;
+                        }
+                    }
+                    ir::Stmt::If { branches, orelse } => {
+                        for (_, b) in branches {
+                            if has_partial(b) {
+                                return true;
+                            }
+                        }
+                        if has_partial(orelse) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        fn expr_has_partial(e: &ir::Expr) -> bool {
+            match &e.kind {
+                ir::ExprKind::GetFieldPartial { .. } => true,
+                ir::ExprKind::Block { stmts, result } => {
+                    has_partial(stmts) || expr_has_partial(result)
+                }
+                _ => false,
+            }
+        }
+        assert!(has_partial(&f.body), "expected GetFieldPartial in f body");
     }
 
     #[test]
@@ -18568,6 +19408,160 @@ print(f(2))
     }
 
     #[test]
+    fn bare_param_infers_from_isinstance() {
+        let m = analyze_ok(
+            "\
+def f(x):
+    if isinstance(x, int):
+        return x + 1
+    return 0
+print(f(3))
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Int);
+    }
+
+    #[test]
+    fn bare_param_multi_isinstance_needs_annotation() {
+        let e = analyze_err(
+            "\
+def f(x):
+    if isinstance(x, (int, float)):
+        return x + 1
+    return 0
+print(f(3))
+",
+        );
+        assert!(
+            e.message.contains("missing a type annotation"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn bare_param_isinstance_list_needs_annotation() {
+        let e = analyze_err(
+            "\
+def f(x):
+    if isinstance(x, list):
+        return len(x)
+    return 0
+print(f([1]))
+",
+        );
+        assert!(
+            e.message.contains("missing a type annotation"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn and_chain_isinstance_keeps_more_specific_class() {
+        let m = analyze_ok(
+            "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(B):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+        self.c = 3
+def f(x: A):
+    if isinstance(x, C) and isinstance(x, B):
+        return x.c
+    return 0
+print(f(C()))
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.ret, ir::Ty::Int);
+    }
+
+    #[test]
+    fn bare_param_infers_str_from_method() {
+        let m = analyze_ok(
+            "\
+def f(x):
+    return x.upper()
+print(f(\"hi\"))
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Str);
+    }
+
+    #[test]
+    fn empty_list_from_append_infers_elem() {
+        let m = analyze_ok(
+            "\
+def f():
+    xs = []
+    xs.append(1)
+    return xs
+print(f())
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.ret, ir::list_of(ir::Ty::Int));
+    }
+
+    #[test]
+    fn isinstance_subclass_peel_allows_subclass_field() {
+        let m = analyze_ok(
+            "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+def f(x: A):
+    if isinstance(x, B):
+        return x.b
+    return x.a
+print(f(B()))
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Class(0));
+        assert_eq!(f.ret, ir::Ty::Int);
+    }
+
+    #[test]
+    fn subclass_into_base_union_ok() {
+        let m = analyze_ok(
+            "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+x: A | int = B()
+print(x)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(
+            entry.body.iter().any(|s| matches!(
+                s,
+                ir::Stmt::GlobalAssign { name, .. } if name == "x"
+            )),
+            "{:?}",
+            entry.body
+        );
+    }
+
+    #[test]
     fn raise_new_exc_types() {
         let m = analyze_ok(
             "\
@@ -18656,6 +19650,31 @@ except (OverflowError, ValueError):
                 )),
             "expected call through re-export; body={:?}",
             entry.body
+        );
+    }
+
+    #[test]
+    fn mixed_class_list_from_empty_is_union() {
+        let m = analyze_ok(
+            "\
+class Dog:
+    def __init__(self):
+        self.name = \"d\"
+class Cat:
+    def __init__(self):
+        self.name = \"c\"
+xs = []
+xs.append(Dog())
+xs.append(Cat())
+print(xs[0].name)
+print(len(xs))
+",
+        );
+        let xs = m.globals.iter().find(|(n, _)| n == "xs").map(|(_, t)| *t);
+        assert!(
+            matches!(xs, Some(ir::Ty::List(e)) if matches!(e, ir::Ty::Union(_))),
+            "expected list[Dog|Cat], got {:?}",
+            xs
         );
     }
 }
