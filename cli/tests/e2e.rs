@@ -8818,20 +8818,58 @@ print(P(7).get())
 }
 
 #[test]
-fn class_super_not_supported() {
-    let (_, stderr) = run_program_expect_fail(
-        "class_super",
-        "\
+fn class_super_outside_method() {
+    let (_, stderr) = run_program_expect_fail("class_super_out", "print(super())\n");
+    assert!(
+        stderr.contains("super()")
+            && (stderr.contains("not supported") || stderr.contains("must be used")),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn v021_super_init_and_method() {
+    let src = "\
+class A:
+    def __init__(self, x: int):
+        self.x = x
+    def tag(self) -> str:
+        return \"A\"
+class B(A):
+    def __init__(self, x: int, y: int):
+        super().__init__(x)
+        self.y = y
+    def tag(self) -> str:
+        return super().tag() + \"B\"
+b = B(1, 2)
+print(b.x, b.y, b.tag())
+";
+    let out = run_program("v021_super", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v021_super_no_base() {
+    let src = "\
 class A:
     def m(self) -> int:
-        return 1
-class B(A):
-    def m(self) -> int:
         return super().m()
-",
-    );
+print(A().m())
+";
+    let (_, stderr) = run_program_expect_fail("v021_super_nobase", src);
     assert!(
-        stderr.contains("super() is not supported yet"),
+        stderr.contains("super()")
+            && (stderr.contains("no base") || stderr.contains("no parent") || stderr.contains("base class")),
         "stderr: {stderr}"
     );
 }

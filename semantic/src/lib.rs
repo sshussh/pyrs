@@ -4900,7 +4900,7 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
             }
         }
         if let Some(methods) = method_orders.get(&m.name) {
-            for (ir_name, _class_id, def) in methods {
+            for (ir_name, class_id, def) in methods {
                 let mut method_def = (*def).clone();
                 method_def.name = ir_name.clone();
                 let funcs_view = &own_funcs[&m.name];
@@ -4919,12 +4919,13 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
                     reexport_origins: &reexport_origins,
                     partial_reexports: &partial_reexports,
                 };
-                let (f, nested) = lower_function(
+                let (f, nested) = lower_function_with_class(
                     &method_def,
                     &mctx_fn,
                     &mut globals,
                     &mut globals_order,
                     false,
+                    Some(*class_id),
                 )
                 .map_err(|d| d.with_file(i))?;
                 // Patch inferred return type (same as free functions).
@@ -5306,6 +5307,11 @@ struct FnCtx<'a> {
     /// uses a union/promoted type without pre-allocating locals (which would
     /// break `global` ordering and late free-cell unbound traps).
     storage_tys: HashMap<String, ir::Ty>,
+    /// When lowering an instance method, the class that owns this method.
+    /// Used by zero-arg `super().m(...)`.
+    current_class: Option<ir::ClassId>,
+    /// Name of the `self` parameter of the current instance method (if any).
+    self_param: Option<String>,
 }
 
 impl FnCtx<'_> {
@@ -5369,6 +5375,18 @@ fn lower_function(
     globals_order: &mut Vec<(String, ir::Ty)>,
     is_entry: bool,
 ) -> SResult<(ir::Function, Vec<ir::Function>)> {
+    lower_function_with_class(f, mctx, globals, globals_order, is_entry, None)
+}
+
+/// Like [`lower_function`], but records the owning class for zero-arg `super()`.
+fn lower_function_with_class(
+    f: &ast::FuncDef,
+    mctx: &ModuleCtx,
+    globals: &mut HashMap<String, ir::Ty>,
+    globals_order: &mut Vec<(String, ir::Ty)>,
+    is_entry: bool,
+    current_class: Option<ir::ClassId>,
+) -> SResult<(ir::Function, Vec<ir::Function>)> {
     lower_function_inner(
         f,
         mctx,
@@ -5377,6 +5395,7 @@ fn lower_function(
         is_entry,
         None,
         HashMap::new(),
+        current_class,
     )
 }
 
@@ -5390,8 +5409,14 @@ fn lower_function_inner(
     is_entry: bool,
     capture_params: Option<Vec<(String, ir::Ty)>>,
     seed_nested: HashMap<String, NestedFnInfo>,
+    current_class: Option<ir::ClassId>,
 ) -> SResult<(ir::Function, Vec<ir::Function>)> {
     let mut params = Vec::new();
+    let self_param = if current_class.is_some() {
+        f.params.first().map(|p| p.name.clone())
+    } else {
+        None
+    };
     let mut ctx = FnCtx {
         mctx,
         globals,
@@ -5425,6 +5450,8 @@ fn lower_function_inner(
         outer_body_assigned: HashSet::new(),
         lowered_nested: HashSet::new(),
         storage_tys: HashMap::new(),
+        current_class,
+        self_param,
     };
 
     // Nonlocals declared in nested defs — free captures of these use cells.
@@ -6614,6 +6641,8 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
         false,
         Some(cap_params),
         seed,
+        // Nested defs are not methods for zero-arg super() purposes.
+        None,
     )?;
     // Patch NestedFnInfo.ret from the lowered body (optional return inference
     // / cell-union returns) so callers see a valued ret, not void.
@@ -9140,6 +9169,11 @@ fn lower_method_stmt(
     args: &[ast::Expr],
     ctx: &mut FnCtx,
 ) -> SResult<ir::Stmt> {
+    // `super().m(...)` in statement position (e.g. super().__init__(...)).
+    if is_zero_arg_super(base) {
+        let call = lower_super_method_call(method, method_span, args, ctx)?;
+        return Ok(ir::Stmt::ExprStmt(call));
+    }
     let base_ir = lower_expr(base, ctx)?;
     if let ir::Ty::Class(id) = base_ir.ty {
         let call = lower_instance_method_call(base_ir, id, method, method_span, args, ctx)?;
@@ -11729,6 +11763,109 @@ fn method_user_sig(sig: &FuncSig) -> FuncSig {
     s
 }
 
+/// True when `e` is a zero-arg `super()` call expression.
+fn is_zero_arg_super(e: &ast::Expr) -> bool {
+    matches!(
+        &e.kind,
+        ast::ExprKind::Call {
+            func,
+            args,
+            keywords,
+            kwargs,
+            ..
+        } if func == "super" && args.is_empty() && keywords.is_empty() && kwargs.is_none()
+    )
+}
+
+/// Lower `super().method(args)` to a **non-virtual** call of the parent (or
+/// further ancestor) implementation, with the current method's `self`.
+fn lower_super_method_call(
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let class_id = ctx.current_class.ok_or_else(|| {
+        err(
+            "super() outside of a method is not supported",
+            method_span,
+        )
+    })?;
+    let parent_id = class_info(class_id)
+        .and_then(|i| i.parent)
+        .ok_or_else(|| {
+            err(
+                "super() requires a base class (this class has no parent)",
+                method_span,
+            )
+        })?;
+    let self_name = ctx.self_param.clone().ok_or_else(|| {
+        err(
+            "super() outside of a method is not supported",
+            method_span,
+        )
+    })?;
+
+    let direct = resolve_method(parent_id, method).ok_or_else(|| {
+        err(
+            format!(
+                "parent of '{}' has no method '{method}'",
+                class_info(class_id)
+                    .map(|c| c.name)
+                    .unwrap_or_else(|| format!("class#{class_id}"))
+            ),
+            method_span,
+        )
+    })?;
+    let sig = ctx
+        .mctx
+        .funcs
+        .get(&direct)
+        .cloned()
+        .or_else(|| method_sig_lookup(&direct))
+        .or_else(|| {
+            for data in ctx.mctx.mods.values() {
+                if let Some(s) = data.funcs.get(&direct) {
+                    return Some(s.clone());
+                }
+            }
+            None
+        })
+        .ok_or_else(|| {
+            err(
+                format!("internal error: missing signature for method '{method}'"),
+                method_span,
+            )
+        })?;
+    let user_sig = method_user_sig(&sig);
+
+    // Load `self` (child instance) and coerce to the parent method's self type.
+    let self_ir = ir::Expr {
+        ty: ir::Ty::Class(class_id),
+        kind: ir::ExprKind::Local(self_name),
+    };
+    let self_ty = sig
+        .params
+        .first()
+        .map(|p| p.ty)
+        .unwrap_or(ir::Ty::Class(parent_id));
+    let self_ir = coerce(self_ir, self_ty, method_span, "super() self")?;
+
+    let pos: Vec<ast::PosArg> = args.iter().map(|e| ast::PosArg::Pos(e.clone())).collect();
+    // Non-virtual: always the parent implementation (not the child's override).
+    lower_call_with_sig(
+        method,
+        direct,
+        &user_sig,
+        &pos,
+        &[],
+        None,
+        method_span,
+        ctx,
+        &[self_ir],
+    )
+}
+
 /// `ClassName(args)` → allocate instance and call `__init__`.
 fn lower_class_construct(
     class_id: ir::ClassId,
@@ -12500,6 +12637,10 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             }
             let plain = require_plain_args(args, method, *method_span)?;
             let args: Vec<ast::Expr> = plain.iter().map(|e| (*e).clone()).collect();
+            // `super().m(...)` — static parent method call (before lowering base).
+            if is_zero_arg_super(base) {
+                return lower_super_method_call(method, *method_span, &args, ctx);
+            }
             let base_ir = lower_expr(base, ctx)?;
             // User class instance method
             if let ir::Ty::Class(id) = base_ir.ty {
@@ -15185,7 +15326,16 @@ fn lower_call(
         return lower_value_call(args, keywords, kwargs, span, ctx);
     }
     if func == "super" {
-        return Err(err("super() is not supported yet", span));
+        if !args.is_empty() || !keywords.is_empty() || kwargs.is_some() {
+            return Err(err(
+                "two-arg super() is not supported yet; use zero-arg super().method(...)",
+                span,
+            ));
+        }
+        return Err(err(
+            "super() must be used as super().method(...); bare super() values are not supported",
+            span,
+        ));
     }
     // Class construction: `Point(1, 2)` → allocate + `__init__`.
     // Bare name in current module, or imported class binding.
