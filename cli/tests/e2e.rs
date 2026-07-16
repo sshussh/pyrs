@@ -9046,3 +9046,1088 @@ print(c.t[0], c.d[\"a\"], 1 in c.s)
     );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
+
+#[test]
+fn v020_isinstance_subclass_field_peel() {
+    // isinstance peels base → subclass so subclass-only fields are usable.
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+def f(x: A):
+    if isinstance(x, B):
+        print(x.b)
+    else:
+        print(x.a)
+f(B())
+f(A())
+";
+    let out = run_program("v020_isinstance_peel", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_isinstance_and_mid_expression_peel() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+def f(x: A):
+    if isinstance(x, B) and x.b == 2:
+        print(\"yes\")
+    else:
+        print(\"no\")
+f(B())
+f(A())
+";
+    let out = run_program("v020_isinstance_and", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_bare_param_infer_and_subclass_param() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+def g(x):
+    return x + 1
+print(g(3))
+def h(x: A):
+    print(x.a)
+h(B())
+x = 1
+x = \"hi\"
+print(x)
+";
+    let out = run_program("v020_bare_subclass", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_empty_list_append_infers_elem() {
+    let src = "\
+def f():
+    xs = []
+    xs.append(1)
+    xs.append(2)
+    return xs
+print(f())
+ys = []
+ys.append(\"a\")
+print(ys)
+";
+    let out = run_program("v020_empty_list", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_subclass_into_base_union() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+x: A | int = B()
+if isinstance(x, A):
+    print(x.a)
+else:
+    print(x)
+x = 7
+if isinstance(x, int):
+    print(x + 1)
+";
+    let out = run_program("v020_sub_union", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_bare_param_isinstance_infer() {
+    let src = "\
+def f(x):
+    if isinstance(x, int):
+        return x + 1
+    return 0
+print(f(3))
+";
+    let out = run_program("v020_bare_isinstance", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_empty_list_without_append_defaults_any() {
+    // Unannotated empty list with only len/print defaults to list[Any].
+    let src = "\
+xs = []
+print(len(xs))
+print(xs)
+";
+    let out = run_program("v020_empty_list_any", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_and_chain_isinstance_keeps_more_specific() {
+    // Right isinstance must not wipe left's more-specific peel.
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(B):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+        self.c = 3
+def f(x: A):
+    if isinstance(x, C) and isinstance(x, B):
+        print(x.c)
+    else:
+        print(\"no\")
+f(C())
+f(A())
+";
+    let out = run_program("v020_and_chain_specific", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_isinstance_and_is_not_none_keeps_subclass() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+def f(x: A | None):
+    if isinstance(x, B) and x is not None:
+        print(x.b)
+    else:
+        print(\"no\")
+f(B())
+f(None)
+f(A())
+";
+    let out = run_program("v020_isinstance_not_none", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_peel_reassign_base_clears_subclass_field() {
+    // After peel, assigning base clears subclass field access.
+    let (_, stderr) = run_program_expect_fail(
+        "v020_peel_reassign_clear",
+        "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+def f(x: A):
+    if isinstance(x, B):
+        x = A()
+        print(x.b)
+f(B())
+",
+    );
+    assert!(stderr.contains("has no attribute 'b'"), "stderr: {stderr}");
+}
+
+#[test]
+fn v020_peel_reassign_subclass_keeps_field() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+def f(x: A):
+    if isinstance(x, B):
+        x = B()
+        print(x.b)
+    else:
+        print(x.a)
+f(B())
+";
+    let out = run_program("v020_peel_reassign_sub", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_list_animal_append_dog() {
+    let src = "\
+class Animal:
+    def __init__(self, name: str):
+        self.name = name
+class Dog(Animal):
+    def __init__(self, name: str):
+        self.name = name
+        self.breed = \"lab\"
+xs: list[Animal] = []
+xs.append(Animal(\"a\"))
+xs.append(Dog(\"d\"))
+print(len(xs))
+print(xs[0].name)
+print(xs[1].name)
+";
+    let out = run_program("v020_list_append_dog", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_optional_isinstance_subclass_peel() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+def f(x: A | None):
+    if isinstance(x, B):
+        print(x.b)
+    elif isinstance(x, A):
+        print(x.a)
+    else:
+        print(\"none\")
+f(B())
+f(A())
+f(None)
+";
+    let out = run_program("v020_opt_isinstance", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_bare_param_class_isinstance() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+def f(x):
+    if isinstance(x, A):
+        return x.a
+    return 0
+print(f(A()))
+";
+    let out = run_program("v020_bare_class_isinstance", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_empty_list_insert_only() {
+    let src = "\
+def f():
+    xs = []
+    xs.insert(0, 10)
+    xs.insert(1, 20)
+    return xs
+print(f())
+";
+    let out = run_program("v020_empty_insert", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_multi_isinstance_bare_needs_annotation() {
+    let (_, stderr) = run_program_expect_fail(
+        "v020_multi_isinstance_bare",
+        "\
+def f(x):
+    if isinstance(x, (int, float)):
+        return x + 1
+    return 0
+print(f(3))
+",
+    );
+    assert!(
+        stderr.contains("missing a type annotation")
+            && stderr.contains("could not infer a unique type"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn v020_isinstance_list_bare_needs_annotation() {
+    let (_, stderr) = run_program_expect_fail(
+        "v020_isinstance_list_bare",
+        "\
+def f(x):
+    if isinstance(x, list):
+        return len(x)
+    return 0
+print(f([1, 2]))
+",
+    );
+    assert!(
+        stderr.contains("missing a type annotation")
+            && stderr.contains("could not infer a unique type"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn v020_nested_def_empty_list_append() {
+    // Free-var append in a nested def fills outer `xs = []`.
+    let src = "\
+def outer():
+    xs = []
+    def add(x: int):
+        xs.append(x)
+    add(1)
+    add(2)
+    print(xs)
+outer()
+";
+    let out = run_program("v020_nested_empty", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_mixed_class_list_common_field() {
+    // Empty list + append Dog/Cat → list[Dog|Cat]; shared field `.name` works.
+    let src = "\
+class Dog:
+    def __init__(self):
+        self.name = \"d\"
+class Cat:
+    def __init__(self):
+        self.name = \"c\"
+xs = []
+xs.append(Dog())
+xs.append(Cat())
+print(xs[0].name)
+print(xs[1].name)
+print(len(xs))
+";
+    let out = run_program("v020_mixed_class_list", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v020_isinstance_multi_class_common_field() {
+    // isinstance(x, (B, C)) peels for shared parent field `.a`.
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(A):
+    def __init__(self):
+        self.a = 1
+        self.c = 3
+def f(x: A):
+    if isinstance(x, (B, C)):
+        print(x.a)
+    else:
+        print(0)
+f(B())
+f(C())
+f(A())
+";
+    let out = run_program("v020_multi_class_peel", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_empty_list_append_and_len() {
+    let src = "\
+xs = []
+print(len(xs))
+xs.append(1)
+print(xs)
+";
+    let out = run_program("v0201_empty_append", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_multi_isinstance_nested_exclusive_fields() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(A):
+    def __init__(self):
+        self.a = 1
+        self.c = 3
+def f(x: A):
+    if isinstance(x, (B, C)):
+        if isinstance(x, B):
+            print(x.b)
+        else:
+            print(x.c)
+    else:
+        print(0)
+f(B())
+f(C())
+f(A())
+";
+    let out = run_program("v0201_multi_nested_fields", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_exclusive_field_runtime_attr_error() {
+    // After multi-class peel, exclusive field raises AttributeError on wrong class.
+    let out_ok = run_program(
+        "v0201_excl_field_ok",
+        "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(A):
+    def __init__(self):
+        self.a = 1
+        self.c = 3
+def g(x: A):
+    if isinstance(x, (B, C)):
+        print(x.b)
+g(B())
+",
+    );
+    assert_eq!(out_ok, "2\n");
+
+    let (code, stderr) = run_program_expect_fail(
+        "v0201_excl_field_err",
+        "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(A):
+    def __init__(self):
+        self.a = 1
+        self.c = 3
+def g(x: A):
+    if isinstance(x, (B, C)):
+        print(x.b)
+g(C())
+",
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("AttributeError: 'C' object has no attribute 'b'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn v0201_exclusive_field_c_ok() {
+    // Exclusive `.c` after multi peel succeeds on C, AttributeError on B.
+    let out = run_program(
+        "v0201_excl_c_ok",
+        "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(A):
+    def __init__(self):
+        self.a = 1
+        self.c = 3
+def g(x: A):
+    if isinstance(x, (B, C)):
+        print(x.c)
+g(C())
+",
+    );
+    assert_eq!(out, "3\n");
+    let (code, stderr) = run_program_expect_fail(
+        "v0201_excl_c_err",
+        "\
+class A:
+    def __init__(self):
+        self.a = 1
+class B(A):
+    def __init__(self):
+        self.a = 1
+        self.b = 2
+class C(A):
+    def __init__(self):
+        self.a = 1
+        self.c = 3
+def g(x: A):
+    if isinstance(x, (B, C)):
+        print(x.c)
+g(B())
+",
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("AttributeError: 'B' object has no attribute 'c'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn v0201_any_annotate_and_coerce() {
+    let src = "\
+x: Any = 1
+y: int = x
+print(y)
+xs: list[Any] = []
+xs.append(2)
+xs.append(\"hi\")
+print(len(xs))
+print(xs[0])
+z: int = xs[0]
+print(z)
+";
+    let out = run_program("v0201_any_basic", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "\
+x = 1
+y = x
+print(y)
+xs = []
+xs.append(2)
+xs.append(\"hi\")
+print(len(xs))
+print(xs[0])
+z = xs[0]
+print(z)
+",
+        )
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_any_wrong_coerce_type_error() {
+    let (code, stderr) = run_program_expect_fail(
+        "v0201_any_type_err",
+        "\
+x: Any = \"hi\"
+y: int = x
+print(y)
+",
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("TypeError: expected int, got incompatible dynamic value"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn v0201_any_fromany_class_name_error() {
+    let (code, stderr) = run_program_expect_fail(
+        "v0201_any_class_from",
+        "\
+class Point:
+    def __init__(self):
+        self.x = 1
+x: Any = 1
+y: Point = x
+print(y)
+",
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("TypeError: expected Point, got incompatible dynamic value"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn v0201_any_str_print_no_quotes() {
+    let src = "\
+s: Any = \"hi\"
+print(s)
+print(isinstance(s, str))
+";
+    let out = run_program("v0201_any_str_print", src);
+    assert_eq!(out, "hi\nTrue\n");
+}
+
+#[test]
+fn v0201_any_isinstance_and_promotions() {
+    let src = "\
+x: Any = 1
+print(isinstance(x, int))
+print(isinstance(x, str))
+b: Any = True
+i: int = b
+print(i)
+print(isinstance(b, int))
+print(isinstance(b, bool))
+n: Any = None
+print(n)
+print(bool(n))
+print(bool(x))
+u: int | str = x
+print(u)
+f: float = x
+print(f)
+";
+    let out = run_program("v0201_any_isinstance", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "\
+x = 1
+print(isinstance(x, int))
+print(isinstance(x, str))
+b = True
+i = int(b)
+print(i)
+print(isinstance(b, int))
+print(isinstance(b, bool))
+n = None
+print(n)
+print(bool(n))
+print(bool(x))
+u = x
+print(u)
+f = float(x)
+print(f)
+",
+        )
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_list_any_eq_and_in() {
+    let src = "\
+xs: list[Any] = []
+xs.append(1)
+xs.append(\"a\")
+ys: list[Any] = []
+ys.append(1)
+ys.append(\"a\")
+print(xs == ys)
+print(1 in xs)
+print(\"a\" in xs)
+print(2 in xs)
+";
+    let out = run_program("v0201_list_any_eq", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "\
+xs = []
+xs.append(1)
+xs.append(\"a\")
+ys = []
+ys.append(1)
+ys.append(\"a\")
+print(xs == ys)
+print(1 in xs)
+print(\"a\" in xs)
+print(2 in xs)
+",
+        )
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_module_empty_list_free_read() {
+    let src = "\
+xs = []
+def f():
+    print(len(xs))
+    xs.append(1)
+f()
+print(xs)
+";
+    let out = run_program("v0201_mod_empty_free", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_null_any_print_none() {
+    // Uninitialized Any local prints as None (null box), not SEGV.
+    let src = "\
+def f():
+    x: Any = None
+    print(x)
+    print(bool(x))
+f()
+";
+    let out = run_program("v0201_null_any", src);
+    assert_eq!(out, "None\nFalse\n");
+}
+
+#[test]
+fn v0201_any_bool_empty_containers() {
+    // bool([]) is False for every list element tag (list[Any]=68, list[str]=28, …).
+    let src = "\
+a: Any = []
+print(bool(a))
+xs: list[Any] = []
+print(bool(xs))
+ys: list[str] = []
+z: Any = ys
+print(bool(z))
+ys.append(\"a\")
+z2: Any = ys
+print(bool(z2))
+s: Any = \"\"
+print(bool(s))
+t: Any = \"x\"
+print(bool(t))
+n: Any = 0
+print(bool(n))
+if a:
+    print(\"truthy_empty\")
+else:
+    print(\"falsy_empty\")
+";
+    let out = run_program("v0201_any_bool_empty", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "\
+a = []
+print(bool(a))
+xs = []
+print(bool(xs))
+ys = []
+z = ys
+print(bool(z))
+ys.append(\"a\")
+z2 = ys
+print(bool(z2))
+s = \"\"
+print(bool(s))
+t = \"x\"
+print(bool(t))
+n = 0
+print(bool(n))
+if a:
+    print(\"truthy_empty\")
+else:
+    print(\"falsy_empty\")
+",
+        )
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_list_any_true_eq_one() {
+    // CPython: True == 1; list[Any] membership/eq should match.
+    let src = "\
+xs: list[Any] = []
+xs.append(True)
+ys: list[Any] = []
+ys.append(1)
+print(xs == ys)
+print(1 in xs)
+print(True in ys)
+";
+    let out = run_program("v0201_list_any_true_one", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "\
+xs = []
+xs.append(True)
+ys = []
+ys.append(1)
+print(xs == ys)
+print(1 in xs)
+print(True in ys)
+",
+        )
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v0201_class_union_print_after_isinstance() {
+    // Multi-class peel must not blank-print (keep storage tags).
+    // PyRs default print is `<Name object>` (no address); pin that form.
+    let src = "\
+class Dog:
+    def __init__(self):
+        self.name = \"d\"
+class Cat:
+    def __init__(self):
+        self.name = \"c\"
+xs = []
+xs.append(Dog())
+xs.append(Cat())
+for x in xs:
+    if isinstance(x, (Dog, Cat)):
+        print(x)
+";
+    let out = run_program("v0201_class_union_print", src);
+    assert_eq!(out, "<Dog object>\n<Cat object>\n");
+}
