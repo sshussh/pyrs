@@ -5914,8 +5914,12 @@ print(check(4))
 #[test]
 fn bare_lambda_param_without_default_rejected() {
     let (_, stderr) = run_program_expect_fail("bare_lam", "f = lambda x: x + 1\nprint(f(1))\n");
+    // Lambdas cannot carry type annotations (first `:` is the body); bare
+    // params still need a default for monomorphic inference.
     assert!(
-        stderr.contains("lambda parameter annotation"),
+        stderr.contains("missing a type annotation")
+            || stderr.contains("lambda parameter")
+            || stderr.contains("could not infer"),
         "stderr: {stderr}"
     );
 }
@@ -8345,8 +8349,7 @@ except ValueError as e:
     let stderr = String::from_utf8_lossy(&out.stderr);
     // Exact diagnostic phrase (not source reprint alone): type name + method.
     assert!(
-        stderr.contains("error[semantic]")
-            && stderr.contains("'exception' has no method 'upper'"),
+        stderr.contains("error[semantic]") && stderr.contains("'exception' has no method 'upper'"),
         "stderr: {stderr}"
     );
 }
@@ -8401,6 +8404,636 @@ if x:
     print(\"int-truthy\")
 ";
     let out = run_program("exc_union_isinstance", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_point_fields_methods_isinstance() {
+    let src = "\
+class Point:
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+    def move(self, dx: int, dy: int):
+        self.x = self.x + dx
+        self.y = self.y + dy
+    def sum(self) -> int:
+        return self.x + self.y
+
+p = Point(1, 2)
+print(p.x, p.y)
+p.move(3, 4)
+print(p.sum())
+print(isinstance(p, Point))
+";
+    let out = run_program("class_point", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_inheritance_override_and_isinstance() {
+    let src = "\
+class Animal:
+    def __init__(self, name: str):
+        self.name = name
+    def speak(self) -> str:
+        return \"...\"
+
+class Dog(Animal):
+    def speak(self) -> str:
+        return \"woof\"
+
+d = Dog(\"rex\")
+print(d.name)
+print(d.speak())
+print(isinstance(d, Dog))
+print(isinstance(d, Animal))
+";
+    let out = run_program("class_inherit", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_virtual_dispatch_via_base_param() {
+    let src = "\
+class Animal:
+    def __init__(self, name: str):
+        self.name = name
+    def speak(self) -> str:
+        return \"...\"
+
+class Dog(Animal):
+    def speak(self) -> str:
+        return \"woof\"
+
+class Cat(Animal):
+    def speak(self) -> str:
+        return \"meow\"
+
+def shout(a: Animal):
+    print(a.speak())
+
+shout(Dog(\"d\"))
+shout(Cat(\"c\"))
+shout(Animal(\"a\"))
+";
+    let out = run_program("class_virtual", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_print_default_str() {
+    // PyRs prints `<Name object>` without address (stable; deliberate vs CPython).
+    let src = "\
+class Point:
+    def __init__(self, x: int):
+        self.x = x
+p = Point(1)
+print(p)
+print(str(p))
+";
+    let out = run_program("class_print", src);
+    assert_eq!(out, "<Point object>\n<Point object>\n");
+}
+
+#[test]
+fn class_multi_base_is_compile_error() {
+    let dir = TempDir::new("class_multi_base");
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "\
+class A:
+    pass
+class B:
+    pass
+class C(A, B):
+    pass
+",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("multiple inheritance is not supported yet"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_bound_method_extract_is_compile_error() {
+    let dir = TempDir::new("class_bound");
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "\
+class P:
+    def __init__(self):
+        self.x = 1
+    def m(self) -> int:
+        return self.x
+p = P()
+f = p.m
+print(f())
+",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("bound methods as values are not supported yet"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_method_calls_other_method() {
+    let src = "\
+class C:
+    def __init__(self, n: int):
+        self.n = n
+    def double(self) -> int:
+        return self.n * 2
+    def show(self) -> int:
+        return self.double()
+
+c = C(21)
+print(c.show())
+";
+    let out = run_program("class_self_method", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_no_init_and_empty() {
+    let src = "\
+class Empty:
+    pass
+
+e = Empty()
+print(isinstance(e, Empty))
+print(e)
+";
+    let out = run_program("class_empty", src);
+    assert!(out.contains("True"));
+    assert!(out.contains("<Empty object>"));
+}
+
+#[test]
+fn class_override_init() {
+    let src = "\
+class A:
+    def __init__(self, x: int):
+        self.x = x
+
+class B(A):
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+
+b = B(1, 2)
+print(b.x, b.y)
+print(isinstance(b, A))
+";
+    let out = run_program("class_override_init", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_list_of_objects() {
+    let src = "\
+class P:
+    def __init__(self, n: int):
+        self.n = n
+    def get(self) -> int:
+        return self.n
+
+xs: list[P] = [P(1), P(2), P(3)]
+print(xs[0].get(), xs[1].get(), xs[2].get())
+print(len(xs))
+";
+    let out = run_program("class_list", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_isinstance_negative() {
+    let src = "\
+class A:
+    def __init__(self):
+        self.x = 1
+class B:
+    def __init__(self):
+        self.x = 2
+a = A()
+print(isinstance(a, A))
+print(isinstance(a, B))
+print(isinstance(1, A))
+";
+    let out = run_program("class_isinstance_neg", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_incompatible_override_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "class_bad_override",
+        "\
+class A:
+    def m(self) -> int:
+        return 1
+class B(A):
+    def m(self) -> str:
+        return \"x\"
+",
+    );
+    assert!(
+        stderr.contains("incompatible return type"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_init_nonzero_return_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "class_init_ret",
+        "\
+class C:
+    def __init__(self):
+        self.x = 1
+        return 5
+",
+    );
+    assert!(
+        stderr.contains("__init__ should return None"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_body_attr_default_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "class_attr_def",
+        "\
+class C:
+    x: int = 5
+    def __init__(self):
+        pass
+",
+    );
+    assert!(
+        stderr.contains("class body attributes are not supported yet"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_unknown_attr_diagnostic_pinned() {
+    let (_, stderr) = run_program_expect_fail(
+        "class_unk_attr2",
+        "\
+class P:
+    def __init__(self):
+        self.x = 1
+p = P()
+print(p.y)
+",
+    );
+    assert!(stderr.contains("no attribute 'y'"), "stderr: {stderr}");
+}
+
+#[test]
+fn class_is_identity() {
+    let src = "\
+class P:
+    def __init__(self, n: int):
+        self.n = n
+a = P(1)
+b = a
+c = P(1)
+print(a is b)
+print(a is c)
+print(a is not c)
+";
+    let out = run_program("class_is", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_method_return_inferred() {
+    let src = "\
+class P:
+    def __init__(self, n: int):
+        self.n = n
+    def get(self):
+        return self.n
+print(P(7).get())
+";
+    let out = run_program("class_ret_infer", src);
+    assert_eq!(out, "7\n");
+}
+
+#[test]
+fn class_super_not_supported() {
+    let (_, stderr) = run_program_expect_fail(
+        "class_super",
+        "\
+class A:
+    def m(self) -> int:
+        return 1
+class B(A):
+    def m(self) -> int:
+        return super().m()
+",
+    );
+    assert!(
+        stderr.contains("super() is not supported yet"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_decorator_not_supported() {
+    let (_, stderr) =
+        run_program_expect_fail("class_deco", "@property\ndef f(self):\n    return 1\n");
+    assert!(
+        stderr.contains("decorators") && stderr.contains("not supported yet"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_match_pattern_not_supported() {
+    let (_, stderr) = run_program_expect_fail(
+        "class_match",
+        "\
+class C:
+    def __init__(self):
+        self.x = 1
+match C():
+    case C():
+        print(1)
+",
+    );
+    assert!(
+        stderr.contains("class patterns in match/case are not supported yet"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_methods_without_init() {
+    let src = "\
+class Greeter:
+    def hi(self) -> str:
+        return \"hello\"
+
+g = Greeter()
+print(g.hi())
+";
+    let out = run_program("class_no_init_methods", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_cross_module_inheritance() {
+    let dir = TempDir::new("class_xmod");
+    fs::write(
+        dir.0.join("animal.py"),
+        "\
+class Animal:
+    def __init__(self, name: str):
+        self.name = name
+    def speak(self) -> str:
+        return \"...\"
+",
+    )
+    .unwrap();
+    fs::write(
+        dir.0.join("main.py"),
+        "\
+from animal import Animal
+
+class Dog(Animal):
+    def speak(self) -> str:
+        return \"woof\"
+
+def label(a: Animal) -> str:
+    return a.speak()
+
+d = Dog(\"rex\")
+print(d.name)
+print(label(d))
+print(isinstance(d, Animal))
+",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["run", "-i"])
+        .arg(dir.0.join("main.py"))
+        .output()
+        .expect("pyrs");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = String::from_utf8_lossy(&out.stdout);
+    let py = Command::new("python3")
+        .arg(dir.0.join("main.py"))
+        .current_dir(&dir.0)
+        .output()
+        .expect("python3");
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(got, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_list_print_runtime_name() {
+    let src = "\
+class P:
+    def __init__(self, n: int):
+        self.n = n
+xs: list[P] = [P(1)]
+print(xs)
+";
+    let out = run_program("class_list_print", src);
+    assert_eq!(out, "[<P object>]\n");
+}
+
+#[test]
+fn class_parent_field_via_inherited_init() {
+    let src = "\
+class Animal:
+    def __init__(self, name: str):
+        self.name = name
+class Dog(Animal):
+    def bark(self) -> str:
+        return self.name
+d = Dog(\"spot\")
+print(d.bark())
+";
+    let out = run_program("class_parent_field", src);
+    assert_eq!(out, "spot\n");
+}
+
+#[test]
+fn class_field_from_self_method() {
+    let src = "\
+class C:
+    def one(self) -> int:
+        return 1
+    def __init__(self):
+        self.y = self.one()
+c = C()
+print(c.y)
+";
+    let out = run_program("class_self_method_field", src);
+    assert_eq!(out, "1\n");
+}
+
+#[test]
+fn class_field_from_free_func() {
+    let src = "\
+def make() -> int:
+    return 42
+
+class C:
+    def __init__(self):
+        self.x = make()
+c = C()
+print(c.x)
+";
+    let out = run_program("class_free_func_field", src);
+    assert_eq!(out, "42\n");
+}
+
+#[test]
+fn class_local_multi_assign_join() {
+    let src = "\
+class C:
+    def __init__(self):
+        pass
+
+def f():
+    x = 1
+    x = C()
+    if isinstance(x, C):
+        print(\"c\")
+    else:
+        print(\"i\")
+f()
+";
+    let out = run_program("class_local_join", src);
+    assert_eq!(out, "c\n");
+}
+
+#[test]
+fn class_dict_tuple_set_fields() {
+    let src = "\
+class C:
+    def __init__(self):
+        self.t = (1, 2)
+        self.d = {\"a\": 1}
+        self.s = {1, 2}
+c = C()
+print(c.t[0], c.d[\"a\"], 1 in c.s)
+";
+    let out = run_program("class_container_fields", src);
     let py = Command::new("python3")
         .arg("-c")
         .arg(src)
