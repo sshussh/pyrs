@@ -384,6 +384,16 @@ pub enum Pattern {
     },
     /// `pattern as name` (PEP 634 as-pattern).
     As { pattern: Box<Pattern>, name: String },
+    /// Class pattern `Point(x, y)` or `Point(x=0, y=y)` (closed-world fields).
+    Class {
+        /// Class name as written (resolved in semantic).
+        name: String,
+        name_span: Span,
+        /// Positional patterns matching fields in declaration order.
+        positional: Vec<Pattern>,
+        /// Keyword patterns `field=pattern`.
+        keywords: Vec<(String, Pattern)>,
+    },
 }
 
 /// One `except` clause under a `try`.

@@ -737,26 +737,32 @@ print(isinstance(d, Animal))  # True
   assignment into a union that includes the base
 - Class names as type annotations (`def f(p: Point)`)
 - **`__str__` / `__repr__`** (must return `str`): used by `print` and
-  `str()` with virtual dispatch; fallback is still `<Name object>`
+  `str()` with virtual dispatch (per runtime class); fallback is still
+  `<Name object>`
 - **Zero-arg `super().method(...)`** including `super().__init__(…)`
   (static call of the parent implementation with the same `self`)
+- **`@staticmethod` / `@classmethod` / read-only `@property`**
+- **Bound methods as values** (`f = obj.m; f(...)`)
+- **`__iter__` / `__next__`** for user for-loops; **`__len__` / `__bool__`**
+- **Class `with`**: `__enter__` / `__exit__` (success path always passes
+  `None, None, None` to `__exit__`; exception suppress / real exc triple
+  not yet)
+- **Match class patterns** `case Point(x=0, y=y):` / positional fields
+- **Single free-function decorators** `@deco def f: ...` (same-module free
+  function; monomorphic closures)
 
 **Not supported yet** (named compile errors): multiple inheritance,
-metaclasses, `__new__`, `__slots__`, bound methods as values
-(`m = obj.m` now works for instance methods), open
-`__dict__` / `__getattr__`, class patterns in `match`, nested classes,
-class decorators, stacked custom decorators, two-arg `super()`, class-body attributes, dotted bases
-(`class D(pkg.C)` — import the base first), first-class class objects
-as values (use as constructor/type only), `==` between instances
-(use `is` for identity). Mixed non-numeric **list literals** still error
-unless annotated (`xs: list[Dog | Cat] = [Dog(), Cat()]`). Empty
-`xs = []` plus later appends (including free-var appends in nested
-defs) join element types; unannotated empty lists with no append/insert
-default to `list[Any]`. Fields shared across a class union (same
-offset/type, including parent fields after `isinstance(x, (B, C))`)
-are readable. Exclusive subclass-only fields after a multi-class peel
-use a runtime `type_id` switch (AttributeError when the live instance
-lacks the field).
+metaclasses, `__new__`, `__slots__`, open `__dict__` / `__getattr__`,
+nested classes, class decorators, stacked custom decorators, two-arg
+`super()`, class-body attributes, dotted bases (`class D(pkg.C)` —
+import the base first), first-class class objects as values (use as
+constructor/type only), `==` between instances (use `is` for identity).
+Mixed non-numeric **list literals** still error unless annotated
+(`xs: list[Dog | Cat] = [Dog(), Cat()]`). Empty `xs = []` plus later
+appends join element types; unannotated empty lists with no append/insert
+default to `list[Any]`. Fields shared across a class union are readable;
+exclusive subclass-only fields after a multi-class peel use a runtime
+`type_id` switch (AttributeError when the live instance lacks the field).
 
 ### Built-in functions
 
@@ -858,8 +864,23 @@ def open_it(path: str) -> file:
     return open(path)
 ```
 
+User classes may also implement the context manager protocol:
+
+```python
+class CM:
+    def __enter__(self) -> int:
+        return 41
+    def __exit__(self, a: Any = None, b: Any = None, c: Any = None) -> None:
+        print("exit")
+with CM() as x:
+    print(x)
+```
+
+Residual: on both success and exception paths, `__exit__` currently
+receives `None, None, None` (no suppress-when-true yet).
+
 Not supported yet: binary modes, printing file objects, multiple context
-managers in one `with`, `with` on non-files, and `list[file]`.
+managers in one `with`, and `list[file]`.
 
 ### Standard input and arguments
 

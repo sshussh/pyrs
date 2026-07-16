@@ -341,6 +341,8 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | FloatToStr(operand)
         | BoolToStr(operand)
         | ExcToStr(operand)
+        | ExcArgs(operand)
+        | ExcRepr(operand)
         | StrRepr(operand)
         | StrAscii(operand)
         | IsNone { value: operand, .. }
@@ -433,6 +435,12 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
             .unwrap_or(0)
             .max(max_try_depth_in_expr(bound)),
         NewObject { .. } => 0,
+        ClassConstructDynamic { cls_obj, args, .. } => args
+            .iter()
+            .map(max_try_depth_in_expr)
+            .max()
+            .unwrap_or(0)
+            .max(max_try_depth_in_expr(cls_obj)),
         ObjectToStr(operand) => max_try_depth_in_expr(operand),
         SetUnion { left, right }
         | SetIntersect { left, right }
@@ -558,6 +566,8 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | FloatToStr(operand)
         | BoolToStr(operand)
         | ExcToStr(operand)
+        | ExcArgs(operand)
+        | ExcRepr(operand)
         | StrRepr(operand)
         | StrAscii(operand)
         | IsNone { value: operand, .. }
@@ -635,6 +645,9 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
             count_yields_in_expr(bound) + args.iter().map(count_yields_in_expr).sum::<i64>()
         }
         NewObject { .. } => 0,
+        ClassConstructDynamic { cls_obj, args, .. } => {
+            count_yields_in_expr(cls_obj) + args.iter().map(count_yields_in_expr).sum::<i64>()
+        }
         ObjectToStr(operand) => count_yields_in_expr(operand),
         SetUnion { left, right }
         | SetIntersect { left, right }
@@ -704,6 +717,8 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_exc_object()\n");
         out.push_str("declare void @pyrs_print_exc(ptr)\n");
         out.push_str("declare ptr @pyrs_str_from_exc(ptr)\n");
+        out.push_str("declare ptr @pyrs_exc_args(ptr)\n");
+        out.push_str("declare ptr @pyrs_repr_from_exc(ptr)\n");
         out.push_str("declare i32 @pyrs_exc_matches(i32, i32)\n");
         out.push_str("declare i32 @pyrs_exc_isinstance(ptr, i32)\n");
         out.push_str("declare void @pyrs_exc_clear()\n");
@@ -2227,6 +2242,53 @@ impl Emitter {
             .map(|(v, b)| format!("[ {v}, %{b} ]"))
             .collect();
         self.line(format!("{t} = phi {} {}", lty(field_ty), parts.join(", ")));
+        t
+    }
+
+    /// Allocate and zero-init a class instance for `class_id`.
+    fn emit_new_object(&mut self, class_id: u32) -> String {
+        let info = self
+            .classes
+            .get(class_id as usize)
+            .expect("NewObject class_id")
+            .clone();
+        let sty = class_struct_ty(&info);
+        let size_p = self.tmp();
+        self.line(format!("{size_p} = getelementptr {sty}, ptr null, i32 1"));
+        let nbytes = self.tmp();
+        self.line(format!("{nbytes} = ptrtoint ptr {size_p} to i64"));
+        let t = self.tmp();
+        self.line(format!(
+            "{t} = call ptr @pyrs_object_new(i64 {}, i64 {nbytes})",
+            class_id as i64
+        ));
+        for (fi, (_, fty)) in info.fields.iter().enumerate() {
+            let idx = fi as i32 + 1;
+            let fp = self.tmp();
+            self.line(format!(
+                "{fp} = getelementptr inbounds {sty}, ptr {t}, i32 0, i32 {idx}"
+            ));
+            let zero = match fty {
+                Ty::Int => "1".to_string(),
+                Ty::Float => fconst(0.0),
+                Ty::Bool => "false".to_string(),
+                Ty::None | Ty::Any => "0".to_string(),
+                Ty::Union(_) => "zeroinitializer".to_string(),
+                Ty::Str
+                | Ty::List(_)
+                | Ty::Tuple(_)
+                | Ty::Dict { .. }
+                | Ty::Set(_)
+                | Ty::File
+                | Ty::Closure { .. }
+                | Ty::BoundMethod { .. }
+                | Ty::Cell(_)
+                | Ty::Generator { .. }
+                | Ty::Exception
+                | Ty::Class(_) => "null".to_string(),
+            };
+            self.line(format!("store {} {zero}, ptr {fp}", lty(*fty)));
+        }
         t
     }
 
@@ -3842,6 +3904,18 @@ impl Emitter {
                 self.line(format!("{t} = call ptr @pyrs_str_from_exc(ptr {v})"));
                 t
             }
+            ExprKind::ExcArgs(inner) => {
+                let v = self.emit_expr(inner);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_exc_args(ptr {v})"));
+                t
+            }
+            ExprKind::ExcRepr(inner) => {
+                let v = self.emit_expr(inner);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_repr_from_exc(ptr {v})"));
+                t
+            }
             ExprKind::ExcIsInstance { value, filters } => {
                 let v = self.emit_expr(value);
                 if filters.is_empty() {
@@ -4117,54 +4191,74 @@ impl Emitter {
                 ));
                 t
             }
-            ExprKind::NewObject { class_id } => {
-                let info = self
-                    .classes
-                    .get(*class_id as usize)
-                    .expect("NewObject class_id")
-                    .clone();
-                let sty = class_struct_ty(&info);
-                // sizeof via GEP: ptrtoint of getelementptr one past
-                let size_p = self.tmp();
-                self.line(format!("{size_p} = getelementptr {sty}, ptr null, i32 1"));
-                let nbytes = self.tmp();
-                self.line(format!("{nbytes} = ptrtoint ptr {size_p} to i64"));
-                let t = self.tmp();
+            ExprKind::ClassConstructDynamic {
+                cls_obj,
+                candidates,
+                args,
+            } => {
+                // Load type_id from cls_obj, switch among candidates: NewObject + init.
+                let cls_p = self.emit_expr(cls_obj);
+                let tid_p = self.tmp();
                 self.line(format!(
-                    "{t} = call ptr @pyrs_object_new(i64 {}, i64 {nbytes})",
-                    *class_id as i64
+                    "{tid_p} = getelementptr inbounds {{ i64 }}, ptr {cls_p}, i32 0, i32 0"
                 ));
-                // Typed zero-init for every field (raw memset leaves int as
-                // untagged 0 → SEGV on arithmetic/print).
-                for (fi, (_, fty)) in info.fields.iter().enumerate() {
-                    let idx = fi as i32 + 1;
-                    let fp = self.tmp();
-                    self.line(format!(
-                        "{fp} = getelementptr inbounds {sty}, ptr {t}, i32 0, i32 {idx}"
-                    ));
-                    let zero = match fty {
-                        Ty::Int => "1".to_string(), // tagged small 0
-                        Ty::Float => fconst(0.0),
-                        Ty::Bool => "false".to_string(),
-                        Ty::None | Ty::Any => "0".to_string(),
-                        Ty::Union(_) => "zeroinitializer".to_string(),
-                        Ty::Str
-                        | Ty::List(_)
-                        | Ty::Tuple(_)
-                        | Ty::Dict { .. }
-                        | Ty::Set(_)
-                        | Ty::File
-                        | Ty::Closure { .. }
-                        | Ty::BoundMethod { .. }
-                        | Ty::Cell(_)
-                        | Ty::Generator { .. }
-                        | Ty::Exception
-                        | Ty::Class(_) => "null".to_string(),
-                    };
-                    self.line(format!("store {} {zero}, ptr {fp}", lty(*fty)));
+                let tid = self.tmp();
+                self.line(format!("{tid} = load i64, ptr {tid_p}"));
+                let mut arg_vals: Vec<(String, Ty)> = Vec::new();
+                for a in args {
+                    arg_vals.push((self.emit_expr(a), a.ty));
                 }
+                let end_l = self.fresh_block("ccons.end");
+                let default_l = self.fresh_block("ccons.def");
+                let mut cases = String::new();
+                let mut blocks = Vec::new();
+                for (cid, init) in candidates {
+                    let bl = self.fresh_block(&format!("ccons.{}", cid));
+                    cases.push_str(&format!(" i64 {}, label %{bl}", *cid as i64));
+                    blocks.push((bl, *cid, init.clone()));
+                }
+                self.line(format!("switch i64 {tid}, label %{default_l} [{cases} ]"));
+                let mut phi_preds = Vec::new();
+                for (bl, cid, init) in &blocks {
+                    self.start_block(bl);
+                    let obj = self.emit_new_object(*cid);
+                    if let Some(init_name) = init {
+                        let mut call_args = vec![(obj.clone(), Ty::Class(*cid))];
+                        call_args.extend(arg_vals.iter().cloned());
+                        self.emit_direct_method_call(init_name, &call_args, Ty::None);
+                    }
+                    let cblk = self.cur_block.clone();
+                    phi_preds.push((obj, cblk));
+                    self.line(format!("br label %{end_l}"));
+                }
+                self.start_block(&default_l);
+                // Fallback: first candidate (should not happen for valid cls tokens).
+                let (fb_cid, fb_init) = candidates
+                    .first()
+                    .map(|(c, i)| (*c, i.clone()))
+                    .unwrap_or((0, None));
+                let obj_def = self.emit_new_object(fb_cid);
+                if let Some(init_name) = fb_init {
+                    let mut call_args = vec![(obj_def.clone(), Ty::Class(fb_cid))];
+                    call_args.extend(arg_vals.iter().cloned());
+                    self.emit_direct_method_call(&init_name, &call_args, Ty::None);
+                }
+                let dblk = self.cur_block.clone();
+                phi_preds.push((obj_def, dblk));
+                self.line(format!("br label %{end_l}"));
+                self.start_block(&end_l);
+                let t = self.tmp();
+                let mut phi = format!("{t} = phi ptr ");
+                for (i, (v, b)) in phi_preds.iter().enumerate() {
+                    if i > 0 {
+                        phi.push_str(", ");
+                    }
+                    phi.push_str(&format!("[ {v}, %{b} ]"));
+                }
+                self.line(phi);
                 t
             }
+            ExprKind::NewObject { class_id } => self.emit_new_object(*class_id),
             ExprKind::GetField {
                 object,
                 class_id,
@@ -5430,6 +5524,15 @@ impl Emitter {
                     // union without None: is None → false
                     if not { "true" } else { "false" }.to_string()
                 }
+            }
+            // Any: null slot or print_tag -1 means None (matches ToAny of None).
+            Ty::Any => {
+                let v = self.emit_expr(value);
+                let (print_tag, _) = self.emit_any_unpack(&v);
+                let t = self.tmp();
+                let pred = if not { "ne" } else { "eq" };
+                self.line(format!("{t} = icmp {pred} i32 {print_tag}, -1"));
+                t
             }
             // concrete non-optional: is None → false
             _ => {

@@ -253,45 +253,55 @@ fn resolve_str_dunder(class_id: ir::ClassId) -> Option<&'static str> {
 
 /// Call `__str__` / `__repr__` on a class instance (virtual when subclasses
 /// override), or fall back to [`ir::ExprKind::ObjectToStr`] (`"<Name object>"`).
+/// Each concrete class resolves its own dunder (`__str__` preferred, else
+/// `__repr__`) so a base-typed value with only a parent `__repr__` still
+/// prints via a subclass `__str__` when that is the live type.
 fn lower_class_to_str(value: ir::Expr, class_id: ir::ClassId, span: Span) -> SResult<ir::Expr> {
-    let Some(method) = resolve_str_dunder(class_id) else {
-        return Ok(ir::Expr {
-            ty: ir::Ty::Str,
-            kind: ir::ExprKind::ObjectToStr(Box::new(value)),
-        });
-    };
-    let direct = resolve_method(class_id, method).expect("resolve_str_dunder checked");
-    let sig = method_sig_lookup(&direct).ok_or_else(|| {
-        err(
-            format!("internal error: missing signature for method '{method}'"),
-            span,
-        )
-    })?;
-    if sig.ret != ir::Ty::Str {
-        return Err(err(format!("{method} must return str"), span));
-    }
-    // User params after self must be empty for str/repr protocol.
-    if sig.params.len() != 1 {
-        return Err(err(
-            format!("{method} must take only self (no extra parameters)"),
-            span,
-        ));
-    }
-
     let mut candidates: Vec<(ir::ClassId, String)> = Vec::new();
     let mut unique_funcs: HashSet<String> = HashSet::new();
     for sid in subclasses_of(class_id) {
-        if let Some(func) = resolve_method(sid, method) {
+        if let Some(m) = resolve_str_dunder(sid)
+            && let Some(func) = resolve_method(sid, m)
+        {
+            let sig = method_sig_lookup(&func).ok_or_else(|| {
+                err(
+                    format!("internal error: missing signature for method '{m}'"),
+                    span,
+                )
+            })?;
+            if sig.ret != ir::Ty::Str {
+                return Err(err(format!("{m} must return str"), span));
+            }
+            if sig.params.len() != 1 {
+                return Err(err(
+                    format!("{m} must take only self (no extra parameters)"),
+                    span,
+                ));
+            }
             unique_funcs.insert(func.clone());
             candidates.push((sid, func));
         }
     }
-    // Prefer __str__ on a subclass even if static type only has __repr__;
-    // when the resolved dunder name differs per class, still virtualize on
-    // the chosen method name from the static type (matches closed-world
-    // resolve_method MRO for each candidate's own method of that name).
-    let virtual_dispatch = unique_funcs.len() > 1;
+    if candidates.is_empty() {
+        return Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::ObjectToStr(Box::new(value)),
+        });
+    }
+    // Prefer the static type's dunder as direct_func when present; else first.
+    let direct = resolve_str_dunder(class_id)
+        .and_then(|m| resolve_method(class_id, m))
+        .or_else(|| candidates.first().map(|(_, f)| f.clone()))
+        .ok_or_else(|| err("internal error: str dunder candidates empty", span))?;
+
     let args = vec![value];
+    let virtual_dispatch = unique_funcs.len() > 1
+        || candidates
+            .iter()
+            .any(|(cid, _)| *cid != class_id && resolve_str_dunder(*cid).is_some());
+    // Also virtualize when any subclass has a dunder and static type may not
+    // share the same func (e.g. only parent has __repr__, child has __str__).
+    let virtual_dispatch = virtual_dispatch || candidates.len() > 1;
     if virtual_dispatch {
         Ok(ir::Expr {
             ty: ir::Ty::Str,
@@ -642,22 +652,20 @@ fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
 fn elem_of(ty: ir::Ty, span: Span) -> SResult<ir::Ty> {
     match ty {
         ir::Ty::File => Err(err("files cannot be stored in lists yet", span)),
-        ir::Ty::Exception => Err(err("exception objects cannot be stored in lists yet", span)),
-        // Pure None list elements are allowed only as part of a union annotation
-        // path; a bare None elem type is rejected when building untyped lists.
+        // Exception objects are allowed as list/tuple elements (v0.24).
         other => Ok(other),
     }
 }
 
-/// Reject exception objects as container elements (no print-slot encoding yet).
+/// Reject types that still cannot live in containers (files only for now).
 fn reject_exception_container_elem(ty: ir::Ty, span: Span, what: &str) -> SResult<()> {
     match ty {
-        ir::Ty::Exception => Err(err(
-            format!("exception objects cannot be stored in {what} yet"),
+        ir::Ty::File => Err(err(
+            format!("file objects cannot be stored in {what} yet"),
             span,
         )),
-        ir::Ty::Union(ms) if ms.contains(&ir::Ty::Exception) => Err(err(
-            format!("unions containing exception objects cannot be stored in {what} yet"),
+        ir::Ty::Union(ms) if ms.iter().any(|m| matches!(m, ir::Ty::File)) => Err(err(
+            format!("unions containing file objects cannot be stored in {what} yet"),
             span,
         )),
         _ => Ok(()),
@@ -1013,6 +1021,22 @@ fn name_storage_ty(name: &str, ctx: &FnCtx) -> Option<ir::Ty> {
         })
 }
 
+/// Best-effort type of an AST expr for flow peels (walrus RHS, etc.).
+fn expr_ty_hint(e: &ast::Expr, ctx: &FnCtx, active: &HashMap<String, ir::Ty>) -> Option<ir::Ty> {
+    match &e.kind {
+        ast::ExprKind::Name(n) => {
+            name_refined_ty(n, ctx, active).or_else(|| name_storage_ty(n, ctx))
+        }
+        ast::ExprKind::NoneLit => Some(ir::Ty::None),
+        ast::ExprKind::Int(_) | ast::ExprKind::IntDigits(_) => Some(ir::Ty::Int),
+        ast::ExprKind::Float(_) => Some(ir::Ty::Float),
+        ast::ExprKind::Bool(_) => Some(ir::Ty::Bool),
+        ast::ExprKind::Str(_) | ast::ExprKind::JoinedStr(_) => Some(ir::Ty::Str),
+        ast::ExprKind::NamedExpr { value, .. } => expr_ty_hint(value, ctx, active),
+        _ => None,
+    }
+}
+
 /// Effective type of `name` under an active refinement overlay (and-chain mid
 /// peels), falling back to `ctx.type_refinements` then storage.
 fn name_refined_ty(name: &str, ctx: &FnCtx, active: &HashMap<String, ir::Ty>) -> Option<ir::Ty> {
@@ -1054,6 +1078,15 @@ fn narrowing_from_condition_with(
         } => {
             let (t, e) = narrowing_from_condition_with(operand, ctx, active);
             return (e, t);
+        }
+        // Walrus in conditions: peels apply to the bound name after the value
+        // expression's peels (e.g. `(y := x) is not None` peels `y`).
+        ast::ExprKind::NamedExpr { target, value, .. } => {
+            let (vt, ve) = narrowing_from_condition_with(value, ctx, active);
+            // Also treat `name := value` where value peels are empty: no then peel
+            // on the name from the assignment alone.
+            let _ = target;
+            return (vt, ve);
         }
         // `A and B`: then sees left peels, then right peels computed *under*
         // left (so `isinstance(x, B) and x is not None` keeps B; chained
@@ -1103,7 +1136,26 @@ fn narrowing_from_condition_with(
             right,
         } => {
             let not = matches!(op, ast::BinOp::IsNot);
+            // `(y := x) is not None` — peel the walrus target using value's type.
             let (name, name_ty) = match (&left.kind, &right.kind) {
+                (
+                    ast::ExprKind::NamedExpr {
+                        target: n, value, ..
+                    },
+                    ast::ExprKind::NoneLit,
+                ) => (
+                    n.as_str(),
+                    name_storage_ty(n, ctx).or_else(|| expr_ty_hint(value, ctx, active)),
+                ),
+                (
+                    ast::ExprKind::NoneLit,
+                    ast::ExprKind::NamedExpr {
+                        target: n, value, ..
+                    },
+                ) => (
+                    n.as_str(),
+                    name_storage_ty(n, ctx).or_else(|| expr_ty_hint(value, ctx, active)),
+                ),
                 (ast::ExprKind::Name(n), ast::ExprKind::NoneLit) => {
                     (n.as_str(), name_storage_ty(n, ctx))
                 }
@@ -2482,9 +2534,26 @@ fn check_override_compatibility(classes: &[ClassAst<'_>]) -> SResult<()> {
             let Some(parent_sig) = method_sig_lookup(&parent_ir) else {
                 continue;
             };
-            // Compare user params (skip self) and return type.
-            let c_user = &child_sig.params[1.min(child_sig.params.len())..];
-            let p_user = &parent_sig.params[1.min(parent_sig.params.len())..];
+            // Compare user params: skip leading self/cls for instance/class/property;
+            // staticmethods have no implicit first param.
+            let child_kind = method_kind_lookup(&child_ir);
+            let parent_kind = method_kind_lookup(&parent_ir);
+            if child_kind != parent_kind {
+                return Err(err(
+                    format!(
+                        "method '{}.{}' overrides parent with a different method kind \
+                         (staticmethod/classmethod/instance/property must match)",
+                        c.name, m.def.name
+                    ),
+                    m.def.span,
+                ));
+            }
+            let skip = match child_kind {
+                MethodKind::Static => 0,
+                MethodKind::Instance | MethodKind::Class | MethodKind::Property => 1,
+            };
+            let c_user = &child_sig.params[skip.min(child_sig.params.len())..];
+            let p_user = &parent_sig.params[skip.min(parent_sig.params.len())..];
             if c_user.len() != p_user.len() {
                 return Err(err(
                     format!(
@@ -2543,12 +2612,22 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
     let mut order: Vec<&ast::FuncDef> = Vec::new();
     for stmt in &module.body {
         if let ast::StmtKind::FuncDef(f) = &stmt.kind {
-            if !f.decorators.is_empty() {
+            if f.decorators.len() > 1 {
                 return Err(err(
-                    "function decorators are not supported yet \
-                     (class method decorators @staticmethod/@classmethod/@property work)",
-                    f.decorators[0].span,
+                    "stacked function decorators are not supported yet",
+                    f.decorators[1].span,
                 ));
+            }
+            if f.decorators.len() == 1 {
+                let d = &f.decorators[0];
+                // Class method decorators only valid on methods, not free funcs.
+                if matches!(d.name.as_str(), "staticmethod" | "classmethod" | "property") {
+                    return Err(err(
+                        format!("@{} is only valid on methods inside a class body", d.name),
+                        d.span,
+                    ));
+                }
+                // Single bare-name decorator is applied at module init (see below).
             }
             if BUILTINS.contains(&f.name.as_str()) {
                 return Err(err(
@@ -3044,7 +3123,16 @@ fn collect_param_constraints(
                     collect_param_constraints(name, &c.body, params, bare, out);
                 }
             }
-            // Nested defs: only scan defaults, not bodies (own scope).
+            // Nested defs: scan bodies for free uses of outer bare params
+            // (e.g. decorator `def deco(f): def g(x): return f(x)+1`).
+            ast::StmtKind::FuncDef(f) => {
+                for p in &f.params {
+                    if let Some(d) = &p.default {
+                        collect_param_constraints_expr(name, d, params, bare, out);
+                    }
+                }
+                collect_param_constraints(name, &f.body, params, bare, out);
+            }
             _ => {}
         }
     }
@@ -3157,6 +3245,19 @@ fn collect_param_constraints_expr(
             collect_param_constraints_expr(name, operand, params, bare, out);
         }
         ast::ExprKind::Call { func, args, .. } => {
+            // Bare param called as a function: monomorphic Closure[args → int].
+            // Ret defaults to Int (common for arithmetic wrappers / decorators).
+            if func == name {
+                let mut ptys = Vec::new();
+                for a in args {
+                    if let ast::PosArg::Pos(e) = a {
+                        ptys.push(
+                            try_type_ast_expr(e, params, &HashMap::new()).unwrap_or(ir::Ty::Int),
+                        );
+                    }
+                }
+                out.push(ir::closure_of(&ptys, ir::Ty::Int));
+            }
             if (func == "len" || func == "abs" || func == "sum" || func == "sorted")
                 && let Some(ast::PosArg::Pos(ae)) = args.first()
                 && matches!(&ae.kind, ast::ExprKind::Name(n) if n == name)
@@ -5077,6 +5178,8 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
                 out_funcs.extend(nested);
             }
         }
+        // Free functions with a single bare-name decorator (applied at init).
+        let mut free_decorators: Vec<(String, String, Span)> = Vec::new();
         for fd in &all_orders[i] {
             let patch = {
                 let funcs_view = &own_funcs[&m.name];
@@ -5099,6 +5202,9 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
                     lower_function(fd, &mctx_fn, &mut globals, &mut globals_order, false)
                         .map_err(|d| d.with_file(i))?;
                 let name = fd.name.clone();
+                if let Some(d) = fd.decorators.first() {
+                    free_decorators.push((name.clone(), d.name.clone(), d.span));
+                }
                 let patch = if f.is_generator {
                     Err((f.params.len() + f.locals.len()) as i64)
                 } else {
@@ -5143,7 +5249,46 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
             partial_reexports: &partial_reexports,
         };
 
-        let init = if is_root && script.is_empty() {
+        // When free functions are decorated, ensure an init function exists even
+        // if the script is otherwise empty (decoration runs at import/entry).
+        // Pre-register Closure globals so Call sites during init lower see them.
+        let need_init_for_deco = !free_decorators.is_empty();
+        if need_init_for_deco {
+            for (fname, dname, dspan) in &free_decorators {
+                let deco_sig = funcs.get(dname.as_str()).cloned().ok_or_else(|| {
+                    err(
+                        format!(
+                            "decorator '{dname}' is not a function in this module \
+                             (only same-module free functions are supported)"
+                        ),
+                        *dspan,
+                    )
+                    .with_file(i)
+                })?;
+                let result_ty = deco_sig.ret;
+                if !matches!(result_ty, ir::Ty::Closure { .. }) {
+                    return Err(err(
+                        format!(
+                            "decorator '{dname}' must return a function/closure, found {result_ty}"
+                        ),
+                        *dspan,
+                    )
+                    .with_file(i));
+                }
+                let gname = if is_root {
+                    fname.clone()
+                } else {
+                    format!("{}.{}", m.name, fname)
+                };
+                globals.insert(fname.clone(), result_ty);
+                if let Some((_, t)) = globals_order.iter_mut().find(|(n, _)| n == &gname) {
+                    *t = result_ty;
+                } else {
+                    globals_order.push((gname, result_ty));
+                }
+            }
+        }
+        let init = if is_root && script.is_empty() && !need_init_for_deco {
             // PyRs convenience: a root that is only definitions calls main()
             if let Some(sig) = funcs.get("main") {
                 if !sig.params.is_empty() || sig.vararg.is_some() || sig.kwarg.is_some() {
@@ -5171,6 +5316,17 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
             } else {
                 None
             }
+        } else if is_root && script.is_empty() && need_init_for_deco {
+            // Empty script but need init for @decorators only.
+            Some(ir::Function {
+                name: ENTRY_NAME.to_string(),
+                params: vec![],
+                ret: ir::Ty::None,
+                locals: vec![],
+                body: vec![],
+                is_generator: false,
+                yield_ty: None,
+            })
         } else {
             let init_def = ast::FuncDef {
                 name: init_name.clone(),
@@ -5191,6 +5347,117 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
             }
             Some(f)
         };
+
+        // Apply free-function decorators: `h = deco(<closure of h>)` at init start.
+        let mut init = init;
+        if !free_decorators.is_empty() {
+            let f = init.as_mut().ok_or_else(|| {
+                err(
+                    "internal: missing init for free-function decorators",
+                    Span::default(),
+                )
+                .with_file(i)
+            })?;
+            let mut deco_stmts = Vec::new();
+            let mut deco_locals: Vec<(String, ir::Ty)> = Vec::new();
+            for (fname, dname, dspan) in &free_decorators {
+                let sig = funcs.get(fname).cloned().ok_or_else(|| {
+                    err(
+                        format!("internal: missing sig for decorated '{fname}'"),
+                        *dspan,
+                    )
+                    .with_file(i)
+                })?;
+                let params: Vec<ir::Ty> = sig.params.iter().map(|p| p.ty).collect();
+                let ir_name = if is_root {
+                    fname.clone()
+                } else {
+                    format!("{}.{}", m.name, fname)
+                };
+                let clos_ty = ir::closure_of_full(&params, sig.ret, &[], &ir_name);
+                let clos_tmp = format!(".deco.clos.{fname}");
+                deco_locals.push((clos_tmp.clone(), clos_ty));
+                deco_stmts.push(ir::Stmt::Assign {
+                    name: clos_tmp.clone(),
+                    value: ir::Expr {
+                        ty: clos_ty,
+                        kind: ir::ExprKind::MakeClosure {
+                            func: ir_name,
+                            captures: vec![],
+                            capture_is_cell: vec![],
+                        },
+                    },
+                });
+                // Call decorator: may be free function or nested... free only.
+                let deco_sig = funcs.get(dname.as_str()).cloned().ok_or_else(|| {
+                    err(
+                        format!(
+                            "decorator '{dname}' is not a function in this module \
+                             (only same-module free functions are supported)"
+                        ),
+                        *dspan,
+                    )
+                    .with_file(i)
+                })?;
+                if deco_sig.params.len() != 1 {
+                    return Err(err(
+                        format!(
+                            "decorator '{dname}' must take exactly one argument (the function)"
+                        ),
+                        *dspan,
+                    )
+                    .with_file(i));
+                }
+                // Coerce clos into the decorator's param type if it's Closure-shaped.
+                let deco_param_ty = deco_sig.params[0].ty;
+                let clos_arg = if deco_param_ty == clos_ty {
+                    ir::Expr {
+                        ty: clos_ty,
+                        kind: ir::ExprKind::Local(clos_tmp.clone()),
+                    }
+                } else if let ir::Ty::Closure { .. } = deco_param_ty {
+                    // Retype for homogeneous closure param.
+                    ir::Expr {
+                        ty: deco_param_ty,
+                        kind: ir::ExprKind::Local(clos_tmp.clone()),
+                    }
+                } else {
+                    return Err(err(
+                        format!(
+                            "decorator '{dname}' parameter type must be a function/closure, \
+                             found {deco_param_ty}"
+                        ),
+                        *dspan,
+                    )
+                    .with_file(i));
+                };
+                let deco_call = ir::Expr {
+                    ty: deco_sig.ret,
+                    kind: ir::ExprKind::Call {
+                        func: if is_root {
+                            dname.clone()
+                        } else {
+                            format!("{}.{}", m.name, dname)
+                        },
+                        args: vec![clos_arg],
+                    },
+                };
+                let gname = if is_root {
+                    fname.clone()
+                } else {
+                    format!("{}.{}", m.name, fname)
+                };
+                deco_stmts.push(ir::Stmt::GlobalAssign {
+                    name: gname,
+                    value: deco_call,
+                });
+            }
+            // Prepend decorator application; register temps as locals.
+            f.locals.extend(deco_locals);
+            let mut body = deco_stmts;
+            body.append(&mut f.body);
+            f.body = body;
+        }
 
         match init {
             Some(f) => out_funcs.push(f),
@@ -5535,11 +5802,17 @@ fn lower_function_inner(
     current_class: Option<ir::ClassId>,
 ) -> SResult<(ir::Function, Vec<ir::Function>)> {
     let mut params = Vec::new();
-    // Detect @classmethod via registered kind when this is a method IR name.
-    let is_classmethod =
-        current_class.is_some() && method_kind_lookup(&f.name) == MethodKind::Class;
-    let self_param = if current_class.is_some() && !is_classmethod {
-        // Instance / property methods use self for super().
+    // Detect method kind when this is a method IR name.
+    let method_kind = if current_class.is_some() {
+        method_kind_lookup(&f.name)
+    } else {
+        MethodKind::Instance
+    };
+    let is_classmethod = method_kind == MethodKind::Class;
+    // Instance / property methods use self for super(); staticmethods do not.
+    let self_param = if current_class.is_some()
+        && matches!(method_kind, MethodKind::Instance | MethodKind::Property)
+    {
         f.params.first().map(|p| p.name.clone())
     } else {
         None
@@ -7667,11 +7940,16 @@ fn collect_used_names_in_expr(e: &ast::Expr, out: &mut HashSet<String>) {
             out.insert(n.clone());
         }
         ast::ExprKind::Call {
+            func,
             args,
             keywords,
             kwargs,
             ..
         } => {
+            // Free function names used as callees must be captured (e.g. `f(x)` in a nested def).
+            if func != ".call" && !func.contains('.') {
+                out.insert(func.clone());
+            }
             for a in args {
                 match a {
                     ast::PosArg::Pos(x) | ast::PosArg::Star(x) => {
@@ -8219,6 +8497,14 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             lower_aug_assign(target, *op, value, stmt.span, ctx, out)
         }
         ast::StmtKind::ExprStmt(e) => {
+            // Bare `name := value` as a statement is a SyntaxError in CPython.
+            if matches!(e.kind, ast::ExprKind::NamedExpr { .. }) {
+                return Err(err(
+                    "assignment expression (:=) cannot be used as a statement; \
+                     wrap it in parentheses in a larger expression",
+                    e.span,
+                ));
+            }
             // print is a statement-level builtin
             if let ast::ExprKind::Call {
                 func,
@@ -8246,9 +8532,13 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     if a.ty == ir::Ty::File {
                         return Err(err("file objects cannot be printed yet", arg.span));
                     }
-                    // Honor class `__str__` / `__repr__` for print (CPython).
+                    // Honor class `__str__` / `__repr__` for print (CPython),
+                    // including when only a subclass defines a dunder.
                     let a = if let ir::Ty::Class(id) = a.ty {
-                        if resolve_str_dunder(id).is_some() {
+                        if subclasses_of(id)
+                            .iter()
+                            .any(|sid| resolve_str_dunder(*sid).is_some())
+                        {
                             lower_class_to_str(a, id, arg.span)?
                         } else {
                             a
@@ -8711,6 +9001,96 @@ fn lower_pattern_match(
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::ConstBool(true),
             })
+        }
+        ast::Pattern::Class {
+            name,
+            name_span,
+            positional,
+            keywords,
+        } => {
+            let class_id = lookup_class(name).ok_or_else(|| {
+                err(
+                    format!("unknown class '{name}' in match pattern"),
+                    *name_span,
+                )
+            })?;
+            // Subject must be class instance (or refine to one).
+            let subj = match subject.ty {
+                ir::Ty::Class(id) if class_is_subclass(id, class_id) || id == class_id => {
+                    subject.clone()
+                }
+                ir::Ty::Class(id) if class_is_subclass(class_id, id) => {
+                    // Static base, pattern is subclass: need isinstance check + retype.
+                    subject.clone()
+                }
+                other => {
+                    return Err(err(
+                        format!(
+                            "class pattern '{name}' requires a class instance subject, found {other}"
+                        ),
+                        span,
+                    ));
+                }
+            };
+            // isinstance(subject, Class)
+            let isa = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::ClassIsInstance {
+                    value: Box::new(subj.clone()),
+                    class_id,
+                },
+            };
+            let info = class_info(class_id)
+                .ok_or_else(|| err("internal: missing class info for pattern", *name_span))?;
+            let fields = &info.fields;
+            if positional.len() > fields.len() {
+                return Err(err(
+                    format!(
+                        "class pattern '{name}' has {} positional sub-patterns but only {} field(s)",
+                        positional.len(),
+                        fields.len()
+                    ),
+                    span,
+                ));
+            }
+            let mut cond = isa;
+            // Positional: match fields in layout order.
+            for (i, pat) in positional.iter().enumerate() {
+                let (fname, fty) = &fields[i];
+                let field_e = ir::Expr {
+                    ty: *fty,
+                    kind: ir::ExprKind::GetField {
+                        object: Box::new(ir::Expr {
+                            ty: ir::Ty::Class(class_id),
+                            kind: subj.kind.clone(),
+                        }),
+                        class_id,
+                        field_index: i as u32,
+                    },
+                };
+                let c = lower_pattern_match(pat, &field_e, span, ctx, binds)?;
+                cond = bool_and(cond, c);
+                let _ = fname;
+            }
+            // Keywords: field=pattern
+            for (fname, pat) in keywords {
+                let (fidx, fty) = field_index(class_id, fname)
+                    .ok_or_else(|| err(format!("class '{name}' has no field '{fname}'"), span))?;
+                let field_e = ir::Expr {
+                    ty: fty,
+                    kind: ir::ExprKind::GetField {
+                        object: Box::new(ir::Expr {
+                            ty: ir::Ty::Class(class_id),
+                            kind: subj.kind.clone(),
+                        }),
+                        class_id,
+                        field_index: fidx,
+                    },
+                };
+                let c = lower_pattern_match(pat, &field_e, span, ctx, binds)?;
+                cond = bool_and(cond, c);
+            }
+            Ok(cond)
         }
         ast::Pattern::Int(v) => {
             let left = subject.clone();
@@ -9315,10 +9695,13 @@ fn lower_with(
         ];
         let exit_call =
             lower_instance_method_call(mgr(), id, "__exit__", item.span, &exit_args, ctx).map_err(
-                |_| {
+                |e| {
                     err(
-                        "__exit__ must accept three arguments after self \
-                 (use a: Any = None, b: Any = None, c: Any = None)",
+                        format!(
+                            "{}; __exit__ must accept three arguments after self \
+                             (e.g. a: Any = None, b: Any = None, c: Any = None)",
+                            e.message
+                        ),
                         item.span,
                     )
                 },
@@ -9414,6 +9797,17 @@ fn lower_method_stmt(
     }
     let base_ir = lower_expr(base, ctx)?;
     if let ir::Ty::Class(id) = base_ir.ty {
+        if resolve_property(id, method).is_some() {
+            return Err(err(
+                format!(
+                    "'{}' object attribute '{method}' is a property and is not callable",
+                    class_info(id)
+                        .map(|c| c.name)
+                        .unwrap_or_else(|| format!("class#{id}"))
+                ),
+                method_span,
+            ));
+        }
         let call = lower_instance_method_call(base_ir, id, method, method_span, args, ctx)?;
         return Ok(ir::Stmt::ExprStmt(call));
     }
@@ -9543,7 +9937,7 @@ fn lower_method_stmt(
             _ => Err(err(
                 format!(
                     "list method '{method}' is not supported yet (supported: \
-                     append, pop, insert, remove, index, clear, sort)"
+                     append, pop, insert, remove, index, clear, sort, extend, copy)"
                 ),
                 method_span,
             )),
@@ -9976,7 +10370,7 @@ fn lower_set_binary_op(
 
 /// `list(iterable)` — shallow copy for lists; chars for str; keys for dict;
 /// elements for set; fixed-arity homogeneous tuple → list.
-fn lower_list_ctor(arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
+fn lower_list_ctor(arg: ir::Expr, span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     match arg.ty {
         ir::Ty::List(elem) => Ok(ir::Expr {
             ty: ir::list_of(*elem),
@@ -10008,21 +10402,33 @@ fn lower_list_ctor(arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
                     span,
                 ));
             }
-            // Fixed-arity: index each element into a new list.
+            // Fixed-arity: bind tuple once, then index the temp (no re-eval).
             let n = elems.len();
+            let tmp = ctx.fresh_temp("list.tup", arg.ty);
             let mut items = Vec::new();
+            let base_local = ir::Expr {
+                ty: arg.ty,
+                kind: ir::ExprKind::Local(tmp.clone()),
+            };
             for i in 0..n {
                 items.push(ir::Expr {
                     ty: first,
                     kind: ir::ExprKind::Index {
-                        base: Box::new(arg.clone()),
+                        base: Box::new(base_local.clone()),
                         index: Box::new(int_const(i as i64)),
                     },
                 });
             }
             Ok(ir::Expr {
                 ty: ir::list_of(first),
-                kind: ir::ExprKind::ListLit(items),
+                kind: ir::ExprKind::Let {
+                    name: tmp,
+                    value: Box::new(arg),
+                    body: Box::new(ir::Expr {
+                        ty: ir::list_of(first),
+                        kind: ir::ExprKind::ListLit(items),
+                    }),
+                },
             })
         }
         other => Err(err(format!("list() cannot convert {other} yet"), span)),
@@ -10663,6 +11069,12 @@ fn lower_assign_ir(
                     ));
                 }
             };
+            if resolve_property(class_id, attr).is_some() {
+                return Err(err(
+                    format!("property '{attr}' is read-only and cannot be assigned"),
+                    *attr_span,
+                ));
+            }
             let (field_index, field_ty) = field_index(class_id, attr).ok_or_else(|| {
                 err(
                     format!(
@@ -12376,6 +12788,13 @@ fn lower_super_method_call(
     let class_id = ctx
         .current_class
         .ok_or_else(|| err("super() outside of a method is not supported", method_span))?;
+    // Reject super() in staticmethod / classmethod (zero-arg needs instance self).
+    if ctx.self_param.is_none() {
+        return Err(err(
+            "super() is only supported in instance methods (not staticmethod/classmethod)",
+            method_span,
+        ));
+    }
     let parent_id = class_info(class_id).and_then(|i| i.parent).ok_or_else(|| {
         err(
             "super() requires a base class (this class has no parent)",
@@ -12448,6 +12867,99 @@ fn lower_super_method_call(
 }
 
 /// `ClassName(args)` → allocate instance and call `__init__`.
+/// Classmethod body `cls(...)`: allocate using `cls`'s runtime type_id.
+fn lower_classmethod_construct(
+    cls_name: String,
+    defining_id: ir::ClassId,
+    args: &[ast::PosArg],
+    keywords: &[ast::Keyword],
+    kwargs: Option<&ast::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    // Match user args against defining class's __init__ (shared by inheritance).
+    let init_func = resolve_method(defining_id, "__init__");
+    let mut user_args: Vec<ir::Expr> = Vec::new();
+    if let Some(init_name) = &init_func {
+        let sig = ctx
+            .mctx
+            .funcs
+            .get(init_name)
+            .cloned()
+            .or_else(|| method_sig_lookup(init_name))
+            .ok_or_else(|| {
+                err(
+                    "cannot construct via cls(...): __init__ signature not available",
+                    span,
+                )
+            })?;
+        let user_sig = method_user_sig(&sig);
+        // Reuse call matching by building a dummy call then extracting args.
+        // Simpler: manually coerce positionals (no keywords for minimal surface).
+        if !keywords.is_empty() || kwargs.is_some() {
+            return Err(err(
+                "keyword arguments in cls(...) classmethod construct are not supported yet",
+                span,
+            ));
+        }
+        let plain = require_plain_args(args, "cls", span)?;
+        let required = user_sig
+            .params
+            .iter()
+            .filter(|p| p.default.is_none())
+            .count();
+        if plain.len() < required || plain.len() > user_sig.params.len() {
+            return Err(err(
+                format!(
+                    "cls() takes {} to {} arguments ({} given)",
+                    required,
+                    user_sig.params.len(),
+                    plain.len()
+                ),
+                span,
+            ));
+        }
+        for (i, a) in plain.iter().enumerate() {
+            let v = lower_expr(a, ctx)?;
+            let want = user_sig.params[i].ty;
+            user_args.push(coerce(v, want, a.span, "cls(...) argument")?);
+        }
+        // Fill defaults for remaining params.
+        for p in user_sig.params.iter().skip(plain.len()) {
+            if let Some(d) = &p.default {
+                let v = lower_expr(d, ctx)?;
+                user_args.push(coerce(v, p.ty, d.span, "cls(...) default")?);
+            }
+        }
+    } else if !args.is_empty() || !keywords.is_empty() || kwargs.is_some() {
+        return Err(err(
+            "cls() takes no arguments (no __init__ on this class)",
+            span,
+        ));
+    }
+
+    let mut candidates: Vec<(ir::ClassId, Option<String>)> = Vec::new();
+    for sid in subclasses_of(defining_id) {
+        candidates.push((sid, resolve_method(sid, "__init__")));
+    }
+    if candidates.is_empty() {
+        candidates.push((defining_id, init_func));
+    }
+    let cls_obj = ir::Expr {
+        ty: ir::Ty::Class(defining_id),
+        kind: ir::ExprKind::Local(cls_name),
+    };
+    // Return type: defining class (subclass is assignable via coerce at use).
+    Ok(ir::Expr {
+        ty: ir::Ty::Class(defining_id),
+        kind: ir::ExprKind::ClassConstructDynamic {
+            cls_obj: Box::new(cls_obj),
+            candidates,
+            args: user_args,
+        },
+    })
+}
+
 fn lower_class_construct(
     class_id: ir::ClassId,
     class_name: &str,
@@ -13242,6 +13754,20 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             }
             // Instance field load: `obj.x` (or common/exclusive field on a class union).
             let base_ir = lower_expr(base, ctx)?;
+            // Exception objects: `e.args` (message tuple as list[str] for empty/non-empty).
+            if base_ir.ty == ir::Ty::Exception {
+                if attr == "args" {
+                    // Materialize as list[str] so empty and 1-element both typecheck.
+                    return Ok(ir::Expr {
+                        ty: ir::list_of(ir::Ty::Str),
+                        kind: ir::ExprKind::ExcArgs(Box::new(base_ir)),
+                    });
+                }
+                return Err(err(
+                    format!("'exception' object has no attribute '{attr}' (supported: args)"),
+                    *attr_span,
+                ));
+            }
             if let ir::Ty::Class(id) = base_ir.ty {
                 // isinstance multi-peel keeps Class ABI; field may only exist
                 // on refined subclasses (or on the shared base layout).
@@ -13432,8 +13958,19 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 return lower_class_name_method_call(class_id, method, *method_span, &args, ctx);
             }
             let base_ir = lower_expr(base, ctx)?;
-            // User class instance method
+            // User class instance method (not property: obj.prop() is TypeError).
             if let ir::Ty::Class(id) = base_ir.ty {
+                if resolve_property(id, method).is_some() {
+                    return Err(err(
+                        format!(
+                            "'{}' object attribute '{method}' is a property and is not callable",
+                            class_info(id)
+                                .map(|c| c.name)
+                                .unwrap_or_else(|| format!("class#{id}"))
+                        ),
+                        *method_span,
+                    ));
+                }
                 return lower_instance_method_call(base_ir, id, method, *method_span, &args, ctx);
             }
             match base_ir.ty {
@@ -16310,11 +16847,20 @@ fn lower_call(
             span,
         ));
     }
-    // Inside @classmethod: `cls(...)` constructs the owning class.
-    if let Some((cls_name, class_id)) = ctx.classmethod_cls.clone()
+    // Inside @classmethod: `cls(...)` constructs the *invoker* class (runtime
+    // type_id of the cls token), not always the defining class.
+    if let Some((cls_name, defining_id)) = ctx.classmethod_cls.clone()
         && func == cls_name
     {
-        return lower_class_construct(class_id, func, args, keywords, kwargs, span, ctx);
+        return lower_classmethod_construct(
+            cls_name,
+            defining_id,
+            args,
+            keywords,
+            kwargs,
+            span,
+            ctx,
+        );
     }
     // Class construction: `Point(1, 2)` → allocate + `__init__`.
     // Bare name in current module, or imported class binding.
@@ -16340,11 +16886,41 @@ fn lower_call(
         return lower_class_construct(class_id, &name, args, keywords, kwargs, span, ctx);
     }
     // Call through a local/global of closure type first (local rebind shadows nested def).
+    // Decorated free functions rebind the name to a Closure global — prefer that
+    // over the original free-function Call target.
+    // Cell-captured outer params (e.g. nested `f(x)` where f is outer) load via cell.
+    if let Some(ty) = ctx.cell_locals.get(func).copied()
+        && let ir::Ty::Closure { .. } = ty
+        && ctx.locals.contains_key(&format!(".cell.{func}"))
+    {
+        let cell = ir::Expr {
+            ty: ir::cell_of(ty),
+            kind: ir::ExprKind::Local(format!(".cell.{func}")),
+        };
+        let clos_expr = ir::Expr {
+            ty,
+            kind: ir::ExprKind::CellLoad(Box::new(cell)),
+        };
+        return lower_call_closure_value(&clos_expr, args, keywords, kwargs, span, ctx);
+    }
     let closure_ty = ctx
         .locals
         .get(func)
         .copied()
         .or_else(|| ctx.globals.get(func).copied());
+    if let Some(ty) = closure_ty
+        && let ir::Ty::Closure { .. } = ty
+        && !ctx.locals.contains_key(func)
+        && ctx.globals.contains_key(func)
+        && ctx.funcs().contains_key(func)
+    {
+        // Free function rebinding via decorator: call as closure value.
+        let clos_expr = ir::Expr {
+            ty,
+            kind: ir::ExprKind::GlobalLoad(ctx.own_global(func)),
+        };
+        return lower_call_closure_value(&clos_expr, args, keywords, kwargs, span, ctx);
+    }
     // nested function in this function (only if name was not rebound to a local)
     if !ctx.locals.contains_key(func)
         && let Some(info) = ctx.nested_funcs.get(func).cloned()
@@ -16662,7 +17238,7 @@ fn lower_call(
                     ));
                 }
                 let arg = lower_expr(args[0], ctx)?;
-                lower_list_ctor(arg, args[0].span)
+                lower_list_ctor(arg, args[0].span, ctx)
             }
             "dict" => {
                 if args.is_empty() {
@@ -18281,14 +18857,21 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             ir::Ty::Class(id) => lower_class_to_str(value, id, span),
             other => Err(err(format!("str() cannot convert {other} yet"), span)),
         },
-        ast::TypeName::List(_) => Err(err("list(...) conversions are not supported", span)),
-        ast::TypeName::Tuple(_) => Err(err("tuple(...) conversions are not supported", span)),
+        // Cast form `list[T](x)` is not supported; use call form `list(x)`.
+        ast::TypeName::List(_) => Err(err(
+            "typed list(...) casts are not supported; use list(iterable) without a type argument",
+            span,
+        )),
+        ast::TypeName::Tuple(_) => Err(err(
+            "typed tuple(...) casts are not supported; use tuple(x) or a tuple literal",
+            span,
+        )),
         ast::TypeName::Dict { .. } => Err(err(
-            "dict(...) conversions are not supported; use a literal or annotate '{}'",
+            "typed dict(...) casts are not supported; use dict(pairs) or a dict literal",
             span,
         )),
         ast::TypeName::Set(_) => Err(err(
-            "set(iterable) is not supported yet; use a set literal or set() with annotation",
+            "typed set(...) casts are not supported; use set(iterable) or a set literal",
             span,
         )),
         ast::TypeName::File => Err(err(
@@ -18422,6 +19005,10 @@ fn lower_repr_like(value: ir::Expr, ascii: bool, span: Span) -> SResult<ir::Expr
             // CPython: repr(42) == '42', ascii same as repr for these.
             lower_cast(ast::TypeName::Str, value, span)
         }
+        ir::Ty::Exception => Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::ExcRepr(Box::new(value)),
+        }),
         other => Err(err(
             format!(
                 "{}() cannot convert {other} yet",
@@ -20640,20 +21227,19 @@ except Exception:
     }
 
     #[test]
-    fn exception_in_list_is_error() {
-        let e = analyze_err(
+    fn exception_in_list_is_ok() {
+        // exceptions may be list elements as of v0.24
+        let m = analyze_ok(
             "\
+xs = []
 try:
     raise ValueError(\"x\")
 except ValueError as e:
-    xs = [e]
+    xs.append(e)
+print(len(xs))
 ",
         );
-        assert!(
-            e.message.contains("exception") && e.message.contains("list"),
-            "{}",
-            e.message
-        );
+        let _ = m;
     }
 
     #[test]

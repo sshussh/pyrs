@@ -82,6 +82,9 @@ A statically-typed Python subset:
   cross-module `from m import C` / subclassing. **`__str__` / `__repr__`**
   (must return `str`): used by `print`/`str()` with virtual dispatch when
   present; default remains `<Name object>` (no address; runtime type_id).
+  **Also (v0.23+):** `@staticmethod` / `@classmethod` / read-only `@property`, bound methods as values,
+  `__iter__`/`__next__` for-loops, `__len__`/`__bool__`, class `with` context managers (success-path
+  `__exit__(None,None,None)` — no suppress yet), single free-function decorators, match class patterns.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, class patterns in `match`, nested classes, class decorators,
   two-arg `super()`, class-body attrs, first-class class values; mixed
@@ -179,9 +182,8 @@ A statically-typed Python subset:
   `except … as e` binds a first-class **exception object** (`print(e)` /
   `str(e)` → message; truthy in conditions; `isinstance(e, OSError)` /
   multi-filter / unions with Exception); uncaught traps print
-  CPython-like messages and exit 1. Residuals: no exception attrs /
-  `repr` / f-string `!r` on objects; exception objects cannot be list /
-  tuple / dict / set elements
+  CPython-like messages and exit 1. Exception objects may be list/tuple elements; `e.args` is `list[str]` (empty or one message);
+  `repr(e)` / `!r` via ExcRepr. Residuals: full CPython `args` as tuple; dict/set of exceptions
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
 - **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for

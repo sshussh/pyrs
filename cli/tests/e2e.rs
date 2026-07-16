@@ -8355,31 +8355,27 @@ except ValueError as e:
 }
 
 #[test]
-fn exception_in_list_is_compile_error() {
-    let dir = TempDir::new("exc_in_list");
-    let src = dir.0.join("prog.py");
-    fs::write(
-        &src,
-        "\
+fn exception_in_list_works() {
+    let src = "\
 try:
     raise ValueError(\"x\")
 except ValueError as e:
     xs = [e]
-    print(xs)
-",
-    )
-    .unwrap();
-    let out = Command::new(PYRS)
-        .args(["compile", "-i"])
-        .arg(&src)
+    print(len(xs))
+    print(xs[0])
+";
+    let out = run_program("exc_in_list", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("error[semantic]") && stderr.contains("exception"),
-        "stderr: {stderr}"
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
     );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
@@ -8806,8 +8802,7 @@ print(P(7).get())
 fn class_super_outside_method() {
     let (_, stderr) = run_program_expect_fail("class_super_out", "print(super())\n");
     assert!(
-        stderr.contains("super()")
-            && (stderr.contains("not supported") || stderr.contains("must be used")),
+        stderr.contains("super() must be used as super().method"),
         "stderr: {stderr}"
     );
 }
@@ -8862,32 +8857,37 @@ print(A().m())
 }
 
 #[test]
-fn free_function_decorator_not_supported() {
+fn property_only_on_methods() {
     let (_, stderr) =
-        run_program_expect_fail("free_deco", "@property\ndef f(self):\n    return 1\n");
+        run_program_expect_fail("prop_free", "@property\ndef f(self):\n    return 1\n");
     assert!(
-        stderr.contains("function decorators") && stderr.contains("not supported yet"),
+        stderr.contains("@property") && stderr.contains("only valid on methods"),
         "stderr: {stderr}"
     );
 }
 
 #[test]
-fn class_match_pattern_not_supported() {
-    let (_, stderr) = run_program_expect_fail(
-        "class_match",
-        "\
+fn class_match_pattern_works() {
+    let src = "\
 class C:
-    def __init__(self):
-        self.x = 1
-match C():
-    case C():
-        print(1)
-",
-    );
+    def __init__(self, x: int):
+        self.x = x
+match C(1):
+    case C(x=x):
+        print(x)
+";
+    let out = run_program("class_match_ok", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
     assert!(
-        stderr.contains("class patterns in match/case are not supported yet"),
-        "stderr: {stderr}"
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
     );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
@@ -10647,4 +10647,349 @@ print(\"done\")
         String::from_utf8_lossy(&py.stderr)
     );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+// --- review-fix / completeness e2e ---
+
+#[test]
+fn v024_classmethod_inherit_factory() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+        self.tag = \"P\"
+    @classmethod
+    def one(cls) -> P:
+        return cls(1)
+class Q(P):
+    def __init__(self, x: int):
+        self.x = x
+        self.tag = \"Q\"
+print(Q.one().tag)
+print(P.one().tag)
+";
+    let out = run_program("v024_cm_inherit", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_str_repr_virtual_subclass() {
+    let src = "\
+class A:
+    def __repr__(self) -> str:
+        return \"RA\"
+class B(A):
+    def __str__(self) -> str:
+        return \"SB\"
+def show(x: A):
+    print(x)
+show(B())
+print(str(B()))
+";
+    let out = run_program("v024_str_virt", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_function_decorator() {
+    let src = "\
+def deco(f):
+    def g(x: int) -> int:
+        return f(x) + 1
+    return g
+@deco
+def h(x: int) -> int:
+    return x * 2
+print(h(3))
+";
+    let out = run_program("v024_deco", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_exc_args_and_list() {
+    let src = "\
+xs = []
+try:
+    raise ValueError(\"boom\")
+except ValueError as e:
+    print(e)
+    xs.append(e)
+    print(len(e.args))
+    print(e.args[0])
+print(len(xs))
+print(xs[0])
+";
+    let out = run_program("v024_exc", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_match_class_pattern() {
+    let src = "\
+class P:
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+def f(v: P):
+    match v:
+        case P(x=0, y=y):
+            print(\"x0\", y)
+        case P(x=x, y=y):
+            print(x, y)
+f(P(0, 2))
+f(P(3, 4))
+";
+    let out = run_program("v024_match_cls", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_walrus_peel() {
+    let src = "\
+def f(x: int | None) -> int:
+    if (y := x) is not None:
+        return y + 1
+    return 0
+print(f(3), f(None))
+";
+    let out = run_program("v024_walrus_peel", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_with_body_raise_exit() {
+    // Residual: __exit__ always receives None triple (no exc suppress/args yet).
+    // Order enter → body → exit → caught must still match CPython for side effects.
+    let src = "\
+class CM:
+    def __enter__(self) -> int:
+        print(\"enter\")
+        return 1
+    def __exit__(self, a: Any = None, b: Any = None, c: Any = None) -> None:
+        print(\"exit\")
+try:
+    with CM() as x:
+        print(x)
+        raise ValueError(\"boom\")
+except ValueError:
+    print(\"caught\")
+";
+    let out = run_program("v024_with_raise", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_list_extend_errors() {
+    let (_, stderr) = run_program_expect_fail("ext_ty", "xs = [1]\nxs.extend([\"a\"])\n");
+    assert!(
+        stderr.contains("list.extend()") && stderr.contains("mismatch"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("ext_nonlist", "xs = [1]\nxs.extend(1)\n");
+    assert!(
+        stderr.contains("list.extend()") && stderr.contains("list"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn v024_deferred_negatives() {
+    let (_, stderr) =
+        run_program_expect_fail("sorted_key", "print(sorted([1, 2], key=lambda x: x))\n");
+    assert!(
+        stderr.contains("key=") || stderr.contains("not supported"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "two_arg_super",
+        "class A:\n    def m(self) -> int:\n        return 1\nclass B(A):\n    def m(self) -> int:\n        return super(B, self).m()\nprint(B().m())\n",
+    );
+    assert!(
+        stderr.contains("two-arg super") || stderr.contains("super()"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("tuple_list", "print(tuple([1, 2]))\n");
+    assert!(
+        stderr.contains("tuple()") && stderr.contains("not supported"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn v024_super_diag_tight() {
+    let (_, stderr) = run_program_expect_fail("super_out", "print(super())\n");
+    assert!(
+        stderr.contains("super() must be used as super().method"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "super_static",
+        "class A:\n    @staticmethod\n    def m():\n        return super().x()\nprint(A.m())\n",
+    );
+    assert!(stderr.contains("instance methods"), "stderr={stderr}");
+}
+
+#[test]
+fn v024_list_ctor_edges() {
+    let src = "\
+print(list(\"ab\"))
+print(list([1, 2]))
+s = {1, 2}
+print(sorted(list(s)))
+d = {\"a\": 1, \"b\": 2}
+print(sorted(list(d)))
+print(list((7, 8)))
+";
+    let out = run_program("v024_list_edges", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_assert_bare() {
+    let src = "\
+try:
+    assert False
+except AssertionError as e:
+    print(\"AssertionError\")
+    print(len(e.args))
+";
+    let out = run_program("v024_assert_bare", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_classmethod_on_instance() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    @classmethod
+    def one(cls) -> P:
+        return cls(9)
+print(P(0).one().x)
+";
+    let out = run_program("v024_cm_inst", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_prop_call_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "prop_call",
+        "class C:\n    @property\n    def p(self) -> int:\n        return 1\nprint(C().p())\n",
+    );
+    assert!(
+        stderr.contains("property") && stderr.contains("not callable"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn v024_bare_walrus_stmt_rejected() {
+    let (_, stderr) = run_program_expect_fail("walrus_stmt", "n := 1\nprint(n)\n");
+    assert!(
+        stderr.contains("assignment expression") || stderr.contains(":="),
+        "stderr={stderr}"
+    );
 }

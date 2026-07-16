@@ -2499,10 +2499,49 @@ impl Parser {
                 Ok(Pattern::Wildcard)
             }
             Token::Ident(name) => {
+                let name_span = self.peek_span();
                 self.advance();
-                // `case Class(...):` / `case Class():` — class patterns not supported.
+                // `case Class(...):` / `case Class():` — class patterns.
                 if self.peek() == &Token::LParen {
-                    return Err(self.error("class patterns in match/case are not supported yet"));
+                    self.advance();
+                    let mut positional = Vec::new();
+                    let mut keywords = Vec::new();
+                    let mut saw_kw = false;
+                    if self.peek() != &Token::RParen {
+                        loop {
+                            // Keyword: Ident '=' pattern (not nested class call).
+                            if let Token::Ident(fname) = self.peek().clone()
+                                && self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::Eq)
+                            {
+                                self.advance(); // field name
+                                self.expect(Token::Eq, "after keyword field in class pattern")?;
+                                let pat = self.parse_pattern()?;
+                                keywords.push((fname, pat));
+                                saw_kw = true;
+                            } else {
+                                if saw_kw {
+                                    return Err(self.error(
+                                        "positional patterns cannot follow keyword patterns \
+                                         in a class pattern",
+                                    ));
+                                }
+                                positional.push(self.parse_pattern()?);
+                            }
+                            if !self.eat(&Token::Comma) {
+                                break;
+                            }
+                            if self.peek() == &Token::RParen {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(Token::RParen, "to close class pattern")?;
+                    return Ok(Pattern::Class {
+                        name,
+                        name_span,
+                        positional,
+                        keywords,
+                    });
                 }
                 Ok(Pattern::Capture(name))
             }

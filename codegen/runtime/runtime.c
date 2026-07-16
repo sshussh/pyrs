@@ -63,7 +63,7 @@
 #define TAG_UNION 8
 #define TAG_CLOSURE 9
 #define TAG_GENERATOR 10
-/* 11 = exception (union-box print only) */
+#define TAG_EXC 11
 /* Class instances: 13 + 8*class_id (distinct per class; avoids list 4+8*k). */
 #define TAG_CLASS_BASE 13
 /* list tags: 4 + 8 * elem_tag */
@@ -350,6 +350,34 @@ PyrsStr *pyrs_str_from_exc(PyrsExc *e) {
         return s;
     }
     return e->msg;
+}
+
+/* e.args as list[str] (empty or one message) — list ABI for variable length. */
+PyrsList *pyrs_exc_args(PyrsExc *e) {
+    if (e == NULL || e->msg == NULL || e->msg->len == 0) {
+        return pyrs_list_new(0);
+    }
+    PyrsList *r = pyrs_list_new(1);
+    pyrs_list_push(r, (long long)(uintptr_t)e->msg);
+    return r;
+}
+
+/* repr(e) → "ExcType('msg')" like CPython (simplified). */
+PyrsStr *pyrs_repr_from_exc(PyrsExc *e) {
+    const char *name = e ? exc_type_name(e->type_tag) : "Exception";
+    const char *body =
+        (e && e->msg && e->msg->len > 0) ? e->msg->data : "";
+    char buf[640];
+    if (body[0] == '\0') {
+        snprintf(buf, sizeof buf, "%s()", name);
+    } else {
+        snprintf(buf, sizeof buf, "%s('%s')", name, body);
+    }
+    size_t n = strlen(buf);
+    PyrsStr *s = xmalloc(sizeof(long long) + n + 1);
+    s->len = (long long)n;
+    memcpy(s->data, buf, n + 1);
+    return s;
 }
 
 /* isinstance(exc, filter_tag) with hierarchy. */
@@ -1706,6 +1734,9 @@ static void print_slot(long long slot, int tag) {
         break;
     case TAG_GENERATOR:
         fputs("<generator>", stdout);
+        break;
+    case TAG_EXC:
+        pyrs_print_exc((PyrsExc *)(uintptr_t)slot);
         break;
     default:
         /* Class instance: 13 + 8*class_id — print via type_id on the object. */

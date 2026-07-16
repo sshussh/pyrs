@@ -810,6 +810,10 @@ pub enum ExprKind {
     },
     /// `str(exc)` for an exception object → message body.
     ExcToStr(Box<Expr>),
+    /// `exc.args` → tuple of message strings (usually `()` or `("msg",)`).
+    ExcArgs(Box<Expr>),
+    /// `repr(exc)` → `TypeName('msg')` form.
+    ExcRepr(Box<Expr>),
     /// `list.pop(index)`; index defaults to -1 (the last element).
     ListPop {
         list: Box<Expr>,
@@ -1034,6 +1038,15 @@ pub enum ExprKind {
     /// Does not call `__init__` — semantic wraps that separately.
     NewObject {
         class_id: ClassId,
+    },
+    /// Classmethod `cls(...)`: allocate + `__init__` using the runtime
+    /// `type_id` of `cls_obj`. `candidates` are `(class_id, optional init IR
+    /// name)` for every closed-world class that may appear. User `args` are
+    /// already coerced to the static `__init__` user signature.
+    ClassConstructDynamic {
+        cls_obj: Box<Expr>,
+        candidates: Vec<(ClassId, Option<String>)>,
+        args: Vec<Expr>,
     },
     /// Load instance field at layout index (0-based into `ClassInfo::fields`).
     GetField {
