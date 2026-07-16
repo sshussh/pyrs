@@ -134,12 +134,18 @@ A statically-typed Python subset:
   `|` / `|=`, `in`, `len`, iteration
 - **Exceptions:** `raise ExcType("msg")` for ValueError, KeyError,
   IndexError, ZeroDivisionError, TypeError, RuntimeError, GeneratorExit,
-  OverflowError, EOFError, FileNotFoundError, OSError, NameError,
-  UnboundLocalError, StopIteration; `try`/`except`/`except Type as e` /
-  `except (A, B)`/`else`/`finally`; flat equality match (no OSError
-  hierarchy — `except OSError` does not catch FileNotFoundError);
-  `except … as e` binds the **message str**, not an exception object;
-  uncaught traps print CPython-like messages and exit 1
+  OverflowError, EOFError, FileNotFoundError, OSError, PermissionError,
+  IsADirectoryError, NameError, UnboundLocalError, StopIteration,
+  Exception; `try`/`except`/`except Type as e` / `except (A, B)`/`else`/
+  `finally`; CPython-like hierarchy match (`except OSError` catches
+  `FileNotFoundError`/`PermissionError`/`IsADirectoryError`; `except
+  Exception` catches normal exceptions but not `GeneratorExit`);
+  `except … as e` binds a first-class **exception object** (`print(e)` /
+  `str(e)` → message; truthy in conditions; `isinstance(e, OSError)` /
+  multi-filter / unions with Exception); uncaught traps print
+  CPython-like messages and exit 1. Residuals: no exception attrs /
+  `repr` / f-string `!r` on objects; exception objects cannot be list /
+  tuple / dict / set elements
 - **Globals:** top-level variables are readable from any function;
   writing needs a `global x` declaration, exactly like Python
 - **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for
@@ -329,4 +335,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.18.0 && git push origin v0.18.0`.
+Release tags: `git tag v0.18.1 && git push origin v0.18.1`.

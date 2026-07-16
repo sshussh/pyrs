@@ -1003,7 +1003,9 @@ handler instead of exiting:
 try:
     raise ValueError("bad")
 except ValueError as e:
-    print(e)          # message body only (str)
+    print(e)          # message body only (exception object)
+    print(str(e))
+    print(isinstance(e, Exception))
 finally:
     print("done")
 ```
@@ -1011,18 +1013,24 @@ finally:
 Supported exception types for `raise` / typed `except`: `ValueError`,
 `KeyError`, `IndexError`, `ZeroDivisionError`, `TypeError`, `RuntimeError`,
 `GeneratorExit`, `OverflowError`, `EOFError`, `FileNotFoundError`,
-`OSError`, `NameError`, `UnboundLocalError`, `StopIteration`. Matching is
-**flat equality** — there is no OSError hierarchy yet, so
-`except OSError` does **not** catch `FileNotFoundError`. Multi-type
-handlers work: `except (A, B) as e:`. Bare `except:` catches all
-(including traps that remain OTHER, e.g. `PermissionError`). The bound
-name is the **message string** (not a full exception object).
-`try`/`except` may have an `else` clause (runs only on normal completion
-of the try body; skipped after a handled exception; exceptions raised in
-`else` are not caught by the same `try`'s handlers). `else` requires at
-least one `except` (not `try`/`finally` alone). `return` / `break` /
-`continue` inside `try` run `finally` and pop the catch frame before
-leaving (CPython-compatible).
+`OSError`, `PermissionError`, `IsADirectoryError`, `NameError`,
+`UnboundLocalError`, `StopIteration`, `Exception`. Matching follows
+CPython-like **subclass** rules for the fixed kit hierarchy (not user
+classes): `FileNotFoundError` / `PermissionError` / `IsADirectoryError`
+⊂ `OSError` ⊂ `Exception`; other named traps ⊂ `Exception`;
+`GeneratorExit` is **not** under `Exception` (BaseException-only, like
+CPython). Multi-type handlers work: `except (A, B) as e:`. Bare
+`except:` catches all. The bound name is a first-class **exception
+object**: `print`/`str` → message body; always truthy in `if`/`not`;
+`isinstance(e, OSError)` (and multi-filter / multi-assign unions that
+include the exception type) work. Not yet: exception attributes, `repr` /
+f-string `!r` on exception objects, or storing exceptions in list/tuple/
+dict/set (compile error). `try`/`except` may have an `else` clause (runs
+only on normal completion of the try body; skipped after a handled
+exception; exceptions raised in `else` are not caught by the same `try`'s
+handlers). `else` requires at least one `except` (not `try`/`finally`
+alone). `return` / `break` / `continue` inside `try` run `finally` and
+pop the catch frame before leaving (CPython-compatible).
 
 | error | raised by |
 |-------|-----------|
@@ -1164,10 +1172,11 @@ Container notes (v0.18):
   homogeneous capturing closures in containers too.
 
 Exception notes: supported named types include OverflowError, EOFError,
-FileNotFoundError, OSError, NameError, UnboundLocalError, StopIteration,
-and GeneratorExit (flat match; no OSError hierarchy).
-`except E as e` binds the message `str`, not an exception object.
-Remaining OTHER traps (e.g. PermissionError) match bare `except:` only.
+FileNotFoundError, OSError, PermissionError, IsADirectoryError, NameError,
+UnboundLocalError, StopIteration, Exception, and GeneratorExit.
+Hierarchy: OSError children and `except Exception` (not GeneratorExit).
+`except E as e` binds an exception object (`print`/`str`/`if`/`isinstance`).
+No container storage, attrs, or `repr`/`!r` on exception objects yet.
 
 Not implemented yet (clear compile errors): classes, GC / heap freeing,
 f-string debug form `{x=}` / grouping / types `n`/`c`, unparenthesized
