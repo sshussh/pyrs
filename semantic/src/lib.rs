@@ -1211,6 +1211,7 @@ fn narrowing_from_condition_with(
         }
         // `isinstance(x, T)` / `isinstance(x, (T1, T2))` peels unions and class
         // bases (subclass → then-arm; complementary miss → else-arm).
+        // Subject may be a Name or walrus target: `isinstance((y := x), T)`.
         ast::ExprKind::Call {
             func,
             args,
@@ -1220,37 +1221,44 @@ fn narrowing_from_condition_with(
         } if func == "isinstance" && keywords.is_empty() && kwargs.is_none() => {
             if let Ok(plain) = require_plain_args(args, "isinstance", cond.span)
                 && plain.len() == 2
-                && let ast::ExprKind::Name(n) = &plain[0].kind
-                && let Some(storage_ty) = name_storage_ty(n, ctx)
                 && let Ok(pats) = parse_isinstance_type_arg(plain[1])
             {
-                // Prefer active overlay (and-chain left peels), then outer.
-                let ty = name_refined_ty(n, ctx, active).unwrap_or(storage_ty);
-                let members = ir::flatten_union_members(ty);
-                let mut hit: Vec<ir::Ty> = Vec::new();
-                let mut miss: Vec<ir::Ty> = Vec::new();
-                for m in members {
-                    let (t, e) = isinstance_peel_member(m, &pats);
-                    if let Some(t) = t {
-                        hit.push(t);
+                let subject = match &plain[0].kind {
+                    ast::ExprKind::Name(n) => name_storage_ty(n, ctx).map(|st| (n.clone(), st)),
+                    ast::ExprKind::NamedExpr { target, value, .. } => name_storage_ty(target, ctx)
+                        .or_else(|| expr_ty_hint(value, ctx, active))
+                        .map(|st| (target.clone(), st)),
+                    _ => None,
+                };
+                if let Some((n, storage_ty)) = subject {
+                    // Prefer active overlay (and-chain left peels), then outer.
+                    let ty = name_refined_ty(&n, ctx, active).unwrap_or(storage_ty);
+                    let members = ir::flatten_union_members(ty);
+                    let mut hit: Vec<ir::Ty> = Vec::new();
+                    let mut miss: Vec<ir::Ty> = Vec::new();
+                    for m in members {
+                        let (t, e) = isinstance_peel_member(m, &pats);
+                        if let Some(t) = t {
+                            hit.push(t);
+                        }
+                        if let Some(e) = e {
+                            miss.push(e);
+                        }
                     }
-                    if let Some(e) = e {
-                        miss.push(e);
+                    if !hit.is_empty() {
+                        let then_ty = match hit.len() {
+                            1 => hit[0],
+                            _ => ir::union_of(&hit),
+                        };
+                        then_m.insert(n.clone(), then_ty);
                     }
-                }
-                if !hit.is_empty() {
-                    let then_ty = match hit.len() {
-                        1 => hit[0],
-                        _ => ir::union_of(&hit),
-                    };
-                    then_m.insert(n.clone(), then_ty);
-                }
-                if !miss.is_empty() {
-                    let else_ty = match miss.len() {
-                        1 => miss[0],
-                        _ => ir::union_of(&miss),
-                    };
-                    else_m.insert(n.clone(), else_ty);
+                    if !miss.is_empty() {
+                        let else_ty = match miss.len() {
+                            1 => miss[0],
+                            _ => ir::union_of(&miss),
+                        };
+                        else_m.insert(n, else_ty);
+                    }
                 }
             }
         }
@@ -12938,11 +12946,100 @@ fn lower_classmethod_construct(
         ));
     }
 
+    // Per closed-world subclass: only call `__init__` when arity matches the
+    // static arg list. Mismatches become runtime TypeError (CPython), not UB.
+    let n_args = user_args.len();
     let mut candidates: Vec<(ir::ClassId, Option<String>)> = Vec::new();
-    for sid in subclasses_of(defining_id) {
-        candidates.push((sid, resolve_method(sid, "__init__")));
+    let mut arity_errors: Vec<(ir::ClassId, String)> = Vec::new();
+    let mut sids = subclasses_of(defining_id);
+    if sids.is_empty() {
+        sids.push(defining_id);
     }
-    if candidates.is_empty() {
+    for sid in sids {
+        let cname = class_info(sid)
+            .map(|c| c.name)
+            .unwrap_or_else(|| format!("class#{sid}"));
+        let sid_init = resolve_method(sid, "__init__");
+        match sid_init {
+            None => {
+                if n_args == 0 {
+                    candidates.push((sid, None));
+                } else {
+                    arity_errors.push((sid, format!("TypeError: {cname}() takes no arguments")));
+                }
+            }
+            Some(init_name) => {
+                let Some(sig) = ctx
+                    .mctx
+                    .funcs
+                    .get(&init_name)
+                    .cloned()
+                    .or_else(|| method_sig_lookup(&init_name))
+                else {
+                    arity_errors.push((
+                        sid,
+                        format!("TypeError: {cname}.__init__() signature not available"),
+                    ));
+                    continue;
+                };
+                let user_sig = method_user_sig(&sig);
+                let required = user_sig
+                    .params
+                    .iter()
+                    .filter(|p| p.default.is_none())
+                    .count();
+                let max_p = user_sig.params.len();
+                if n_args < required {
+                    let missing = required - n_args;
+                    let names: Vec<&str> = user_sig
+                        .params
+                        .iter()
+                        .skip(n_args)
+                        .filter(|p| p.default.is_none())
+                        .map(|p| p.name.as_str())
+                        .collect();
+                    let arg_list = if names.len() == 1 {
+                        format!("'{}'", names[0])
+                    } else if names.is_empty() {
+                        String::new()
+                    } else {
+                        let mut parts: Vec<String> =
+                            names.iter().map(|n| format!("'{n}'")).collect();
+                        let last = parts.pop().unwrap();
+                        format!("{} and {last}", parts.join(", "))
+                    };
+                    let noun = if missing == 1 {
+                        "argument"
+                    } else {
+                        "arguments"
+                    };
+                    let msg = if arg_list.is_empty() {
+                        format!(
+                            "TypeError: {cname}.__init__() missing {missing} required positional {noun}"
+                        )
+                    } else {
+                        format!(
+                            "TypeError: {cname}.__init__() missing {missing} required positional {noun}: {arg_list}"
+                        )
+                    };
+                    arity_errors.push((sid, msg));
+                } else if n_args > max_p {
+                    // CPython counts `self` in "takes N positional arguments".
+                    arity_errors.push((
+                        sid,
+                        format!(
+                            "TypeError: {cname}.__init__() takes {} positional arguments but {} were given",
+                            max_p + 1,
+                            n_args + 1
+                        ),
+                    ));
+                } else {
+                    candidates.push((sid, Some(init_name)));
+                }
+            }
+        }
+    }
+    if candidates.is_empty() && arity_errors.is_empty() {
         candidates.push((defining_id, init_func));
     }
     let cls_obj = ir::Expr {
@@ -12955,6 +13052,7 @@ fn lower_classmethod_construct(
         kind: ir::ExprKind::ClassConstructDynamic {
             cls_obj: Box::new(cls_obj),
             candidates,
+            arity_errors,
             args: user_args,
         },
     })

@@ -4194,9 +4194,11 @@ impl Emitter {
             ExprKind::ClassConstructDynamic {
                 cls_obj,
                 candidates,
+                arity_errors,
                 args,
             } => {
                 // Load type_id from cls_obj, switch among candidates: NewObject + init.
+                // Arity-incompatible subclasses TypeError (no short-arg call / SIGSEGV).
                 let cls_p = self.emit_expr(cls_obj);
                 let tid_p = self.tmp();
                 self.line(format!(
@@ -4217,6 +4219,12 @@ impl Emitter {
                     cases.push_str(&format!(" i64 {}, label %{bl}", *cid as i64));
                     blocks.push((bl, *cid, init.clone()));
                 }
+                let mut err_blocks = Vec::new();
+                for (cid, msg) in arity_errors {
+                    let bl = self.fresh_block(&format!("ccons.err.{}", cid));
+                    cases.push_str(&format!(" i64 {}, label %{bl}", *cid as i64));
+                    err_blocks.push((bl, msg.clone()));
+                }
                 self.line(format!("switch i64 {tid}, label %{default_l} [{cases} ]"));
                 let mut phi_preds = Vec::new();
                 for (bl, cid, init) in &blocks {
@@ -4231,32 +4239,44 @@ impl Emitter {
                     phi_preds.push((obj, cblk));
                     self.line(format!("br label %{end_l}"));
                 }
+                for (bl, msg) in &err_blocks {
+                    self.start_block(bl);
+                    self.emit_die(msg);
+                }
                 self.start_block(&default_l);
-                // Fallback: first candidate (should not happen for valid cls tokens).
-                let (fb_cid, fb_init) = candidates
-                    .first()
-                    .map(|(c, i)| (*c, i.clone()))
-                    .unwrap_or((0, None));
-                let obj_def = self.emit_new_object(fb_cid);
-                if let Some(init_name) = fb_init {
-                    let mut call_args = vec![(obj_def.clone(), Ty::Class(fb_cid))];
-                    call_args.extend(arg_vals.iter().cloned());
-                    self.emit_direct_method_call(&init_name, &call_args, Ty::None);
-                }
-                let dblk = self.cur_block.clone();
-                phi_preds.push((obj_def, dblk));
-                self.line(format!("br label %{end_l}"));
-                self.start_block(&end_l);
-                let t = self.tmp();
-                let mut phi = format!("{t} = phi ptr ");
-                for (i, (v, b)) in phi_preds.iter().enumerate() {
-                    if i > 0 {
-                        phi.push_str(", ");
+                if let Some((fb_cid, fb_init)) = candidates.first() {
+                    // Fallback: first compatible candidate (should not happen for valid cls).
+                    let obj_def = self.emit_new_object(*fb_cid);
+                    if let Some(init_name) = fb_init {
+                        let mut call_args = vec![(obj_def.clone(), Ty::Class(*fb_cid))];
+                        call_args.extend(arg_vals.iter().cloned());
+                        self.emit_direct_method_call(init_name, &call_args, Ty::None);
                     }
-                    phi.push_str(&format!("[ {v}, %{b} ]"));
+                    let dblk = self.cur_block.clone();
+                    phi_preds.push((obj_def, dblk));
+                    self.line(format!("br label %{end_l}"));
+                } else if let Some((_, msg)) = arity_errors.first() {
+                    // All arms are arity errors — still TypeError on unknown id.
+                    self.emit_die(msg);
+                } else {
+                    self.emit_die("TypeError: cls() construct failed");
                 }
-                self.line(phi);
-                t
+                self.start_block(&end_l);
+                if phi_preds.is_empty() {
+                    // All paths die; provide a dummy for SSA (unreachable).
+                    "null".to_string()
+                } else {
+                    let t = self.tmp();
+                    let mut phi = format!("{t} = phi ptr ");
+                    for (i, (v, b)) in phi_preds.iter().enumerate() {
+                        if i > 0 {
+                            phi.push_str(", ");
+                        }
+                        phi.push_str(&format!("[ {v}, %{b} ]"));
+                    }
+                    self.line(phi);
+                    t
+                }
             }
             ExprKind::NewObject { class_id } => self.emit_new_object(*class_id),
             ExprKind::GetField {

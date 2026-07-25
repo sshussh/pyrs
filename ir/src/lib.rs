@@ -1041,11 +1041,15 @@ pub enum ExprKind {
     },
     /// Classmethod `cls(...)`: allocate + `__init__` using the runtime
     /// `type_id` of `cls_obj`. `candidates` are `(class_id, optional init IR
-    /// name)` for every closed-world class that may appear. User `args` are
-    /// already coerced to the static `__init__` user signature.
+    /// name)` for closed-world classes whose `__init__` accepts `args`.
+    /// `arity_errors` maps type_ids whose `__init__` cannot accept `args` to a
+    /// TypeError message (avoids calling with a short/long arg list / SIGSEGV).
+    /// User `args` are already coerced to the defining class's user signature.
     ClassConstructDynamic {
         cls_obj: Box<Expr>,
         candidates: Vec<(ClassId, Option<String>)>,
+        /// `(class_id, TypeError message)` for incompatible subclass `__init__`s.
+        arity_errors: Vec<(ClassId, String)>,
         args: Vec<Expr>,
     },
     /// Load instance field at layout index (0-based into `ClassInfo::fields`).
