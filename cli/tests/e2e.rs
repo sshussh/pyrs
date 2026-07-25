@@ -8848,10 +8848,7 @@ print(A().m())
 ";
     let (_, stderr) = run_program_expect_fail("v021_super_nobase", src);
     assert!(
-        stderr.contains("super()")
-            && (stderr.contains("no base")
-                || stderr.contains("no parent")
-                || stderr.contains("base class")),
+        stderr.contains("super() requires a base class"),
         "stderr: {stderr}"
     );
 }
@@ -10818,6 +10815,72 @@ print(f(3), f(None))
 }
 
 #[test]
+fn v024_walrus_isinstance_peel() {
+    let src = "\
+class A:
+    def __init__(self, n: int):
+        self.n = n
+class B(A):
+    def __init__(self, n: int, k: int):
+        self.n = n
+        self.k = k
+def f(x: A) -> int:
+    if isinstance((y := x), B):
+        return y.k
+    return y.n
+print(f(B(1, 9)), f(A(3)))
+";
+    let out = run_program("v024_walrus_isa", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v024_classmethod_subclass_init_arity() {
+    // Subclass __init__ needs more args than the classmethod factory passes.
+    // Must TypeError (CPython), not SIGSEGV.
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    @classmethod
+    def one(cls) -> P:
+        return cls(1)
+class Q(P):
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+try:
+    print(Q.one().x)
+except TypeError as e:
+    print(\"TypeError\")
+    print(\"missing\" in str(e) or \"argument\" in str(e))
+print(P.one().x)
+";
+    let out = run_program("v024_cm_arity", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn v024_with_body_raise_exit() {
     // Residual: __exit__ always receives None triple (no exc suppress/args yet).
     // Order enter → body → exit → caught must still match CPython for side effects.
@@ -10858,7 +10921,7 @@ fn v024_list_extend_errors() {
     );
     let (_, stderr) = run_program_expect_fail("ext_nonlist", "xs = [1]\nxs.extend(1)\n");
     assert!(
-        stderr.contains("list.extend()") && stderr.contains("list"),
+        stderr.contains("list.extend()") && stderr.contains("requires a list argument"),
         "stderr={stderr}"
     );
 }
@@ -10868,7 +10931,7 @@ fn v024_deferred_negatives() {
     let (_, stderr) =
         run_program_expect_fail("sorted_key", "print(sorted([1, 2], key=lambda x: x))\n");
     assert!(
-        stderr.contains("key=") || stderr.contains("not supported"),
+        stderr.contains("'sorted()' does not take keyword arguments"),
         "stderr={stderr}"
     );
     let (_, stderr) = run_program_expect_fail(
@@ -10876,7 +10939,7 @@ fn v024_deferred_negatives() {
         "class A:\n    def m(self) -> int:\n        return 1\nclass B(A):\n    def m(self) -> int:\n        return super(B, self).m()\nprint(B().m())\n",
     );
     assert!(
-        stderr.contains("two-arg super") || stderr.contains("super()"),
+        stderr.contains("two-arg super() is not supported yet"),
         "stderr={stderr}"
     );
     let (_, stderr) = run_program_expect_fail("tuple_list", "print(tuple([1, 2]))\n");
@@ -10986,10 +11049,67 @@ fn v024_prop_call_rejected() {
 }
 
 #[test]
+fn v024_prop_assign_readonly() {
+    let (_, stderr) = run_program_expect_fail(
+        "prop_asg",
+        "class C:\n    @property\n    def p(self) -> int:\n        return 1\nc = C()\nc.p = 2\n",
+    );
+    assert!(
+        stderr.contains("property 'p' is read-only"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn v024_match_class_positional() {
+    // PyRs layout-order positional class patterns (not CPython __match_args__).
+    let src = "\
+class P:
+    def __init__(self, x: int, y: int):
+        self.x = x
+        self.y = y
+def f(v: P):
+    match v:
+        case P(0, y):
+            print(\"x0\", y)
+        case P(x, y):
+            print(x, y)
+f(P(0, 2))
+f(P(3, 4))
+";
+    let out = run_program("v024_match_pos", src);
+    assert_eq!(out, "x0 2\n3 4\n");
+}
+
+#[test]
+fn v024_match_class_unknown_field() {
+    let (_, stderr) = run_program_expect_fail(
+        "match_bad_fld",
+        "class P:\n    def __init__(self, x: int):\n        self.x = x\ndef f(v: P):\n    match v:\n        case P(y=1):\n            print(1)\nf(P(0))\n",
+    );
+    assert!(
+        stderr.contains("class 'P' has no field 'y'"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn v024_stacked_function_decorator_rejected() {
+    let (_, stderr) = run_program_expect_fail(
+        "stack_deco",
+        "def a(f: int) -> int:\n    return f\ndef b(f: int) -> int:\n    return f\n@a\n@b\ndef g() -> int:\n    return 1\nprint(g())\n",
+    );
+    assert!(
+        stderr.contains("stacked function decorators are not supported yet"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn v024_bare_walrus_stmt_rejected() {
     let (_, stderr) = run_program_expect_fail("walrus_stmt", "n := 1\nprint(n)\n");
     assert!(
-        stderr.contains("assignment expression") || stderr.contains(":="),
+        stderr.contains("assignment expression (:=) cannot be used as a statement"),
         "stderr={stderr}"
     );
 }
