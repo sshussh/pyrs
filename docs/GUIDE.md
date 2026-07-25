@@ -1176,7 +1176,7 @@ character, bad indentation), `parse` (syntax), `semantic` (names, types,
 return paths), `codegen` (internal — you should never see one; it means a
 compiler bug). Unsupported Python features produce parse/semantic errors
 that name the feature: `two-arg super() is not supported yet`,
-`class patterns in match/case are not supported yet`, and so on.
+`key= is not supported yet`, and so on.
 Compilation stops at the
 first error.
 
@@ -1297,8 +1297,10 @@ Exception notes: supported named types include OverflowError, EOFError,
 FileNotFoundError, OSError, PermissionError, IsADirectoryError, NameError,
 UnboundLocalError, StopIteration, Exception, and GeneratorExit.
 Hierarchy: OSError children and `except Exception` (not GeneratorExit).
-`except E as e` binds an exception object (`print`/`str`/`if`/`isinstance`).
-No container storage, attrs, or `repr`/`!r` on exception objects yet.
+`except E as e` binds an exception object (`print`/`str`/`if`/`isinstance`);
+exceptions may be list/tuple elements; `e.args` is `list[str]`; `repr(e)` /
+`!r` via ExcRepr. Residual: CPython `args` is a tuple; dict/set of exceptions
+not yet.
 
 Not implemented yet (clear compile errors): full class dynamism (see
 [Classes](#classes) residuals), GC / heap freeing,
@@ -1311,7 +1313,7 @@ tuple/dict/set. Generator exhaustion is **Optional None** (not raised
 `StopIteration`) by design for this subset.
 `match`/`case` is a documented subset (literals, capture, `or`, sequence
 with optional `*rest`, mapping with str keys and optional `**rest`, `as`
-patterns, guards — **no class patterns**).
+patterns, guards, **class patterns** with positional/keyword fields).
 
 ## 9. Performance
 

@@ -86,9 +86,9 @@ A statically-typed Python subset:
   `__iter__`/`__next__` for-loops, `__len__`/`__bool__`, class `with` context managers (success-path
   `__exit__(None,None,None)` — no suppress yet), single free-function decorators, match class patterns.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
-  `__dict__`, class patterns in `match`, nested classes, class decorators,
-  two-arg `super()`, class-body attrs, first-class class values; mixed
-  non-numeric list **literals** need a union annotation (empty `[]` +
+  `__dict__`, nested classes, class decorators, stacked free-function
+  decorators, two-arg `super()`, class-body attrs, first-class class values;
+  mixed non-numeric list **literals** need a union annotation (empty `[]` +
   mixed appends join; common fields on class unions are readable;
   exclusive subclass fields after multi-class `isinstance` use a
   **runtime type_id switch** — AttributeError when the live instance
@@ -116,7 +116,7 @@ A statically-typed Python subset:
   (including inside generators),
   `match`/`case` (literal, wildcard, capture, or-patterns, guards,
   sequence with optional `*rest`, mapping with optional `**rest`,
-  `as` patterns)
+  `as` patterns, class patterns with positional/keyword fields)
 - **Expressions:** full arithmetic including `**`, comparisons with
   chaining (`0 < x < 10`), `in`/`not in` (substring, list/tuple/set
   membership, dict keys),
@@ -279,8 +279,9 @@ beyond attribute/call chains; `os.path` is POSIX only; `*args` /
 homogeneous list/dict types; starred assignment `a, *rest = xs` and
 list displays `[*a, *b]` work for lists/tuples; `json` has no dynamic
 `loads`; f-string `{x=}`, grouping (`,`/`_`), and types `n`/`c` are
-unsupported; match/case is still a subset (**no class patterns**; or-patterns bind
-only the matching alt; duplicate names/keys rejected); generators
+unsupported; match/case includes class patterns (closed-world fields),
+or-patterns bind only the matching alt; duplicate names/keys rejected;
+generators
 support `yield` / `yield from` on list/tuple/str/generator (including
 inside `finally`; subgen `return` feeds yield-from; close cascades to
 yield-from subgens), `try`/`except`/`else`/`finally` (phase and try
@@ -300,7 +301,7 @@ is supported; free captures use cells (late bind; load before assign
 defaults need literals); lambda params without defaults still need
 annotations or defaults for inference; homogeneous closures in
 containers need matching params/ret/capture-env shape; classes are the
-closed-world subset above (no multi-base / bound methods / open attrs);
+closed-world subset above (no multi-base / open attrs / full dynamism);
 heap objects including class instances are never freed (no GC yet).
 
 Errors come with source snippets:

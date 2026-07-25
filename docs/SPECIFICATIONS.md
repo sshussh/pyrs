@@ -375,13 +375,13 @@ programs** link only the object file from the shim plus `runtime.c`.
   frames (process-global, single-threaded); runtime traps (`pyrs_die`) are
   catchable. `return`/`break`/`continue` pop the frame and run `finally`.
   Named traps only: other prefixes match bare `except:` only.
-- **User classes (v0.24):** BoundMethod IR for `obj.method` values; classmethod `cls(...)` uses runtime type_id.
-
-**User classes (v0.21):** closed-world `Ty::Class(ClassId)`; instance
+**User classes (v0.24):** closed-world `Ty::Class(ClassId)`; instance
   header `{ i64 type_id, fields… }`; methods as IR functions
   `Class.method`; single inheritance + virtual dispatch; field layout
   specialized; `isinstance` with parent walk and flow peels to subclass;
-  no multi-base, bound-method values, open `__dict__`, or GC free.
+  `BoundMethod` / `BindMethod` / `CallBoundMethod`; classmethod construct
+  via runtime `type_id`; match class patterns; no multi-base, open
+  `__dict__`, or GC free.
 
 **Direction:**
 
