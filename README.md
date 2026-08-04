@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.24.0)
+## The language (v0.25.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.25.0**, not 1.0) until it is ready for
+milestone after this one is **0.26.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
@@ -83,8 +83,12 @@ A statically-typed Python subset:
   (must return `str`): used by `print`/`str()` with virtual dispatch when
   present; default remains `<Name object>` (no address; runtime type_id).
   **Also (v0.23+):** `@staticmethod` / `@classmethod` / read-only `@property`, bound methods as values,
-  `__iter__`/`__next__` for-loops, `__len__`/`__bool__`, class `with` context managers (success-path
-  `__exit__(None,None,None)` — no suppress yet), single free-function decorators, match class patterns.
+  `__iter__`/`__next__` for-loops, `__len__`/`__bool__`, class `with` context managers, single free-function
+  decorators, match class patterns.
+  **v0.25 protocol completion:** `__exit__` suppress (truthy return swallows the body exception);
+  exception path passes `__exit__(None, exc, None)` (type and traceback remain `None` — no exception
+  type objects / traceback objects yet); builtin `next(it)` / `next(it, default)` for user iterators
+  and generators; user-class `__contains__` for `in` / `not in`.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -242,7 +246,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.24.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.25.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
@@ -386,4 +390,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.24.0 && git push origin v0.24.0`.
+Release tags: `git tag v0.25.0 && git push origin v0.25.0`.

@@ -686,7 +686,7 @@ print(inc(2))  # 3
 
 ### Classes
 
-Closed-world, layout-specialized objects (v0.24). Instances carry a
+Closed-world, layout-specialized objects (v0.25). Instances carry a
 `type_id` header (GC-ready); heap objects are still never freed.
 
 ```python
@@ -743,10 +743,13 @@ print(isinstance(d, Animal))  # True
   (static call of the parent implementation with the same `self`)
 - **`@staticmethod` / `@classmethod` / read-only `@property`**
 - **Bound methods as values** (`f = obj.m; f(...)`)
-- **`__iter__` / `__next__`** for user for-loops; **`__len__` / `__bool__`**
-- **Class `with`**: `__enter__` / `__exit__` (success path always passes
-  `None, None, None` to `__exit__`; exception suppress / real exc triple
-  not yet)
+- **`__iter__` / `__next__`** for user for-loops; **`__len__` / `__bool__`**;
+  builtin **`next(it)`** / **`next(it, default)`** (user iterators and generators)
+- **`__contains__`** for user-class `in` / `not in`
+- **Class `with`**: `__enter__` / `__exit__` — success path
+  `__exit__(None, None, None)`; exception path `__exit__(None, exc, None)`
+  (type and traceback args stay `None`); truthy `__exit__` return **suppresses**
+  the exception (CPython-compatible for bool/`None` returns)
 - **Match class patterns** `case Point(x=0, y=y):` / positional fields
 - **Single free-function decorators** `@deco def f: ...` (same-module free
   function; monomorphic closures)
@@ -775,6 +778,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `min(xs)` / `max(xs)` | `list[int\|float\|bool]` | element type; empty list → `ValueError: … iterable argument is empty` |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
 | `sorted(xs)` | `list[int\|float\|bool\|str]` | new sorted list (no `key=`/`reverse=`) |
+| `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `set()` | empty only; needs annotation | `s: set[int] = set()` |
 | `global x` | (statement) | write access to a module global |
@@ -876,8 +880,10 @@ with CM() as x:
     print(x)
 ```
 
-Residual: on both success and exception paths, `__exit__` currently
-receives `None, None, None` (no suppress-when-true yet).
+On success, `__exit__(None, None, None)`. On exception, `__exit__(None,
+exc, None)` where `exc` is the exception object (type and traceback stay
+`None` — no first-class exception types or traceback objects yet). A
+truthy return value suppresses the exception; `None` / false re-raises.
 
 Not supported yet: binary modes, printing file objects, multiple context
 managers in one `with`, and `list[file]`.
