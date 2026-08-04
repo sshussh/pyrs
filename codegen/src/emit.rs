@@ -295,6 +295,7 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         | Stmt::Return(Some(e))
         | Stmt::Yield(e)
         | Stmt::Raise { message: e, .. }
+        | Stmt::RaiseExc { value: e }
         | Stmt::GenClose { generator: e }
         | Stmt::ListAppend { value: e, .. }
         | Stmt::ListRemove { value: e, .. }
@@ -521,6 +522,7 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
         | Stmt::GlobalAssign { value: e, .. }
         | Stmt::Return(Some(e))
         | Stmt::Raise { message: e, .. }
+        | Stmt::RaiseExc { value: e }
         | Stmt::GenClose { generator: e }
         | Stmt::ListAppend { value: e, .. }
         | Stmt::ListRemove { value: e, .. }
@@ -703,6 +705,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
         out.push_str("declare void @pyrs_raise(i32, ptr) noreturn\n");
+        out.push_str("declare void @pyrs_raise_exc(ptr) noreturn\n");
         out.push_str("declare void @pyrs_reraise() noreturn\n");
         out.push_str("declare void @pyrs_set_exc(i32, ptr)\n");
         out.push_str("declare void @pyrs_set_exc_msg(ptr)\n");
@@ -2932,6 +2935,16 @@ impl Emitter {
                     "call void @pyrs_raise(i32 {}, ptr {data})",
                     exc.tag()
                 ));
+                self.line("unreachable");
+                self.terminated = true;
+            }
+            Stmt::RaiseExc { value } => {
+                let v = self.emit_expr(value);
+                if self.gen_frame.is_some() && self.tries.is_empty() {
+                    let frame = self.gen_frame.clone().unwrap();
+                    self.line(format!("call void @pyrs_gen_set_done(ptr {frame})"));
+                }
+                self.line(format!("call void @pyrs_raise_exc(ptr {v})"));
                 self.line("unreachable");
                 self.terminated = true;
             }

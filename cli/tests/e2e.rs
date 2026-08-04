@@ -10882,7 +10882,7 @@ print(P.one().x)
 
 #[test]
 fn v024_with_body_raise_exit() {
-    // Residual: __exit__ always receives None triple (no exc suppress/args yet).
+    // Exception path calls __exit__(None, exc, None); None return does not suppress.
     // Order enter → body → exit → caught must still match CPython for side effects.
     let src = "\
 class CM:
@@ -11112,4 +11112,209 @@ fn v024_bare_walrus_stmt_rejected() {
         stderr.contains("assignment expression (:=) cannot be used as a statement"),
         "stderr={stderr}"
     );
+}
+
+// --- v0.25 protocol completion ---
+
+#[test]
+fn v025_with_exit_suppress() {
+    let src = "\
+class CM:
+    def __enter__(self) -> int:
+        print(\"enter\")
+        return 1
+    def __exit__(self, a: Any = None, b: Any = None, c: Any = None) -> bool:
+        print(\"exit\", b is not None)
+        return True
+with CM():
+    raise ValueError(\"boom\")
+print(\"suppressed\")
+";
+    let out = run_program("v025_with_sup", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v025_with_exit_no_suppress() {
+    let src = "\
+class CM:
+    def __enter__(self) -> int:
+        print(\"enter\")
+        return 1
+    def __exit__(self, a: Any = None, b: Any = None, c: Any = None) -> bool:
+        print(\"exit\")
+        return False
+try:
+    with CM():
+        print(\"body\")
+        raise ValueError(\"boom\")
+except ValueError as e:
+    print(\"caught\", e)
+";
+    let out = run_program("v025_with_nosup", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v025_with_exit_none_return_reraise() {
+    // __exit__ -> None is falsy: exception propagates (CPython).
+    let src = "\
+class CM:
+    def __enter__(self) -> int:
+        print(\"enter\")
+        return 1
+    def __exit__(self, a: Any = None, b: Any = None, c: Any = None) -> None:
+        print(\"exit\")
+try:
+    with CM() as x:
+        print(x)
+        raise ValueError(\"boom\")
+except ValueError:
+    print(\"caught\")
+";
+    let out = run_program("v025_with_none", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v025_contains_dunder() {
+    let src = "\
+class Bag:
+    def __init__(self, xs: list[int]):
+        self.xs = xs
+    def __contains__(self, x: int) -> bool:
+        return x in self.xs
+b = Bag([1, 2, 3])
+print(2 in b)
+print(9 in b)
+print(9 not in b)
+";
+    let out = run_program("v025_contains", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v025_next_builtin() {
+    let src = "\
+class Counter:
+    def __init__(self, n: int):
+        self.n = n
+        self.i = 0
+    def __iter__(self) -> Counter:
+        return self
+    def __next__(self) -> int:
+        if self.i >= self.n:
+            raise StopIteration(\"\")
+        v = self.i
+        self.i = self.i + 1
+        return v
+it = Counter(3)
+print(next(it))
+print(next(it))
+print(next(it))
+print(next(it, -1))
+print(next(it, -2))
+";
+    let out = run_program("v025_next", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v025_next_generator() {
+    let src = "\
+def g():
+    yield 10
+    yield 20
+gen = g()
+print(next(gen))
+print(next(gen))
+print(next(gen, 99))
+";
+    let out = run_program("v025_next_gen", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn v025_next_stopiteration() {
+    let src = "\
+class Empty:
+    def __next__(self) -> int:
+        raise StopIteration(\"\")
+try:
+    print(next(Empty()))
+except StopIteration:
+    print(\"stopped\")
+";
+    let out = run_program("v025_next_stop", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }

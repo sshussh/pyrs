@@ -637,6 +637,11 @@ pub enum Stmt {
         exc: ExcType,
         message: Expr,
     },
+    /// Re-raise a first-class exception object (e.g. after `__exit__` declines
+    /// to suppress). Value must be `Ty::Exception`.
+    RaiseExc {
+        value: Expr,
+    },
     /// try / except / else / finally. See [`ExceptHandler`].
     /// `orelse` runs only on normal completion of `body` (not after a handled
     /// exception).

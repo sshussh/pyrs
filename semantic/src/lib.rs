@@ -1572,7 +1572,7 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 17] = [
+const BUILTINS: [&str; 18] = [
     "print",
     "len",
     "range",
@@ -1590,6 +1590,7 @@ const BUILTINS: [&str; 17] = [
     "enumerate",
     "zip",
     "reversed",
+    "next",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -9661,7 +9662,15 @@ fn lower_with(
 ) -> SResult<()> {
     let item_ir = lower_expr(item, ctx)?;
 
-    // User class context manager: __enter__ / __exit__(self, None, None, None).
+    // User class context manager:
+    //   mgr = item; val = mgr.__enter__(); [bind]
+    //   try: body
+    //   except Exception as e:
+    //       if not mgr.__exit__(None, e, None): raise e
+    //   else:
+    //       mgr.__exit__(None, None, None)
+    // Residual vs CPython: type and traceback args are always None; the value
+    // arg is the exception object (as Any) when an exception occurred.
     if let ir::Ty::Class(id) = item_ir.ty {
         if resolve_method(id, "__enter__").is_none() || resolve_method(id, "__exit__").is_none() {
             return Err(err(
@@ -9691,35 +9700,69 @@ fn lower_with(
         } else {
             out.push(ir::Stmt::ExprStmt(entered));
         }
-        // __exit__(None, None, None) — params typically Any/Optional.
         let none_ast = |sp: Span| ast::Expr {
             kind: ast::ExprKind::NoneLit,
             span: sp,
         };
-        let exit_args = [
+        let map_exit_err = |e: Diagnostic| {
+            err(
+                format!(
+                    "{}; __exit__ must accept three arguments after self \
+                     (e.g. a: Any = None, b: Any = None, c: Any = None)",
+                    e.message
+                ),
+                item.span,
+            )
+        };
+        // Success path: __exit__(None, None, None)
+        let exit_ok_args = [
             none_ast(item.span),
             none_ast(item.span),
             none_ast(item.span),
         ];
-        let exit_call =
-            lower_instance_method_call(mgr(), id, "__exit__", item.span, &exit_args, ctx).map_err(
-                |e| {
-                    err(
-                        format!(
-                            "{}; __exit__ must accept three arguments after self \
-                             (e.g. a: Any = None, b: Any = None, c: Any = None)",
-                            e.message
-                        ),
-                        item.span,
-                    )
-                },
-            )?;
+        let exit_ok =
+            lower_instance_method_call(mgr(), id, "__exit__", item.span, &exit_ok_args, ctx)
+                .map_err(map_exit_err)?;
+        // Exception path: bind e, __exit__(None, e, None), suppress or re-raise.
+        let exc_t = ctx.fresh_temp("with.exc", ir::Ty::Exception);
+        let exc_name_ast = ast::Expr {
+            kind: ast::ExprKind::Name(exc_t.clone()),
+            span: item.span,
+        };
+        let exit_exc_args = [none_ast(item.span), exc_name_ast, none_ast(item.span)];
+        let exit_exc =
+            lower_instance_method_call(mgr(), id, "__exit__", item.span, &exit_exc_args, ctx)
+                .map_err(map_exit_err)?;
+        let suppress = to_bool(exit_exc, item.span, ctx)?;
+        let not_suppress = ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Unary {
+                op: ir::UnOp::Not,
+                operand: Box::new(suppress),
+            },
+        };
+        let handler_body = vec![ir::Stmt::If {
+            branches: vec![(
+                not_suppress,
+                vec![ir::Stmt::RaiseExc {
+                    value: ir::Expr {
+                        ty: ir::Ty::Exception,
+                        kind: ir::ExprKind::Local(exc_t.clone()),
+                    },
+                }],
+            )],
+            orelse: vec![],
+        }];
         let body_ir = lower_nested_block(body, ctx)?;
         out.push(ir::Stmt::Try {
             body: body_ir,
-            handlers: vec![],
-            orelse: vec![],
-            finally: vec![ir::Stmt::ExprStmt(exit_call)],
+            handlers: vec![(
+                Some(vec![ir::ExcType::Exception]),
+                Some(exc_t),
+                handler_body,
+            )],
+            orelse: vec![ir::Stmt::ExprStmt(exit_ok)],
+            finally: vec![],
         });
         return Ok(());
     }
@@ -11621,7 +11664,7 @@ fn lower_aug_assign(
                 });
                 return Ok(());
             }
-            let combined = lower_binary(op, left, right, span)?;
+            let combined = lower_binary(op, left, right, span, ctx)?;
             let combined = coerce_assign(combined, current_ty, name, span)?;
             out.push(if is_global {
                 ir::Stmt::GlobalAssign {
@@ -11667,7 +11710,7 @@ fn lower_aug_assign(
                 },
             };
             let right = lower_expr(value, ctx)?;
-            let combined = lower_binary(op, current, right, span)?;
+            let combined = lower_binary(op, current, right, span, ctx)?;
             let combined = coerce(combined, elem, span, "item assignment").map_err(|e| {
                 Diagnostic::new(
                     Phase::Semantic,
@@ -11728,7 +11771,7 @@ fn lower_aug_assign(
                 },
             };
             let right = lower_expr(value, ctx)?;
-            let combined = lower_binary(op, current, right, span)?;
+            let combined = lower_binary(op, current, right, span, ctx)?;
             let combined = coerce(combined, field_ty, span, "attribute assignment")?;
             out.push(ir::Stmt::SetField {
                 object: base_local,
@@ -11825,6 +11868,204 @@ fn lower_for(
             lower_for_user_iter(target, seq, id, body, orelse, iter.span, ctx, out)
         }
         other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
+    }
+}
+
+/// `next(it)` / `next(it, default)` for user iterators and generators.
+fn lower_builtin_next(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(err(
+            format!("next() takes 1 or 2 arguments ({} given)", args.len()),
+            span,
+        ));
+    }
+    let it = lower_expr(args[0], ctx)?;
+    let default = if args.len() == 2 {
+        Some(lower_expr(args[1], ctx)?)
+    } else {
+        None
+    };
+
+    match it.ty {
+        ir::Ty::Class(id) if resolve_method(id, "__next__").is_some() => {
+            // Evaluate iterator once into a temp, then call __next__.
+            let it_t = ctx.fresh_temp("next.it", ir::Ty::Class(id));
+            let it_local = ir::Expr {
+                ty: ir::Ty::Class(id),
+                kind: ir::ExprKind::Local(it_t.clone()),
+            };
+            let next_call = lower_instance_method_call(it_local, id, "__next__", span, &[], ctx)?;
+            let yield_ty = next_call.ty;
+            if yield_ty == ir::Ty::None {
+                return Err(err("__next__ must return a non-None value type", span));
+            }
+            match default {
+                None => Ok(ir::Expr {
+                    ty: yield_ty,
+                    kind: ir::ExprKind::Block {
+                        stmts: vec![ir::Stmt::Assign {
+                            name: it_t,
+                            value: it,
+                        }],
+                        result: Box::new(next_call),
+                    },
+                }),
+                Some(def) => {
+                    let def = coerce(def, yield_ty, args[1].span, "next() default")?;
+                    let out_t = ctx.fresh_temp("next.out", yield_ty);
+                    let stmts = vec![
+                        ir::Stmt::Assign {
+                            name: it_t,
+                            value: it,
+                        },
+                        ir::Stmt::Try {
+                            body: vec![ir::Stmt::Assign {
+                                name: out_t.clone(),
+                                value: next_call,
+                            }],
+                            handlers: vec![(
+                                Some(vec![ir::ExcType::StopIteration]),
+                                None,
+                                vec![ir::Stmt::Assign {
+                                    name: out_t.clone(),
+                                    value: def,
+                                }],
+                            )],
+                            orelse: vec![],
+                            finally: vec![],
+                        },
+                    ];
+                    Ok(ir::Expr {
+                        ty: yield_ty,
+                        kind: ir::ExprKind::Block {
+                            stmts,
+                            result: Box::new(ir::Expr {
+                                ty: yield_ty,
+                                kind: ir::ExprKind::Local(out_t),
+                            }),
+                        },
+                    })
+                }
+            }
+        }
+        ir::Ty::Generator { yield_ty } => {
+            let yield_ty = *yield_ty;
+            let opt_ty = ir::optional_of(yield_ty);
+            let gen_t = ctx.fresh_temp("next.gen", it.ty);
+            let nxt_t = ctx.fresh_temp("next.gnxt", opt_ty);
+            let out_t = ctx.fresh_temp("next.gout", yield_ty);
+            let gen_local = ir::Expr {
+                ty: it.ty,
+                kind: ir::ExprKind::Local(gen_t.clone()),
+            };
+            let next_e = ir::Expr {
+                ty: opt_ty,
+                kind: ir::ExprKind::GeneratorNext {
+                    generator: Box::new(gen_local),
+                    send: Box::new(const_none()),
+                },
+            };
+            let is_none = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::IsNone {
+                    value: Box::new(ir::Expr {
+                        ty: opt_ty,
+                        kind: ir::ExprKind::Local(nxt_t.clone()),
+                    }),
+                    not: false,
+                },
+            };
+            let extracted = ir::Expr {
+                ty: yield_ty,
+                kind: ir::ExprKind::FromUnion {
+                    value: Box::new(ir::Expr {
+                        ty: opt_ty,
+                        kind: ir::ExprKind::Local(nxt_t.clone()),
+                    }),
+                },
+            };
+            match default {
+                None => {
+                    // if next is None: raise StopIteration("") else: yield value
+                    let stmts = vec![
+                        ir::Stmt::Assign {
+                            name: gen_t,
+                            value: it,
+                        },
+                        ir::Stmt::Assign {
+                            name: nxt_t,
+                            value: next_e,
+                        },
+                        ir::Stmt::If {
+                            branches: vec![(
+                                is_none,
+                                vec![ir::Stmt::Raise {
+                                    exc: ir::ExcType::StopIteration,
+                                    message: ir::Expr {
+                                        ty: ir::Ty::Str,
+                                        kind: ir::ExprKind::ConstStr(String::new()),
+                                    },
+                                }],
+                            )],
+                            orelse: vec![ir::Stmt::Assign {
+                                name: out_t.clone(),
+                                value: extracted,
+                            }],
+                        },
+                    ];
+                    Ok(ir::Expr {
+                        ty: yield_ty,
+                        kind: ir::ExprKind::Block {
+                            stmts,
+                            result: Box::new(ir::Expr {
+                                ty: yield_ty,
+                                kind: ir::ExprKind::Local(out_t),
+                            }),
+                        },
+                    })
+                }
+                Some(def) => {
+                    let def = coerce(def, yield_ty, args[1].span, "next() default")?;
+                    let stmts = vec![
+                        ir::Stmt::Assign {
+                            name: gen_t,
+                            value: it,
+                        },
+                        ir::Stmt::Assign {
+                            name: nxt_t,
+                            value: next_e,
+                        },
+                        ir::Stmt::If {
+                            branches: vec![(
+                                is_none,
+                                vec![ir::Stmt::Assign {
+                                    name: out_t.clone(),
+                                    value: def,
+                                }],
+                            )],
+                            orelse: vec![ir::Stmt::Assign {
+                                name: out_t.clone(),
+                                value: extracted,
+                            }],
+                        },
+                    ];
+                    Ok(ir::Expr {
+                        ty: yield_ty,
+                        kind: ir::ExprKind::Block {
+                            stmts,
+                            result: Box::new(ir::Expr {
+                                ty: yield_ty,
+                                kind: ir::ExprKind::Local(out_t),
+                            }),
+                        },
+                    })
+                }
+            }
+        }
+        other => Err(err(
+            format!("'{other}' object is not an iterator"),
+            args[0].span,
+        )),
     }
 }
 
@@ -14389,7 +14630,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             }
             let l = lower_expr(left, ctx)?;
             let r = lower_expr(right, ctx)?;
-            lower_binary(*op, l, r, expr.span)
+            lower_binary(*op, l, r, expr.span, ctx)
         }
         ast::ExprKind::Lambda { params, body } => lower_lambda(params, body, expr.span, ctx),
         ast::ExprKind::Yield(v) => {
@@ -14791,7 +15032,7 @@ fn lower_compare_chain(
     let cur = lower_expr(operand, ctx)?;
 
     if rest.len() == 1 {
-        return lower_binary(*op, prev, cur, span);
+        return lower_binary(*op, prev, cur, span, ctx);
     }
 
     let cur_ty = cur.ty;
@@ -14801,7 +15042,7 @@ fn lower_compare_chain(
         kind: ir::ExprKind::Local(temp.clone()),
     };
 
-    let head = lower_binary(*op, prev, temp_local.clone(), span)?;
+    let head = lower_binary(*op, prev, temp_local.clone(), span, ctx)?;
     let tail = lower_compare_chain(temp_local, &rest[1..], span, ctx)?;
 
     Ok(ir::Expr {
@@ -17432,6 +17673,7 @@ fn lower_call(
                     kind: ir::ExprKind::Abs(Box::new(arg)),
                 })
             }
+            "next" => lower_builtin_next(&args, span, ctx),
             "min" | "max" => {
                 if args.len() == 1 {
                     // Iterable form: list of numbers (int/float/bool).
@@ -19328,12 +19570,18 @@ fn lower_is_none(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
     }
 }
 
-fn lower_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+fn lower_binary(
+    op: ast::BinOp,
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
     let describe = format!("operator '{op}'");
 
     // membership tests work on str and list; check before type dispatch
     if matches!(op, ast::BinOp::In | ast::BinOp::NotIn) {
-        return lower_contains(op, l, r, span);
+        return lower_contains(op, l, r, span, ctx);
     }
 
     // `is` / `is not` — only `… is None` / `… is not None` (either side).
@@ -19592,8 +19840,81 @@ fn comparison_ir_op(op: ast::BinOp) -> ir::BinOp {
     }
 }
 
-/// `needle in haystack` / `not in`: substring, list/tuple/set membership, dict keys.
-fn lower_contains(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+/// `needle in haystack` / `not in`: substring, list/tuple/set membership, dict keys,
+/// or user-class `__contains__`.
+fn lower_contains(
+    op: ast::BinOp,
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    // Class with __contains__(self, item) -> bool (desugar; do not use Contains IR).
+    if let ir::Ty::Class(id) = r.ty {
+        if resolve_method(id, "__contains__").is_none() {
+            return Err(err(
+                format!(
+                    "'{}' object does not support 'in' (need __contains__)",
+                    class_info(id)
+                        .map(|c| c.name)
+                        .unwrap_or_else(|| format!("class#{id}"))
+                ),
+                span,
+            ));
+        }
+        // Stash needle/haystack in temps so we can pass needle as an AST Name.
+        let hay_t = ctx.fresh_temp("in.hay", r.ty);
+        let ndl_t = ctx.fresh_temp("in.ndl", l.ty);
+        // Build call via IR temps: we cannot easily pass IR needle through the
+        // AST-based method helper, so materialize locals then Name them.
+        // Emit as a Block: assign temps, call, result.
+        let hay_local = ir::Expr {
+            ty: r.ty,
+            kind: ir::ExprKind::Local(hay_t.clone()),
+        };
+        let ndl_name = ast::Expr {
+            kind: ast::ExprKind::Name(ndl_t.clone()),
+            span,
+        };
+        // Register needle type before Name lookup in method call.
+        // (fresh_temp already registered both.)
+        let call =
+            lower_instance_method_call(hay_local, id, "__contains__", span, &[ndl_name], ctx)?;
+        let call = if call.ty == ir::Ty::Bool {
+            call
+        } else {
+            // CPython prefers bool; accept any truthy return.
+            to_bool(call, span, ctx)?
+        };
+        let result = if op == ast::BinOp::NotIn {
+            ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Unary {
+                    op: ir::UnOp::Not,
+                    operand: Box::new(call),
+                },
+            }
+        } else {
+            call
+        };
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Block {
+                stmts: vec![
+                    ir::Stmt::Assign {
+                        name: hay_t,
+                        value: r,
+                    },
+                    ir::Stmt::Assign {
+                        name: ndl_t,
+                        value: l,
+                    },
+                ],
+                result: Box::new(result),
+            },
+        });
+    }
+
     let needle = match r.ty {
         ir::Ty::Str => {
             if l.ty != ir::Ty::Str {
@@ -19844,7 +20165,7 @@ fn stmt_returns(stmt: &ir::Stmt) -> bool {
     match stmt {
         ir::Stmt::Return(_) => true,
         // Die / Raise exit the process or transfer; cannot fall through
-        ir::Stmt::Die(_) | ir::Stmt::Raise { .. } => true,
+        ir::Stmt::Die(_) | ir::Stmt::Raise { .. } | ir::Stmt::RaiseExc { .. } => true,
         ir::Stmt::If { branches, orelse } => {
             !orelse.is_empty()
                 && branches.iter().all(|(_, body)| block_returns(body))
@@ -19890,7 +20211,7 @@ fn stmt_returns(stmt: &ir::Stmt) -> bool {
 /// Conservative: body may transfer via raise/die (so except handlers matter).
 fn block_may_raise(stmts: &[ir::Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        ir::Stmt::Raise { .. } | ir::Stmt::Die(_) => true,
+        ir::Stmt::Raise { .. } | ir::Stmt::RaiseExc { .. } | ir::Stmt::Die(_) => true,
         ir::Stmt::If { branches, orelse } => {
             branches.iter().any(|(_, b)| block_may_raise(b)) || block_may_raise(orelse)
         }

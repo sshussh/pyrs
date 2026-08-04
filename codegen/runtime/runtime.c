@@ -415,6 +415,21 @@ _Noreturn void pyrs_reraise(void) {
     die_uncaught(g_exc_msg[0] ? g_exc_msg : "RuntimeError: unknown error");
 }
 
+/* Raise from a first-class exception object (after exc_clear in a handler). */
+_Noreturn void pyrs_raise_exc(PyrsExc *e) {
+    if (e == NULL) {
+        pyrs_raise(PYRS_EXC_RUNTIME, "unknown error");
+    }
+    g_exc_type = e->type_tag;
+    const char *body =
+        (e->msg != NULL && e->msg->data != NULL) ? e->msg->data : "";
+    snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(e->type_tag), body);
+    if (g_exc_frames != NULL) {
+        longjmp(g_exc_frames->buf, 1);
+    }
+    die_uncaught(g_exc_msg);
+}
+
 /* zero-initialized (null) str/list locals read before assignment land here
  * instead of segfaulting */
 static void check_ref(const void *p) {
