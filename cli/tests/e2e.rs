@@ -1763,11 +1763,55 @@ print(max(xs, key=id))
 }
 
 #[test]
+fn sorted_list_sort_reverse_match_python() {
+    // reverse=True is stable reverse-sort-reverse; works with and without key=.
+    let src = "\
+def neg(x: int) -> int:
+    return -x
+def k0(t: tuple[int, str]) -> int:
+    return t[0]
+print(sorted([3, 1, 2], reverse=True))
+print(sorted([3, 1, 2], reverse=False))
+print(sorted([3, 1, 2], key=neg, reverse=True))
+xs: list[tuple[int, str]] = [(1, \"b\"), (1, \"a\"), (2, \"c\")]
+print(sorted(xs, key=k0, reverse=True))
+a = [3, 1, 2]
+a.sort(reverse=True)
+print(a)
+b = [\"bb\", \"a\", \"ccc\"]
+b.sort(key=lambda s=\"\": len(s), reverse=True)
+print(b)
+c: list[tuple[int, str]] = [(1, \"b\"), (1, \"a\"), (2, \"c\")]
+c.sort(key=k0, reverse=True)
+print(c)
+empty: list[int] = []
+empty.sort(reverse=True)
+print(empty)
+print(sorted(empty, reverse=True))
+# runtime reverse flag
+flag = True
+print(sorted([1, 3, 2], reverse=flag))
+";
+    let out = run_program("sort_reverse", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn sorted_min_max_key_negatives() {
     let (_, stderr) =
-        run_program_expect_fail("sorted_rev", "print(sorted([1, 2], reverse=True))\n");
+        run_program_expect_fail("sorted_rev_nonbool", "print(sorted([1, 2], reverse=1))\n");
     assert!(
-        stderr.contains("reverse=") && stderr.contains("not supported"),
+        stderr.contains("reverse=") && stderr.contains("bool"),
         "stderr={stderr}"
     );
     let (_, stderr) = run_program_expect_fail(
@@ -1804,12 +1848,13 @@ fn sorted_min_max_key_negatives() {
         stderr.contains("default=") && stderr.contains("not supported"),
         "stderr={stderr}"
     );
-    let (_, stderr) =
-        run_program_expect_fail("list_sort_reverse", "xs = [1, 2]\nxs.sort(reverse=True)\n");
+    // Expr position still rejects (returns None), even with reverse= supported.
+    let (_, stderr) = run_program_expect_fail(
+        "list_sort_rev_expr",
+        "xs = [1, 2]\nys = xs.sort(reverse=True)\n",
+    );
     assert!(
-        stderr.contains("list.sort()")
-            && stderr.contains("reverse=")
-            && stderr.contains("not supported"),
+        stderr.contains("returns None") && stderr.contains("list.sort"),
         "stderr={stderr}"
     );
     // Expr position still rejects (returns None), even with key= supported.

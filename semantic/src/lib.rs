@@ -8591,7 +8591,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                         *method_span,
                     ));
                 }
-                // `list.sort(key=f)` — keyword form (statement position only).
+                // `list.sort(key=…, reverse=…)` — keyword form (statement only).
                 if method == "sort" && !keywords.is_empty() {
                     let base_ir = lower_expr(base, ctx)?;
                     match base_ir.ty {
@@ -8605,27 +8605,30 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                                     *method_span,
                                 ));
                             }
-                            let key_ast = take_sort_key_keyword(keywords, "list.sort")?;
-                            let Some(key_ast) = key_ast else {
-                                // Only reverse=/unknown would leave key None with
-                                // non-empty keywords — those already error above.
-                                return Err(err(
-                                    "list.sort() keyword arguments require key=",
-                                    keywords[0].name_span,
-                                ));
-                            };
+                            let sk = take_sort_keywords(keywords, "list.sort")?;
                             let list_ty = base_ir.ty;
                             let xs_t = ctx.fresh_temp("lsort", list_ty);
+                            let xs = local_expr(xs_t.clone(), list_ty);
+                            let (rev_mode, mut rev_bind) = resolve_reverse_flag(sk.reverse, ctx)?;
                             let mut stmts = vec![ir::Stmt::Assign {
-                                name: xs_t.clone(),
+                                name: xs_t,
                                 value: base_ir,
                             }];
-                            stmts.extend(lower_list_sort_key_stmts(
-                                local_expr(xs_t, list_ty),
-                                *elem,
-                                key_ast,
-                                ctx,
-                            )?);
+                            stmts.append(&mut rev_bind);
+                            // CPython stable reverse: reverse → sort ascending → reverse.
+                            push_maybe_reverse(&mut stmts, &rev_mode, &xs, *elem, ctx);
+                            if let Some(key_ast) = sk.key {
+                                stmts.extend(lower_list_sort_key_stmts(
+                                    xs.clone(),
+                                    *elem,
+                                    key_ast,
+                                    ctx,
+                                )?);
+                            } else {
+                                ensure_sortable_list_elem(*elem, *method_span)?;
+                                stmts.push(ir::Stmt::ListSort { list: xs.clone() });
+                            }
+                            push_maybe_reverse(&mut stmts, &rev_mode, &xs, *elem, ctx);
                             out.extend(stmts);
                             return Ok(());
                         }
@@ -9969,7 +9972,7 @@ fn lower_method_stmt(
                     return Err(err(
                         format!(
                             "sort() takes no positional arguments ({} given); \
-                             use sort(key=...) for a key function (reverse= residual)",
+                             use sort(key=..., reverse=...)",
                             args.len()
                         ),
                         method_span,
@@ -14324,13 +14327,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     *method_span,
                 ));
             }
-            // `list.sort(key=…)` is statement-only (returns None).
+            // `list.sort(key=…, reverse=…)` is statement-only (returns None).
             if method == "sort" && !keywords.is_empty() {
                 let base_ir = lower_expr(base, ctx)?;
                 match base_ir.ty {
                     ir::Ty::List(_) => {
                         // Validate kwargs the same way as the statement path.
-                        let _ = take_sort_key_keyword(keywords, "list.sort")?;
+                        let _ = take_sort_keywords(keywords, "list.sort")?;
                         return Err(err(
                             "list.sort(...) returns None and cannot be used \
                              in an expression",
@@ -18411,12 +18414,19 @@ fn const_str(s: &str) -> ir::Expr {
     }
 }
 
-/// Parse `key=` / reject `reverse=` / other kwargs for sorted/min/max/list.sort.
-fn take_sort_key_keyword<'a>(
+/// Parsed `key=` / `reverse=` kwargs for sorted / list.sort / min / max.
+struct SortKeywords<'a> {
+    key: Option<&'a ast::Expr>,
+    reverse: Option<&'a ast::Expr>,
+}
+
+/// Parse `key=` / `reverse=` (sorted & list.sort) / reject unexpected kwargs.
+fn take_sort_keywords<'a>(
     keywords: &'a [ast::Keyword],
     builtin: &str,
-) -> SResult<Option<&'a ast::Expr>> {
+) -> SResult<SortKeywords<'a>> {
     let mut key = None;
+    let mut reverse = None;
     for kw in keywords {
         match kw.name.as_str() {
             "key" => {
@@ -18436,10 +18446,13 @@ fn take_sort_key_keyword<'a>(
                         kw.name_span,
                     ));
                 }
-                return Err(err(
-                    format!("{builtin}() keyword argument 'reverse=' is not supported yet"),
-                    kw.name_span,
-                ));
+                if reverse.is_some() {
+                    return Err(err(
+                        format!("{builtin}() got multiple values for keyword argument 'reverse'"),
+                        kw.name_span,
+                    ));
+                }
+                reverse = Some(&kw.value);
             }
             "default" if matches!(builtin, "min" | "max") => {
                 return Err(err(
@@ -18455,7 +18468,167 @@ fn take_sort_key_keyword<'a>(
             }
         }
     }
-    Ok(key)
+    Ok(SortKeywords { key, reverse })
+}
+
+/// min/max path: only `key=` (reverse already rejected as unexpected).
+fn take_sort_key_keyword<'a>(
+    keywords: &'a [ast::Keyword],
+    builtin: &str,
+) -> SResult<Option<&'a ast::Expr>> {
+    Ok(take_sort_keywords(keywords, builtin)?.key)
+}
+
+/// How to apply CPython's stable reverse-sort-reverse.
+enum ReverseMode {
+    Never,
+    Always,
+    /// Runtime `bool` (prefer a Local so the cond is cheap).
+    Cond(ir::Expr),
+}
+
+/// Lower `reverse=` to a mode. `reverse=` must be `bool` (const folds True/False).
+fn resolve_reverse_flag(
+    rev_ast: Option<&ast::Expr>,
+    ctx: &mut FnCtx,
+) -> SResult<(ReverseMode, Vec<ir::Stmt>)> {
+    let Some(rev_ast) = rev_ast else {
+        return Ok((ReverseMode::Never, vec![]));
+    };
+    let rev = lower_expr(rev_ast, ctx)?;
+    if rev.ty != ir::Ty::Bool {
+        return Err(err(
+            format!("reverse= expects bool, found {}", rev.ty),
+            rev_ast.span,
+        ));
+    }
+    match rev.kind {
+        ir::ExprKind::ConstBool(true) => Ok((ReverseMode::Always, vec![])),
+        ir::ExprKind::ConstBool(false) => Ok((ReverseMode::Never, vec![])),
+        _ => {
+            let name = ctx.fresh_temp("sort.rev", ir::Ty::Bool);
+            let stmts = vec![ir::Stmt::Assign {
+                name: name.clone(),
+                value: rev,
+            }];
+            Ok((ReverseMode::Cond(local_expr(name, ir::Ty::Bool)), stmts))
+        }
+    }
+}
+
+/// In-place reverse of a list (swap from both ends). `list` should be a Local.
+fn lower_list_reverse_in_place(list: ir::Expr, elem: ir::Ty, ctx: &mut FnCtx) -> Vec<ir::Stmt> {
+    let n_t = ctx.fresh_temp("lrev.n", ir::Ty::Int);
+    let i_t = ctx.fresh_temp("lrev.i", ir::Ty::Int);
+    let j_t = ctx.fresh_temp("lrev.j", ir::Ty::Int);
+    let tmp_t = ctx.fresh_temp("lrev.tmp", elem);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    let j = local_expr(j_t.clone(), ir::Ty::Int);
+    let mut stmts = vec![
+        ir::Stmt::Assign {
+            name: n_t,
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(list.clone())),
+            },
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(0),
+        },
+        ir::Stmt::Assign {
+            name: j_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Sub,
+                    left: Box::new(n),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+    ];
+    let cond = key_cmp(ir::BinOp::Lt, i.clone(), j.clone());
+    let body = vec![
+        ir::Stmt::Assign {
+            name: tmp_t.clone(),
+            value: ir::Expr {
+                ty: elem,
+                kind: ir::ExprKind::Index {
+                    base: Box::new(list.clone()),
+                    index: Box::new(i.clone()),
+                },
+            },
+        },
+        ir::Stmt::IndexAssign {
+            base: list.clone(),
+            index: i.clone(),
+            value: ir::Expr {
+                ty: elem,
+                kind: ir::ExprKind::Index {
+                    base: Box::new(list.clone()),
+                    index: Box::new(j.clone()),
+                },
+            },
+        },
+        ir::Stmt::IndexAssign {
+            base: list.clone(),
+            index: j.clone(),
+            value: local_expr(tmp_t, elem),
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(i),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+        ir::Stmt::Assign {
+            name: j_t,
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Sub,
+                    left: Box::new(j),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+    ];
+    stmts.push(ir::Stmt::While {
+        cond,
+        body,
+        step: vec![],
+    });
+    stmts
+}
+
+/// Append reverse-before/after steps for stable reverse sort (CPython reverse-sort-reverse).
+fn push_maybe_reverse(
+    stmts: &mut Vec<ir::Stmt>,
+    mode: &ReverseMode,
+    list: &ir::Expr,
+    elem: ir::Ty,
+    ctx: &mut FnCtx,
+) {
+    match mode {
+        ReverseMode::Never => {}
+        ReverseMode::Always => {
+            stmts.extend(lower_list_reverse_in_place(list.clone(), elem, ctx));
+        }
+        ReverseMode::Cond(cond) => {
+            let body = lower_list_reverse_in_place(list.clone(), elem, ctx);
+            stmts.push(ir::Stmt::If {
+                branches: vec![(cond.clone(), body)],
+                orelse: vec![],
+            });
+        }
+    }
 }
 
 /// Type-level coerce check without allocating IR temps (discards the result).
@@ -18680,7 +18853,7 @@ fn lower_sorted_expr(
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    let key_ast = take_sort_key_keyword(keywords, "sorted")?;
+    let sk = take_sort_keywords(keywords, "sorted")?;
     if args.len() != 1 {
         return Err(err(
             format!(
@@ -18701,40 +18874,14 @@ fn lower_sorted_expr(
         }
     };
     let list_ty = arg.ty;
+    let (rev_mode, mut rev_bind) = resolve_reverse_flag(sk.reverse, ctx)?;
 
-    // No key=: existing path — element itself must be sortable.
-    let Some(key_ast) = key_ast else {
-        ensure_sortable_list_elem(elem, args[0].span)?;
-        let tmp = ctx.fresh_temp("sorted", list_ty);
-        let copy = ir::Expr {
-            ty: list_ty,
-            kind: ir::ExprKind::Binary {
-                op: ir::BinOp::Mul,
-                left: Box::new(arg),
-                right: Box::new(int_const(1)),
-            },
-        };
-        return Ok(ir::Expr {
-            ty: list_ty,
-            kind: ir::ExprKind::Block {
-                stmts: vec![
-                    ir::Stmt::Assign {
-                        name: tmp.clone(),
-                        value: copy,
-                    },
-                    ir::Stmt::ListSort {
-                        list: local_expr(tmp.clone(), list_ty),
-                    },
-                ],
-                result: Box::new(local_expr(tmp, list_ty)),
-            },
-        });
-    };
-
-    // key= path: copy then in-place keyed sort (shared with list.sort).
+    // Copy input, then reverse-sort-reverse (stable) optionally with key=.
     let out_t = ctx.fresh_temp("sorted", list_ty);
     let out = local_expr(out_t.clone(), list_ty);
-    let mut stmts = vec![ir::Stmt::Assign {
+    let mut stmts = Vec::new();
+    stmts.append(&mut rev_bind);
+    stmts.push(ir::Stmt::Assign {
         name: out_t,
         value: ir::Expr {
             ty: list_ty,
@@ -18744,8 +18891,15 @@ fn lower_sorted_expr(
                 right: Box::new(int_const(1)),
             },
         },
-    }];
-    stmts.extend(lower_list_sort_key_stmts(out.clone(), elem, key_ast, ctx)?);
+    });
+    push_maybe_reverse(&mut stmts, &rev_mode, &out, elem, ctx);
+    if let Some(key_ast) = sk.key {
+        stmts.extend(lower_list_sort_key_stmts(out.clone(), elem, key_ast, ctx)?);
+    } else {
+        ensure_sortable_list_elem(elem, args[0].span)?;
+        stmts.push(ir::Stmt::ListSort { list: out.clone() });
+    }
+    push_maybe_reverse(&mut stmts, &rev_mode, &out, elem, ctx);
     Ok(ir::Expr {
         ty: list_ty,
         kind: ir::ExprKind::Block {
@@ -21682,12 +21836,56 @@ xs.sort(key=k)
     }
 
     #[test]
-    fn list_sort_reverse_residual() {
-        let e = analyze_err("xs = [1, 2]\nxs.sort(reverse=True)\n");
+    fn list_sort_reverse_desugars_with_reverse_loops() {
+        let m = analyze_ok("xs = [3, 1, 2]\nxs.sort(reverse=True)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let while_count = entry
+            .body
+            .iter()
+            .filter(|s| matches!(s, ir::Stmt::While { .. }))
+            .count();
+        // reverse before + reverse after (each one While) — no key fill.
         assert!(
-            e.message.contains("list.sort()")
-                && e.message.contains("reverse=")
-                && e.message.contains("not supported"),
+            while_count >= 2,
+            "expected reverse Whiles around ListSort, body={:?}",
+            entry.body
+        );
+        assert!(
+            entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::ListSort { .. })),
+            "expected ListSort, body={:?}",
+            entry.body
+        );
+    }
+
+    #[test]
+    fn sorted_reverse_desugars_to_block() {
+        let m = analyze_ok("ys = sorted([3, 1, 2], reverse=True)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("expected Block");
+        };
+        assert!(
+            stmts.iter().any(|s| matches!(s, ir::Stmt::ListSort { .. })),
+            "expected ListSort in sorted(reverse=)"
+        );
+        let while_count = stmts
+            .iter()
+            .filter(|s| matches!(s, ir::Stmt::While { .. }))
+            .count();
+        assert!(while_count >= 2, "expected reverse Whiles, stmts={stmts:?}");
+    }
+
+    #[test]
+    fn reverse_non_bool_is_error() {
+        let e = analyze_err("print(sorted([1, 2], reverse=1))\n");
+        assert!(
+            e.message.contains("reverse=") && e.message.contains("bool"),
             "{}",
             e.message
         );
