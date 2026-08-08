@@ -18518,7 +18518,8 @@ enum ReverseMode {
     Cond(ir::Expr),
 }
 
-/// Lower `reverse=` to a mode. `reverse=` must be `bool` (const folds True/False).
+/// Lower `reverse=` to a mode. CPython truthiness (bool, int, str, …);
+/// const-folds common literals so True/1 always reverse and False/0 never do.
 fn resolve_reverse_flag(
     rev_ast: Option<&ast::Expr>,
     ctx: &mut FnCtx,
@@ -18527,20 +18528,29 @@ fn resolve_reverse_flag(
         return Ok((ReverseMode::Never, vec![]));
     };
     let rev = lower_expr(rev_ast, ctx)?;
-    if rev.ty != ir::Ty::Bool {
-        return Err(err(
-            format!("reverse= expects bool, found {}", rev.ty),
-            rev_ast.span,
-        ));
+    // Const-fold known truthy/falsy literals (CPython reverse= uses truthiness).
+    match &rev.kind {
+        ir::ExprKind::ConstBool(true) => return Ok((ReverseMode::Always, vec![])),
+        ir::ExprKind::ConstBool(false) => return Ok((ReverseMode::Never, vec![])),
+        ir::ExprKind::ConstNone => return Ok((ReverseMode::Never, vec![])),
+        ir::ExprKind::ConstInt(0) => return Ok((ReverseMode::Never, vec![])),
+        ir::ExprKind::ConstInt(_) => return Ok((ReverseMode::Always, vec![])),
+        ir::ExprKind::ConstFloat(f) if *f == 0.0 => return Ok((ReverseMode::Never, vec![])),
+        ir::ExprKind::ConstFloat(_) => return Ok((ReverseMode::Always, vec![])),
+        ir::ExprKind::ConstStr(s) if s.is_empty() => return Ok((ReverseMode::Never, vec![])),
+        ir::ExprKind::ConstStr(_) => return Ok((ReverseMode::Always, vec![])),
+        _ => {}
     }
-    match rev.kind {
+    // Runtime truthiness via ToBool (same rules as if/while conditions).
+    let as_bool = to_bool(rev, rev_ast.span, ctx)?;
+    match as_bool.kind {
         ir::ExprKind::ConstBool(true) => Ok((ReverseMode::Always, vec![])),
         ir::ExprKind::ConstBool(false) => Ok((ReverseMode::Never, vec![])),
         _ => {
             let name = ctx.fresh_temp("sort.rev", ir::Ty::Bool);
             let stmts = vec![ir::Stmt::Assign {
                 name: name.clone(),
-                value: rev,
+                value: as_bool,
             }];
             Ok((ReverseMode::Cond(local_expr(name, ir::Ty::Bool)), stmts))
         }
@@ -22341,12 +22351,44 @@ xs.sort(key=k)
     }
 
     #[test]
-    fn reverse_non_bool_is_error() {
-        let e = analyze_err("print(sorted([1, 2], reverse=1))\n");
+    fn reverse_truthy_int_const_folds() {
+        let m = analyze_ok("ys = sorted([1, 2], reverse=1)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("expected Block");
+        };
+        // reverse=1 is Always: reverse Whiles present (before and after sort).
+        let while_count = stmts
+            .iter()
+            .filter(|s| matches!(s, ir::Stmt::While { .. }))
+            .count();
         assert!(
-            e.message.contains("reverse=") && e.message.contains("bool"),
-            "{}",
-            e.message
+            while_count >= 2,
+            "expected reverse Whiles for reverse=1, stmts={stmts:?}"
+        );
+    }
+
+    #[test]
+    fn reverse_falsy_int_is_noop() {
+        let m = analyze_ok("ys = sorted([1, 2], reverse=0)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        // reverse=0 → Never: only the ascending sort While(s), no reverse pair.
+        // Still a Block; presence of sort is enough — no Cond bind for reverse.
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("expected Block");
+        };
+        assert!(
+            !stmts.iter().any(|s| matches!(
+                s,
+                ir::Stmt::Assign { name, .. } if name.starts_with(".sort.rev")
+            )),
+            "reverse=0 should not bind runtime reverse cond"
         );
     }
 

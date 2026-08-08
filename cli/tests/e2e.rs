@@ -1841,7 +1841,7 @@ print(max(1, 10, 100, key=lambda x=0: 0))
 
 #[test]
 fn sorted_list_sort_reverse_match_python() {
-    // reverse=True is stable reverse-sort-reverse; works with and without key=.
+    // reverse= is CPython-truthy (bool/int/str); stable reverse-sort-reverse.
     let src = "\
 def neg(x: int) -> int:
     return -x
@@ -1849,12 +1849,19 @@ def k0(t: tuple[int, str]) -> int:
     return t[0]
 print(sorted([3, 1, 2], reverse=True))
 print(sorted([3, 1, 2], reverse=False))
+print(sorted([3, 1, 2], reverse=1))
+print(sorted([3, 1, 2], reverse=0))
+print(sorted([3, 1, 2], reverse=-1))
 print(sorted([3, 1, 2], key=neg, reverse=True))
+print(sorted([3, 1, 2], key=neg, reverse=1))
 xs: list[tuple[int, str]] = [(1, \"b\"), (1, \"a\"), (2, \"c\")]
 print(sorted(xs, key=k0, reverse=True))
 a = [3, 1, 2]
 a.sort(reverse=True)
 print(a)
+d = [3, 1, 2]
+d.sort(reverse=1)
+print(d)
 b = [\"bb\", \"a\", \"ccc\"]
 b.sort(key=lambda s=\"\": len(s), reverse=True)
 print(b)
@@ -1865,9 +1872,13 @@ empty: list[int] = []
 empty.sort(reverse=True)
 print(empty)
 print(sorted(empty, reverse=True))
-# runtime reverse flag
+# runtime reverse flag (bool and truthy int)
 flag = True
 print(sorted([1, 3, 2], reverse=flag))
+n = 1
+print(sorted([1, 3, 2], reverse=n))
+z = 0
+print(sorted([1, 3, 2], reverse=z))
 ";
     let out = run_program("sort_reverse", src);
     let py = std::process::Command::new("python3")
@@ -1885,12 +1896,6 @@ print(sorted([1, 3, 2], reverse=flag))
 
 #[test]
 fn sorted_min_max_key_negatives() {
-    let (_, stderr) =
-        run_program_expect_fail("sorted_rev_nonbool", "print(sorted([1, 2], reverse=1))\n");
-    assert!(
-        stderr.contains("reverse=") && stderr.contains("bool"),
-        "stderr={stderr}"
-    );
     let (_, stderr) = run_program_expect_fail("min_reverse", "print(min([1, 2], reverse=True))\n");
     assert!(
         stderr.contains("unexpected keyword argument 'reverse'"),
