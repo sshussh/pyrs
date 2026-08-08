@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.32.0)
+## The language (v0.33.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.33.0**, not 1.0) until it is ready for
+milestone after this one is **0.34.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
@@ -106,6 +106,8 @@ A statically-typed Python subset:
   (IR ops, not first-class values); other builtins still need a wrapper.
   **v0.32:** lexicographic `min`/`max` for homogeneous `str` (multi-arg and
   `list[str]` without `key=`); numeric multi-arg/list path unchanged.
+  **v0.33:** `sorted` / `list.sort` `reverse=` uses CPython truthiness
+  (`reverse=1` / runtime int, not only `bool`); const-folds 0/1/True/False.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -268,7 +270,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.32.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.33.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -283,8 +285,8 @@ multi-arg rejects `default=`; bare `key=` builtins supported are `len`,
 `abs`, `int`/`float`/`bool`/`str` (other builtins and class `__len__` still
 need a wrapper); `sorted(..., key=)`
 and `list.sort(key=)` materialize a never-freed auxiliary keys list of
-length `n`; `sorted`/`list.sort` `reverse=` requires `bool` (not truthy
-int); `min`/`max` reject `reverse=` as unexpected (CPython has no such
+length `n`; `sorted`/`list.sort` `reverse=` uses truthiness (bool/int/str/…);
+`min`/`max` reject `reverse=` as unexpected (CPython has no such
 kwarg); multi-arg/list lexicographic for tuples is residual,
 control-flow narrowing covers `is None` / `is not None` (and `not`,
 `and`/`or` body peels and **mid-expression** refine of
@@ -424,4 +426,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.32.0 && git push origin v0.32.0`.
+Release tags: `git tag v0.33.0 && git push origin v0.33.0`.
