@@ -1657,6 +1657,46 @@ print(sorted([], key=neg))
 }
 
 #[test]
+fn list_sort_key_match_python() {
+    // In-place list.sort(key=): free fn, lambda, stability, empty list.
+    let src = "\
+def neg(x: int) -> int:
+    return -x
+def k0(t: tuple[int, str]) -> int:
+    return t[0]
+xs = [3, 1, 2]
+xs.sort(key=neg)
+print(xs)
+ys = [\"bb\", \"a\", \"ccc\"]
+ys.sort(key=lambda s=\"\": len(s))
+print(ys)
+zs: list[tuple[int, str]] = [(1, \"b\"), (1, \"a\"), (2, \"c\")]
+zs.sort(key=k0)
+print(zs)
+empty: list[int] = []
+empty.sort(key=neg)
+print(empty)
+# alias: sort mutates shared list
+a = [3, 1, 2]
+b = a
+b.sort(key=neg)
+print(a, b)
+";
+    let out = run_program("list_sort_key", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn sorted_key_imported_free_function_match_python() {
     // Cross-module free function as key= (ImportBinding → Direct Call).
     let out = run_project(
@@ -1765,11 +1805,25 @@ fn sorted_min_max_key_negatives() {
         "stderr={stderr}"
     );
     let (_, stderr) =
-        run_program_expect_fail("list_sort_key", "xs = [1, 2]\nxs.sort(key=lambda x=0: x)\n");
+        run_program_expect_fail("list_sort_reverse", "xs = [1, 2]\nxs.sort(reverse=True)\n");
     assert!(
         stderr.contains("list.sort()")
-            && stderr.contains("key=")
+            && stderr.contains("reverse=")
             && stderr.contains("not supported"),
+        "stderr={stderr}"
+    );
+    // Expr position still rejects (returns None), even with key= supported.
+    let (_, stderr) = run_program_expect_fail(
+        "list_sort_key_expr",
+        "\
+def id(x: int) -> int:
+    return x
+xs = [1, 2]
+ys = xs.sort(key=id)
+",
+    );
+    assert!(
+        stderr.contains("returns None") && stderr.contains("list.sort"),
         "stderr={stderr}"
     );
     // Monomorphic key failures
