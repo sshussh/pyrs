@@ -19121,6 +19121,12 @@ fn lower_min_max_expr(
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     let key_ast = take_sort_key_keyword(keywords, func)?;
+    if args.is_empty() {
+        return Err(err(
+            format!("{func}() expected at least 1 argument, got 0"),
+            span,
+        ));
+    }
     if args.len() == 1 {
         let arg = lower_expr(args[0], ctx)?;
         let elem = match arg.ty {
@@ -19153,46 +19159,123 @@ fn lower_min_max_expr(
                 args[0].span,
             )),
         }
-    } else if args.len() == 2 {
-        if key_ast.is_some() {
+    } else if let Some(key_ast) = key_ast {
+        // Multi-arg form with key=: min(a, b[, c…], key=f) — linear scan.
+        lower_min_max_multi_key(func, args, key_ast, span, ctx)
+    } else {
+        // Multi-arg numeric form: fold Min/Max with unify_numeric (2-arg and 3+).
+        let mut acc = lower_expr(args[0], ctx)?;
+        for a in &args[1..] {
+            let right = lower_expr(a, ctx)?;
+            let (left, right, ty) = unify_numeric(acc, right, span, &format!("{func}()"))?;
+            let kind = if func == "min" {
+                ir::ExprKind::Min {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            } else {
+                ir::ExprKind::Max {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            };
+            acc = ir::Expr { ty, kind };
+        }
+        Ok(acc)
+    }
+}
+
+/// `min(a, b[, c…], key=f)` / `max(...)` — compare monomorphic `key=` over positionals.
+fn lower_min_max_multi_key(
+    func: &str,
+    args: &[&ast::Expr],
+    key_ast: &ast::Expr,
+    _span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    debug_assert!(args.len() >= 2);
+    let mut lowered = Vec::with_capacity(args.len());
+    for a in args {
+        lowered.push(lower_expr(a, ctx)?);
+    }
+    // Homogeneous candidates so `best` has a single storage type (monomorphic key).
+    let elem = lowered[0].ty;
+    for (i, e) in lowered.iter().enumerate().skip(1) {
+        if e.ty != elem {
             return Err(err(
                 format!(
-                    "{func}() two-argument form does not take key= \
-                     (use the iterable form: {func}(xs, key=...))"
+                    "{func}() multi-arg form with key= requires all arguments to have \
+                     the same type (found {elem} and {})",
+                    e.ty
                 ),
-                span,
+                args[i].span,
             ));
         }
-        let left = lower_expr(args[0], ctx)?;
-        let right = lower_expr(args[1], ctx)?;
-        let (left, right, ty) = unify_numeric(left, right, span, &format!("{func}()"))?;
-        let kind = if func == "min" {
-            ir::ExprKind::Min {
-                left: Box::new(left),
-                right: Box::new(right),
-            }
-        } else {
-            ir::ExprKind::Max {
-                left: Box::new(left),
-                right: Box::new(right),
-            }
-        };
-        Ok(ir::Expr { ty, kind })
-    } else if key_ast.is_some() {
-        Err(err(
-            format!(
-                "{func}() multi-arg form with key= is not supported yet \
-                 (use the iterable form: {func}(xs, key=...)); {} arguments given",
-                args.len()
-            ),
-            span,
-        ))
-    } else {
-        Err(err(
-            format!("{func}() takes 1 or 2 arguments ({} given)", args.len()),
-            span,
-        ))
     }
+    let (key, key_ty) = resolve_sort_key(key_ast, elem, ctx)?;
+    let (key, mut key_bind) = bind_sort_key(key, ctx);
+
+    let best_t = ctx.fresh_temp("mm.best", elem);
+    let best_k_t = ctx.fresh_temp("mm.bestk", key_ty);
+
+    let mut stmts = Vec::new();
+    stmts.append(&mut key_bind);
+    // best = args[0]; best_k = key(best)
+    stmts.push(ir::Stmt::Assign {
+        name: best_t.clone(),
+        value: lowered[0].clone(),
+    });
+    stmts.push(ir::Stmt::Assign {
+        name: best_k_t.clone(),
+        value: call_sort_key(&key, local_expr(best_t.clone(), elem), args[0].span)?,
+    });
+
+    let cmp_op = if func == "min" {
+        ir::BinOp::Lt
+    } else {
+        ir::BinOp::Gt
+    };
+    for (i, val) in lowered.into_iter().enumerate().skip(1) {
+        let x_t = ctx.fresh_temp("mm.x", elem);
+        let k_t = ctx.fresh_temp("mm.k", key_ty);
+        stmts.push(ir::Stmt::Assign {
+            name: x_t.clone(),
+            value: val,
+        });
+        stmts.push(ir::Stmt::Assign {
+            name: k_t.clone(),
+            value: call_sort_key(&key, local_expr(x_t.clone(), elem), args[i].span)?,
+        });
+        let better = key_cmp(
+            cmp_op,
+            local_expr(k_t.clone(), key_ty),
+            local_expr(best_k_t.clone(), key_ty),
+        );
+        stmts.push(ir::Stmt::If {
+            branches: vec![(
+                better,
+                vec![
+                    ir::Stmt::Assign {
+                        name: best_t.clone(),
+                        value: local_expr(x_t, elem),
+                    },
+                    ir::Stmt::Assign {
+                        name: best_k_t.clone(),
+                        value: local_expr(k_t, key_ty),
+                    },
+                ],
+            )],
+            orelse: vec![],
+        });
+    }
+
+    Ok(ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(best_t, elem)),
+        },
+    })
 }
 
 /// Bind a closure key into a local so MakeClosure runs once.
@@ -21499,9 +21582,48 @@ print(f())
     fn min_arity() {
         let e = analyze_err("x = min()\n");
         assert!(
-            e.message.contains("1 or 2 arguments") || e.message.contains("takes"),
+            e.message.contains("at least 1 argument") || e.message.contains("got 0"),
             "{}",
             e.message
+        );
+    }
+
+    #[test]
+    fn min_multi_arg_numeric_folds() {
+        let m = analyze_ok("a = min(3, 1, 4, 2)\nb = max(3, 1, 4)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Min { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Max { .. }));
+    }
+
+    #[test]
+    fn min_multi_arg_with_key_desugars_to_block() {
+        let m = analyze_ok(
+            "\
+def k(x: int) -> int:
+    return -x
+v = min(3, 1, 4, key=k)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("expected Block desugar, got {:?}", value.kind);
+        };
+        assert!(
+            stmts.iter().any(|s| matches!(s, ir::Stmt::If { .. })),
+            "expected comparison Ifs, stmts={stmts:?}"
         );
     }
 
@@ -21954,16 +22076,17 @@ v = min([3, 1, 2], key=k)
     }
 
     #[test]
-    fn min_three_args_message_omits_key_when_absent() {
-        let e = analyze_err("print(min(1, 2, 3))\n");
-        assert!(
-            e.message.contains("takes 1 or 2 arguments") && e.message.contains("3 given"),
-            "{}",
-            e.message
+    fn min_multi_arg_key_type_mismatch() {
+        let e = analyze_err(
+            "\
+def k(x: int) -> int:
+    return x
+print(min(1, \"a\", key=k))
+",
         );
         assert!(
-            !e.message.contains("key="),
-            "should not mention key= when none was passed: {}",
+            e.message.contains("same type") && e.message.contains("key="),
+            "{}",
             e.message
         );
     }

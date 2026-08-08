@@ -1763,6 +1763,45 @@ print(max(xs, key=id))
 }
 
 #[test]
+fn min_max_multi_arg_match_python() {
+    // Multi-arg form: min(a, b, c[, key=…]) / max — numeric fold and monomorphic key=.
+    let src = "\
+def neg(x: int) -> int:
+    return -x
+def k0(t: tuple[int, str]) -> int:
+    return t[0]
+print(min(3, 1, 4, 2))
+print(max(3, 1, 4, 2))
+print(min(1.0, 2.5, 3.0))
+print(max(1.0, 2.5, 3.0))
+# bool multi-arg promotes to int (same as two-arg; not CPython's False/True print)
+print(min(3, 1, 4, key=neg))
+print(max(3, 1, 4, key=neg))
+print(min(1, 2, key=neg))
+print(max(1, 2, key=neg))
+print(min(\"bb\", \"a\", \"ccc\", key=lambda s=\"\": len(s)))
+print(max(\"bb\", \"a\", \"ccc\", key=lambda s=\"\": len(s)))
+print(min((1, \"b\"), (1, \"a\"), (2, \"c\"), key=k0))
+print(max((1, \"b\"), (1, \"a\"), (2, \"c\"), key=k0))
+# equal keys keep the first argument
+print(min(1, 10, 100, key=lambda x=0: 0))
+print(max(1, 10, 100, key=lambda x=0: 0))
+";
+    let out = run_program("min_max_multi", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn sorted_list_sort_reverse_match_python() {
     // reverse=True is stable reverse-sort-reverse; works with and without key=.
     let src = "\
@@ -1814,22 +1853,6 @@ fn sorted_min_max_key_negatives() {
         stderr.contains("reverse=") && stderr.contains("bool"),
         "stderr={stderr}"
     );
-    let (_, stderr) = run_program_expect_fail(
-        "min_twoarg_key",
-        "def id(x: int) -> int:\n    return x\nprint(min(1, 2, key=id))\n",
-    );
-    assert!(
-        stderr.contains("two-argument form") && stderr.contains("key="),
-        "stderr={stderr}"
-    );
-    let (_, stderr) = run_program_expect_fail(
-        "max_twoarg_key",
-        "def id(x: int) -> int:\n    return x\nprint(max(1, 2, key=id))\n",
-    );
-    assert!(
-        stderr.contains("two-argument form") && stderr.contains("key="),
-        "stderr={stderr}"
-    );
     let (_, stderr) = run_program_expect_fail("min_reverse", "print(min([1, 2], reverse=True))\n");
     assert!(
         stderr.contains("unexpected keyword argument 'reverse'"),
@@ -1846,6 +1869,15 @@ fn sorted_min_max_key_negatives() {
     );
     assert!(
         stderr.contains("default=") && stderr.contains("not supported"),
+        "stderr={stderr}"
+    );
+    // Multi-arg key= still requires homogeneous positional types.
+    let (_, stderr) = run_program_expect_fail(
+        "min_multiarg_key_mixed",
+        "def id(x: int) -> int:\n    return x\nprint(min(1, \"a\", key=id))\n",
+    );
+    assert!(
+        stderr.contains("same type") && stderr.contains("key="),
         "stderr={stderr}"
     );
     // Expr position still rejects (returns None), even with reverse= supported.
@@ -1901,14 +1933,6 @@ print(sorted([1, 2], key=as_str))
         stderr.contains("key= must be a monomorphic callable"),
         "stderr={stderr}"
     );
-    let (_, stderr) = run_program_expect_fail(
-        "min_multiarg_key",
-        "def id(x: int) -> int:\n    return x\nprint(min(1, 2, 3, key=id))\n",
-    );
-    assert!(
-        stderr.contains("multi-arg") && stderr.contains("key="),
-        "stderr={stderr}"
-    );
     // Non-list receiver: generic method-kwargs residual (not list.sort).
     let (_, stderr) = run_program_expect_fail(
         "class_sort_key",
@@ -1942,11 +1966,6 @@ print(sorted([1, 2], key=two))
     );
     assert!(
         stderr.contains("builtin 'len'") && stderr.contains("key="),
-        "stderr={stderr}"
-    );
-    let (_, stderr) = run_program_expect_fail("min_three_args", "print(min(1, 2, 3))\n");
-    assert!(
-        stderr.contains("takes 1 or 2 arguments") && stderr.contains("3 given"),
         "stderr={stderr}"
     );
 }
