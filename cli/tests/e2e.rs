@@ -1763,6 +1763,39 @@ print(max(xs, key=id))
 }
 
 #[test]
+fn min_max_default_match_python() {
+    // Iterable-only default=; empty → default; non-empty ignores default; works with key=.
+    let src = "\
+def neg(x: int) -> int:
+    return -x
+xs: list[int] = []
+print(min(xs, default=99))
+print(max(xs, default=-1))
+print(min([3, 1, 4], default=99))
+print(max([3, 1, 4], default=-1))
+print(min(xs, key=neg, default=7))
+print(max(xs, key=neg, default=7))
+print(min([3, 1, 4], key=neg, default=7))
+print(max([3, 1, 4], key=neg, default=7))
+ys: list[str] = []
+print(min(ys, key=lambda s=\"\": len(s), default=\"z\"))
+print(min([\"bb\", \"a\", \"ccc\"], key=lambda s=\"\": len(s), default=\"z\"))
+";
+    let out = run_program("min_max_default", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn min_max_multi_arg_match_python() {
     // Multi-arg form: min(a, b, c[, key=…]) / max — numeric fold and monomorphic key=.
     let src = "\
@@ -1863,12 +1896,17 @@ fn sorted_min_max_key_negatives() {
         stderr.contains("unexpected keyword argument 'reverse'"),
         "stderr={stderr}"
     );
-    let (_, stderr) = run_program_expect_fail(
-        "min_default",
-        "def id(x: int) -> int:\n    return x\nprint(min([1], key=id, default=0))\n",
-    );
+    // Multi-arg form rejects default= (CPython wording).
+    let (_, stderr) = run_program_expect_fail("min_default_multi", "print(min(1, 2, default=0))\n");
     assert!(
-        stderr.contains("default=") && stderr.contains("not supported"),
+        stderr.contains("default") && stderr.contains("multiple positional"),
+        "stderr={stderr}"
+    );
+    // sorted rejects default=
+    let (_, stderr) =
+        run_program_expect_fail("sorted_default", "print(sorted([1, 2], default=0))\n");
+    assert!(
+        stderr.contains("unexpected keyword argument 'default'"),
         "stderr={stderr}"
     );
     // Multi-arg key= still requires homogeneous positional types.

@@ -18414,19 +18414,22 @@ fn const_str(s: &str) -> ir::Expr {
     }
 }
 
-/// Parsed `key=` / `reverse=` kwargs for sorted / list.sort / min / max.
+/// Parsed `key=` / `reverse=` / `default=` kwargs for sorted / list.sort / min / max.
 struct SortKeywords<'a> {
     key: Option<&'a ast::Expr>,
     reverse: Option<&'a ast::Expr>,
+    default: Option<&'a ast::Expr>,
 }
 
-/// Parse `key=` / `reverse=` (sorted & list.sort) / reject unexpected kwargs.
+/// Parse `key=` / `reverse=` (sorted & list.sort) / `default=` (min/max) /
+/// reject unexpected kwargs.
 fn take_sort_keywords<'a>(
     keywords: &'a [ast::Keyword],
     builtin: &str,
 ) -> SResult<SortKeywords<'a>> {
     let mut key = None;
     let mut reverse = None;
+    let mut default = None;
     for kw in keywords {
         match kw.name.as_str() {
             "key" => {
@@ -18454,11 +18457,21 @@ fn take_sort_keywords<'a>(
                 }
                 reverse = Some(&kw.value);
             }
-            "default" if matches!(builtin, "min" | "max") => {
-                return Err(err(
-                    format!("{builtin}() keyword argument 'default=' is not supported yet"),
-                    kw.name_span,
-                ));
+            "default" => {
+                // CPython: only min/max iterable form; sorted/list.sort reject.
+                if !matches!(builtin, "min" | "max") {
+                    return Err(err(
+                        format!("{builtin}() got an unexpected keyword argument 'default'"),
+                        kw.name_span,
+                    ));
+                }
+                if default.is_some() {
+                    return Err(err(
+                        format!("{builtin}() got multiple values for keyword argument 'default'"),
+                        kw.name_span,
+                    ));
+                }
+                default = Some(&kw.value);
             }
             other => {
                 return Err(err(
@@ -18468,15 +18481,20 @@ fn take_sort_keywords<'a>(
             }
         }
     }
-    Ok(SortKeywords { key, reverse })
+    Ok(SortKeywords {
+        key,
+        reverse,
+        default,
+    })
 }
 
-/// min/max path: only `key=` (reverse already rejected as unexpected).
-fn take_sort_key_keyword<'a>(
+/// min/max path: `key=` and optional `default=` (reverse already unexpected).
+fn take_min_max_keywords<'a>(
     keywords: &'a [ast::Keyword],
     builtin: &str,
-) -> SResult<Option<&'a ast::Expr>> {
-    Ok(take_sort_keywords(keywords, builtin)?.key)
+) -> SResult<(Option<&'a ast::Expr>, Option<&'a ast::Expr>)> {
+    let kw = take_sort_keywords(keywords, builtin)?;
+    Ok((kw.key, kw.default))
 }
 
 /// How to apply CPython's stable reverse-sort-reverse.
@@ -19120,49 +19138,25 @@ fn lower_min_max_expr(
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    let key_ast = take_sort_key_keyword(keywords, func)?;
+    let (key_ast, default_ast) = take_min_max_keywords(keywords, func)?;
     if args.is_empty() {
         return Err(err(
             format!("{func}() expected at least 1 argument, got 0"),
             span,
         ));
     }
-    if args.len() == 1 {
-        let arg = lower_expr(args[0], ctx)?;
-        let elem = match arg.ty {
-            ir::Ty::List(e) => *e,
-            other => {
-                return Err(err(
-                    format!("{func}() iterable form expects a list, found {other}"),
-                    args[0].span,
-                ));
-            }
-        };
+    // CPython: default= only with a single iterable positional.
+    if args.len() != 1 {
+        if default_ast.is_some() {
+            return Err(err(
+                format!("Cannot specify a default for {func}() with multiple positional arguments"),
+                span,
+            ));
+        }
         if let Some(key_ast) = key_ast {
-            return lower_min_max_list_key(func, arg, elem, key_ast, args[0].span, ctx);
+            // Multi-arg form with key=: min(a, b[, c…], key=f) — linear scan.
+            return lower_min_max_multi_key(func, args, key_ast, span, ctx);
         }
-        // No key=: numbers only (existing IR MinList/MaxList).
-        match elem {
-            ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool => {
-                let kind = if func == "min" {
-                    ir::ExprKind::MinList(Box::new(arg))
-                } else {
-                    ir::ExprKind::MaxList(Box::new(arg))
-                };
-                Ok(ir::Expr { ty: elem, kind })
-            }
-            other => Err(err(
-                format!(
-                    "{func}() is only supported for list[int], list[float], \
-                     and list[bool] without key=; found list[{other}]"
-                ),
-                args[0].span,
-            )),
-        }
-    } else if let Some(key_ast) = key_ast {
-        // Multi-arg form with key=: min(a, b[, c…], key=f) — linear scan.
-        lower_min_max_multi_key(func, args, key_ast, span, ctx)
-    } else {
         // Multi-arg numeric form: fold Min/Max with unify_numeric (2-arg and 3+).
         let mut acc = lower_expr(args[0], ctx)?;
         for a in &args[1..] {
@@ -19181,8 +19175,115 @@ fn lower_min_max_expr(
             };
             acc = ir::Expr { ty, kind };
         }
-        Ok(acc)
+        return Ok(acc);
     }
+
+    // Iterable form (one list).
+    let arg = lower_expr(args[0], ctx)?;
+    let elem = match arg.ty {
+        ir::Ty::List(e) => *e,
+        other => {
+            return Err(err(
+                format!("{func}() iterable form expects a list, found {other}"),
+                args[0].span,
+            ));
+        }
+    };
+    let default_ir = match default_ast {
+        Some(d) => Some(lower_expr(d, ctx)?),
+        None => None,
+    };
+    if let Some(key_ast) = key_ast {
+        return lower_min_max_list_key(func, arg, elem, key_ast, default_ir, args[0].span, ctx);
+    }
+    // No key=: numbers only (existing IR MinList/MaxList), optional default=.
+    match elem {
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool => {
+            lower_min_max_list_numeric(func, arg, elem, default_ir, span, ctx)
+        }
+        other => Err(err(
+            format!(
+                "{func}() is only supported for list[int], list[float], \
+                 and list[bool] without key=; found list[{other}]"
+            ),
+            args[0].span,
+        )),
+    }
+}
+
+/// `min(xs)` / `max(xs)` over numeric lists; optional `default=` on empty.
+fn lower_min_max_list_numeric(
+    func: &str,
+    arg: ir::Expr,
+    elem: ir::Ty,
+    default_ir: Option<ir::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let kind_of = |list: ir::Expr| -> ir::ExprKind {
+        if func == "min" {
+            ir::ExprKind::MinList(Box::new(list))
+        } else {
+            ir::ExprKind::MaxList(Box::new(list))
+        }
+    };
+    let Some(default_ir) = default_ir else {
+        return Ok(ir::Expr {
+            ty: elem,
+            kind: kind_of(arg),
+        });
+    };
+    // result type = join(elem, default); empty → default, else MinList/MaxList.
+    let ret_ty = join_types(elem, default_ir.ty);
+    let list_ty = arg.ty;
+    let xs_t = ctx.fresh_temp("mm.xs", list_ty);
+    let n_t = ctx.fresh_temp("mm.n", ir::Ty::Int);
+    let out_t = ctx.fresh_temp("mm.out", ret_ty);
+    let xs = local_expr(xs_t.clone(), list_ty);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let def_c = coerce(default_ir, ret_ty, span, &format!("{func}() default="))?;
+    let min_c = coerce(
+        ir::Expr {
+            ty: elem,
+            kind: kind_of(xs.clone()),
+        },
+        ret_ty,
+        span,
+        &format!("{func}()"),
+    )?;
+    let stmts = vec![
+        ir::Stmt::Assign {
+            name: xs_t,
+            value: arg,
+        },
+        ir::Stmt::Assign {
+            name: n_t,
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(xs)),
+            },
+        },
+        ir::Stmt::If {
+            branches: vec![(
+                key_cmp(ir::BinOp::Eq, n, int_const(0)),
+                vec![ir::Stmt::Assign {
+                    name: out_t.clone(),
+                    value: def_c,
+                }],
+            )],
+            orelse: vec![ir::Stmt::Assign {
+                name: out_t.clone(),
+                value: min_c,
+            }],
+        },
+    ];
+    Ok(ir::Expr {
+        ty: ret_ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(out_t, ret_ty)),
+        },
+    })
 }
 
 /// `min(a, b[, c…], key=f)` / `max(...)` — compare monomorphic `key=` over positionals.
@@ -19294,12 +19395,13 @@ fn bind_sort_key(key: SortKey, ctx: &mut FnCtx) -> (SortKey, Vec<ir::Stmt>) {
     }
 }
 
-/// `min(xs, key=f)` / `max(xs, key=f)` — linear scan comparing `f(x)`.
+/// `min(xs, key=f[, default=d])` / `max(...)` — linear scan comparing `f(x)`.
 fn lower_min_max_list_key(
     func: &str,
     arg: ir::Expr,
     elem: ir::Ty,
     key_ast: &ast::Expr,
+    default_ir: Option<ir::Expr>,
     _arg_span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
@@ -19308,6 +19410,11 @@ fn lower_min_max_list_key(
     let (key, mut key_bind) = bind_sort_key(key, ctx);
     // Param/ret compatibility already checked in resolve_sort_key.
 
+    let ret_ty = match &default_ir {
+        Some(d) => join_types(elem, d.ty),
+        None => elem,
+    };
+
     let xs_t = ctx.fresh_temp("mm.xs", list_ty);
     let n_t = ctx.fresh_temp("mm.n", ir::Ty::Int);
     let i_t = ctx.fresh_temp("mm.i", ir::Ty::Int);
@@ -19315,6 +19422,7 @@ fn lower_min_max_list_key(
     let best_k_t = ctx.fresh_temp("mm.bestk", key_ty);
     let x_t = ctx.fresh_temp("mm.x", elem);
     let k_t = ctx.fresh_temp("mm.k", key_ty);
+    let out_t = ctx.fresh_temp("mm.out", ret_ty);
 
     let xs = local_expr(xs_t.clone(), list_ty);
     let n = local_expr(n_t.clone(), ir::Ty::Int);
@@ -19340,17 +19448,10 @@ fn lower_min_max_list_key(
                 kind: ir::ExprKind::Len(Box::new(xs.clone())),
             },
         },
-        // if n == 0: raise ValueError
-        ir::Stmt::If {
-            branches: vec![(
-                key_cmp(ir::BinOp::Eq, n.clone(), int_const(0)),
-                vec![ir::Stmt::Raise {
-                    exc: ir::ExcType::ValueError,
-                    message: const_str(empty_msg),
-                }],
-            )],
-            orelse: vec![],
-        },
+    ]);
+
+    // Non-empty path: scan then coerce best into out.
+    let mut nonempty_body = vec![
         // best = xs[0]; best_k = key(best)
         ir::Stmt::Assign {
             name: best_t.clone(),
@@ -19370,10 +19471,10 @@ fn lower_min_max_list_key(
             name: i_t.clone(),
             value: int_const(1),
         },
-    ]);
+    ];
 
     // while i < n: x = xs[i]; k = key(x); if k < best_k (or > for max): update
-    let loop_cond = key_cmp(ir::BinOp::Lt, i.clone(), n);
+    let loop_cond = key_cmp(ir::BinOp::Lt, i.clone(), n.clone());
     let x_load = ir::Expr {
         ty: elem,
         kind: ir::ExprKind::Index {
@@ -19426,17 +19527,48 @@ fn lower_min_max_list_key(
             },
         },
     ];
-    stmts.push(ir::Stmt::While {
+    nonempty_body.push(ir::Stmt::While {
         cond: loop_cond,
         body,
         step: vec![],
     });
+    nonempty_body.push(ir::Stmt::Assign {
+        name: out_t.clone(),
+        value: coerce(
+            local_expr(best_t, elem),
+            ret_ty,
+            key_ast.span,
+            &format!("{func}()"),
+        )?,
+    });
+
+    let empty_body = if let Some(default_ir) = default_ir {
+        vec![ir::Stmt::Assign {
+            name: out_t.clone(),
+            value: coerce(
+                default_ir,
+                ret_ty,
+                key_ast.span,
+                &format!("{func}() default="),
+            )?,
+        }]
+    } else {
+        vec![ir::Stmt::Raise {
+            exc: ir::ExcType::ValueError,
+            message: const_str(empty_msg),
+        }]
+    };
+
+    stmts.push(ir::Stmt::If {
+        branches: vec![(key_cmp(ir::BinOp::Eq, n, int_const(0)), empty_body)],
+        orelse: nonempty_body,
+    });
 
     Ok(ir::Expr {
-        ty: elem,
+        ty: ret_ty,
         kind: ir::ExprKind::Block {
             stmts,
-            result: Box::new(local_expr(best_t, elem)),
+            result: Box::new(local_expr(out_t, ret_ty)),
         },
     })
 }
@@ -22059,9 +22191,72 @@ v = min([3, 1, 2], key=k)
             )),
             "expected empty-list Raise ValueError, stmts={stmts:?}"
         );
+        // Scan While lives in the non-empty orelse of the empty check.
         assert!(
-            stmts.iter().any(|s| matches!(s, ir::Stmt::While { .. })),
-            "expected scan While"
+            stmts.iter().any(|s| matches!(
+                s,
+                ir::Stmt::If { orelse, .. }
+                    if orelse.iter().any(|st| matches!(st, ir::Stmt::While { .. }))
+            )),
+            "expected scan While in nonempty branch, stmts={stmts:?}"
+        );
+    }
+
+    #[test]
+    fn min_with_default_no_raise_on_empty() {
+        let m = analyze_ok("xs: list[int] = []\nv = min(xs, default=99)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!("{:?}", entry.body);
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("expected Block for default=");
+        };
+        assert!(
+            !stmts.iter().any(|s| matches!(
+                s,
+                ir::Stmt::If {
+                    branches,
+                    ..
+                } if branches.iter().any(|(_, b)| b
+                    .iter()
+                    .any(|st| matches!(st, ir::Stmt::Raise { .. })))
+            )),
+            "default= must not Raise on empty"
+        );
+    }
+
+    #[test]
+    fn min_default_none_joins_optional() {
+        let m = analyze_ok("v = min([1, 2], default=None)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        // int | None
+        assert!(
+            matches!(value.ty, ir::Ty::Union(_))
+                || value.ty == ir::Ty::None
+                || value.ty == ir::Ty::Int,
+            "expected joined type, got {}",
+            value.ty
+        );
+        let members = ir::flatten_union_members(value.ty);
+        assert!(
+            members.contains(&ir::Ty::Int) && members.contains(&ir::Ty::None),
+            "expected int|None, got {}",
+            value.ty
+        );
+    }
+
+    #[test]
+    fn min_multi_arg_rejects_default() {
+        let e = analyze_err("print(min(1, 2, default=0))\n");
+        assert!(
+            e.message.contains("default") && e.message.contains("multiple positional"),
+            "{}",
+            e.message
         );
     }
 
