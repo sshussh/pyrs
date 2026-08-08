@@ -19,8 +19,9 @@
 ## Residuals
 
 - Keyed sort materializes a never-freed auxiliary keys list of length `n`
-- Multi-arg / list `min`/`max` for tuples (lexicographic)
+- Multi-arg / list `min`/`max` for tuples (lexicographic) — **done in 0.34**
 - Class `__len__` via bare `key=len`
+- List lexicographic ordering (`list < list`) still residual
 
 ## Out of scope (unchanged)
 

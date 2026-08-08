@@ -784,11 +784,11 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `print(a, b, ...)` | any values, any count | space-separated, newline at end |
 | `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
-| `min(a, b[, c…])` / `max(…)` | int, float, bool, or homogeneous str (2+ args) | numeric: common type via `bool` → `int` → `float`; str: lexicographic; optional monomorphic `key=` over homogeneous positionals; no `default=` |
-| `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
+| `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, or orderable tuple (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple: lexicographic; optional monomorphic `key=` over homogeneous positionals; no `default=` |
+| `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
-| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len`/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list; stable reverse-sort-reverse; keyed path materializes never-freed keys list |
-| `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` | without `key=`: sortable elem; with monomorphic `key=`: any `list[T]`; same bare-builtin `key=` surface as `sorted`; `reverse=` is truthy | in-place (statement only); same key/reverse surface as `sorted` |
+| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str\|orderable tuple]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len`/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list; stable reverse-sort-reverse; keyed path materializes never-freed keys list |
+| `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` | without `key=`: sortable elem (incl. orderable tuples); with monomorphic `key=`: any `list[T]`; same bare-builtin `key=` surface as `sorted`; `reverse=` is truthy | in-place (statement only); same key/reverse surface as `sorted` |
 | `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `set()` | empty only; needs annotation | `s: set[int] = set()` |
