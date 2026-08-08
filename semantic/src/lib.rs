@@ -19301,25 +19301,8 @@ fn lower_min_max_expr(
             // Multi-arg form with key=: min(a, b[, c…], key=f) — linear scan.
             return lower_min_max_multi_key(func, args, key_ast, span, ctx);
         }
-        // Multi-arg numeric form: fold Min/Max with unify_numeric (2-arg and 3+).
-        let mut acc = lower_expr(args[0], ctx)?;
-        for a in &args[1..] {
-            let right = lower_expr(a, ctx)?;
-            let (left, right, ty) = unify_numeric(acc, right, span, &format!("{func}()"))?;
-            let kind = if func == "min" {
-                ir::ExprKind::Min {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                }
-            } else {
-                ir::ExprKind::Max {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                }
-            };
-            acc = ir::Expr { ty, kind };
-        }
-        return Ok(acc);
+        // Multi-arg without key=: homogeneous str (lexicographic) or numeric fold.
+        return lower_min_max_multi_plain(func, args, span, ctx);
     }
 
     // Iterable form (one list).
@@ -19340,23 +19323,77 @@ fn lower_min_max_expr(
     if let Some(key_ast) = key_ast {
         return lower_min_max_list_key(func, arg, elem, key_ast, default_ir, args[0].span, ctx);
     }
-    // No key=: numbers only (existing IR MinList/MaxList), optional default=.
+    // No key=: numbers or str (MinList/MaxList), optional default=.
     match elem {
-        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool => {
-            lower_min_max_list_numeric(func, arg, elem, default_ir, span, ctx)
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => {
+            lower_min_max_list_plain(func, arg, elem, default_ir, span, ctx)
         }
         other => Err(err(
             format!(
                 "{func}() is only supported for list[int], list[float], \
-                 and list[bool] without key=; found list[{other}]"
+                 list[bool], and list[str] without key=; found list[{other}]"
             ),
             args[0].span,
         )),
     }
 }
 
-/// `min(xs)` / `max(xs)` over numeric lists; optional `default=` on empty.
-fn lower_min_max_list_numeric(
+/// Multi-arg `min(a, b[, c…])` / `max` without key=: str fold or numeric unify.
+fn lower_min_max_multi_plain(
+    func: &str,
+    args: &[&ast::Expr],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    debug_assert!(args.len() >= 2);
+    let mut lowered = Vec::with_capacity(args.len());
+    for a in args {
+        lowered.push(lower_expr(a, ctx)?);
+    }
+    // Homogeneous str: lexicographic Min/Max fold (no numeric promote).
+    if lowered.iter().all(|e| e.ty == ir::Ty::Str) {
+        let mut acc = lowered.remove(0);
+        for right in lowered {
+            let kind = if func == "min" {
+                ir::ExprKind::Min {
+                    left: Box::new(acc),
+                    right: Box::new(right),
+                }
+            } else {
+                ir::ExprKind::Max {
+                    left: Box::new(acc),
+                    right: Box::new(right),
+                }
+            };
+            acc = ir::Expr {
+                ty: ir::Ty::Str,
+                kind,
+            };
+        }
+        return Ok(acc);
+    }
+    // Numeric form: fold Min/Max with unify_numeric (bool → int → float).
+    let mut acc = lowered.remove(0);
+    for right in lowered {
+        let (left, right, ty) = unify_numeric(acc, right, span, &format!("{func}()"))?;
+        let kind = if func == "min" {
+            ir::ExprKind::Min {
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        } else {
+            ir::ExprKind::Max {
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        };
+        acc = ir::Expr { ty, kind };
+    }
+    Ok(acc)
+}
+
+/// `min(xs)` / `max(xs)` over numeric or str lists; optional `default=` on empty.
+fn lower_min_max_list_plain(
     func: &str,
     arg: ir::Expr,
     elem: ir::Ty,
@@ -21882,6 +21919,22 @@ print(f())
     }
 
     #[test]
+    fn min_multi_arg_str_folds() {
+        let m = analyze_ok("a = min(\"bb\", \"a\", \"ccc\")\nb = max(\"bb\", \"a\")\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(value.kind, ir::ExprKind::Min { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(value.kind, ir::ExprKind::Max { .. }));
+    }
+
+    #[test]
     fn min_multi_arg_with_key_desugars_to_block() {
         let m = analyze_ok(
             "\
@@ -21906,7 +21959,9 @@ v = min(3, 1, 4, key=k)
 
     #[test]
     fn min_list_form() {
-        let m = analyze_ok("a = min([3, 1, 4])\nb = max([1.5, -2.0])\n");
+        let m = analyze_ok(
+            "a = min([3, 1, 4])\nb = max([1.5, -2.0])\nc = min([\"b\", \"a\", \"c\"])\n",
+        );
         let entry = find_func(&m, ENTRY_NAME);
         let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
@@ -21918,6 +21973,11 @@ v = min(3, 1, 4, key=k)
         };
         assert_eq!(value.ty, ir::Ty::Float);
         assert!(matches!(value.kind, ir::ExprKind::MaxList(_)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(value.kind, ir::ExprKind::MinList(_)));
     }
 
     #[test]

@@ -1108,6 +1108,13 @@ impl Emitter {
                 let pred = if is_max { "ogt" } else { "olt" };
                 self.line(format!("{pick_r} = fcmp {pred} double {r}, {l}"));
             }
+            Ty::Str => {
+                // pyrs_str_cmp(a, b): negative if a < b (same convention as int_cmp).
+                let c = self.tmp();
+                self.line(format!("{c} = call i32 @pyrs_str_cmp(ptr {r}, ptr {l})"));
+                let pred = if is_max { "sgt" } else { "slt" };
+                self.line(format!("{pick_r} = icmp {pred} i32 {c}, 0"));
+            }
             other => unreachable!("min/max on {other:?}"),
         }
         let t = self.tmp();
@@ -1191,7 +1198,7 @@ impl Emitter {
         acc
     }
 
-    /// `min(xs)` / `max(xs)` over a numeric list; empty → ValueError.
+    /// `min(xs)` / `max(xs)` over a numeric or str list; empty → ValueError.
     fn emit_min_max_list(&mut self, is_max: bool, list: &Expr) -> String {
         let Ty::List(elem) = list.ty else {
             unreachable!("min/max list of non-list");
@@ -1283,6 +1290,14 @@ impl Emitter {
                 // bool stored as i1; treat as unsigned 0/1
                 let pred = if is_max { "ugt" } else { "ult" };
                 self.line(format!("{pick} = icmp {pred} i1 {cur}, {best}"));
+            }
+            Ty::Str => {
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_str_cmp(ptr {cur}, ptr {best})"
+                ));
+                let pred = if is_max { "sgt" } else { "slt" };
+                self.line(format!("{pick} = icmp {pred} i32 {c}, 0"));
             }
             other => unreachable!("min/max list element {other:?}"),
         }

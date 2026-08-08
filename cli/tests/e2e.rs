@@ -1797,7 +1797,7 @@ print(min([\"bb\", \"a\", \"ccc\"], key=lambda s=\"\": len(s), default=\"z\"))
 
 #[test]
 fn min_max_multi_arg_match_python() {
-    // Multi-arg form: min(a, b, c[, key=…]) / max — numeric fold and monomorphic key=.
+    // Multi-arg form: min(a, b, c[, key=…]) / max — numeric/str fold and monomorphic key=.
     let src = "\
 def neg(x: int) -> int:
     return -x
@@ -1807,6 +1807,11 @@ print(min(3, 1, 4, 2))
 print(max(3, 1, 4, 2))
 print(min(1.0, 2.5, 3.0))
 print(max(1.0, 2.5, 3.0))
+# lexicographic str multi-arg (no key)
+print(min(\"bb\", \"a\", \"ccc\"))
+print(max(\"bb\", \"a\", \"ccc\"))
+print(min(\"b\", \"a\"))
+print(max(\"b\", \"a\"))
 # bool multi-arg promotes to int (same as two-arg; not CPython's False/True print)
 print(min(3, 1, 4, key=neg))
 print(max(3, 1, 4, key=neg))
@@ -5124,9 +5129,7 @@ fn incomplete_entry_os_package_does_not_use_stdlib_path() {
 
 #[test]
 fn min_max_iterable_matches_python() {
-    let out = run_program(
-        "minmax_list",
-        "\
+    let src = "\
 print(min([3, 1, 4, 1, 5]))
 print(max([3, 1, 4, 1, 5]))
 print(min([1.5, -2.0, 3.0]))
@@ -5136,21 +5139,24 @@ print(max([False, True]))
 xs: list[int] = [10, -3, 7]
 print(min(xs), max(xs))
 print(min(-3, 2), max([1, 9, 3]))
-",
+print(min([\"bb\", \"a\", \"ccc\"]))
+print(max([\"bb\", \"a\", \"ccc\"]))
+ys: list[str] = []
+print(min(ys, default=\"z\"))
+print(max(ys, default=\"z\"))
+";
+    let out = run_program("minmax_list", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
     );
-    assert_eq!(
-        out,
-        "\
-1
-5
--2.0
-3.0
-False
-True
--3 10
--3 9
-"
-    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
