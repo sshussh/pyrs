@@ -16,7 +16,7 @@
 
 ## Residuals
 
-- Multi-arg `min(a, b, c[, key=…])`
+- Multi-arg `min(a, b, c[, key=…])` — **done in 0.29**
 - `min`/`max` `default=`
 - Builtins as bare key values (`key=len`)
 - Keyed sort materializes a never-freed auxiliary keys list of length `n`

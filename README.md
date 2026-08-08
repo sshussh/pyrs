@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.28.0)
+## The language (v0.29.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.29.0**, not 1.0) until it is ready for
+milestone after this one is **0.30.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
@@ -95,6 +95,9 @@ A statically-typed Python subset:
   desugar with `sorted`; `reverse=` still residual).
   **v0.28:** `sorted(..., reverse=bool)` and `list.sort(reverse=bool)` (stable
   reverse-sort-reverse; works with `key=`; `reverse=` must be `bool`).
+  **v0.29:** multi-arg `min(a, b, c, …)` / `max(…)` (numeric fold with
+  `bool`→`int`→`float` unify) and multi-arg with monomorphic `key=`
+  (`min(a, b[, c…], key=f)`); positionals must share one type when `key=` is used.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -138,8 +141,9 @@ A statically-typed Python subset:
   (short-circuit; `and`/`or` return an operand, not always `bool`, and
   may yield a union when operands differ, e.g. `0 or "x"`), casts
   `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, `min()`/`max()`
-  (two numeric args, or one list: without `key=` only
-  `list[int|float|bool]`; with monomorphic `key=` any `list[T]`),
+  (two-or-more numeric args, or one list: without `key=` only
+  `list[int|float|bool]`; with monomorphic `key=` any `list[T]` or
+  multi-arg homogeneous candidates),
   `sum()` on `list[int]`/`list[float]`, `isinstance(x, T)` /
   `isinstance(x, (T1,T2))` with flow-sensitive narrowing, `any`/`all`,
   `enumerate`/`zip`/`reversed` (materialize to lists when used as values),
@@ -256,12 +260,13 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.28.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.29.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
-two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
-not the int `1`) and does not take `key=`; multi-arg `min(a, b, c[, key=])`
-is residual (use the iterable form); iterable `min`/`max` without
+multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
+`1.0`, not the int `1`; pure `bool` args print as `0`/`1`); multi-arg with
+monomorphic `key=` requires homogeneous positionals (mixed types → compile
+error; use the iterable form or a common type); iterable `min`/`max` without
 `key=` is only for `list[int|float|bool]` (empty list → ValueError like
 CPython); with monomorphic `key=` any `list[T]` is fine; bare builtins as
 key values (`key=len`) need a wrapper lambda/function; `sorted(..., key=)`
@@ -407,4 +412,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.28.0 && git push origin v0.28.0`.
+Release tags: `git tag v0.29.0 && git push origin v0.29.0`.

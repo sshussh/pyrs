@@ -783,7 +783,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `print(a, b, ...)` | any values, any count | space-separated, newline at end |
 | `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
-| `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg; no `key=`; multi-arg `min(a,b,c)` residual) |
+| `min(a, b[, c…])` / `max(…)` | int, float, bool (2+ args) | common numeric type via `bool` → `int` → `float` (ties keep the first arg); optional monomorphic `key=` over homogeneous positionals |
 | `min(xs)` / `max(xs)` | `list[int\|float\|bool]` without `key=`; any `list[T]` with monomorphic `key=` | element type; empty list → `ValueError: … iterable argument is empty`; no `default=`/`reverse=` |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
 | `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=bool)` | without `key=`: `list[int\|float\|bool\|str]`; with monomorphic `key=`: any `list[T]`; `reverse=` is `bool` | new sorted list; stable reverse-sort-reverse; keyed path materializes never-freed keys list; no bare `key=len` |
