@@ -729,6 +729,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_tuple_set(ptr, i64, i64, i32)\n");
         out.push_str("declare i64 @pyrs_tuple_get(ptr, i64)\n");
         out.push_str("declare i32 @pyrs_tuple_eq(ptr, ptr)\n");
+        out.push_str("declare i32 @pyrs_tuple_cmp(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_tuple_contains(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_unpack_check(i64, i64)\n");
         out.push_str("declare void @pyrs_unpack_check_min(i64, i64)\n");
@@ -1115,6 +1116,13 @@ impl Emitter {
                 let pred = if is_max { "sgt" } else { "slt" };
                 self.line(format!("{pick_r} = icmp {pred} i32 {c}, 0"));
             }
+            Ty::Tuple(_) => {
+                let c = self.tmp();
+                // pick right when right is strictly less/greater than left.
+                self.line(format!("{c} = call i32 @pyrs_tuple_cmp(ptr {r}, ptr {l})"));
+                let pred = if is_max { "sgt" } else { "slt" };
+                self.line(format!("{pick_r} = icmp {pred} i32 {c}, 0"));
+            }
             other => unreachable!("min/max on {other:?}"),
         }
         let t = self.tmp();
@@ -1295,6 +1303,14 @@ impl Emitter {
                 let c = self.tmp();
                 self.line(format!(
                     "{c} = call i32 @pyrs_str_cmp(ptr {cur}, ptr {best})"
+                ));
+                let pred = if is_max { "sgt" } else { "slt" };
+                self.line(format!("{pick} = icmp {pred} i32 {c}, 0"));
+            }
+            Ty::Tuple(_) => {
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_tuple_cmp(ptr {cur}, ptr {best})"
                 ));
                 let pred = if is_max { "sgt" } else { "slt" };
                 self.line(format!("{pick} = icmp {pred} i32 {c}, 0"));
@@ -5477,6 +5493,20 @@ impl Emitter {
                     self.line(format!("{t} = xor i1 {eq}, true"));
                     t
                 }
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let c = self.tmp();
+                self.line(format!("{c} = call i32 @pyrs_tuple_cmp(ptr {l}, ptr {r})"));
+                let t = self.tmp();
+                let pred = match op {
+                    BinOp::Lt => "slt",
+                    BinOp::Le => "sle",
+                    BinOp::Gt => "sgt",
+                    BinOp::Ge => "sge",
+                    _ => unreachable!(),
+                };
+                self.line(format!("{t} = icmp {pred} i32 {c}, 0"));
+                t
             }
             other => unreachable!("bad tuple op {other:?}"),
         }

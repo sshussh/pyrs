@@ -3374,6 +3374,8 @@ void pyrs_list_clear(PyrsList *l) {
 
 /* qsort needs a tag; single-threaded compiler runtime is fine */
 static int sort_elem_tag;
+/* Forward: defined with tuple helpers below (used by list_sort for tag 5). */
+int pyrs_tuple_cmp(const PyrsTuple *a, const PyrsTuple *b);
 
 static int cmp_slots_qsort(const void *pa, const void *pb) {
     long long a = *(const long long *)pa;
@@ -3403,6 +3405,8 @@ static int cmp_slots_qsort(const void *pa, const void *pb) {
     }
     case 3:
         return pyrs_str_cmp((const PyrsStr *)a, (const PyrsStr *)b);
+    case TAG_TUPLE:
+        return pyrs_tuple_cmp((const PyrsTuple *)(uintptr_t)a, (const PyrsTuple *)(uintptr_t)b);
     default:
         return 0;
     }
@@ -3765,6 +3769,61 @@ int pyrs_tuple_eq(const PyrsTuple *a, const PyrsTuple *b) {
         }
     }
     return 1;
+}
+
+/* Lexicographic ordering: negative if a < b, 0 if equal, positive if a > b.
+ * Recurses into nested tuples; dies on incomparable element tags. */
+static int slot_ord_cmp(long long a, long long b, int tag);
+
+static int slot_ord_cmp(long long a, long long b, int tag) {
+    switch (tag) {
+    case TAG_INT:
+        return pyrs_int_cmp(a, b);
+    case TAG_FLOAT: {
+        double x, y;
+        memcpy(&x, &a, sizeof x);
+        memcpy(&y, &b, sizeof y);
+        /* Match float binary compares: unordered NaN yields 0 here so neither
+         * side is strictly less (min/max keep the left/first operand). */
+        if (isnan(x) || isnan(y)) {
+            if (isnan(x) && isnan(y)) {
+                return 0;
+            }
+            return 0;
+        }
+        return (x > y) - (x < y);
+    }
+    case TAG_BOOL:
+        return (a > b) - (a < b);
+    case TAG_STR:
+        return pyrs_str_cmp((const PyrsStr *)(uintptr_t)a, (const PyrsStr *)(uintptr_t)b);
+    case TAG_TUPLE:
+        return pyrs_tuple_cmp((const PyrsTuple *)(uintptr_t)a, (const PyrsTuple *)(uintptr_t)b);
+    default:
+        pyrs_die("TypeError: '<' not supported between these types");
+    }
+}
+
+int pyrs_tuple_cmp(const PyrsTuple *a, const PyrsTuple *b) {
+    check_ref(a);
+    check_ref(b);
+    long long n = a->len < b->len ? a->len : b->len;
+    for (long long i = 0; i < n; i++) {
+        if (a->tags[i] != b->tags[i]) {
+            pyrs_die("TypeError: '<' not supported between instances of different types");
+        }
+        int c = slot_ord_cmp(a->data[i], b->data[i], a->tags[i]);
+        if (c != 0) {
+            return c;
+        }
+    }
+    if (a->len < b->len) {
+        return -1;
+    }
+    if (a->len > b->len) {
+        return 1;
+    }
+    return 0;
 }
 
 /* Membership: only compare elements whose tag matches the needle tag. */

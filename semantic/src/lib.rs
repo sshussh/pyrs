@@ -10983,10 +10983,11 @@ fn lower_list_pop(
 fn ensure_sortable_list_elem(elem: ir::Ty, span: Span) -> SResult<()> {
     match elem {
         ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => Ok(()),
+        ir::Ty::Tuple(_) if is_orderable_ty(elem) => Ok(()),
         other => Err(err(
             format!(
                 "sort is only supported for list[int], list[float], list[bool], \
-                 and list[str], found list[{other}]"
+                 list[str], and list of orderable tuples, found list[{other}]"
             ),
             span,
         )),
@@ -19333,15 +19334,19 @@ fn lower_min_max_expr(
     if let Some(key_ast) = key_ast {
         return lower_min_max_list_key(func, arg, elem, key_ast, default_ir, args[0].span, ctx);
     }
-    // No key=: numbers or str (MinList/MaxList), optional default=.
+    // No key=: numbers, str, or orderable tuples (MinList/MaxList), optional default=.
     match elem {
         ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => {
+            lower_min_max_list_plain(func, arg, elem, default_ir, span, ctx)
+        }
+        ir::Ty::Tuple(_) if is_orderable_ty(elem) => {
             lower_min_max_list_plain(func, arg, elem, default_ir, span, ctx)
         }
         other => Err(err(
             format!(
                 "{func}() is only supported for list[int], list[float], \
-                 list[bool], and list[str] without key=; found list[{other}]"
+                 list[bool], list[str], and list of orderable tuples without key=; \
+                 found list[{other}]"
             ),
             args[0].span,
         )),
@@ -19360,8 +19365,12 @@ fn lower_min_max_multi_plain(
     for a in args {
         lowered.push(lower_expr(a, ctx)?);
     }
-    // Homogeneous str: lexicographic Min/Max fold (no numeric promote).
-    if lowered.iter().all(|e| e.ty == ir::Ty::Str) {
+    // Homogeneous str or orderable tuple: lexicographic Min/Max fold.
+    let first_ty = lowered[0].ty;
+    if (first_ty == ir::Ty::Str
+        || matches!(first_ty, ir::Ty::Tuple(_)) && is_orderable_ty(first_ty))
+        && lowered.iter().all(|e| e.ty == first_ty)
+    {
         let mut acc = lowered.remove(0);
         for right in lowered {
             let kind = if func == "min" {
@@ -19375,10 +19384,7 @@ fn lower_min_max_multi_plain(
                     right: Box::new(right),
                 }
             };
-            acc = ir::Expr {
-                ty: ir::Ty::Str,
-                kind,
-            };
+            acc = ir::Expr { ty: first_ty, kind };
         }
         return Ok(acc);
     }
@@ -21327,19 +21333,34 @@ fn lower_contains(
 
 fn lower_tuple_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
     match op {
-        ast::BinOp::Eq | ast::BinOp::NotEq => match (l.ty, r.ty) {
-            (ir::Ty::Tuple(a), ir::Ty::Tuple(b)) if a == b => Ok(ir::Expr {
-                ty: ir::Ty::Bool,
-                kind: ir::ExprKind::Binary {
-                    op: if matches!(op, ast::BinOp::Eq) {
-                        ir::BinOp::Eq
-                    } else {
-                        ir::BinOp::Ne
+        ast::BinOp::Eq
+        | ast::BinOp::NotEq
+        | ast::BinOp::Lt
+        | ast::BinOp::LtEq
+        | ast::BinOp::Gt
+        | ast::BinOp::GtEq => match (l.ty, r.ty) {
+            (ir::Ty::Tuple(a), ir::Ty::Tuple(b)) if a == b => {
+                if !matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq)
+                    && !a.iter().all(|e| is_orderable_ty(*e))
+                {
+                    return Err(err(
+                        format!(
+                            "operator '{op}' is not supported for {0} (element types must be \
+                             orderable: int|float|bool|str|tuple of those)",
+                            l.ty
+                        ),
+                        span,
+                    ));
+                }
+                Ok(ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::Binary {
+                        op: comparison_ir_op(op),
+                        left: Box::new(l),
+                        right: Box::new(r),
                     },
-                    left: Box::new(l),
-                    right: Box::new(r),
-                },
-            }),
+                })
+            }
             (ir::Ty::Tuple(_), ir::Ty::Tuple(_)) => {
                 Err(err(format!("cannot compare {} and {}", l.ty, r.ty), span))
             }
@@ -21352,6 +21373,15 @@ fn lower_tuple_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> S
             format!("operator '{other}' is not supported for tuples yet"),
             span,
         )),
+    }
+}
+
+/// Element types that support lexicographic / numeric ordering (`<` / min / sort).
+fn is_orderable_ty(ty: ir::Ty) -> bool {
+    match ty {
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => true,
+        ir::Ty::Tuple(elems) => elems.iter().all(|e| is_orderable_ty(*e)),
+        _ => false,
     }
 }
 
@@ -21942,6 +21972,44 @@ print(f())
         };
         assert_eq!(value.ty, ir::Ty::Str);
         assert!(matches!(value.kind, ir::ExprKind::Max { .. }));
+    }
+
+    #[test]
+    fn min_multi_arg_tuple_folds() {
+        let m = analyze_ok("a = min((1, 2), (0, 9), (1, 0))\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(value.ty, ir::Ty::Tuple(_)));
+        assert!(matches!(value.kind, ir::ExprKind::Min { .. }));
+    }
+
+    #[test]
+    fn tuple_lt_lowers() {
+        let m = analyze_ok("b = (1, 2) < (0, 9)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Binary {
+                op: ir::BinOp::Lt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sorted_list_of_tuples_ok() {
+        let m = analyze_ok("ys = sorted([(1, \"b\"), (0, \"a\")])\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(value.ty, ir::Ty::List(_)));
     }
 
     #[test]

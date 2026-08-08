@@ -1797,7 +1797,7 @@ print(min([\"bb\", \"a\", \"ccc\"], key=lambda s=\"\": len(s), default=\"z\"))
 
 #[test]
 fn min_max_multi_arg_match_python() {
-    // Multi-arg form: min(a, b, c[, key=…]) / max — numeric/str fold and monomorphic key=.
+    // Multi-arg form: min(a, b, c[, key=…]) / max — numeric/str/tuple fold and monomorphic key=.
     let src = "\
 def neg(x: int) -> int:
     return -x
@@ -1812,6 +1812,11 @@ print(min(\"bb\", \"a\", \"ccc\"))
 print(max(\"bb\", \"a\", \"ccc\"))
 print(min(\"b\", \"a\"))
 print(max(\"b\", \"a\"))
+# lexicographic tuple multi-arg (no key)
+print(min((1, 2), (0, 9), (1, 0)))
+print(max((1, 2), (0, 9), (1, 0)))
+print(min((1, \"b\"), (1, \"a\"), (2, \"c\")))
+print(max((1, \"b\"), (1, \"a\"), (2, \"c\")))
 # bool multi-arg promotes to int (same as two-arg; not CPython's False/True print)
 print(min(3, 1, 4, key=neg))
 print(max(3, 1, 4, key=neg))
@@ -5149,6 +5154,12 @@ print(max([\"bb\", \"a\", \"ccc\"]))
 ys: list[str] = []
 print(min(ys, default=\"z\"))
 print(max(ys, default=\"z\"))
+print(min([(1, 2), (0, 9), (1, 0)]))
+print(max([(1, 2), (0, 9), (1, 0)]))
+print(sorted([(1, \"b\"), (1, \"a\"), (0, \"z\")]))
+print((1, 2) < (0, 9))
+print((1, 2) < (1, 3))
+print((1, 2) <= (1, 2))
 ";
     let out = run_program("minmax_list", src);
     let py = std::process::Command::new("python3")
