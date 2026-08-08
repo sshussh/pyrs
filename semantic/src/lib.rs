@@ -8586,6 +8586,13 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     return Ok(());
                 }
                 if !keywords.is_empty() {
+                    if method == "sort" {
+                        return Err(sort_method_keyword_residual(
+                            base,
+                            keywords[0].name_span,
+                            ctx,
+                        ));
+                    }
                     return Err(err(
                         "keyword arguments are not supported for this method call",
                         keywords[0].name_span,
@@ -14273,6 +14280,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 );
             }
             if !keywords.is_empty() {
+                if method == "sort" {
+                    return Err(sort_method_keyword_residual(
+                        base,
+                        keywords[0].name_span,
+                        ctx,
+                    ));
+                }
                 return Err(err(
                     "keyword arguments are not supported for this method call",
                     keywords[0].name_span,
@@ -17530,8 +17544,8 @@ fn lower_call(
     if kwargs.is_some() {
         return Err(err(format!("'{func}()' does not take **kwargs"), span));
     }
-    // `enumerate(..., start=n)` is the only builtin keyword we accept here.
-    if func != "enumerate"
+    // Builtin keywords we accept: enumerate(start=), sorted/min/max(key=).
+    if !matches!(func, "enumerate" | "sorted" | "min" | "max")
         && let Some(kw) = keywords.first()
     {
         return Err(err(
@@ -17674,65 +17688,7 @@ fn lower_call(
                 })
             }
             "next" => lower_builtin_next(&args, span, ctx),
-            "min" | "max" => {
-                if args.len() == 1 {
-                    // Iterable form: list of numbers (int/float/bool).
-                    let arg = lower_expr(args[0], ctx)?;
-                    let elem = match arg.ty {
-                        ir::Ty::List(e) => *e,
-                        other => {
-                            return Err(err(
-                                format!(
-                                    "{func}() iterable form expects a list of numbers, found {other}"
-                                ),
-                                args[0].span,
-                            ));
-                        }
-                    };
-                    match elem {
-                        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool => {
-                            let kind = if func == "min" {
-                                ir::ExprKind::MinList(Box::new(arg))
-                            } else {
-                                ir::ExprKind::MaxList(Box::new(arg))
-                            };
-                            Ok(ir::Expr { ty: elem, kind })
-                        }
-                        other => Err(err(
-                            format!(
-                                "{func}() is only supported for list[int], list[float], \
-                                 and list[bool], found list[{other}]"
-                            ),
-                            args[0].span,
-                        )),
-                    }
-                } else if args.len() == 2 {
-                    let left = lower_expr(args[0], ctx)?;
-                    let right = lower_expr(args[1], ctx)?;
-                    let (left, right, ty) = unify_numeric(left, right, span, &format!("{func}()"))?;
-                    let kind = if func == "min" {
-                        ir::ExprKind::Min {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                        }
-                    } else {
-                        ir::ExprKind::Max {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                        }
-                    };
-                    Ok(ir::Expr { ty, kind })
-                } else {
-                    Err(err(
-                        format!(
-                            "{func}() takes 1 or 2 arguments ({} given); \
-                             key=/default= are not supported yet",
-                            args.len()
-                        ),
-                        span,
-                    ))
-                }
-            }
+            "min" | "max" => lower_min_max_expr(func, &args, keywords, span, ctx),
             "sum" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -17768,59 +17724,7 @@ fn lower_call(
                     )),
                 }
             }
-            "sorted" => {
-                if args.len() != 1 {
-                    return Err(err(
-                        format!(
-                            "sorted() takes exactly 1 argument ({} given); \
-                             key=/reverse= are not supported yet",
-                            args.len()
-                        ),
-                        span,
-                    ));
-                }
-                let arg = lower_expr(args[0], ctx)?;
-                let elem = match arg.ty {
-                    ir::Ty::List(e) => *e,
-                    other => {
-                        return Err(err(
-                            format!("sorted() expects a list, found {other}"),
-                            args[0].span,
-                        ));
-                    }
-                };
-                ensure_sortable_list_elem(elem, args[0].span)?;
-                // copy via `xs * 1`, sort the copy, yield it
-                let ty = arg.ty;
-                let tmp = ctx.fresh_temp("sorted", ty);
-                let copy = ir::Expr {
-                    ty,
-                    kind: ir::ExprKind::Binary {
-                        op: ir::BinOp::Mul,
-                        left: Box::new(arg),
-                        right: Box::new(int_const(1)),
-                    },
-                };
-                let local = |name: String| ir::Expr {
-                    ty,
-                    kind: ir::ExprKind::Local(name),
-                };
-                Ok(ir::Expr {
-                    ty,
-                    kind: ir::ExprKind::Block {
-                        stmts: vec![
-                            ir::Stmt::Assign {
-                                name: tmp.clone(),
-                                value: copy,
-                            },
-                            ir::Stmt::ListSort {
-                                list: local(tmp.clone()),
-                            },
-                        ],
-                        result: Box::new(local(tmp)),
-                    },
-                })
-            }
+            "sorted" => lower_sorted_expr(&args, keywords, span, ctx),
             "range" => Err(err(
                 "range(...) is only supported as the iterable of a 'for' loop",
                 span,
@@ -18424,6 +18328,830 @@ fn lower_any_all(
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::Local(acc_t),
             }),
+        },
+    })
+}
+
+/// Residual for `.sort(key=…)` / `.sort(reverse=…)`: list-named only when the
+/// receiver is actually a list (user-class `.sort` keeps the generic message).
+fn sort_method_keyword_residual(base: &ast::Expr, kw_span: Span, ctx: &mut FnCtx) -> Diagnostic {
+    match lower_expr(base, ctx) {
+        Ok(base_ir) if matches!(base_ir.ty, ir::Ty::List(_)) => err(
+            "list.sort() keyword arguments (key=/reverse=) are not supported yet",
+            kw_span,
+        ),
+        Ok(_) => err(
+            "keyword arguments are not supported for this method call",
+            kw_span,
+        ),
+        // Prefer a real type/name error on the receiver over a keyword residual.
+        Err(e) => e,
+    }
+}
+
+/// Callable used by `sorted` / `min` / `max` `key=` desugaring.
+enum SortKey {
+    /// First-class closure / lambda (CallClosure).
+    Closure(ir::Expr),
+    /// Module-level free function (direct Call by IR name).
+    Direct {
+        ir_name: String,
+        param_ty: ir::Ty,
+        ret: ir::Ty,
+    },
+}
+
+fn local_expr(name: String, ty: ir::Ty) -> ir::Expr {
+    ir::Expr {
+        ty,
+        kind: ir::ExprKind::Local(name),
+    }
+}
+
+fn const_str(s: &str) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::ConstStr(s.to_string()),
+    }
+}
+
+/// Parse `key=` / reject `reverse=` / other kwargs for sorted/min/max.
+fn take_sort_key_keyword<'a>(
+    keywords: &'a [ast::Keyword],
+    builtin: &str,
+) -> SResult<Option<&'a ast::Expr>> {
+    let mut key = None;
+    for kw in keywords {
+        match kw.name.as_str() {
+            "key" => {
+                if key.is_some() {
+                    return Err(err(
+                        format!("{builtin}() got multiple values for keyword argument 'key'"),
+                        kw.name_span,
+                    ));
+                }
+                key = Some(&kw.value);
+            }
+            "reverse" => {
+                // CPython: only sorted accepts reverse=; min/max do not.
+                if matches!(builtin, "min" | "max") {
+                    return Err(err(
+                        format!("{builtin}() got an unexpected keyword argument 'reverse'"),
+                        kw.name_span,
+                    ));
+                }
+                return Err(err(
+                    "sorted() keyword argument 'reverse=' is not supported yet",
+                    kw.name_span,
+                ));
+            }
+            "default" if matches!(builtin, "min" | "max") => {
+                return Err(err(
+                    format!("{builtin}() keyword argument 'default=' is not supported yet"),
+                    kw.name_span,
+                ));
+            }
+            other => {
+                return Err(err(
+                    format!("{builtin}() got an unexpected keyword argument '{other}'"),
+                    kw.name_span,
+                ));
+            }
+        }
+    }
+    Ok(key)
+}
+
+/// Type-level coerce check without allocating IR temps (discards the result).
+fn ensure_key_arg_types(elem_ty: ir::Ty, param_ty: ir::Ty, span: Span) -> SResult<()> {
+    let dummy = ir::Expr {
+        ty: elem_ty,
+        kind: ir::ExprKind::Local(".key.probe".into()),
+    };
+    let _ = coerce(dummy, param_ty, span, "key= argument")?;
+    Ok(())
+}
+
+/// Resolve `key=` to a monomorphic `T → K` callable; `K` must be sortable.
+fn resolve_sort_key(
+    key_ast: &ast::Expr,
+    elem_ty: ir::Ty,
+    ctx: &mut FnCtx,
+) -> SResult<(SortKey, ir::Ty)> {
+    // Bare name of a free / nested / imported function: free functions are not
+    // first-class values in this subset, so special-case them before lower_expr.
+    if let ast::ExprKind::Name(name) = &key_ast.kind
+        && !ctx.locals.contains_key(name)
+        && !ctx.cell_locals.contains_key(name)
+    {
+        if let Some(info) = ctx.nested_funcs.get(name).cloned() {
+            let clos = make_closure_expr(&info, key_ast.span, ctx)?;
+            return validate_sort_key_closure(clos, elem_ty, key_ast.span);
+        }
+        if let Some(sig) = ctx.funcs().get(name).cloned() {
+            return validate_sort_key_direct(ctx.own_func(name), &sig, elem_ty, key_ast.span);
+        }
+        // Imported free function: use Direct Call with foreign IR name.
+        if let Some(ImportBinding::Symbol { module, name: real }) = ctx
+            .local_imports
+            .get(name)
+            .or_else(|| ctx.mctx.imports.get(name))
+            .cloned()
+        {
+            if let Some(data) = ctx.mctx.mods.get(&module) {
+                let (om, on) = data
+                    .reexports
+                    .get(&real)
+                    .cloned()
+                    .unwrap_or_else(|| (module.clone(), real.clone()));
+                if let Some(sig) = data.funcs.get(&real).cloned().or_else(|| {
+                    ctx.mctx
+                        .mods
+                        .get(&om)
+                        .and_then(|d| d.funcs.get(&on).cloned())
+                }) {
+                    return validate_sort_key_direct(qual(&om, &on), &sig, elem_ty, key_ast.span);
+                }
+            }
+            return Err(err(
+                format!(
+                    "key= cannot use imported name '{name}' as a free-function key \
+                     (module '{module}' has no function '{real}'); use a same-module \
+                     function, nested def, or lambda"
+                ),
+                key_ast.span,
+            ));
+        }
+        // Builtins / cast names are not first-class values.
+        if BUILTINS.contains(&name.as_str())
+            || matches!(
+                name.as_str(),
+                "int" | "float" | "bool" | "str" | "list" | "dict" | "tuple"
+            )
+        {
+            return Err(err(
+                format!(
+                    "key= cannot use builtin '{name}' as a value; wrap it in a free \
+                     function or lambda (e.g. lambda x=0: {name}(x))"
+                ),
+                key_ast.span,
+            ));
+        }
+    }
+    let key_val = lower_expr(key_ast, ctx)?;
+    match key_val.ty {
+        ir::Ty::Closure { .. } => validate_sort_key_closure(key_val, elem_ty, key_ast.span),
+        other => Err(err(
+            format!(
+                "key= must be a monomorphic callable (lambda / nested function / \
+                 free function), found {other}"
+            ),
+            key_ast.span,
+        )),
+    }
+}
+
+fn validate_sort_key_direct(
+    ir_name: String,
+    sig: &FuncSig,
+    elem_ty: ir::Ty,
+    span: Span,
+) -> SResult<(SortKey, ir::Ty)> {
+    if sig.vararg.is_some() || sig.kwarg.is_some() {
+        return Err(err(
+            "key= function must take exactly one positional parameter \
+             (no *args/**kwargs)",
+            span,
+        ));
+    }
+    if sig.params.len() != 1 {
+        return Err(err(
+            format!(
+                "key= function must take exactly one argument (takes {})",
+                sig.params.len()
+            ),
+            span,
+        ));
+    }
+    let param_ty = sig.params[0].ty;
+    ensure_key_arg_types(elem_ty, param_ty, span)?;
+    let ret = sig.ret;
+    if !matches!(
+        ret,
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str
+    ) {
+        return Err(err(
+            format!("key= return type must be sortable (int|float|bool|str), found {ret}"),
+            span,
+        ));
+    }
+    Ok((
+        SortKey::Direct {
+            ir_name,
+            param_ty,
+            ret,
+        },
+        ret,
+    ))
+}
+
+fn validate_sort_key_closure(
+    clos: ir::Expr,
+    elem_ty: ir::Ty,
+    span: Span,
+) -> SResult<(SortKey, ir::Ty)> {
+    let ir::Ty::Closure { params, ret, .. } = clos.ty else {
+        return Err(err("internal: expected closure key", span));
+    };
+    if params.len() != 1 {
+        return Err(err(
+            format!(
+                "key= callable must take exactly one argument (takes {})",
+                params.len()
+            ),
+            span,
+        ));
+    }
+    ensure_key_arg_types(elem_ty, params[0], span)?;
+    let key_ty = *ret;
+    if !matches!(
+        key_ty,
+        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str
+    ) {
+        return Err(err(
+            format!("key= return type must be sortable (int|float|bool|str), found {key_ty}"),
+            span,
+        ));
+    }
+    Ok((SortKey::Closure(clos), key_ty))
+}
+
+fn call_sort_key(key: &SortKey, arg: ir::Expr, arg_span: Span) -> SResult<ir::Expr> {
+    match key {
+        SortKey::Direct {
+            ir_name,
+            param_ty,
+            ret,
+        } => {
+            let arg = coerce(arg, *param_ty, arg_span, "key= argument")?;
+            Ok(ir::Expr {
+                ty: *ret,
+                kind: ir::ExprKind::Call {
+                    func: ir_name.clone(),
+                    args: vec![arg],
+                },
+            })
+        }
+        SortKey::Closure(clos) => {
+            let ir::Ty::Closure {
+                params,
+                ret,
+                capture_tys,
+                func,
+            } = clos.ty
+            else {
+                return Err(err("internal: expected closure key", arg_span));
+            };
+            let arg = coerce(arg, params[0], arg_span, "key= argument")?;
+            Ok(ir::Expr {
+                ty: *ret,
+                kind: ir::ExprKind::CallClosure {
+                    closure: Box::new(clos.clone()),
+                    args: vec![arg],
+                    capture_tys: capture_tys.to_vec(),
+                    func: func.to_string(),
+                },
+            })
+        }
+    }
+}
+
+/// Compare two keys of the same sortable type with `<` (for min) or `>` (for max/sort).
+fn key_cmp(op: ir::BinOp, left: ir::Expr, right: ir::Expr) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+    }
+}
+
+fn lower_sorted_expr(
+    args: &[&ast::Expr],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let key_ast = take_sort_key_keyword(keywords, "sorted")?;
+    if args.len() != 1 {
+        return Err(err(
+            format!(
+                "sorted() takes exactly 1 positional argument ({} given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let arg = lower_expr(args[0], ctx)?;
+    let elem = match arg.ty {
+        ir::Ty::List(e) => *e,
+        other => {
+            return Err(err(
+                format!("sorted() expects a list, found {other}"),
+                args[0].span,
+            ));
+        }
+    };
+    let list_ty = arg.ty;
+
+    // No key=: existing path — element itself must be sortable.
+    let Some(key_ast) = key_ast else {
+        ensure_sortable_list_elem(elem, args[0].span)?;
+        let tmp = ctx.fresh_temp("sorted", list_ty);
+        let copy = ir::Expr {
+            ty: list_ty,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Mul,
+                left: Box::new(arg),
+                right: Box::new(int_const(1)),
+            },
+        };
+        return Ok(ir::Expr {
+            ty: list_ty,
+            kind: ir::ExprKind::Block {
+                stmts: vec![
+                    ir::Stmt::Assign {
+                        name: tmp.clone(),
+                        value: copy,
+                    },
+                    ir::Stmt::ListSort {
+                        list: local_expr(tmp.clone(), list_ty),
+                    },
+                ],
+                result: Box::new(local_expr(tmp, list_ty)),
+            },
+        });
+    };
+
+    // key= path: decorate with keys once, then stable insertion-sort both lists.
+    let (key, key_ty) = resolve_sort_key(key_ast, elem, ctx)?;
+    // Bind key callable once (CPython evaluates `key` once).
+    let (key, mut key_bind) = bind_sort_key(key, ctx);
+
+    let keys_ty = ir::list_of(key_ty);
+    let out_t = ctx.fresh_temp("sorted", list_ty);
+    let keys_t = ctx.fresh_temp("sorted.keys", keys_ty);
+    let n_t = ctx.fresh_temp("sorted.n", ir::Ty::Int);
+    let i_t = ctx.fresh_temp("sorted.i", ir::Ty::Int);
+    let j_t = ctx.fresh_temp("sorted.j", ir::Ty::Int);
+    let cur_t = ctx.fresh_temp("sorted.cur", elem);
+    let cur_k_t = ctx.fresh_temp("sorted.curk", key_ty);
+
+    let out = local_expr(out_t.clone(), list_ty);
+    let keys = local_expr(keys_t.clone(), keys_ty);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    let j = local_expr(j_t.clone(), ir::Ty::Int);
+
+    let mut stmts = Vec::new();
+    stmts.append(&mut key_bind);
+    // Param/ret compatibility already checked in resolve_sort_key.
+    stmts.extend([
+        // out = arg * 1
+        ir::Stmt::Assign {
+            name: out_t.clone(),
+            value: ir::Expr {
+                ty: list_ty,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Mul,
+                    left: Box::new(arg),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+        // n = len(out)
+        ir::Stmt::Assign {
+            name: n_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(out.clone())),
+            },
+        },
+        // keys = ListNew(n)
+        ir::Stmt::Assign {
+            name: keys_t.clone(),
+            value: ir::Expr {
+                ty: keys_ty,
+                kind: ir::ExprKind::ListNew {
+                    cap: Box::new(n.clone()),
+                },
+            },
+        },
+        // i = 0
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(0),
+        },
+    ]);
+
+    // while i < n: keys.append(key(out[i])); i += 1
+    // Capacity is n from ListNew — use unchecked appends (comprehension style).
+    let fill_cond = key_cmp(ir::BinOp::Lt, i.clone(), n.clone());
+    let elem_i = ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Index {
+            base: Box::new(out.clone()),
+            index: Box::new(i.clone()),
+        },
+    };
+    let keyed = call_sort_key(&key, elem_i, key_ast.span)?;
+    let fill_body = vec![
+        ir::Stmt::ListAppendUnchecked {
+            list: keys.clone(),
+            value: keyed,
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(i.clone()),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+    ];
+    stmts.push(ir::Stmt::While {
+        cond: fill_cond,
+        body: fill_body,
+        step: vec![],
+    });
+
+    // Insertion sort (stable): i from 1..n
+    stmts.push(ir::Stmt::Assign {
+        name: i_t.clone(),
+        value: int_const(1),
+    });
+    let sort_cond = key_cmp(ir::BinOp::Lt, i.clone(), n.clone());
+    let cur_load = ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Index {
+            base: Box::new(out.clone()),
+            index: Box::new(i.clone()),
+        },
+    };
+    let cur_key_load = ir::Expr {
+        ty: key_ty,
+        kind: ir::ExprKind::Index {
+            base: Box::new(keys.clone()),
+            index: Box::new(i.clone()),
+        },
+    };
+    // inner: while j > 0 and keys[j-1] > cur_key
+    let j_gt0 = key_cmp(ir::BinOp::Gt, j.clone(), int_const(0));
+    let j_m1 = ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Binary {
+            op: ir::BinOp::Sub,
+            left: Box::new(j.clone()),
+            right: Box::new(int_const(1)),
+        },
+    };
+    let keys_jm1 = ir::Expr {
+        ty: key_ty,
+        kind: ir::ExprKind::Index {
+            base: Box::new(keys.clone()),
+            index: Box::new(j_m1.clone()),
+        },
+    };
+    let key_gt = key_cmp(
+        ir::BinOp::Gt,
+        keys_jm1.clone(),
+        local_expr(cur_k_t.clone(), key_ty),
+    );
+    let shift_cond = bool_and(j_gt0, key_gt);
+    let out_jm1 = ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Index {
+            base: Box::new(out.clone()),
+            index: Box::new(j_m1.clone()),
+        },
+    };
+    let shift_body = vec![
+        ir::Stmt::IndexAssign {
+            base: out.clone(),
+            index: j.clone(),
+            value: out_jm1,
+        },
+        ir::Stmt::IndexAssign {
+            base: keys.clone(),
+            index: j.clone(),
+            value: keys_jm1,
+        },
+        ir::Stmt::Assign {
+            name: j_t.clone(),
+            value: j_m1,
+        },
+    ];
+    let outer_body = vec![
+        ir::Stmt::Assign {
+            name: cur_t.clone(),
+            value: cur_load,
+        },
+        ir::Stmt::Assign {
+            name: cur_k_t.clone(),
+            value: cur_key_load,
+        },
+        ir::Stmt::Assign {
+            name: j_t.clone(),
+            value: i.clone(),
+        },
+        ir::Stmt::While {
+            cond: shift_cond,
+            body: shift_body,
+            step: vec![],
+        },
+        ir::Stmt::IndexAssign {
+            base: out.clone(),
+            index: j.clone(),
+            value: local_expr(cur_t, elem),
+        },
+        ir::Stmt::IndexAssign {
+            base: keys.clone(),
+            index: j,
+            value: local_expr(cur_k_t, key_ty),
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(i),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+    ];
+    stmts.push(ir::Stmt::While {
+        cond: sort_cond,
+        body: outer_body,
+        step: vec![],
+    });
+
+    Ok(ir::Expr {
+        ty: list_ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(out),
+        },
+    })
+}
+
+fn lower_min_max_expr(
+    func: &str,
+    args: &[&ast::Expr],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let key_ast = take_sort_key_keyword(keywords, func)?;
+    if args.len() == 1 {
+        let arg = lower_expr(args[0], ctx)?;
+        let elem = match arg.ty {
+            ir::Ty::List(e) => *e,
+            other => {
+                return Err(err(
+                    format!("{func}() iterable form expects a list, found {other}"),
+                    args[0].span,
+                ));
+            }
+        };
+        if let Some(key_ast) = key_ast {
+            return lower_min_max_list_key(func, arg, elem, key_ast, args[0].span, ctx);
+        }
+        // No key=: numbers only (existing IR MinList/MaxList).
+        match elem {
+            ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool => {
+                let kind = if func == "min" {
+                    ir::ExprKind::MinList(Box::new(arg))
+                } else {
+                    ir::ExprKind::MaxList(Box::new(arg))
+                };
+                Ok(ir::Expr { ty: elem, kind })
+            }
+            other => Err(err(
+                format!(
+                    "{func}() is only supported for list[int], list[float], \
+                     and list[bool] without key=; found list[{other}]"
+                ),
+                args[0].span,
+            )),
+        }
+    } else if args.len() == 2 {
+        if key_ast.is_some() {
+            return Err(err(
+                format!(
+                    "{func}() two-argument form does not take key= \
+                     (use the iterable form: {func}(xs, key=...))"
+                ),
+                span,
+            ));
+        }
+        let left = lower_expr(args[0], ctx)?;
+        let right = lower_expr(args[1], ctx)?;
+        let (left, right, ty) = unify_numeric(left, right, span, &format!("{func}()"))?;
+        let kind = if func == "min" {
+            ir::ExprKind::Min {
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        } else {
+            ir::ExprKind::Max {
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        };
+        Ok(ir::Expr { ty, kind })
+    } else if key_ast.is_some() {
+        Err(err(
+            format!(
+                "{func}() multi-arg form with key= is not supported yet \
+                 (use the iterable form: {func}(xs, key=...)); {} arguments given",
+                args.len()
+            ),
+            span,
+        ))
+    } else {
+        Err(err(
+            format!("{func}() takes 1 or 2 arguments ({} given)", args.len()),
+            span,
+        ))
+    }
+}
+
+/// Bind a closure key into a local so MakeClosure runs once.
+fn bind_sort_key(key: SortKey, ctx: &mut FnCtx) -> (SortKey, Vec<ir::Stmt>) {
+    match key {
+        SortKey::Closure(clos) => {
+            let ty = clos.ty;
+            let name = ctx.fresh_temp("key.fn", ty);
+            let stmts = vec![ir::Stmt::Assign {
+                name: name.clone(),
+                value: clos,
+            }];
+            (SortKey::Closure(local_expr(name, ty)), stmts)
+        }
+        other => (other, vec![]),
+    }
+}
+
+/// `min(xs, key=f)` / `max(xs, key=f)` — linear scan comparing `f(x)`.
+fn lower_min_max_list_key(
+    func: &str,
+    arg: ir::Expr,
+    elem: ir::Ty,
+    key_ast: &ast::Expr,
+    _arg_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let list_ty = arg.ty;
+    let (key, key_ty) = resolve_sort_key(key_ast, elem, ctx)?;
+    let (key, mut key_bind) = bind_sort_key(key, ctx);
+    // Param/ret compatibility already checked in resolve_sort_key.
+
+    let xs_t = ctx.fresh_temp("mm.xs", list_ty);
+    let n_t = ctx.fresh_temp("mm.n", ir::Ty::Int);
+    let i_t = ctx.fresh_temp("mm.i", ir::Ty::Int);
+    let best_t = ctx.fresh_temp("mm.best", elem);
+    let best_k_t = ctx.fresh_temp("mm.bestk", key_ty);
+    let x_t = ctx.fresh_temp("mm.x", elem);
+    let k_t = ctx.fresh_temp("mm.k", key_ty);
+
+    let xs = local_expr(xs_t.clone(), list_ty);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+
+    let empty_msg = if func == "min" {
+        "min() iterable argument is empty"
+    } else {
+        "max() iterable argument is empty"
+    };
+
+    let mut stmts = Vec::new();
+    stmts.append(&mut key_bind);
+    stmts.extend([
+        ir::Stmt::Assign {
+            name: xs_t.clone(),
+            value: arg,
+        },
+        ir::Stmt::Assign {
+            name: n_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(xs.clone())),
+            },
+        },
+        // if n == 0: raise ValueError
+        ir::Stmt::If {
+            branches: vec![(
+                key_cmp(ir::BinOp::Eq, n.clone(), int_const(0)),
+                vec![ir::Stmt::Raise {
+                    exc: ir::ExcType::ValueError,
+                    message: const_str(empty_msg),
+                }],
+            )],
+            orelse: vec![],
+        },
+        // best = xs[0]; best_k = key(best)
+        ir::Stmt::Assign {
+            name: best_t.clone(),
+            value: ir::Expr {
+                ty: elem,
+                kind: ir::ExprKind::Index {
+                    base: Box::new(xs.clone()),
+                    index: Box::new(int_const(0)),
+                },
+            },
+        },
+        ir::Stmt::Assign {
+            name: best_k_t.clone(),
+            value: call_sort_key(&key, local_expr(best_t.clone(), elem), key_ast.span)?,
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(1),
+        },
+    ]);
+
+    // while i < n: x = xs[i]; k = key(x); if k < best_k (or > for max): update
+    let loop_cond = key_cmp(ir::BinOp::Lt, i.clone(), n);
+    let x_load = ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Index {
+            base: Box::new(xs),
+            index: Box::new(i.clone()),
+        },
+    };
+    let cmp_op = if func == "min" {
+        ir::BinOp::Lt
+    } else {
+        ir::BinOp::Gt
+    };
+    let better = key_cmp(
+        cmp_op,
+        local_expr(k_t.clone(), key_ty),
+        local_expr(best_k_t.clone(), key_ty),
+    );
+    let update = vec![
+        ir::Stmt::Assign {
+            name: best_t.clone(),
+            value: local_expr(x_t.clone(), elem),
+        },
+        ir::Stmt::Assign {
+            name: best_k_t.clone(),
+            value: local_expr(k_t.clone(), key_ty),
+        },
+    ];
+    let body = vec![
+        ir::Stmt::Assign {
+            name: x_t.clone(),
+            value: x_load,
+        },
+        ir::Stmt::Assign {
+            name: k_t,
+            value: call_sort_key(&key, local_expr(x_t, elem), key_ast.span)?,
+        },
+        ir::Stmt::If {
+            branches: vec![(better, update)],
+            orelse: vec![],
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(i),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+    ];
+    stmts.push(ir::Stmt::While {
+        cond: loop_cond,
+        body,
+        step: vec![],
+    });
+
+    Ok(ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(best_t, elem)),
         },
     })
 }
@@ -20832,6 +21560,103 @@ print(f(B()))
         };
         assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
         assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn sorted_with_key_desugars_to_block_with_whiles() {
+        let m = analyze_ok(
+            "\
+def k(x: int) -> int:
+    return -x
+ys = sorted([3, 1, 2], key=k)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!("expected GlobalAssign, got {:?}", entry.body[0]);
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("expected Block");
+        };
+        let while_count = stmts
+            .iter()
+            .filter(|s| matches!(s, ir::Stmt::While { .. }))
+            .count();
+        assert!(
+            while_count >= 2,
+            "expected fill + insertion-sort Whiles, stmts={stmts:?}"
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(
+                s,
+                ir::Stmt::While {
+                    body,
+                    ..
+                } if body.iter().any(|b| matches!(b, ir::Stmt::ListAppendUnchecked { .. }))
+            )),
+            "expected ListAppendUnchecked in key-fill loop"
+        );
+    }
+
+    #[test]
+    fn min_with_key_desugars_to_block_with_raise_on_empty() {
+        let m = analyze_ok(
+            "\
+def k(x: int) -> int:
+    return x
+v = min([3, 1, 2], key=k)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("expected Block");
+        };
+        assert!(
+            stmts.iter().any(|s| matches!(
+                s,
+                ir::Stmt::If {
+                    branches,
+                    ..
+                } if branches.iter().any(|(_, b)| b
+                    .iter()
+                    .any(|st| matches!(st, ir::Stmt::Raise { exc: ir::ExcType::ValueError, .. })))
+            )),
+            "expected empty-list Raise ValueError, stmts={stmts:?}"
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(s, ir::Stmt::While { .. })),
+            "expected scan While"
+        );
+    }
+
+    #[test]
+    fn key_builtin_len_is_compile_error() {
+        let e = analyze_err("print(sorted([\"a\", \"bb\"], key=len))\n");
+        assert!(
+            e.message.contains("builtin 'len'") && e.message.contains("key="),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn min_three_args_message_omits_key_when_absent() {
+        let e = analyze_err("print(min(1, 2, 3))\n");
+        assert!(
+            e.message.contains("takes 1 or 2 arguments") && e.message.contains("3 given"),
+            "{}",
+            e.message
+        );
+        assert!(
+            !e.message.contains("key="),
+            "should not mention key= when none was passed: {}",
+            e.message
+        );
     }
 
     #[test]

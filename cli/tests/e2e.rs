@@ -1617,6 +1617,242 @@ print(a, b)
 }
 
 #[test]
+fn sorted_min_max_key_match_python() {
+    // key= accepts free functions, nested defs, and monomorphic lambdas (param via default).
+    // Capture expected stdout from CPython — never invent.
+    let src = "\
+def neg(x: int) -> int:
+    return -x
+def k0(t: tuple[int, str]) -> int:
+    return t[0]
+def with_nested(xs: list[int]) -> list[int]:
+    def neg2(x: int) -> int:
+        return -x
+    return sorted(xs, key=neg2)
+print(sorted([3, 1, 2], key=neg))
+print(sorted([\"bb\", \"a\", \"ccc\"], key=lambda s=\"\": len(s)))
+xs: list[tuple[int, str]] = [(1, \"b\"), (1, \"a\"), (2, \"c\")]
+print(sorted(xs, key=k0))
+print(min([3, 1, 2], key=neg))
+print(max([3, 1, 2], key=neg))
+print(min([\"bb\", \"a\", \"ccc\"], key=lambda s=\"\": len(s)))
+print(max([\"bb\", \"a\", \"ccc\"], key=lambda s=\"\": len(s)))
+print(min(xs, key=k0))
+print(max(xs, key=k0))
+print(with_nested([3, 1, 2]))
+print(sorted([], key=neg))
+";
+    let out = run_program("sorted_key", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn sorted_key_imported_free_function_match_python() {
+    // Cross-module free function as key= (ImportBinding → Direct Call).
+    let out = run_project(
+        "sorted_key_import",
+        &[
+            ("keys.py", "def neg(x: int) -> int:\n    return -x\n"),
+            (
+                "main.py",
+                "from keys import neg\nprint(sorted([3, 1, 2], key=neg))\nprint(min([3, 1, 2], key=neg))\nprint(max([3, 1, 2], key=neg))\n",
+            ),
+        ],
+        "main.py",
+    );
+    let py_src = "\
+def neg(x: int) -> int:
+    return -x
+print(sorted([3, 1, 2], key=neg))
+print(min([3, 1, 2], key=neg))
+print(max([3, 1, 2], key=neg))
+";
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(py_src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn min_max_empty_with_key_traps() {
+    let (code, err) = run_program_expect_fail(
+        "min_empty_key",
+        "\
+def id(x: int) -> int:
+    return x
+xs: list[int] = []
+print(min(xs, key=id))
+",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("min() iterable argument is empty"),
+        "stderr: {err}"
+    );
+    let (code, err) = run_program_expect_fail(
+        "max_empty_key",
+        "\
+def id(x: int) -> int:
+    return x
+xs: list[int] = []
+print(max(xs, key=id))
+",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("max() iterable argument is empty"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn sorted_min_max_key_negatives() {
+    let (_, stderr) =
+        run_program_expect_fail("sorted_rev", "print(sorted([1, 2], reverse=True))\n");
+    assert!(
+        stderr.contains("reverse=") && stderr.contains("not supported"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "min_twoarg_key",
+        "def id(x: int) -> int:\n    return x\nprint(min(1, 2, key=id))\n",
+    );
+    assert!(
+        stderr.contains("two-argument form") && stderr.contains("key="),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "max_twoarg_key",
+        "def id(x: int) -> int:\n    return x\nprint(max(1, 2, key=id))\n",
+    );
+    assert!(
+        stderr.contains("two-argument form") && stderr.contains("key="),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("min_reverse", "print(min([1, 2], reverse=True))\n");
+    assert!(
+        stderr.contains("unexpected keyword argument 'reverse'"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("max_reverse", "print(max([1, 2], reverse=True))\n");
+    assert!(
+        stderr.contains("unexpected keyword argument 'reverse'"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "min_default",
+        "def id(x: int) -> int:\n    return x\nprint(min([1], key=id, default=0))\n",
+    );
+    assert!(
+        stderr.contains("default=") && stderr.contains("not supported"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) =
+        run_program_expect_fail("list_sort_key", "xs = [1, 2]\nxs.sort(key=lambda x=0: x)\n");
+    assert!(
+        stderr.contains("list.sort()")
+            && stderr.contains("key=")
+            && stderr.contains("not supported"),
+        "stderr={stderr}"
+    );
+    // Monomorphic key failures
+    let (_, stderr) = run_program_expect_fail(
+        "key_bad_ret",
+        "\
+def bad(x: int) -> list[int]:
+    return [x]
+print(sorted([1, 2], key=bad))
+",
+    );
+    assert!(
+        stderr.contains("key= return type must be sortable"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "key_param_mismatch",
+        "\
+def as_str(x: str) -> int:
+    return len(x)
+print(sorted([1, 2], key=as_str))
+",
+    );
+    assert!(
+        stderr.contains("key= argument") && stderr.contains("type mismatch"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("key_noncallable", "print(sorted([1, 2], key=1))\n");
+    assert!(
+        stderr.contains("key= must be a monomorphic callable"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "min_multiarg_key",
+        "def id(x: int) -> int:\n    return x\nprint(min(1, 2, 3, key=id))\n",
+    );
+    assert!(
+        stderr.contains("multi-arg") && stderr.contains("key="),
+        "stderr={stderr}"
+    );
+    // Non-list receiver: generic method-kwargs residual (not list.sort).
+    let (_, stderr) = run_program_expect_fail(
+        "class_sort_key",
+        "\
+class C:
+    def sort(self) -> int:
+        return 0
+C().sort(key=1)
+",
+    );
+    assert!(
+        stderr.contains("keyword arguments are not supported for this method call"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("list.sort()"),
+        "non-list .sort must not claim list residual: {stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "key_wrong_arity",
+        "\
+def two(a: int, b: int) -> int:
+    return a + b
+print(sorted([1, 2], key=two))
+",
+    );
+    assert!(stderr.contains("exactly one argument"), "stderr={stderr}");
+    let (_, stderr) = run_program_expect_fail(
+        "key_builtin_len",
+        "print(sorted([\"a\", \"bb\"], key=len))\n",
+    );
+    assert!(
+        stderr.contains("builtin 'len'") && stderr.contains("key="),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("min_three_args", "print(min(1, 2, 3))\n");
+    assert!(
+        stderr.contains("takes 1 or 2 arguments") && stderr.contains("3 given"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn list_eq_ne_match_python() {
     let out = run_program(
         "listeq",
@@ -10928,12 +11164,7 @@ fn v024_list_extend_errors() {
 
 #[test]
 fn v024_deferred_negatives() {
-    let (_, stderr) =
-        run_program_expect_fail("sorted_key", "print(sorted([1, 2], key=lambda x: x))\n");
-    assert!(
-        stderr.contains("'sorted()' does not take keyword arguments"),
-        "stderr={stderr}"
-    );
+    // sorted reverse= covered by sorted_min_max_key_negatives; keep other residuals.
     let (_, stderr) = run_program_expect_fail(
         "two_arg_super",
         "class A:\n    def m(self) -> int:\n        return 1\nclass B(A):\n    def m(self) -> int:\n        return super(B, self).m()\nprint(B().m())\n",
