@@ -527,9 +527,18 @@ m.append(["a", "b"])
 List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
 `index(v)`, `clear()`, `sort()`. `insert` clamps the index like CPython;
 `remove` / `index` trap with `ValueError` when the value is missing.
-`sort()` is in-place (statement only); `sorted(xs)` returns a new sorted
-copy. Supported element types: `int`, `float`, `bool`, `str` (no
-`key=`/`reverse=` yet). Float NaN sorts last (stable total order).
+`sort()` is in-place (statement only; no `key=`/`reverse=` yet);
+`sorted(xs)` returns a new sorted copy. Without `key=`, element types
+are `int`, `float`, `bool`, `str`; Float NaN sorts last on that path
+(stable total order via runtime `ListSort`). With monomorphic `key=f`
+(`T → K`, `K` in `int|float|bool|str` — same-module free function,
+imported free function, nested function, or lambda with typed/defaulted
+params), any `list[T]` is accepted; keys are evaluated once into an
+auxiliary never-freed `list[K]` of length `n`, then a stable insertion
+sort rearranges both lists. Float keys use ordinary `<`/`>` compares
+(not the no-key NaN-last order). `reverse=` is not supported yet.
+Bare builtins as key values (`key=len`) are not first-class — wrap in a
+function or lambda.
 
 List `+` concatenates (same element type); `*` repeats with an int count
 (`n <= 0` yields `[]`). Both produce a new list (shallow copy of slots).
@@ -774,10 +783,10 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `print(a, b, ...)` | any values, any count | space-separated, newline at end |
 | `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
-| `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg) |
-| `min(xs)` / `max(xs)` | `list[int\|float\|bool]` | element type; empty list → `ValueError: … iterable argument is empty` |
+| `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg; no `key=`; multi-arg `min(a,b,c)` residual) |
+| `min(xs)` / `max(xs)` | `list[int\|float\|bool]` without `key=`; any `list[T]` with monomorphic `key=` | element type; empty list → `ValueError: … iterable argument is empty`; no `default=`/`reverse=` |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
-| `sorted(xs)` | `list[int\|float\|bool\|str]` | new sorted list (no `key=`/`reverse=`) |
+| `sorted(xs)` / `sorted(xs, key=f)` | without `key=`: `list[int\|float\|bool\|str]`; with monomorphic `key=`: any `list[T]` | new sorted list; keyed path materializes never-freed keys list; no `reverse=`; `list.sort(key=)` residual; no bare `key=len` |
 | `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `set()` | empty only; needs annotation | `s: set[int] = set()` |
@@ -1182,7 +1191,7 @@ character, bad indentation), `parse` (syntax), `semantic` (names, types,
 return paths), `codegen` (internal — you should never see one; it means a
 compiler bug). Unsupported Python features produce parse/semantic errors
 that name the feature: `two-arg super() is not supported yet`,
-`key= is not supported yet`, and so on.
+`reverse= is not supported yet`, and so on.
 Compilation stops at the
 first error.
 

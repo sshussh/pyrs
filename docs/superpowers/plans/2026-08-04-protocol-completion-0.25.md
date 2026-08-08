@@ -20,7 +20,7 @@
 
 ## Deferred (still residual)
 
-- `sorted` / `min` / `max` with `key=` (and `reverse=`)
+- `sorted` / `min` / `max` with `key=` → **shipped in 0.26** (`reverse=` still residual; see `2026-08-08-sorted-min-max-key-0.26.md`)
 - Full CPython `__exit__` type/traceback objects
 - Multi-item `with`
 - GC / multi-inherit / new stdlib modules
