@@ -22,7 +22,7 @@
 
 ## Residuals
 
-- `min`/`max` `default=`
+- `min`/`max` `default=` — **done in 0.30**
 - Builtins as bare key values (`key=len`)
 - Keyed sort materializes a never-freed auxiliary keys list of length `n`
 - Truthy non-bool `reverse=` on `sorted` / `list.sort`
