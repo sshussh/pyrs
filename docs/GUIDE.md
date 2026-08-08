@@ -527,18 +527,18 @@ m.append(["a", "b"])
 List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
 `index(v)`, `clear()`, `sort()`. `insert` clamps the index like CPython;
 `remove` / `index` trap with `ValueError` when the value is missing.
-`sort()` is in-place (statement only; no `key=`/`reverse=` yet);
-`sorted(xs)` returns a new sorted copy. Without `key=`, element types
-are `int`, `float`, `bool`, `str`; Float NaN sorts last on that path
-(stable total order via runtime `ListSort`). With monomorphic `key=f`
-(`T → K`, `K` in `int|float|bool|str` — same-module free function,
-imported free function, nested function, or lambda with typed/defaulted
-params), any `list[T]` is accepted; keys are evaluated once into an
-auxiliary never-freed `list[K]` of length `n`, then a stable insertion
-sort rearranges both lists. Float keys use ordinary `<`/`>` compares
-(not the no-key NaN-last order). `reverse=` is not supported yet.
-Bare builtins as key values (`key=len`) are not first-class — wrap in a
-function or lambda.
+`sort()` is in-place (statement only); `sorted(xs)` returns a new sorted
+copy. Without `key=`, element types are `int`, `float`, `bool`, `str`;
+float NaN sorts last on that path (stable total order via runtime
+`ListSort`). With monomorphic `key=f` (`T → K`, `K` in
+`int|float|bool|str` — same-module free function, imported free function,
+nested function, lambda with typed/defaulted params, or bare `len` /
+`abs` / `int` / `float` / `bool` / `str`), any `list[T]` is accepted; keys
+are evaluated once into an auxiliary never-freed `list[K]` of length `n`,
+then a stable insertion sort rearranges both lists. Float keys use
+ordinary `<`/`>` compares (not the no-key NaN-last order). `reverse=` must
+be `bool` (stable reverse-sort-reverse). Other bare builtins still need a
+wrapper lambda/function.
 
 List `+` concatenates (same element type); `*` repeats with an int count
 (`n <= 0` yields `[]`). Both produce a new list (shallow copy of slots).
@@ -786,8 +786,8 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `min(a, b[, c…])` / `max(…)` | int, float, bool (2+ args) | common numeric type via `bool` → `int` → `float` (ties keep the first arg); optional monomorphic `key=` over homogeneous positionals; no `default=` |
 | `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
-| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=bool)` | without `key=`: `list[int\|float\|bool\|str]`; with monomorphic `key=`: any `list[T]`; `reverse=` is `bool` | new sorted list; stable reverse-sort-reverse; keyed path materializes never-freed keys list; no bare `key=len` |
-| `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=bool)` | without `key=`: sortable elem; with monomorphic `key=`: any `list[T]`; `reverse=` is `bool` | in-place (statement only); same key/reverse surface as `sorted` |
+| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=bool)` | without `key=`: `list[int\|float\|bool\|str]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len`/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is `bool` | new sorted list; stable reverse-sort-reverse; keyed path materializes never-freed keys list |
+| `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=bool)` | without `key=`: sortable elem; with monomorphic `key=`: any `list[T]`; same bare-builtin `key=` surface as `sorted`; `reverse=` is `bool` | in-place (statement only); same key/reverse surface as `sorted` |
 | `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `set()` | empty only; needs annotation | `s: set[int] = set()` |

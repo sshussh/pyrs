@@ -22,7 +22,7 @@
 
 ## Residuals
 
-- Builtins as bare key values (`key=len`)
+- Builtins as bare key values (`key=len`) — **done in 0.31** (`len`/`abs`/casts)
 - Keyed sort materializes a never-freed auxiliary keys list of length `n`
 - Truthy non-bool `reverse=` on `sorted` / `list.sort`
 - Multi-arg `min`/`max` without `key=` still numeric-only (no str/tuple lexicographic)
