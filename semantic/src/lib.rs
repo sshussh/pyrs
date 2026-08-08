@@ -18388,6 +18388,17 @@ fn lower_any_all(
     })
 }
 
+/// Builtin / cast used as a monomorphic `key=` (not first-class values).
+#[derive(Clone, Copy, Debug)]
+enum BuiltinKey {
+    Len,
+    Abs,
+    CastInt,
+    CastFloat,
+    CastBool,
+    CastStr,
+}
+
 /// Callable used by `sorted` / `min` / `max` / `list.sort` `key=` desugaring.
 enum SortKey {
     /// First-class closure / lambda (CallClosure).
@@ -18398,6 +18409,8 @@ enum SortKey {
         param_ty: ir::Ty,
         ret: ir::Ty,
     },
+    /// Builtin or cast applied as IR ops (`key=len`, `key=abs`, `key=str`, …).
+    Builtin(BuiltinKey),
 }
 
 fn local_expr(name: String, ty: ir::Ty) -> ir::Expr {
@@ -18709,7 +18722,10 @@ fn resolve_sort_key(
                 key_ast.span,
             ));
         }
-        // Builtins / cast names are not first-class values.
+        // Builtins / casts as monomorphic key= (not first-class values).
+        if let Some(result) = resolve_builtin_sort_key(name, elem_ty, key_ast.span)? {
+            return Ok(result);
+        }
         if BUILTINS.contains(&name.as_str())
             || matches!(
                 name.as_str(),
@@ -18731,9 +18747,92 @@ fn resolve_sort_key(
         other => Err(err(
             format!(
                 "key= must be a monomorphic callable (lambda / nested function / \
-                 free function), found {other}"
+                 free function / builtin len|abs|int|float|bool|str), found {other}"
             ),
             key_ast.span,
+        )),
+    }
+}
+
+/// Resolve bare `key=len` / `key=abs` / cast names to a monomorphic Builtin key.
+/// Returns `Ok(None)` when the name is not a supported key builtin (caller
+/// may still reject other builtins).
+fn resolve_builtin_sort_key(
+    name: &str,
+    elem_ty: ir::Ty,
+    span: Span,
+) -> SResult<Option<(SortKey, ir::Ty)>> {
+    match name {
+        "len" => {
+            let ok = matches!(
+                elem_ty,
+                ir::Ty::Str
+                    | ir::Ty::List(_)
+                    | ir::Ty::Tuple(_)
+                    | ir::Ty::Dict { .. }
+                    | ir::Ty::Set(_)
+            );
+            if !ok {
+                // Class with __len__ still needs a wrapper (no ctx method lower here).
+                return Err(err(
+                    format!(
+                        "key=len is not supported for element type {elem_ty}; \
+                         use a free function or lambda (e.g. lambda x=\"\": len(x))"
+                    ),
+                    span,
+                ));
+            }
+            Ok(Some((SortKey::Builtin(BuiltinKey::Len), ir::Ty::Int)))
+        }
+        "abs" => {
+            let ret = match elem_ty {
+                ir::Ty::Bool | ir::Ty::Int => ir::Ty::Int,
+                ir::Ty::Float => ir::Ty::Float,
+                other => {
+                    return Err(err(
+                        format!("bad operand type for key=abs: '{other}'"),
+                        span,
+                    ));
+                }
+            };
+            Ok(Some((SortKey::Builtin(BuiltinKey::Abs), ret)))
+        }
+        "int" => {
+            ensure_key_cast_ok(elem_ty, ast::TypeName::Int, span, "int")?;
+            Ok(Some((SortKey::Builtin(BuiltinKey::CastInt), ir::Ty::Int)))
+        }
+        "float" => {
+            ensure_key_cast_ok(elem_ty, ast::TypeName::Float, span, "float")?;
+            Ok(Some((
+                SortKey::Builtin(BuiltinKey::CastFloat),
+                ir::Ty::Float,
+            )))
+        }
+        "bool" => {
+            ensure_key_cast_ok(elem_ty, ast::TypeName::Bool, span, "bool")?;
+            Ok(Some((SortKey::Builtin(BuiltinKey::CastBool), ir::Ty::Bool)))
+        }
+        "str" => {
+            ensure_key_cast_ok(elem_ty, ast::TypeName::Str, span, "str")?;
+            Ok(Some((SortKey::Builtin(BuiltinKey::CastStr), ir::Ty::Str)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn ensure_key_cast_ok(elem_ty: ir::Ty, cast: ast::TypeName, span: Span, name: &str) -> SResult<()> {
+    let dummy = ir::Expr {
+        ty: elem_ty,
+        kind: ir::ExprKind::Local(".key.cast.probe".into()),
+    };
+    match lower_cast(cast, dummy, span) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(err(
+            format!(
+                "key={name} cannot convert element type {elem_ty}: {}",
+                e.message
+            ),
+            span,
         )),
     }
 }
@@ -18850,6 +18949,51 @@ fn call_sort_key(key: &SortKey, arg: ir::Expr, arg_span: Span) -> SResult<ir::Ex
                 },
             })
         }
+        SortKey::Builtin(bk) => call_builtin_sort_key(*bk, arg, arg_span),
+    }
+}
+
+fn call_builtin_sort_key(bk: BuiltinKey, arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match bk {
+        BuiltinKey::Len => {
+            if !matches!(
+                arg.ty,
+                ir::Ty::Str
+                    | ir::Ty::List(_)
+                    | ir::Ty::Tuple(_)
+                    | ir::Ty::Dict { .. }
+                    | ir::Ty::Set(_)
+            ) {
+                return Err(err(
+                    format!("object of type '{}' has no len()", arg.ty),
+                    span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(arg)),
+            })
+        }
+        BuiltinKey::Abs => {
+            let arg = match arg.ty {
+                ir::Ty::Bool => ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::BoolToInt(Box::new(arg)),
+                },
+                ir::Ty::Int | ir::Ty::Float => arg,
+                other => {
+                    return Err(err(format!("bad operand type for abs(): '{other}'"), span));
+                }
+            };
+            Ok(ir::Expr {
+                ty: arg.ty,
+                kind: ir::ExprKind::Abs(Box::new(arg)),
+            })
+        }
+        BuiltinKey::CastInt => lower_cast(ast::TypeName::Int, arg, span),
+        BuiltinKey::CastFloat => lower_cast(ast::TypeName::Float, arg, span),
+        BuiltinKey::CastBool => lower_cast(ast::TypeName::Bool, arg, span),
+        BuiltinKey::CastStr => lower_cast(ast::TypeName::Str, arg, span),
     }
 }
 
@@ -19391,6 +19535,7 @@ fn bind_sort_key(key: SortKey, ctx: &mut FnCtx) -> (SortKey, Vec<ir::Stmt>) {
             }];
             (SortKey::Closure(local_expr(name, ty)), stmts)
         }
+        // Direct / Builtin need no bind (stateless).
         other => (other, vec![]),
     }
 }
@@ -22261,10 +22406,58 @@ v = min([3, 1, 2], key=k)
     }
 
     #[test]
-    fn key_builtin_len_is_compile_error() {
-        let e = analyze_err("print(sorted([\"a\", \"bb\"], key=len))\n");
+    fn key_builtin_len_desugars() {
+        let m = analyze_ok("ys = sorted([\"a\", \"bb\"], key=len)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Str));
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("expected Block desugar");
+        };
+        // Keys list is built with Len on each str element.
+        let has_len_key = stmts.iter().any(|s| match s {
+            ir::Stmt::While { body, .. } => body.iter().any(|st| {
+                matches!(
+                    st,
+                    ir::Stmt::ListAppendUnchecked { value, .. }
+                        if matches!(value.kind, ir::ExprKind::Len(_))
+                )
+            }),
+            _ => false,
+        });
         assert!(
-            e.message.contains("builtin 'len'") && e.message.contains("key="),
+            has_len_key,
+            "expected Len in key materialize, stmts={stmts:?}"
+        );
+    }
+
+    #[test]
+    fn key_builtin_abs_ok() {
+        let m = analyze_ok("ys = sorted([-3, 1, -2], key=abs)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
+    }
+
+    #[test]
+    fn key_builtin_sum_still_rejected() {
+        let e = analyze_err("print(sorted([[1], [1, 2]], key=sum))\n");
+        assert!(
+            e.message.contains("builtin 'sum'") && e.message.contains("key="),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn key_len_on_int_rejected() {
+        let e = analyze_err("print(sorted([1, 2], key=len))\n");
+        assert!(
+            e.message.contains("key=len") && e.message.contains("int"),
             "{}",
             e.message
         );

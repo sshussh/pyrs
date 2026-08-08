@@ -1998,14 +1998,53 @@ print(sorted([1, 2], key=two))
 ",
     );
     assert!(stderr.contains("exactly one argument"), "stderr={stderr}");
-    let (_, stderr) = run_program_expect_fail(
-        "key_builtin_len",
-        "print(sorted([\"a\", \"bb\"], key=len))\n",
-    );
+    // Unsupported bare key builtins still need a wrapper.
+    let (_, stderr) =
+        run_program_expect_fail("key_builtin_sum", "print(sorted([[1], [1, 2]], key=sum))\n");
     assert!(
-        stderr.contains("builtin 'len'") && stderr.contains("key="),
+        stderr.contains("builtin 'sum'") && stderr.contains("key="),
         "stderr={stderr}"
     );
+    let (_, stderr) = run_program_expect_fail("key_len_int", "print(sorted([1, 2], key=len))\n");
+    assert!(
+        stderr.contains("key=len") && stderr.contains("int"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn key_builtin_len_abs_match_python() {
+    // Bare builtins as key=: len, abs, int, str (monomorphic casts).
+    let src = "\
+print(sorted([\"bb\", \"a\", \"ccc\"], key=len))
+print(min([\"bb\", \"a\", \"ccc\"], key=len))
+print(max([\"bb\", \"a\", \"ccc\"], key=len))
+print(sorted([-3, 1, -2], key=abs))
+print(min([-3, 1, -2], key=abs))
+print(max([-3, 1, -2], key=abs))
+print(sorted([1.5, -2.0, 0.5], key=abs))
+print(sorted([True, False], key=int))
+print(sorted([3, 1, 2], key=str))
+xs = [\"bb\", \"a\", \"ccc\"]
+xs.sort(key=len)
+print(xs)
+ys = [-3, 1, -2]
+ys.sort(key=abs)
+print(ys)
+print(sorted([\"bb\", \"a\", \"ccc\"], key=len, reverse=True))
+";
+    let out = run_program("key_builtin", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
