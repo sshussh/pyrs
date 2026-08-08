@@ -21,7 +21,7 @@
 ## Residuals
 
 - `reverse=` on `sorted` only (`min`/`max` treat it as unexpected keyword, like CPython)
-- `list.sort(key=)` / `list.sort(reverse=)` (named residual on method kwargs)
+- `list.sort(key=)` / `list.sort(reverse=)` — **key= done in 0.27**; `reverse=` still residual
 - Multi-arg `min(a, b, c[, key=…])`
 - `min`/`max` `default=`
 - Builtins as bare key values (`key=len`) — guided residual; use wrapper lambda/function

@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.26.0)
+## The language (v0.27.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.27.0**, not 1.0) until it is ready for
+milestone after this one is **0.28.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
@@ -91,6 +91,8 @@ A statically-typed Python subset:
   and generators; user-class `__contains__` for `in` / `not in`.
   **v0.26:** `sorted(xs, key=f)`, `min(xs, key=f)`, `max(xs, key=f)` with a monomorphic
   `key=` callable (`T →` sortable `int|float|bool|str`); desugared in semantic (no C comparator).
+  **v0.27:** `list.sort(key=f)` in-place with the same monomorphic `key=` surface (shared
+  desugar with `sorted`; `reverse=` still residual).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -165,8 +167,8 @@ A statically-typed Python subset:
   knowable: results are pre-sized and appends inlined),
   indexing (read/write), slicing (copies, like Python),
   `append`/`pop`/`insert`/`remove`/`index`/`clear`/`sort`/`extend`/`copy` (homogeneous
-  list arg), `list(iterable)`, `sorted(xs)` / `sorted(xs, key=f)`
-  (no `reverse=`; `list.sort(key=)` not yet),
+  list arg), `list(iterable)`, `sorted(xs)` / `sorted(xs, key=f)`,
+  `list.sort()` / `list.sort(key=f)` (no `reverse=`),
   `+`/`*` (concat / repeat), `==`/`!=`, `in`, `len`, iteration;
   assignment aliases like Python
 - **Tuples:** fixed-arity, heterogeneous; literals `(a, b)`, `(a,)`,
@@ -251,7 +253,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.26.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.27.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 two-arg form unifies to a common numeric type (`min(1, 1.5)` is `1.0`,
@@ -260,9 +262,9 @@ is residual (use the iterable form); iterable `min`/`max` without
 `key=` is only for `list[int|float|bool]` (empty list → ValueError like
 CPython); with monomorphic `key=` any `list[T]` is fine; bare builtins as
 key values (`key=len`) need a wrapper lambda/function; `sorted(..., key=)`
-materializes a never-freed auxiliary keys list of length `n`;
-`sorted` `reverse=` and `list.sort(key=)`/`list.sort(reverse=)` are still
-residual; `min`/`max` reject `reverse=` as unexpected (CPython has no such
+and `list.sort(key=)` materialize a never-freed auxiliary keys list of
+length `n`; `sorted`/`list.sort` `reverse=` are still residual;
+`min`/`max` reject `reverse=` as unexpected (CPython has no such
 kwarg) and `default=` is residual,
 control-flow narrowing covers `is None` / `is not None` (and `not`,
 `and`/`or` body peels and **mid-expression** refine of
@@ -402,4 +404,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.26.0 && git push origin v0.26.0`.
+Release tags: `git tag v0.27.0 && git push origin v0.27.0`.
