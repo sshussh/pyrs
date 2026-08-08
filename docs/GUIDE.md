@@ -786,8 +786,8 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `min(a, b)` / `max(a, b)` | int, float, bool | common numeric type via `bool` → `int` → `float` (ties keep the first arg; no `key=`; multi-arg `min(a,b,c)` residual) |
 | `min(xs)` / `max(xs)` | `list[int\|float\|bool]` without `key=`; any `list[T]` with monomorphic `key=` | element type; empty list → `ValueError: … iterable argument is empty`; no `default=`/`reverse=` |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
-| `sorted(xs)` / `sorted(xs, key=f)` | without `key=`: `list[int\|float\|bool\|str]`; with monomorphic `key=`: any `list[T]` | new sorted list; keyed path materializes never-freed keys list; no `reverse=`; no bare `key=len` |
-| `list.sort()` / `list.sort(key=f)` | without `key=`: sortable elem; with monomorphic `key=`: any `list[T]` | in-place (statement only); same key surface as `sorted`; no `reverse=` |
+| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=bool)` | without `key=`: `list[int\|float\|bool\|str]`; with monomorphic `key=`: any `list[T]`; `reverse=` is `bool` | new sorted list; stable reverse-sort-reverse; keyed path materializes never-freed keys list; no bare `key=len` |
+| `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=bool)` | without `key=`: sortable elem; with monomorphic `key=`: any `list[T]`; `reverse=` is `bool` | in-place (statement only); same key/reverse surface as `sorted` |
 | `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `set()` | empty only; needs annotation | `s: set[int] = set()` |

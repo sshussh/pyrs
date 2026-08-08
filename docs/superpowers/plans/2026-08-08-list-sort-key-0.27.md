@@ -15,7 +15,7 @@
 
 ## Residuals
 
-- `reverse=` on `sorted` and `list.sort`
+- `reverse=` on `sorted` and `list.sort` — **done in 0.28**
 - Multi-arg `min(a, b, c[, key=…])`
 - `min`/`max` `default=`
 - Builtins as bare key values (`key=len`)
