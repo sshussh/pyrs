@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.31.0)
+## The language (v0.32.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.32.0**, not 1.0) until it is ready for
+milestone after this one is **0.33.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
@@ -104,6 +104,8 @@ A statically-typed Python subset:
   **v0.31:** bare builtins as monomorphic `key=` — `len`, `abs`, and
   casts `int`/`float`/`bool`/`str` on `sorted` / `list.sort` / `min` / `max`
   (IR ops, not first-class values); other builtins still need a wrapper.
+  **v0.32:** lexicographic `min`/`max` for homogeneous `str` (multi-arg and
+  `list[str]` without `key=`); numeric multi-arg/list path unchanged.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -266,14 +268,15 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.31.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.32.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
-`1.0`, not the int `1`; pure `bool` args print as `0`/`1`); multi-arg with
+`1.0`, not the int `1`; pure `bool` args print as `0`/`1`); multi-arg and
+iterable form also accept homogeneous `str` (lexicographic); multi-arg with
 monomorphic `key=` requires homogeneous positionals (mixed types → compile
 error; use the iterable form or a common type); iterable `min`/`max` without
-`key=` is only for `list[int|float|bool]` (empty without `default=` →
+`key=` is for `list[int|float|bool|str]` (empty without `default=` →
 ValueError like CPython); with monomorphic `key=` any `list[T]` is fine;
 iterable `default=` joins with element type (`default=None` → Optional);
 multi-arg rejects `default=`; bare `key=` builtins supported are `len`,
@@ -282,7 +285,7 @@ need a wrapper); `sorted(..., key=)`
 and `list.sort(key=)` materialize a never-freed auxiliary keys list of
 length `n`; `sorted`/`list.sort` `reverse=` requires `bool` (not truthy
 int); `min`/`max` reject `reverse=` as unexpected (CPython has no such
-kwarg),
+kwarg); multi-arg/list lexicographic for tuples is residual,
 control-flow narrowing covers `is None` / `is not None` (and `not`,
 `and`/`or` body peels and **mid-expression** refine of
 `x is not None and x > 0` / `x is None or x < 0`) **and** `isinstance`
@@ -421,4 +424,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.31.0 && git push origin v0.31.0`.
+Release tags: `git tag v0.32.0 && git push origin v0.32.0`.

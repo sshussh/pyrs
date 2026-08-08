@@ -21,7 +21,7 @@
 
 - Keyed sort materializes a never-freed auxiliary keys list of length `n`
 - Truthy non-bool `reverse=` on `sorted` / `list.sort`
-- Multi-arg `min`/`max` without `key=` still numeric-only (no str/tuple lexicographic)
+- Multi-arg / list `min`/`max` str lexicographic — **done in 0.32** (tuple still residual)
 - Class `__len__` via bare `key=len`
 
 ## Out of scope (unchanged)
