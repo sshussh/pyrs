@@ -5160,6 +5160,16 @@ print(sorted([(1, \"b\"), (1, \"a\"), (0, \"z\")]))
 print((1, 2) < (0, 9))
 print((1, 2) < (1, 3))
 print((1, 2) <= (1, 2))
+# list lexicographic order / min / sort
+print([1, 2] < [1, 3])
+print([1, 2] < [1, 2, 0])
+empty_i: list[int] = []
+print(empty_i < [0])
+print(min([1, 2], [0, 9], [1, 0]))
+print(max([1, 2], [0, 9], [1, 0]))
+print(min([[3, 1], [1, 9], [2, 0]]))
+print(max([[3, 1], [1, 9], [2, 0]]))
+print(sorted([[1, 2], [0, 9], [1, 0]]))
 ";
     let out = run_program("minmax_list", src);
     let py = std::process::Command::new("python3")

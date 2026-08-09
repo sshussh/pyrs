@@ -10983,11 +10983,11 @@ fn lower_list_pop(
 fn ensure_sortable_list_elem(elem: ir::Ty, span: Span) -> SResult<()> {
     match elem {
         ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => Ok(()),
-        ir::Ty::Tuple(_) if is_orderable_ty(elem) => Ok(()),
+        ir::Ty::Tuple(_) | ir::Ty::List(_) if is_orderable_ty(elem) => Ok(()),
         other => Err(err(
             format!(
                 "sort is only supported for list[int], list[float], list[bool], \
-                 list[str], and list of orderable tuples, found list[{other}]"
+                 list[str], and lists of orderable tuples/lists, found list[{other}]"
             ),
             span,
         )),
@@ -19334,18 +19334,18 @@ fn lower_min_max_expr(
     if let Some(key_ast) = key_ast {
         return lower_min_max_list_key(func, arg, elem, key_ast, default_ir, args[0].span, ctx);
     }
-    // No key=: numbers, str, or orderable tuples (MinList/MaxList), optional default=.
+    // No key=: numbers, str, orderable tuples/lists (MinList/MaxList), optional default=.
     match elem {
         ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => {
             lower_min_max_list_plain(func, arg, elem, default_ir, span, ctx)
         }
-        ir::Ty::Tuple(_) if is_orderable_ty(elem) => {
+        ir::Ty::Tuple(_) | ir::Ty::List(_) if is_orderable_ty(elem) => {
             lower_min_max_list_plain(func, arg, elem, default_ir, span, ctx)
         }
         other => Err(err(
             format!(
                 "{func}() is only supported for list[int], list[float], \
-                 list[bool], list[str], and list of orderable tuples without key=; \
+                 list[bool], list[str], and lists of orderable tuples/lists without key=; \
                  found list[{other}]"
             ),
             args[0].span,
@@ -19365,10 +19365,10 @@ fn lower_min_max_multi_plain(
     for a in args {
         lowered.push(lower_expr(a, ctx)?);
     }
-    // Homogeneous str or orderable tuple: lexicographic Min/Max fold.
+    // Homogeneous str / orderable tuple / orderable list: lexicographic Min/Max fold.
     let first_ty = lowered[0].ty;
     if (first_ty == ir::Ty::Str
-        || matches!(first_ty, ir::Ty::Tuple(_)) && is_orderable_ty(first_ty))
+        || matches!(first_ty, ir::Ty::Tuple(_) | ir::Ty::List(_)) && is_orderable_ty(first_ty))
         && lowered.iter().all(|e| e.ty == first_ty)
     {
         let mut acc = lowered.remove(0);
@@ -21381,6 +21381,7 @@ fn is_orderable_ty(ty: ir::Ty) -> bool {
     match ty {
         ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => true,
         ir::Ty::Tuple(elems) => elems.iter().all(|e| is_orderable_ty(*e)),
+        ir::Ty::List(elem) => is_orderable_ty(*elem),
         _ => false,
     }
 }
@@ -21433,20 +21434,32 @@ fn lower_list_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SR
                 },
             })
         }
-        // element-wise equality (same list element type)
-        ast::BinOp::Eq | ast::BinOp::NotEq => match (l.ty, r.ty) {
-            (ir::Ty::List(a), ir::Ty::List(b)) if a == b => Ok(ir::Expr {
-                ty: ir::Ty::Bool,
-                kind: ir::ExprKind::Binary {
-                    op: if matches!(op, ast::BinOp::Eq) {
-                        ir::BinOp::Eq
-                    } else {
-                        ir::BinOp::Ne
+        // element-wise equality / lexicographic order (same list element type)
+        ast::BinOp::Eq
+        | ast::BinOp::NotEq
+        | ast::BinOp::Lt
+        | ast::BinOp::LtEq
+        | ast::BinOp::Gt
+        | ast::BinOp::GtEq => match (l.ty, r.ty) {
+            (ir::Ty::List(a), ir::Ty::List(b)) if a == b => {
+                if !matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) && !is_orderable_ty(*a) {
+                    return Err(err(
+                        format!(
+                            "operator '{op}' is not supported for list[{a}] (element type must be \
+                             orderable: int|float|bool|str|tuple|list of those)"
+                        ),
+                        span,
+                    ));
+                }
+                Ok(ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::Binary {
+                        op: comparison_ir_op(op),
+                        left: Box::new(l),
+                        right: Box::new(r),
                     },
-                    left: Box::new(l),
-                    right: Box::new(r),
-                },
-            }),
+                })
+            }
             (ir::Ty::List(a), ir::Ty::List(b)) => {
                 Err(err(format!("cannot compare list[{a}] and list[{b}]"), span))
             }
@@ -22010,6 +22023,34 @@ print(f())
             panic!();
         };
         assert!(matches!(value.ty, ir::Ty::List(_)));
+    }
+
+    #[test]
+    fn list_lt_lowers() {
+        let m = analyze_ok("b = [1, 2] < [1, 3]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Binary {
+                op: ir::BinOp::Lt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn min_multi_arg_list_folds() {
+        let m = analyze_ok("a = min([1, 2], [0, 9], [1, 0])\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(value.ty, ir::Ty::List(_)));
+        assert!(matches!(value.kind, ir::ExprKind::Min { .. }));
     }
 
     #[test]

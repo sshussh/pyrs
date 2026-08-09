@@ -3309,6 +3309,15 @@ int pyrs_list_eq(const PyrsList *a, const PyrsList *b, int tag) {
     return 1;
 }
 
+/* List tags: 4 + 8 * elem_tag (codegen elem_tag). */
+static int is_list_tag(int tag) {
+    return tag >= 4 && ((tag - 4) % 8) == 0;
+}
+
+/* Lexicographic list order; tag is the element print-tag. Forward for
+ * slot_ord_cmp recursion into nested lists. */
+int pyrs_list_cmp(const PyrsList *a, const PyrsList *b, int tag);
+
 int pyrs_list_contains(const PyrsList *l, long long slot, int tag) {
     check_ref(l);
     for (long long i = 0; i < l->len; i++) {
@@ -3408,6 +3417,11 @@ static int cmp_slots_qsort(const void *pa, const void *pb) {
     case TAG_TUPLE:
         return pyrs_tuple_cmp((const PyrsTuple *)(uintptr_t)a, (const PyrsTuple *)(uintptr_t)b);
     default:
+        if (is_list_tag(tag)) {
+            int inner = (tag - 4) / 8;
+            return pyrs_list_cmp((const PyrsList *)(uintptr_t)a, (const PyrsList *)(uintptr_t)b,
+                                inner);
+        }
         return 0;
     }
 }
@@ -3800,8 +3814,33 @@ static int slot_ord_cmp(long long a, long long b, int tag) {
     case TAG_TUPLE:
         return pyrs_tuple_cmp((const PyrsTuple *)(uintptr_t)a, (const PyrsTuple *)(uintptr_t)b);
     default:
+        if (is_list_tag(tag)) {
+            int inner = (tag - 4) / 8;
+            return pyrs_list_cmp((const PyrsList *)(uintptr_t)a, (const PyrsList *)(uintptr_t)b,
+                                inner);
+        }
         pyrs_die("TypeError: '<' not supported between these types");
     }
+}
+
+/* Lexicographic: negative if a < b, 0 if equal, positive if a > b. */
+int pyrs_list_cmp(const PyrsList *a, const PyrsList *b, int tag) {
+    check_ref(a);
+    check_ref(b);
+    long long n = a->len < b->len ? a->len : b->len;
+    for (long long i = 0; i < n; i++) {
+        int c = slot_ord_cmp(a->data[i], b->data[i], tag);
+        if (c != 0) {
+            return c;
+        }
+    }
+    if (a->len < b->len) {
+        return -1;
+    }
+    if (a->len > b->len) {
+        return 1;
+    }
+    return 0;
 }
 
 int pyrs_tuple_cmp(const PyrsTuple *a, const PyrsTuple *b) {

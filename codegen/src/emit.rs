@@ -848,6 +848,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
         out.push_str("declare i32 @pyrs_list_eq(ptr, ptr, i32)\n");
+        out.push_str("declare i32 @pyrs_list_cmp(ptr, ptr, i32)\n");
         out.push_str("declare i64 @pyrs_list_pop(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_input(ptr)\n");
         out.push_str("declare ptr @pyrs_argv()\n");
@@ -1123,6 +1124,15 @@ impl Emitter {
                 let pred = if is_max { "sgt" } else { "slt" };
                 self.line(format!("{pick_r} = icmp {pred} i32 {c}, 0"));
             }
+            Ty::List(elem) => {
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_list_cmp(ptr {r}, ptr {l}, i32 {})",
+                    elem_tag(elem)
+                ));
+                let pred = if is_max { "sgt" } else { "slt" };
+                self.line(format!("{pick_r} = icmp {pred} i32 {c}, 0"));
+            }
             other => unreachable!("min/max on {other:?}"),
         }
         let t = self.tmp();
@@ -1311,6 +1321,15 @@ impl Emitter {
                 let c = self.tmp();
                 self.line(format!(
                     "{c} = call i32 @pyrs_tuple_cmp(ptr {cur}, ptr {best})"
+                ));
+                let pred = if is_max { "sgt" } else { "slt" };
+                self.line(format!("{pick} = icmp {pred} i32 {c}, 0"));
+            }
+            Ty::List(inner) => {
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_list_cmp(ptr {cur}, ptr {best}, i32 {})",
+                    elem_tag(inner)
                 ));
                 let pred = if is_max { "sgt" } else { "slt" };
                 self.line(format!("{pick} = icmp {pred} i32 {c}, 0"));
@@ -5472,6 +5491,26 @@ impl Emitter {
                     self.line(format!("{t} = xor i1 {eq}, true"));
                     t
                 }
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let Ty::List(elem) = left.ty else {
+                    unreachable!("list cmp without list type");
+                };
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_list_cmp(ptr {l}, ptr {r}, i32 {})",
+                    elem_tag(elem)
+                ));
+                let t = self.tmp();
+                let pred = match op {
+                    BinOp::Lt => "slt",
+                    BinOp::Le => "sle",
+                    BinOp::Gt => "sgt",
+                    BinOp::Ge => "sge",
+                    _ => unreachable!(),
+                };
+                self.line(format!("{t} = icmp {pred} i32 {c}, 0"));
+                t
             }
             other => unreachable!("bad list op {other:?}"),
         }
