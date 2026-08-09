@@ -46,6 +46,100 @@ fn run_program(tag: &str, source: &str) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// Compile and run with deterministic collector settings. Returns both
+/// streams because GC statistics are intentionally written to stderr so they
+/// never become part of a PyRs program's stdout contract.
+fn run_program_gc_opt(
+    tag: &str,
+    source: &str,
+    opt_level: &str,
+    settings: &[(&str, &str)],
+) -> (String, String) {
+    let dir = TempDir::new(tag);
+    let src = dir.0.join("prog.py");
+    fs::write(&src, source).unwrap();
+    let mut command = Command::new(PYRS);
+    command
+        .args(["run", "-O", opt_level, "-i"])
+        .arg(&src)
+        .env("PYRS_GC", "marksweep")
+        .env_remove("PYRS_GC_STRESS")
+        .env_remove("PYRS_GC_THRESHOLD")
+        .env("PYRS_GC_STATS", "1");
+    for (name, value) in settings {
+        command.env(name, value);
+    }
+    let out = command.output().expect("failed to spawn PyRs");
+    assert!(
+        out.status.success(),
+        "PyRs GC run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+fn run_program_gc(tag: &str, source: &str, settings: &[(&str, &str)]) -> (String, String) {
+    run_program_gc_opt(tag, source, "2", settings)
+}
+
+fn run_program_gc_stress(tag: &str, source: &str) -> (String, String) {
+    run_program_gc(tag, source, &[("PYRS_GC_STRESS", "1")])
+}
+
+#[derive(Debug)]
+struct GcStats {
+    collections: u64,
+    allocated: u64,
+    reclaimed: u64,
+    live: u64,
+    objects: u64,
+}
+
+fn parse_gc_stat(line: &str, key: &str) -> u64 {
+    let needle = format!("{key}=");
+    let start = line
+        .find(&needle)
+        .unwrap_or_else(|| panic!("missing GC statistic '{key}' in: {line}"))
+        + needle.len();
+    let digits: String = line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    assert!(
+        !digits.is_empty(),
+        "invalid GC statistic '{key}' in: {line}"
+    );
+    digits
+        .parse()
+        .unwrap_or_else(|e| panic!("invalid GC statistic '{key}' in '{line}': {e}"))
+}
+
+fn parse_gc_stats(stderr: &str) -> GcStats {
+    let mut lines = stderr.lines().filter(|line| !line.trim().is_empty());
+    let line = lines
+        .next()
+        .unwrap_or_else(|| panic!("missing PYRS_GC_STATS output"));
+    assert!(
+        lines.next().is_none(),
+        "PYRS_GC_STATS must emit exactly one stderr line, got:\n{stderr}"
+    );
+    assert!(
+        line.starts_with("[pyrs-gc] "),
+        "unexpected PYRS_GC_STATS prefix in: {line}"
+    );
+    GcStats {
+        collections: parse_gc_stat(line, "collections"),
+        allocated: parse_gc_stat(line, "allocated"),
+        reclaimed: parse_gc_stat(line, "reclaimed"),
+        live: parse_gc_stat(line, "live"),
+        objects: parse_gc_stat(line, "objects"),
+    }
+}
+
 /// Like `run_program`, but kills the child after `timeout` so hang regressions
 /// fail CI quickly instead of blocking the suite.
 fn run_program_timeout(tag: &str, source: &str, timeout: Duration) -> String {
@@ -11789,4 +11883,376 @@ except StopIteration:
         String::from_utf8_lossy(&py.stderr)
     );
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn gc_stress_preserves_roots_across_runtime_boundaries() {
+    let src = "\
+ROOTS = [\"global-\" + str(41)]
+
+def churn(n: int):
+    i = 0
+    while i < n:
+        item = \"junk-\" + str(i)
+        items = [item, item.upper()]
+        mirror = items.copy()
+        i = i + len(mirror) - 1
+
+def make_reader():
+    token = \"closure-\" + str(42)
+    def read() -> str:
+        return token
+    return read
+
+def suspended() -> str:
+    token = \"generator-\" + str(43)
+    yield token
+    yield token.upper()
+
+def local_survivor() -> str:
+    token = \"local-\" + str(46)
+    churn(40)
+    return token
+
+def make_dynamic_root() -> list[Any]:
+    result: list[Any] = []
+    result.append(\"any-\" + str(45))
+    result.append([\"nested-\" + str(47)])
+    return result
+
+read = make_reader()
+gen = suspended()
+first = next(gen)
+bucket = [ROOTS[0], read(), first]
+local = local_survivor()
+dynamic = make_dynamic_root()
+
+churn(80)
+print(bucket[0])
+print(bucket[1])
+print(bucket[2])
+print(next(gen))
+
+try:
+    raise ValueError(\"exception-\" + str(44))
+except ValueError as exc:
+    kept = [exc]
+    churn(80)
+    print(kept[0])
+
+churn(80)
+print(dynamic[0])
+print(dynamic[1])
+print(local)
+print(ROOTS[0])
+print(read())
+";
+
+    let (stdout, stderr) = run_program_gc_stress("gc_roots", src);
+    assert_eq!(
+        stdout,
+        "global-41\nclosure-42\ngenerator-43\nGENERATOR-43\n\
+exception-44\nany-45\n['nested-47']\nlocal-46\nglobal-41\nclosure-42\n"
+    );
+
+    let stats = parse_gc_stats(&stderr);
+    assert!(stats.collections > 0, "stats: {stats:?}");
+    assert!(stats.allocated > 0, "stats: {stats:?}");
+    assert!(stats.reclaimed > 0, "stats: {stats:?}");
+    assert!(stats.live <= stats.allocated, "stats: {stats:?}");
+    assert!(stats.objects > 0, "stats: {stats:?}");
+}
+
+#[test]
+fn gc_stress_reclaims_unreachable_cycles() {
+    let src = "\
+class Node:
+    def __init__(self):
+        self.link = self
+
+def build_cycles(n: int):
+    i = 0
+    while i < n:
+        xs: list[Any] = []
+        xs.append(xs)
+
+        mapping: dict[str, Any] = {}
+        mapping[\"self\"] = mapping
+
+        holder: list[Any] = []
+        pair = (holder,)
+        holder.append(pair)
+
+        node = Node()
+        i = i + 1
+
+build_cycles(120)
+print(\"cycles-ok\")
+";
+
+    let (stdout, stderr) = run_program_gc_stress("gc_cycles", src);
+    assert_eq!(stdout, "cycles-ok\n");
+
+    let stats = parse_gc_stats(&stderr);
+    assert!(stats.collections > 1, "stats: {stats:?}");
+    assert!(stats.allocated > 0, "stats: {stats:?}");
+    assert!(
+        stats.reclaimed > 0,
+        "cyclic list/dict/tuple/class graphs were not reclaimed: {stats:?}"
+    );
+    assert!(stats.live <= stats.allocated, "stats: {stats:?}");
+}
+
+#[test]
+fn gc_threshold_triggers_without_stress_mode() {
+    let src = "\
+def allocate(n: int):
+    i = 0
+    while i < n:
+        left = \"threshold-\" + str(i)
+        right = left + \"-payload-payload-payload\"
+        values = [left, right, right.upper()]
+        i = i + len(values) - 2
+
+allocate(300)
+print(\"threshold-ok\")
+";
+
+    let (stdout, stderr) = run_program_gc("gc_threshold", src, &[("PYRS_GC_THRESHOLD", "1024")]);
+    assert_eq!(stdout, "threshold-ok\n");
+
+    let stats = parse_gc_stats(&stderr);
+    assert!(
+        stats.collections > 0,
+        "automatic threshold did not collect: {stats:?}"
+    );
+    assert!(stats.allocated > 0, "stats: {stats:?}");
+    assert!(
+        stats.reclaimed > 0,
+        "automatic threshold did not reclaim garbage: {stats:?}"
+    );
+    assert!(stats.live <= stats.allocated, "stats: {stats:?}");
+}
+
+#[test]
+fn gc_roots_survive_unoptimized_and_aggressively_optimized_code() {
+    let src = "\
+def keep_left() -> str:
+    left = \"left-\" + str(1)
+    holder = [left]
+    right = \"right-\" + str(2)
+    dynamic: Any = holder
+    return holder[0] + \"/\" + right
+
+print(keep_left())
+";
+
+    for opt_level in ["0", "3"] {
+        let tag = format!("gc_opt_{opt_level}");
+        let (stdout, stderr) = run_program_gc_opt(&tag, src, opt_level, &[("PYRS_GC_STRESS", "1")]);
+        assert_eq!(stdout, "left-1/right-2\n", "-O{opt_level}");
+        let stats = parse_gc_stats(&stderr);
+        assert!(stats.collections > 0, "-O{opt_level}: {stats:?}");
+        assert!(stats.reclaimed > 0, "-O{opt_level}: {stats:?}");
+    }
+}
+
+#[test]
+fn gc_preserves_roots_restored_only_by_longjmp() {
+    // At -O3 LLVM formerly placed s5 in x86-64 rbp, then reused rbp for the
+    // loop counter. glibc pointer-mangles the saved rbp in jmp_buf, so a
+    // conservative scan missed s5 and reclaimed it before longjmp restored
+    // the dangling pointer. Functions containing setjmp must reserve the
+    // native frame pointer; other saved values remain in plain registers or
+    // stack slots visible to the collector.
+    let src = "\
+def keep_across_raise():
+    s0 = \"root-0-\" + str(700)
+    s1 = \"root-1-\" + str(701)
+    s2 = \"root-2-\" + str(702)
+    s3 = \"root-3-\" + str(703)
+    s4 = \"root-4-\" + str(704)
+    s5 = \"root-5-\" + str(705)
+    s6 = \"root-6-\" + str(706)
+    s7 = \"root-7-\" + str(707)
+    s8 = \"root-8-\" + str(708)
+    s9 = \"root-9-\" + str(709)
+    try:
+        i = 0
+        while i < 4000:
+            left = \"garbage-\" + str(i)
+            right = left + \"-payload-payload-payload\"
+            values = [left, right, right.upper()]
+            i = i + len(values) - 2
+        raise ValueError(\"boom\")
+    except ValueError:
+        print(s0)
+        print(s1)
+        print(s2)
+        print(s3)
+        print(s4)
+        print(s5)
+        print(s6)
+        print(s7)
+        print(s8)
+        print(s9)
+
+keep_across_raise()
+";
+
+    let (stdout, stderr) =
+        run_program_gc_opt("gc_longjmp_roots", src, "3", &[("PYRS_GC_STRESS", "1")]);
+    assert_eq!(
+        stdout,
+        "root-0-700\nroot-1-701\nroot-2-702\nroot-3-703\nroot-4-704\n\
+root-5-705\nroot-6-706\nroot-7-707\nroot-8-708\nroot-9-709\n"
+    );
+    let stats = parse_gc_stats(&stderr);
+    assert!(stats.collections > 1000, "stats: {stats:?}");
+    assert!(stats.reclaimed > 0, "stats: {stats:?}");
+}
+
+#[test]
+fn gc_nogc_mode_is_an_explicit_diagnostic_baseline() {
+    let src = "\
+def allocate(n: int):
+    i = 0
+    while i < n:
+        value = \"nogc-\" + str(i)
+        i += 1
+
+allocate(40)
+print(\"nogc-ok\")
+";
+
+    let (stdout, stderr) = run_program_gc(
+        "gc_nogc",
+        src,
+        &[("PYRS_GC", "nogc"), ("PYRS_GC_STRESS", "1")],
+    );
+    assert_eq!(stdout, "nogc-ok\n");
+    let stats = parse_gc_stats(&stderr);
+    assert_eq!(stats.collections, 0, "stats: {stats:?}");
+    assert_eq!(stats.reclaimed, 0, "stats: {stats:?}");
+    assert!(stats.allocated > 0, "stats: {stats:?}");
+    assert_eq!(stats.live, stats.allocated, "stats: {stats:?}");
+    assert!(stats.objects > 0, "stats: {stats:?}");
+}
+
+#[test]
+fn try_controls_are_entry_hoisted_and_caught_exception_loops_stay_bounded() {
+    let dir = TempDir::new("try_loop_stack");
+    let src = dir.0.join("prog.py");
+    let exe = dir.0.join("prog");
+    fs::write(
+        &src,
+        "\
+i = 0
+while i < 400000:
+    try:
+        values: list[int] = []
+        values[0]
+    except IndexError:
+        pass
+    i += 1
+print(i)
+",
+    )
+    .unwrap();
+
+    let compiled = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .arg("--emit-llvm")
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let llvm = fs::read_to_string(dir.0.join("prog.ll")).unwrap();
+    let control = llvm
+        .find("%try.exit.0 = alloca i32")
+        .expect("missing preallocated try control");
+    let loop_body = llvm.find("while.body.").expect("missing while body");
+    assert!(
+        control < loop_body,
+        "try control alloca must dominate the loop instead of growing stack per iteration"
+    );
+
+    let run = Command::new(&exe)
+        .env_remove("PYRS_GC_STRESS")
+        .env_remove("PYRS_GC_STATS")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "long caught-exception loop failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "400000\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn caught_json_errors_release_native_scratch_before_longjmp() {
+    let dir = TempDir::new("json_longjmp_cleanup");
+    let src = dir.0.join("prog.py");
+    let exe = dir.0.join("prog");
+    fs::write(
+        &src,
+        "\
+import json
+
+def one() -> None:
+    try:
+        value = 1e308 * 10
+        json.dumps(value)
+    except ValueError:
+        pass
+
+i = 0
+while i < 1000000:
+    one()
+    i += 1
+print(i)
+",
+    )
+    .unwrap();
+
+    let compiled = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    // The leaked version retained at least 64 MiB for this workload. A 48 MiB
+    // address-space ceiling makes that regression deterministic while the
+    // cleanup-chain implementation continually reuses one small buffer.
+    let run = Command::new("sh")
+        .args(["-c", "ulimit -v 49152; exec \"$1\"", "pyrs-json-cleanup"])
+        .arg(&exe)
+        .env_remove("PYRS_GC_STRESS")
+        .env_remove("PYRS_GC_STATS")
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "caught JSON errors leaked native scratch under a 48 MiB limit\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "1000000\n");
 }

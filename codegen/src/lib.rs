@@ -5,9 +5,9 @@
 //! IRReader, verifies it, runs the standard optimization pipeline, and
 //! writes a native object file ([`compile_ir_to_object`]).
 //!
-//! Compiled programs also link a small C runtime ([`RUNTIME_C`]) providing
-//! Python-faithful printing and runtime error traps; the driver compiles it
-//! with the system C compiler at link time.
+//! Compiled programs also link the C runtime ([`RUNTIME_C`]) and its
+//! nonmoving collector ([`GC_C`], [`GC_H`]); the driver compiles them with
+//! the system C compiler at link time.
 
 pub mod emit;
 
@@ -18,6 +18,12 @@ pub use emit::emit_llvm_ir;
 
 /// Source of the C runtime linked into every compiled program.
 pub const RUNTIME_C: &str = include_str!("../runtime/runtime.c");
+
+/// Source of the collector linked into every compiled program.
+pub const GC_C: &str = include_str!("../runtime/gc.c");
+
+/// Shared collector/runtime declarations written beside the embedded C files.
+pub const GC_H: &str = include_str!("../runtime/gc.h");
 
 pub fn ping() -> String {
     String::from("pong")
@@ -94,6 +100,103 @@ mod tests {
         );
         assert!(ll.contains("call void @pyrs___main__()"), "{ll}");
         assert!(ll.contains("call void @pyrs_print_int"), "{ll}");
+    }
+
+    #[test]
+    fn initializes_gc_and_registers_managed_globals() {
+        let ll = lower(
+            "text: str = \"root\"\n\
+             number: int = 42\n\
+             dynamic: Any = text\n\
+             choice: int | str = text\n\
+             flag: bool = True\n",
+        );
+
+        let init = ll
+            .find("call void @pyrs_gc_init(ptr %gc.stack.anchor)")
+            .expect("missing GC initialization");
+        let roots = ll
+            .find("call void @pyrs_gc_add_root_range(ptr @g.text, i64 8)")
+            .expect("missing pointer-global root");
+        let set_args = ll
+            .find("call void @pyrs_set_args(i32 %argc, ptr %argv)")
+            .expect("missing argv initialization");
+        assert!(init < roots && roots < set_args, "{ll}");
+        assert!(
+            ll.contains("call void @pyrs_gc_add_root_range(ptr @g.number, i64 8)"),
+            "{ll}"
+        );
+        assert!(
+            ll.contains("call void @pyrs_gc_add_root_range(ptr @g.dynamic, i64 8)"),
+            "{ll}"
+        );
+        assert!(
+            ll.contains("call void @pyrs_gc_add_root_range(ptr @g.choice, i64 16)"),
+            "{ll}"
+        );
+        assert!(
+            !ll.contains("pyrs_gc_add_root_range(ptr @g.flag"),
+            "scalar-only global was registered: {ll}"
+        );
+    }
+
+    #[test]
+    fn emits_managed_box_constructors_without_raw_malloc() {
+        let ll = lower(
+            "class Greeter:\n    def message(self) -> str:\n        return \"hi\"\n\ngreeter = Greeter()\ncallback = greeter.message\ndynamic: Any = callback\n",
+        );
+
+        assert!(
+            ll.contains(" = call ptr @pyrs_bound_method_new(ptr "),
+            "{ll}"
+        );
+        assert!(ll.contains(" = call ptr @pyrs_union_box_new(i32 "), "{ll}");
+        assert!(!ll.contains("declare ptr @malloc"), "{ll}");
+        assert!(!ll.contains("call ptr @malloc"), "{ll}");
+    }
+
+    #[test]
+    fn try_functions_reserve_the_native_frame_pointer_for_gc_roots() {
+        let ll = lower(
+            "def guarded() -> str:\n    value = \"kept\"\n    try:\n        raise ValueError(\"boom\")\n    except ValueError:\n        return value\n\ndef guarded_gen():\n    try:\n        yield 1\n    finally:\n        pass\n\ndef plain() -> str:\n    return \"plain\"\n\nprint(guarded())\nprint(next(guarded_gen()))\n",
+        );
+
+        assert!(
+            ll.contains("attributes #0 = { \"frame-pointer\"=\"all\" }"),
+            "{ll}"
+        );
+        assert!(
+            ll.contains("define ptr @pyrs_guarded() #0 {"),
+            "try function did not reserve the frame pointer: {ll}"
+        );
+        assert!(
+            ll.contains("define ptr @pyrs_plain() {"),
+            "plain function unnecessarily reserved the frame pointer: {ll}"
+        );
+        assert!(
+            ll.contains("define i32 @pyrs_guarded_gen(ptr %gen) #0 {"),
+            "generator try function did not reserve the frame pointer: {ll}"
+        );
+    }
+
+    #[test]
+    fn synthesized_expression_tries_reserve_the_native_frame_pointer() {
+        let ll = lower(
+            "class ListIter:\n    def __next__(self) -> list[int]:\n        raise StopIteration(\"\")\n\ndef hidden_gen():\n    fallback: list[int] = []\n    next(ListIter(), fallback).append(7)\n    yield 1\n\nfallback: list[int] = []\nnext(ListIter(), fallback).append(7)\nprint(next(hidden_gen()))\n",
+        );
+
+        assert!(
+            ll.contains("define void @pyrs___main__() #0 {"),
+            "top-level synthesized try did not reserve the frame pointer: {ll}"
+        );
+        assert!(
+            ll.contains("define i32 @pyrs_hidden_gen(ptr %gen) #0 {"),
+            "generator synthesized try did not reserve the frame pointer: {ll}"
+        );
+        assert!(
+            ll.matches("call i32 @setjmp(").count() >= 2,
+            "expected synthesized setjmp calls: {ll}"
+        );
     }
 
     #[test]

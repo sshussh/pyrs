@@ -13,7 +13,7 @@
 //!
 //! Strings are length-prefixed `{ i64, [n x i8] }` blobs; lists are
 //! `{ len, cap, data }` headers with 8-byte value slots. Both live behind
-//! `ptr` and are managed by the C runtime (allocated, never freed).
+//! `ptr` and are managed by the C runtime.
 //!
 //! All user symbols are prefixed `pyrs_` so they can never collide with
 //! libc symbols (a user function named `printf` is fine).
@@ -62,6 +62,32 @@ fn lty_ret(ty: Ty) -> &'static str {
     match ty {
         Ty::None => "void",
         other => lty(other),
+    }
+}
+
+/// Byte width of a module-global slot that can carry a managed allocation.
+///
+/// The first collector traces heap objects precisely but discovers native
+/// roots conservatively. Registering the complete inline union lets the
+/// runtime inspect its payload word without teaching this ABI boundary every
+/// static union member layout. Other scalar-only globals need no registration.
+fn gc_root_range_size(ty: Ty) -> Option<u64> {
+    match ty {
+        Ty::Int | Ty::Any => Some(8),
+        Ty::Str
+        | Ty::List(_)
+        | Ty::Tuple(_)
+        | Ty::Dict { .. }
+        | Ty::Set(_)
+        | Ty::File
+        | Ty::Closure { .. }
+        | Ty::BoundMethod { .. }
+        | Ty::Cell(_)
+        | Ty::Generator { .. }
+        | Ty::Exception
+        | Ty::Class(_) => Some(8),
+        Ty::Union(_) => Some(16),
+        Ty::Float | Ty::Bool | Ty::None => None,
     }
 }
 
@@ -166,7 +192,7 @@ struct TryScope {
     phase_ptr: String,
     /// `loops.len()` when this try was entered.
     loops_at_entry: usize,
-    /// Index into `gen_try_pool` / gen frame try phase+exit slots (generators).
+    /// Index into `try_pool` / gen frame try phase+exit slots.
     pool_idx: usize,
 }
 
@@ -207,11 +233,13 @@ struct Emitter {
     /// Next yield resume state id.
     gen_next_state: i64,
     gen_yield_ty: Ty,
-    /// Preallocated try control allocas for generators (dominate all gstates).
+    /// Preallocated try control allocas. Keeping every alloca in the entry
+    /// block prevents unbounded native-stack growth when a try runs in a loop;
+    /// for generators it also makes the slots dominate every resume state.
     /// Each entry: (exit_ptr, live_ptr, phase_ptr).
-    gen_try_pool: Vec<(String, String, String)>,
-    /// Next free index into `gen_try_pool`.
-    gen_try_pool_next: usize,
+    try_pool: Vec<(String, String, String)>,
+    /// Next free index into `try_pool` while emitting nested tries.
+    try_pool_next: usize,
     /// Tries currently executing their `finally` (innermost last).
     gen_fin_stack: Vec<FinallyScope>,
     /// Class layouts for field GEP / isinstance parent walk.
@@ -242,8 +270,8 @@ impl Default for Emitter {
             gen_local_index: HashMap::new(),
             gen_next_state: 1,
             gen_yield_ty: Ty::Int,
-            gen_try_pool: Vec::new(),
-            gen_try_pool_next: 0,
+            try_pool: Vec::new(),
+            try_pool_next: 0,
             gen_fin_stack: Vec::new(),
             classes: Vec::new(),
             local_storage: HashMap::new(),
@@ -297,29 +325,43 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         | Stmt::Raise { message: e, .. }
         | Stmt::RaiseExc { value: e }
         | Stmt::GenClose { generator: e }
-        | Stmt::ListAppend { value: e, .. }
-        | Stmt::ListRemove { value: e, .. }
-        | Stmt::CellStore { value: e, .. } => max_try_depth_in_expr(e),
+        | Stmt::ListClear { list: e }
+        | Stmt::ListSort { list: e }
+        | Stmt::DictClear { dict: e }
+        | Stmt::SetClear { set: e }
+        | Stmt::UnpackCheck { len: e, .. }
+        | Stmt::UnpackCheckMin { len: e, .. } => max_try_depth_in_expr(e),
+        Stmt::IndexAssign { base, index, value } => max_try_depth_in_expr(base)
+            .max(max_try_depth_in_expr(index))
+            .max(max_try_depth_in_expr(value)),
+        Stmt::IndexDelete { base, index } => {
+            max_try_depth_in_expr(base).max(max_try_depth_in_expr(index))
+        }
+        Stmt::ListAppend { list, value }
+        | Stmt::ListAppendUnchecked { list, value }
+        | Stmt::ListRemove { list, value }
+        | Stmt::CellStore { cell: list, value }
+        | Stmt::SetAdd { set: list, value }
+        | Stmt::SetRemove { set: list, value }
+        | Stmt::SetDiscard { set: list, value } => {
+            max_try_depth_in_expr(list).max(max_try_depth_in_expr(value))
+        }
+        Stmt::ListInsert { list, index, value } => max_try_depth_in_expr(list)
+            .max(max_try_depth_in_expr(index))
+            .max(max_try_depth_in_expr(value)),
         Stmt::SetField {
             object: o,
             value: v,
             ..
         } => max_try_depth_in_expr(o).max(max_try_depth_in_expr(v)),
         Stmt::Print(args) => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
-        Stmt::ListInsert {
-            index: i, value: v, ..
-        }
-        | Stmt::IndexAssign {
-            index: i, value: v, ..
-        } => max_try_depth_in_expr(i).max(max_try_depth_in_expr(v)),
-        Stmt::IndexDelete { index: i, .. } => max_try_depth_in_expr(i),
         Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
             max_try_depth_in_expr(dict).max(max_try_depth_in_expr(other))
         }
         Stmt::ListExtend { list, other } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(other))
         }
-        _ => 0,
+        Stmt::Return(None) | Stmt::Die(_) | Stmt::Break | Stmt::Continue => 0,
     }
 }
 
@@ -477,7 +519,9 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
             .map(|p| max_try_depth_in_expr(p))
             .unwrap_or(0),
         Open { path, mode } => max_try_depth_in_expr(path).max(max_try_depth_in_expr(mode)),
-        _ => 0,
+        ConstInt(_) | ConstIntDigits(_) | ConstFloat(_) | ConstBool(_) | ConstStr(_)
+        | ConstNone | Local(_) | GlobalLoad(_) | Argv | DictNew | SetNew | OsGetcwd
+        | CellNewUnbound => 0,
     }
 }
 
@@ -691,6 +735,10 @@ impl Emitter {
     fn finish(self) -> String {
         let mut out = String::new();
         out.push_str("; generated by pyrs\n\n");
+        out.push_str("declare void @pyrs_gc_init(ptr)\n");
+        out.push_str("declare void @pyrs_gc_add_root_range(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_union_box_new(i32, i64)\n");
+        out.push_str("declare ptr @pyrs_bound_method_new(ptr)\n");
         out.push_str("declare void @pyrs_print_int(i64)\n");
         out.push_str("declare void @pyrs_print_float(double)\n");
         out.push_str("declare void @pyrs_print_bool(i32)\n");
@@ -789,7 +837,6 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_set_diff(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_set_symdiff(ptr, ptr)\n");
         out.push_str("declare void @pyrs_set_update(ptr, ptr)\n");
-        out.push_str("declare ptr @malloc(i64)\n");
         out.push_str("declare i32 @pyrs_set_contains(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_set_clear(ptr)\n");
         out.push_str("declare ptr @pyrs_set_elements(ptr)\n");
@@ -916,6 +963,11 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_class_instance(ptr)\n");
         out.push_str("declare ptr @pyrs_str_from_object(ptr)\n");
         out.push_str("declare void @pyrs_set_class_names(ptr, i64)\n\n");
+        // glibc pointer-mangles the frame-pointer slot in jmp_buf on x86-64.
+        // Functions containing setjmp reserve that register as an actual frame
+        // pointer, so every managed value restored by longjmp is either in a
+        // plain saved callee register or in stack memory visible to the GC.
+        out.push_str("attributes #0 = { \"frame-pointer\"=\"all\" }\n\n");
         out.push_str(&self.global_defs);
         out.push_str(&self.string_defs);
         out.push('\n');
@@ -1008,8 +1060,19 @@ impl Emitter {
                 module.classes.len()
             )
         };
+        let mut root_setup = String::new();
+        for (name, ty) in &module.globals {
+            if let Some(size) = gc_root_range_size(*ty) {
+                root_setup.push_str(&format!(
+                    "  call void @pyrs_gc_add_root_range(ptr @g.{name}, i64 {size})\n"
+                ));
+            }
+        }
         self.funcs.push_str(&format!(
             "define i32 @main(i32 %argc, ptr %argv) {{\nentry:\n  \
+             %gc.stack.anchor = alloca i8, align 16\n\
+             call void @pyrs_gc_init(ptr %gc.stack.anchor)\n\
+             {root_setup}  \
              call void @pyrs_set_args(i32 %argc, ptr %argv)\n\
              {class_setup}  \
              call void @{entry}()\n  ret i32 0\n}}\n\n"
@@ -1528,17 +1591,9 @@ impl Emitter {
                 // Map member index → print tag via switch
                 let print_tag = self.emit_union_index_to_print_tag(&tag, members);
                 let box_p = self.tmp();
-                self.line(format!("{box_p} = call ptr @malloc(i64 16)"));
-                let tag_p = self.tmp();
                 self.line(format!(
-                    "{tag_p} = getelementptr inbounds {{ i32, i64 }}, ptr {box_p}, i32 0, i32 0"
+                    "{box_p} = call ptr @pyrs_union_box_new(i32 {print_tag}, i64 {payload})"
                 ));
-                self.line(format!("store i32 {print_tag}, ptr {tag_p}"));
-                let pay_p = self.tmp();
-                self.line(format!(
-                    "{pay_p} = getelementptr inbounds {{ i32, i64 }}, ptr {box_p}, i32 0, i32 1"
-                ));
-                self.line(format!("store i64 {payload}, ptr {pay_p}"));
                 let slot = self.tmp();
                 self.line(format!("{slot} = ptrtoint ptr {box_p} to i64"));
                 slot
@@ -1761,17 +1816,9 @@ impl Emitter {
         let print_tag = member_print_tag(value_ty);
         let payload = self.slot_from_value(value, value_ty);
         let box_p = self.tmp();
-        self.line(format!("{box_p} = call ptr @malloc(i64 16)"));
-        let tag_p = self.tmp();
         self.line(format!(
-            "{tag_p} = getelementptr inbounds {{ i32, i64 }}, ptr {box_p}, i32 0, i32 0"
+            "{box_p} = call ptr @pyrs_union_box_new(i32 {print_tag}, i64 {payload})"
         ));
-        self.line(format!("store i32 {print_tag}, ptr {tag_p}"));
-        let pay_p = self.tmp();
-        self.line(format!(
-            "{pay_p} = getelementptr inbounds {{ i32, i64 }}, ptr {box_p}, i32 0, i32 1"
-        ));
-        self.line(format!("store i64 {payload}, ptr {pay_p}"));
         let slot = self.tmp();
         self.line(format!("{slot} = ptrtoint ptr {box_p} to i64"));
         slot
@@ -2450,6 +2497,7 @@ impl Emitter {
         self.tries.clear();
         self.fn_ret = func.ret;
         self.try_ret_ptr = None;
+        self.gen_frame = None;
         self.local_storage.clear();
         for (name, ty) in &func.params {
             self.local_storage.insert(name.clone(), *ty);
@@ -2459,6 +2507,21 @@ impl Emitter {
         }
 
         self.start_block("entry");
+        // LLVM allocas execute each time control reaches them. Preallocate one
+        // control triple per lexical nesting level here so `try` inside a loop
+        // does not consume native stack on every iteration.
+        let try_depth = max_try_depth_in_stmts(&func.body);
+        self.try_pool.clear();
+        self.try_pool_next = 0;
+        for i in 0..try_depth {
+            let e = format!("%try.exit.{i}");
+            let l = format!("%try.live.{i}");
+            let p = format!("%try.phase.{i}");
+            self.line(format!("{e} = alloca i32, align 4"));
+            self.line(format!("{l} = alloca i32, align 4"));
+            self.line(format!("{p} = alloca i32, align 4"));
+            self.try_pool.push((e, l, p));
+        }
         // spill params into allocas so assignment to params just works
         for (name, ty) in &func.params {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
@@ -2513,8 +2576,14 @@ impl Emitter {
             .map(|(name, ty)| format!("{} %p.{name}", lty(*ty)))
             .collect::<Vec<_>>()
             .join(", ");
+        let emits_setjmp = self.body.contains("call i32 @setjmp(");
+        assert!(
+            !emits_setjmp || try_depth > 0,
+            "try-depth pre-scan missed an emitted setjmp"
+        );
+        let gc_try_attr = if emits_setjmp { " #0" } else { "" };
         self.funcs.push_str(&format!(
-            "define {} @{}({params}) {{\n{}}}\n\n",
+            "define {} @{}({params}){gc_try_attr} {{\n{}}}\n\n",
             lty_ret(func.ret),
             mangle(&func.name),
             self.body
@@ -2559,9 +2628,10 @@ impl Emitter {
         self.start_block("entry");
         // Preallocate try control allocas so they dominate every gstate
         // (needed when yield resumes re-arm setjmp using the same slots).
-        let try_depth = max_try_depth_in_stmts(&func.body).max(1);
-        self.gen_try_pool.clear();
-        self.gen_try_pool_next = 0;
+        let lexical_try_depth = max_try_depth_in_stmts(&func.body);
+        let try_depth = lexical_try_depth.max(1);
+        self.try_pool.clear();
+        self.try_pool_next = 0;
         for i in 0..try_depth {
             let e = format!("%gen.try.exit.{i}");
             let l = format!("%gen.try.live.{i}");
@@ -2569,7 +2639,7 @@ impl Emitter {
             self.line(format!("{e} = alloca i32, align 4"));
             self.line(format!("{l} = alloca i32, align 4"));
             self.line(format!("{p} = alloca i32, align 4"));
-            self.gen_try_pool.push((e, l, p));
+            self.try_pool.push((e, l, p));
         }
         // Already finished → never re-enter body (post-exhaust / post-close /
         // uncaught throw). Close() and send/next rely on this.
@@ -2601,7 +2671,7 @@ impl Emitter {
         // state 0 = start
         self.start_block("gstate0");
         self.gen_next_state = 1;
-        self.gen_try_pool_next = 0;
+        self.try_pool_next = 0;
         self.emit_block(&func.body);
         if !self.terminated {
             self.line("call void @pyrs_gen_set_done(ptr %gen)");
@@ -2621,8 +2691,14 @@ impl Emitter {
             }
         }
         self.gen_frame = None;
+        let emits_setjmp = self.body.contains("call i32 @setjmp(");
+        assert!(
+            !emits_setjmp || lexical_try_depth > 0,
+            "generator try-depth pre-scan missed an emitted setjmp"
+        );
+        let gc_try_attr = if emits_setjmp { " #0" } else { "" };
         self.funcs.push_str(&format!(
-            "define i32 @{}(ptr %gen) {{\n{}}}\n\n",
+            "define i32 @{}(ptr %gen){gc_try_attr} {{\n{}}}\n\n",
             mangle(&func.name),
             self.body
         ));
@@ -4375,12 +4451,9 @@ impl Emitter {
                 // Heap box: { ptr object } (method resolved from type at call).
                 let obj = self.emit_expr(object);
                 let box_p = self.tmp();
-                self.line(format!("{box_p} = call ptr @malloc(i64 8)"));
-                let fp = self.tmp();
                 self.line(format!(
-                    "{fp} = getelementptr inbounds {{ ptr }}, ptr {box_p}, i32 0, i32 0"
+                    "{box_p} = call ptr @pyrs_bound_method_new(ptr {obj})"
                 ));
-                self.line(format!("store ptr {obj}, ptr {fp}"));
                 box_p
             }
             ExprKind::CallBoundMethod {
@@ -5036,34 +5109,16 @@ impl Emitter {
         orelse: &[Stmt],
         finally: &[Stmt],
     ) {
-        // Generators: use preallocated pool slots (dominate yield resume).
-        // Ordinary functions: fresh allocas.
-        let (exit_ptr, live_ptr, phase_ptr, pool_idx) = if self.gen_frame.is_some() {
-            let i = self.gen_try_pool_next;
-            self.gen_try_pool_next += 1;
-            if i >= self.gen_try_pool.len() {
-                // Over-deep nesting vs pre-scan — allocate anyway (may not
-                // dominate resume, but rare; grow pool defensively).
-                let e = self.tmp();
-                let l = self.tmp();
-                let p = self.tmp();
-                self.line(format!("{e} = alloca i32, align 4"));
-                self.line(format!("{l} = alloca i32, align 4"));
-                self.line(format!("{p} = alloca i32, align 4"));
-                (e, l, p, i)
-            } else {
-                let (e, l, p) = self.gen_try_pool[i].clone();
-                (e, l, p, i)
-            }
-        } else {
-            let e = self.tmp();
-            let l = self.tmp();
-            let p = self.tmp();
-            self.line(format!("{e} = alloca i32, align 4"));
-            self.line(format!("{l} = alloca i32, align 4"));
-            self.line(format!("{p} = alloca i32, align 4"));
-            (e, l, p, 0usize)
-        };
+        // Every function preallocates these slots in its entry block. Reuse is
+        // by lexical nesting depth; the slot remains reserved through finally
+        // because its exit kind is still needed there.
+        let pool_idx = self.try_pool_next;
+        self.try_pool_next += 1;
+        let (exit_ptr, live_ptr, phase_ptr) = self
+            .try_pool
+            .get(pool_idx)
+            .cloned()
+            .expect("try-depth pre-scan must cover every emitted try");
         self.store_try_i32(TRY_EXIT_NORMAL, &exit_ptr);
         self.store_try_i32(1, &live_ptr);
         // 0 = try body, 1 = except handler, 2 = else
@@ -5241,10 +5296,12 @@ impl Emitter {
         self.emit_block(finally);
         if self.gen_frame.is_some() {
             self.gen_fin_stack.pop();
-            // Free this slot (and anything nested that completed under it).
-            if self.gen_try_pool_next > scope.pool_idx {
-                self.gen_try_pool_next = scope.pool_idx;
-            }
+        }
+        // Free this slot (and anything nested that completed under it). This
+        // applies to ordinary functions too, allowing sequential tries to
+        // share their entry-block controls without loop-local allocas.
+        if self.try_pool_next > scope.pool_idx {
+            self.try_pool_next = scope.pool_idx;
         }
         if !self.terminated {
             self.emit_finally_dispatch(&scope.exit_ptr, &scope.end_l);

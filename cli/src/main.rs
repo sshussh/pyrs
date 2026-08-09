@@ -101,14 +101,22 @@ fn compile(input: &Path, output: &Path, opt_level: u8, emit_llvm: bool) -> Resul
         codegen::compile_ir_to_object(&llvm_ir, &object, opt_level)
             .map_err(|e| format!("error[codegen]: {e}"))?;
 
-        // the C runtime is compiled and linked in the same cc invocation
+        // The C runtime and collector are compiled and linked in the same cc
+        // invocation.  They are embedded in the compiler binary so produced
+        // executables do not depend on a PyRs installation at run time.
         let runtime = workdir.join("runtime.c");
         fs::write(&runtime, codegen::RUNTIME_C)
             .map_err(|e| format!("failed to write runtime: {e}"))?;
+        let gc = workdir.join("gc.c");
+        fs::write(&gc, codegen::GC_C).map_err(|e| format!("failed to write collector: {e}"))?;
+        let gc_header = workdir.join("gc.h");
+        fs::write(&gc_header, codegen::GC_H)
+            .map_err(|e| format!("failed to write collector header: {e}"))?;
 
         let status = process::Command::new("cc")
             .arg(&object)
             .arg(&runtime)
+            .arg(&gc)
             .arg("-O2")
             .arg("-lm")
             .arg("-o")

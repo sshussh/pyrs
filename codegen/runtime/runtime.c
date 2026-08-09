@@ -7,8 +7,9 @@
  * - runtime errors (ZeroDivisionError, IndexError, ...) print to stderr
  *   and exit(1), unless a try-frame is active (then longjmp to handler)
  *
- * Heap objects (str/list/tuple/dict/set) are never freed — fine for
- * short-lived compiled programs, documented as a known limitation.
+ * Heap objects use the nonmoving tracing collector in gc.c.  Payload
+ * addresses remain stable because generated LLVM and runtime slots expose raw
+ * pointers; object-owned native buffers are released with their owner.
  *
  * Slot tags (shared list/tuple/dict/set): 0=int 1=float 2=bool 3=str
  * 4+8*inner = nested list, 5 = tuple (self-describing), 6 = dict,
@@ -25,6 +26,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "gc.h"
 
 /* exception type tags — keep in sync with ir::ExcType. Matching uses
  * CPython-like subclass checks via pyrs_exc_matches (Exception base,
@@ -98,7 +101,7 @@ typedef struct {
     char data[];
 } PyrsStr;
 
-/* First-class exception instance bound by `except E as e`. Never freed. */
+/* GC-managed first-class exception instance bound by `except E as e`. */
 typedef struct {
     int type_tag;
     PyrsStr *msg;
@@ -118,9 +121,29 @@ void pyrs_list_push(PyrsList *l, long long slot);
 /* ---- exceptions (setjmp/longjmp try frames) ----
  * Single-threaded process-global state (PyRs programs are not multi-threaded). */
 
+struct PyrsExcFrame;
+
+typedef void (*PyrsCleanupFn)(void *context);
+
+/* Native runtime temporaries cannot rely on ordinary C cleanup after a
+ * longjmp.  A small per-try LIFO lets helpers register stack-owned cleanup
+ * records while their malloc-backed scratch state is live. */
+typedef struct PyrsCleanup {
+    PyrsCleanupFn run;
+    void *context;
+    struct PyrsCleanup *prev;
+    struct PyrsExcFrame *frame;
+} PyrsCleanup;
+
 typedef struct PyrsExcFrame {
     jmp_buf buf;
     struct PyrsExcFrame *prev;
+    PyrsCleanup *cleanups;
+    /* setjmp saves registers outside the native stack. Generated functions
+     * containing a try reserve the native frame-pointer register, because
+     * glibc pointer-mangles that jmp_buf slot; the other saved value registers
+     * and this complete frame remain visible to conservative root discovery. */
+    PyrsGcRoot gc_root;
 } PyrsExcFrame;
 
 static PyrsExcFrame *g_exc_frames = NULL;
@@ -128,6 +151,45 @@ static int g_exc_type = 0;
 static char g_exc_msg[512];
 
 static void *xmalloc(size_t n);
+
+static void pyrs_cleanup_push(PyrsCleanup *cleanup, PyrsCleanupFn run, void *context) {
+    cleanup->run = run;
+    cleanup->context = context;
+    cleanup->prev = NULL;
+    cleanup->frame = g_exc_frames;
+    if (cleanup->frame != NULL) {
+        cleanup->prev = cleanup->frame->cleanups;
+        cleanup->frame->cleanups = cleanup;
+    }
+}
+
+static void pyrs_cleanup_pop(PyrsCleanup *cleanup) {
+    PyrsExcFrame *frame = cleanup->frame;
+    if (frame == NULL) {
+        return;
+    }
+    if (frame->cleanups != cleanup) {
+        fputs("RuntimeError: native cleanup stack corrupted\n", stderr);
+        abort();
+    }
+    frame->cleanups = cleanup->prev;
+    cleanup->frame = NULL;
+}
+
+static void pyrs_run_cleanups(PyrsExcFrame *frame) {
+    while (frame->cleanups != NULL) {
+        PyrsCleanup *cleanup = frame->cleanups;
+        frame->cleanups = cleanup->prev;
+        cleanup->frame = NULL;
+        cleanup->run(cleanup->context);
+    }
+}
+
+static _Noreturn void pyrs_jump_current(void) {
+    PyrsExcFrame *frame = g_exc_frames;
+    pyrs_run_cleanups(frame);
+    longjmp(frame->buf, 1);
+}
 
 static const char *exc_type_name(int ty) {
     switch (ty) {
@@ -270,7 +332,7 @@ _Noreturn void pyrs_raise(int type, const char *msg) {
     g_exc_type = type;
     snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(type), msg ? msg : "");
     if (g_exc_frames != NULL) {
-        longjmp(g_exc_frames->buf, 1);
+        pyrs_jump_current();
     }
     die_uncaught(g_exc_msg);
 }
@@ -280,13 +342,19 @@ _Noreturn void pyrs_die(const char *msg) {
     g_exc_type = ty;
     snprintf(g_exc_msg, sizeof g_exc_msg, "%s", msg);
     if (g_exc_frames != NULL) {
-        longjmp(g_exc_frames->buf, 1);
+        pyrs_jump_current();
     }
     die_uncaught(msg);
 }
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
+    if (p == NULL) {
+        /* Native scratch/backing allocation also gets one chance to reclaim
+         * unreachable managed owners before treating OOM as fatal. */
+        pyrs_gc_collect();
+        p = malloc(n);
+    }
     if (p == NULL) {
         /* bypass catch frames — OOM is fatal */
         fflush(stdout);
@@ -299,6 +367,8 @@ static void *xmalloc(size_t n) {
 PyrsExcFrame *pyrs_try_push(void) {
     PyrsExcFrame *f = xmalloc(sizeof(PyrsExcFrame));
     f->prev = g_exc_frames;
+    f->cleanups = NULL;
+    pyrs_gc_root_push(&f->gc_root, f, sizeof(*f));
     g_exc_frames = f;
     return f;
 }
@@ -308,7 +378,10 @@ PyrsExcFrame *pyrs_try_push(void) {
 
 void pyrs_try_pop(void) {
     if (g_exc_frames != NULL) {
-        g_exc_frames = g_exc_frames->prev;
+        PyrsExcFrame *old = g_exc_frames;
+        g_exc_frames = old->prev;
+        pyrs_gc_root_pop(&old->gc_root);
+        free(old);
     }
 }
 
@@ -320,7 +393,7 @@ int pyrs_exc_type(void) {
 PyrsStr *pyrs_exc_message(void) {
     const char *body = exc_msg_body(g_exc_msg);
     size_t n = strlen(body);
-    PyrsStr *s = xmalloc(sizeof(long long) + n + 1);
+    PyrsStr *s = pyrs_gc_alloc(sizeof(long long) + n + 1, PYRS_GC_STRING);
     s->len = (long long)n;
     memcpy(s->data, body, n + 1);
     return s;
@@ -328,7 +401,7 @@ PyrsStr *pyrs_exc_message(void) {
 
 /* Build a first-class exception object from the active pending exception. */
 PyrsExc *pyrs_exc_object(void) {
-    PyrsExc *e = xmalloc(sizeof(PyrsExc));
+    PyrsExc *e = pyrs_gc_alloc(sizeof(PyrsExc), PYRS_GC_EXCEPTION);
     e->type_tag = g_exc_type;
     e->msg = pyrs_exc_message();
     return e;
@@ -344,7 +417,8 @@ void pyrs_print_exc(PyrsExc *e) {
 
 PyrsStr *pyrs_str_from_exc(PyrsExc *e) {
     if (e == NULL || e->msg == NULL) {
-        PyrsStr *s = xmalloc(sizeof(long long) + 1);
+        PyrsStr *s =
+            pyrs_gc_alloc(sizeof(long long) + 1, PYRS_GC_STRING);
         s->len = 0;
         s->data[0] = '\0';
         return s;
@@ -374,7 +448,7 @@ PyrsStr *pyrs_repr_from_exc(PyrsExc *e) {
         snprintf(buf, sizeof buf, "%s('%s')", name, body);
     }
     size_t n = strlen(buf);
-    PyrsStr *s = xmalloc(sizeof(long long) + n + 1);
+    PyrsStr *s = pyrs_gc_alloc(sizeof(long long) + n + 1, PYRS_GC_STRING);
     s->len = (long long)n;
     memcpy(s->data, buf, n + 1);
     return s;
@@ -410,7 +484,7 @@ void pyrs_set_exc_msg(const char *msg) {
 /* re-raise the current exception (no active frame → print and exit) */
 _Noreturn void pyrs_reraise(void) {
     if (g_exc_frames != NULL) {
-        longjmp(g_exc_frames->buf, 1);
+        pyrs_jump_current();
     }
     die_uncaught(g_exc_msg[0] ? g_exc_msg : "RuntimeError: unknown error");
 }
@@ -425,7 +499,7 @@ _Noreturn void pyrs_raise_exc(PyrsExc *e) {
         (e->msg != NULL && e->msg->data != NULL) ? e->msg->data : "";
     snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(e->type_tag), body);
     if (g_exc_frames != NULL) {
-        longjmp(g_exc_frames->buf, 1);
+        pyrs_jump_current();
     }
     die_uncaught(g_exc_msg);
 }
@@ -439,7 +513,8 @@ static void check_ref(const void *p) {
 }
 
 static PyrsStr *str_alloc(long long len) {
-    PyrsStr *s = xmalloc(sizeof(long long) + (size_t)len + 1);
+    PyrsStr *s = pyrs_gc_alloc(sizeof(long long) + (size_t)len + 1,
+                              PYRS_GC_STRING);
     s->len = len;
     s->data[len] = '\0';
     return s;
@@ -486,7 +561,7 @@ static void format_double(double v, char *buf) {
 
 /* ---- arbitrary-precision int (tagged i64) ----
  * LSB=1 → small: value = tagged >> 1 (signed, range ±2^62)
- * LSB=0 → pointer to heap PyrsInt (never freed)
+ * LSB=0 → pointer to a GC-managed heap PyrsInt
  * Zero is always the small tag 1 (((0)<<1)|1).
  *
  * This file is #include'd into runtime.c (not compiled standalone).
@@ -542,10 +617,13 @@ static long long int_from_sign_limbs(int sign, unsigned long long *limbs,
             return pyrs_int_tag_small(-(long long)mag);
         }
     }
-    PyrsInt *h = xmalloc(sizeof(PyrsInt));
+    PyrsInt *h = pyrs_gc_alloc(sizeof(PyrsInt), PYRS_GC_BIGINT);
     h->sign = sign > 0 ? 1 : -1;
     h->nlimbs = nlimbs;
     h->limbs = limbs;
+    if ((unsigned long long)nlimbs <= SIZE_MAX / sizeof(*limbs)) {
+        pyrs_gc_external_allocated(h, (size_t)nlimbs * sizeof(*limbs));
+    }
     return (long long)(uintptr_t)h;
 }
 
@@ -1704,6 +1782,14 @@ typedef struct {
     int print_tag;
     long long payload;
 } PyrsUnionBox;
+
+PyrsUnionBox *pyrs_union_box_new(int print_tag, long long payload) {
+    PyrsUnionBox *box =
+        pyrs_gc_alloc(sizeof(PyrsUnionBox), PYRS_GC_UNION_BOX);
+    box->print_tag = print_tag;
+    box->payload = payload;
+    return box;
+}
 
 static void print_slot(long long slot, int tag) {
     switch (tag) {
@@ -2984,8 +3070,7 @@ PyrsStr *pyrs_format_str(const PyrsStr *s, const PyrsStr *spec) {
     check_ref(s);
     check_ref(spec);
     if (spec->len == 0) {
-        /* return a copy — callers may concat; strings are immutable heap objs
-         * never freed, so sharing the pointer is fine. */
+        /* Strings are immutable, so sharing the managed object is safe. */
         return (PyrsStr *)s;
     }
 
@@ -3110,10 +3195,11 @@ PyrsList *pyrs_list_new(long long cap) {
     if (cap < 4) {
         cap = 4;
     }
-    PyrsList *l = xmalloc(sizeof(PyrsList));
+    PyrsList *l = pyrs_gc_alloc(sizeof(PyrsList), PYRS_GC_LIST);
     l->len = 0;
     l->cap = cap;
     l->data = xmalloc((size_t)cap * sizeof(long long));
+    pyrs_gc_external_allocated(l, (size_t)cap * sizeof(long long));
     return l;
 }
 
@@ -3122,8 +3208,11 @@ void pyrs_list_push(PyrsList *l, long long slot) {
     if (l->len == l->cap) {
         long long cap = l->cap * 2;
         long long *data = xmalloc((size_t)cap * sizeof(long long));
+        pyrs_gc_external_allocated(l, (size_t)cap * sizeof(long long));
         memcpy(data, l->data, (size_t)l->len * sizeof(long long));
-        /* the old block is intentionally leaked (no GC yet) */
+        pyrs_gc_external_freed(l,
+                               (size_t)l->cap * sizeof(long long));
+        free(l->data);
         l->data = data;
         l->cap = cap;
     }
@@ -3343,7 +3432,11 @@ void pyrs_list_insert(PyrsList *l, long long i, long long slot) {
     if (l->len == l->cap) {
         long long cap = l->cap < 4 ? 4 : l->cap * 2;
         long long *data = xmalloc((size_t)cap * sizeof(long long));
+        pyrs_gc_external_allocated(l, (size_t)cap * sizeof(long long));
         memcpy(data, l->data, (size_t)l->len * sizeof(long long));
+        pyrs_gc_external_freed(l,
+                               (size_t)l->cap * sizeof(long long));
+        free(l->data);
         l->data = data;
         l->cap = cap;
     }
@@ -3558,7 +3651,7 @@ PyrsFile *pyrs_open(const PyrsStr *path, const PyrsStr *mode) {
         }
     }
 
-    PyrsFile *f = xmalloc(sizeof(PyrsFile));
+    PyrsFile *f = pyrs_gc_alloc(sizeof(PyrsFile), PYRS_GC_FILE);
     f->fp = fp;
     f->name = path;
     f->readable = readable;
@@ -3584,6 +3677,8 @@ static void file_check_readable(const PyrsFile *f) {
 /* everything remaining in the file */
 PyrsStr *pyrs_file_read(PyrsFile *f) {
     file_check_readable(f);
+    PyrsGcRoot file_root;
+    pyrs_gc_root_push(&file_root, &f, sizeof(f));
     size_t cap = 1 << 16;
     size_t len = 0;
     char *buf = xmalloc(cap);
@@ -3596,11 +3691,14 @@ PyrsStr *pyrs_file_read(PyrsFile *f) {
         size_t newcap = cap * 2;
         char *bigger = xmalloc(newcap);
         memcpy(bigger, buf, len);
+        free(buf);
         buf = bigger;
         cap = newcap;
     }
     PyrsStr *r = str_alloc((long long)len);
     memcpy(r->data, buf, len);
+    free(buf);
+    pyrs_gc_root_pop(&file_root);
     return r;
 }
 
@@ -3622,7 +3720,11 @@ PyrsStr *pyrs_file_readline(PyrsFile *f) {
 
 PyrsList *pyrs_file_readlines(PyrsFile *f) {
     file_check_readable(f);
+    PyrsGcRoot file_root;
+    pyrs_gc_root_push(&file_root, &f, sizeof(f));
     PyrsList *out = pyrs_list_new(8);
+    PyrsGcRoot out_root;
+    pyrs_gc_root_push(&out_root, &out, sizeof(out));
     for (;;) {
         PyrsStr *line = pyrs_file_readline(f);
         if (line->len == 0) {
@@ -3630,11 +3732,13 @@ PyrsList *pyrs_file_readlines(PyrsFile *f) {
         }
         pyrs_list_push(out, (long long)line);
     }
+    pyrs_gc_root_pop(&out_root);
+    pyrs_gc_root_pop(&file_root);
     return out;
 }
 
 /* returns the number of characters written, like Python; flushed so data
- * survives even if close() is never called (nothing is freed anyway) */
+ * is visible immediately even when deterministic close is omitted */
 long long pyrs_file_write(PyrsFile *f, const PyrsStr *s) {
     file_check_open(f);
     if (!f->writable) {
@@ -3659,6 +3763,8 @@ void pyrs_file_close(PyrsFile *f) {
 
 static int g_argc = 0;
 static char **g_argv = NULL;
+static PyrsList *g_argv_cached = NULL;
+static int g_argv_root_registered = 0;
 
 void pyrs_set_args(int argc, char **argv) {
     g_argc = argc;
@@ -3677,14 +3783,20 @@ static PyrsStr *str_from_cstr(const char *c) {
 
 /* sys.argv: built once so repeated accesses alias, like Python */
 PyrsList *pyrs_argv(void) {
-    static PyrsList *cached = NULL;
-    if (cached == NULL) {
-        cached = pyrs_list_new(g_argc > 0 ? g_argc : 1);
+    if (!g_argv_root_registered) {
+        /* Register before the first list allocation: stress mode may collect
+         * while the cached list is being populated. */
+        pyrs_gc_add_root_range(&g_argv_cached, sizeof(g_argv_cached));
+        g_argv_root_registered = 1;
+    }
+    if (g_argv_cached == NULL) {
+        g_argv_cached = pyrs_list_new(g_argc > 0 ? g_argc : 1);
         for (int i = 0; i < g_argc; i++) {
-            pyrs_list_push(cached, (long long)str_from_cstr(g_argv[i]));
+            pyrs_list_push(g_argv_cached,
+                           (long long)str_from_cstr(g_argv[i]));
         }
     }
-    return cached;
+    return g_argv_cached;
 }
 
 /* input([prompt]): print the prompt (no newline), read a line, strip the
@@ -3698,6 +3810,7 @@ PyrsStr *pyrs_input(const PyrsStr *prompt) {
     size_t cap = 0;
     ssize_t n = getline(&line, &cap, stdin);
     if (n < 0) {
+        free(line);
         pyrs_die("EOFError: EOF when reading a line");
     }
     if (n > 0 && line[n - 1] == '\n') {
@@ -3726,10 +3839,18 @@ PyrsTuple *pyrs_tuple_new(long long n) {
     if (n < 0) {
         n = 0;
     }
-    PyrsTuple *t = xmalloc(sizeof(PyrsTuple));
+    PyrsTuple *t = pyrs_gc_alloc(sizeof(PyrsTuple), PYRS_GC_TUPLE);
     t->len = n;
     t->data = n > 0 ? xmalloc((size_t)n * sizeof(long long)) : NULL;
+    if (n > 0) {
+        pyrs_gc_external_allocated(t, (size_t)n * sizeof(long long));
+        memset(t->data, 0, (size_t)n * sizeof(long long));
+    }
     t->tags = n > 0 ? xmalloc((size_t)n * sizeof(int)) : NULL;
+    if (n > 0) {
+        pyrs_gc_external_allocated(t, (size_t)n * sizeof(int));
+        memset(t->tags, 0, (size_t)n * sizeof(int));
+    }
     return t;
 }
 
@@ -3926,8 +4047,8 @@ struct PyrsDict {
 static void die_keyerror_int(long long key) {
     long long n;
     char *s = int_to_dec(key, &n);
-    char *buf = xmalloc((size_t)n + 16);
-    snprintf(buf, (size_t)n + 16, "KeyError: %s", s);
+    char buf[512];
+    snprintf(buf, sizeof buf, "KeyError: %.496s", s);
     free(s);
     pyrs_die(buf);
 }
@@ -3957,14 +4078,17 @@ static int key_eq(long long a, int at, long long b, int bt) {
 }
 
 PyrsDict *pyrs_dict_new(void) {
-    PyrsDict *d = xmalloc(sizeof(PyrsDict));
+    PyrsDict *d = pyrs_gc_alloc(sizeof(PyrsDict), PYRS_GC_DICT);
     d->len = 0;
     d->cap = 8;
     d->table = xmalloc((size_t)d->cap * sizeof(DictSlot));
+    pyrs_gc_external_allocated(d, (size_t)d->cap * sizeof(DictSlot));
     memset(d->table, 0, (size_t)d->cap * sizeof(DictSlot));
     d->order_cap = 8;
     d->order_len = 0;
     d->order = xmalloc((size_t)d->order_cap * sizeof(long long));
+    pyrs_gc_external_allocated(d,
+                               (size_t)d->order_cap * sizeof(long long));
     return d;
 }
 
@@ -4000,12 +4124,24 @@ static void dict_grow(PyrsDict *d) {
     DictSlot *old = d->table;
     long long *old_order = d->order;
     long long old_order_len = d->order_len;
+    long long old_order_cap = d->order_cap;
 
-    d->cap *= 2;
-    d->table = xmalloc((size_t)d->cap * sizeof(DictSlot));
-    memset(d->table, 0, (size_t)d->cap * sizeof(DictSlot));
-    d->order_cap = d->cap;
-    d->order = xmalloc((size_t)d->order_cap * sizeof(long long));
+    /* Keep the published object internally consistent if either native
+     * allocation has to invoke an OOM collection. */
+    long long new_cap = old_cap * 2;
+    DictSlot *new_table =
+        xmalloc((size_t)new_cap * sizeof(DictSlot));
+    memset(new_table, 0, (size_t)new_cap * sizeof(DictSlot));
+    long long *new_order =
+        xmalloc((size_t)new_cap * sizeof(long long));
+
+    d->cap = new_cap;
+    d->table = new_table;
+    d->order_cap = new_cap;
+    d->order = new_order;
+    pyrs_gc_external_allocated(d, (size_t)new_cap * sizeof(DictSlot));
+    pyrs_gc_external_allocated(d,
+                               (size_t)new_cap * sizeof(long long));
     d->order_len = 0;
     d->len = 0;
 
@@ -4020,9 +4156,11 @@ static void dict_grow(PyrsDict *d) {
             d->len++;
         }
     }
-    (void)old_cap;
-    (void)old; /* leaked */
-    (void)old_order;
+    pyrs_gc_external_freed(d, (size_t)old_cap * sizeof(DictSlot));
+    pyrs_gc_external_freed(d,
+                           (size_t)old_order_cap * sizeof(long long));
+    free(old);
+    free(old_order);
 }
 
 void pyrs_dict_set(PyrsDict *d, long long key, int key_tag, long long val, int val_tag) {
@@ -4045,7 +4183,11 @@ void pyrs_dict_set(PyrsDict *d, long long key, int key_tag, long long val, int v
     if (d->order_len == d->order_cap) {
         long long nc = d->order_cap * 2;
         long long *no = xmalloc((size_t)nc * sizeof(long long));
+        pyrs_gc_external_allocated(d, (size_t)nc * sizeof(long long));
         memcpy(no, d->order, (size_t)d->order_len * sizeof(long long));
+        pyrs_gc_external_freed(
+            d, (size_t)d->order_cap * sizeof(long long));
+        free(d->order);
         d->order = no;
         d->order_cap = nc;
     }
@@ -4292,14 +4434,17 @@ struct PyrsSet {
 };
 
 PyrsSet *pyrs_set_new(void) {
-    PyrsSet *s = xmalloc(sizeof(PyrsSet));
+    PyrsSet *s = pyrs_gc_alloc(sizeof(PyrsSet), PYRS_GC_SET);
     s->len = 0;
     s->cap = 8;
     s->table = xmalloc((size_t)s->cap * sizeof(SetSlot));
+    pyrs_gc_external_allocated(s, (size_t)s->cap * sizeof(SetSlot));
     memset(s->table, 0, (size_t)s->cap * sizeof(SetSlot));
     s->order_cap = 8;
     s->order_len = 0;
     s->order = xmalloc((size_t)s->order_cap * sizeof(long long));
+    pyrs_gc_external_allocated(s,
+                               (size_t)s->order_cap * sizeof(long long));
     return s;
 }
 
@@ -4332,11 +4477,23 @@ static void set_grow(PyrsSet *s) {
     SetSlot *old = s->table;
     long long *old_order = s->order;
     long long old_order_len = s->order_len;
-    s->cap *= 2;
-    s->table = xmalloc((size_t)s->cap * sizeof(SetSlot));
-    memset(s->table, 0, (size_t)s->cap * sizeof(SetSlot));
-    s->order_cap = s->cap;
-    s->order = xmalloc((size_t)s->order_cap * sizeof(long long));
+    long long old_cap = s->cap;
+    long long old_order_cap = s->order_cap;
+    /* Publish the resized shape only after both allocations succeed; xmalloc
+     * may run a collection on its first OOM attempt. */
+    long long new_cap = old_cap * 2;
+    SetSlot *new_table = xmalloc((size_t)new_cap * sizeof(SetSlot));
+    memset(new_table, 0, (size_t)new_cap * sizeof(SetSlot));
+    long long *new_order =
+        xmalloc((size_t)new_cap * sizeof(long long));
+
+    s->cap = new_cap;
+    s->table = new_table;
+    s->order_cap = new_cap;
+    s->order = new_order;
+    pyrs_gc_external_allocated(s, (size_t)new_cap * sizeof(SetSlot));
+    pyrs_gc_external_allocated(s,
+                               (size_t)new_cap * sizeof(long long));
     s->order_len = 0;
     s->len = 0;
     for (long long k = 0; k < old_order_len; k++) {
@@ -4350,8 +4507,11 @@ static void set_grow(PyrsSet *s) {
             s->len++;
         }
     }
-    (void)old;
-    (void)old_order;
+    pyrs_gc_external_freed(s, (size_t)old_cap * sizeof(SetSlot));
+    pyrs_gc_external_freed(s,
+                           (size_t)old_order_cap * sizeof(long long));
+    free(old);
+    free(old_order);
 }
 
 void pyrs_set_add(PyrsSet *s, long long key, int key_tag) {
@@ -4370,7 +4530,11 @@ void pyrs_set_add(PyrsSet *s, long long key, int key_tag) {
     if (s->order_len == s->order_cap) {
         long long nc = s->order_cap * 2;
         long long *no = xmalloc((size_t)nc * sizeof(long long));
+        pyrs_gc_external_allocated(s, (size_t)nc * sizeof(long long));
         memcpy(no, s->order, (size_t)s->order_len * sizeof(long long));
+        pyrs_gc_external_freed(
+            s, (size_t)s->order_cap * sizeof(long long));
+        free(s->order);
         s->order = no;
         s->order_cap = nc;
     }
@@ -5025,6 +5189,14 @@ static void jbuf_init(JsonBuf *b) {
     b->data[0] = '\0';
 }
 
+static void jbuf_dispose(void *context) {
+    JsonBuf *b = (JsonBuf *)context;
+    free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
 static void jbuf_ensure(JsonBuf *b, size_t extra) {
     if (b->len + extra + 1 > b->cap) {
         size_t nc = b->cap * 2;
@@ -5162,10 +5334,13 @@ static void json_dumps_into(JsonBuf *b, long long slot, int tag) {
 
 PyrsStr *pyrs_json_dumps(long long slot, int tag) {
     JsonBuf b;
+    PyrsCleanup cleanup;
     jbuf_init(&b);
+    pyrs_cleanup_push(&cleanup, jbuf_dispose, &b);
     json_dumps_into(&b, slot, tag);
     PyrsStr *r = str_from_cstr(b.data);
-    free(b.data);
+    pyrs_cleanup_pop(&cleanup);
+    jbuf_dispose(&b);
     return r;
 }
 
@@ -5176,7 +5351,7 @@ typedef struct {
 } PyrsCell;
 
 PyrsCell *pyrs_cell_new(long long slot) {
-    PyrsCell *c = (PyrsCell *)xmalloc(sizeof(PyrsCell));
+    PyrsCell *c = (PyrsCell *)pyrs_gc_alloc(sizeof(PyrsCell), PYRS_GC_CELL);
     c->slot = slot;
     c->bound = 1;
     return c;
@@ -5184,7 +5359,7 @@ PyrsCell *pyrs_cell_new(long long slot) {
 
 /* Unbound cell for late free-var capture (CPython empty cell until assign). */
 PyrsCell *pyrs_cell_new_unbound(void) {
-    PyrsCell *c = (PyrsCell *)xmalloc(sizeof(PyrsCell));
+    PyrsCell *c = (PyrsCell *)pyrs_gc_alloc(sizeof(PyrsCell), PYRS_GC_CELL);
     c->slot = 0;
     c->bound = 0;
     return c;
@@ -5215,7 +5390,7 @@ typedef struct {
 
 PyrsClosure *pyrs_closure_new(void *code, long long ncap) {
     size_t sz = sizeof(PyrsClosure) + (size_t)ncap * sizeof(long long);
-    PyrsClosure *c = (PyrsClosure *)xmalloc(sz);
+    PyrsClosure *c = (PyrsClosure *)pyrs_gc_alloc(sz, PYRS_GC_CLOSURE);
     c->code = code;
     c->ncap = ncap;
     for (long long i = 0; i < ncap; i++) {
@@ -5267,7 +5442,7 @@ typedef struct {
 
 PyrsGen *pyrs_gen_new(void *code, long long nlocals) {
     size_t sz = sizeof(PyrsGen) + (size_t)nlocals * sizeof(long long);
-    PyrsGen *g = (PyrsGen *)xmalloc(sz);
+    PyrsGen *g = (PyrsGen *)pyrs_gc_alloc(sz, PYRS_GC_GENERATOR);
     g->code = code;
     g->state = 0;
     g->done = 0;
@@ -5507,7 +5682,7 @@ void pyrs_gen_set_done(PyrsGen *g) {
 int pyrs_gen_is_genexit(void) {
     return g_exc_type == PYRS_EXC_GENEXIT ? 1 : 0;
 }
-/* ---- user class objects (closed-world layouts; never freed) ---- */
+/* ---- user class objects (closed-world layouts) ---- */
 
 /* Allocate nbytes (including i64 type_id header) and write type_id at offset 0.
  * Remaining bytes are zeroed so fields start as 0/null. */
@@ -5515,7 +5690,7 @@ void *pyrs_object_new(long long type_id, long long nbytes) {
     if (nbytes < (long long)sizeof(long long)) {
         nbytes = (long long)sizeof(long long);
     }
-    void *p = xmalloc((size_t)nbytes);
+    void *p = pyrs_gc_alloc((size_t)nbytes, PYRS_GC_CLASS);
     memset(p, 0, (size_t)nbytes);
     *(long long *)p = type_id;
     return p;
@@ -5562,8 +5737,254 @@ PyrsStr *pyrs_str_from_object(void *obj) {
         snprintf(buf, sizeof buf, "<object>");
     }
     size_t n = strlen(buf);
-    PyrsStr *s = xmalloc(sizeof(long long) + n + 1);
+    PyrsStr *s = pyrs_gc_alloc(sizeof(long long) + n + 1, PYRS_GC_STRING);
     s->len = (long long)n;
     memcpy(s->data, buf, n + 1);
     return s;
+}
+
+/* ---- collector object-model hooks ----
+ *
+ * These are deliberately kept beside the concrete runtime layouts instead of
+ * duplicating those layouts in gc.c. Heap traversal is layout-directed;
+ * erased i64 payload slots are still validated conservatively because not
+ * every object layout retains source-level type metadata.
+ */
+
+typedef struct {
+    void *receiver;
+} PyrsBoundMethodBox;
+
+void *pyrs_bound_method_new(void *receiver) {
+    PyrsBoundMethodBox *box =
+        pyrs_gc_alloc(sizeof(PyrsBoundMethodBox), PYRS_GC_BOUND_METHOD);
+    box->receiver = receiver;
+    return box;
+}
+
+static void gc_visit_slot(long long slot, PyrsGcVisitFn visit,
+                          void *context) {
+    visit((uintptr_t)(unsigned long long)slot, context);
+}
+
+void pyrs_gc_trace_object(int kind, void *object, size_t size,
+                          PyrsGcVisitFn visit, void *context) {
+    if (object == NULL || visit == NULL) {
+        return;
+    }
+    switch (kind) {
+    case PYRS_GC_STRING:
+    case PYRS_GC_BIGINT:
+        return;
+    case PYRS_GC_EXCEPTION: {
+        PyrsExc *e = object;
+        visit((uintptr_t)e->msg, context);
+        return;
+    }
+    case PYRS_GC_LIST: {
+        PyrsList *list = object;
+        long long n = list->len;
+        if (n < 0 || n > list->cap || list->data == NULL) {
+            return;
+        }
+        for (long long i = 0; i < n; i++) {
+            gc_visit_slot(list->data[i], visit, context);
+        }
+        return;
+    }
+    case PYRS_GC_FILE: {
+        PyrsFile *file = object;
+        visit((uintptr_t)file->name, context);
+        return;
+    }
+    case PYRS_GC_TUPLE: {
+        PyrsTuple *tuple = object;
+        if (tuple->len < 0 || tuple->data == NULL) {
+            return;
+        }
+        for (long long i = 0; i < tuple->len; i++) {
+            gc_visit_slot(tuple->data[i], visit, context);
+        }
+        return;
+    }
+    case PYRS_GC_DICT: {
+        PyrsDict *dict = object;
+        if (dict->cap < 0 || dict->table == NULL) {
+            return;
+        }
+        for (long long i = 0; i < dict->cap; i++) {
+            DictSlot *slot = &dict->table[i];
+            if (slot->state == 1) {
+                gc_visit_slot(slot->key, visit, context);
+                gc_visit_slot(slot->val, visit, context);
+            }
+        }
+        return;
+    }
+    case PYRS_GC_SET: {
+        PyrsSet *set = object;
+        if (set->cap < 0 || set->table == NULL) {
+            return;
+        }
+        for (long long i = 0; i < set->cap; i++) {
+            SetSlot *slot = &set->table[i];
+            if (slot->state == 1) {
+                gc_visit_slot(slot->key, visit, context);
+            }
+        }
+        return;
+    }
+    case PYRS_GC_CELL: {
+        PyrsCell *cell = object;
+        if (cell->bound) {
+            gc_visit_slot(cell->slot, visit, context);
+        }
+        return;
+    }
+    case PYRS_GC_CLOSURE: {
+        PyrsClosure *closure = object;
+        if (closure->ncap < 0) {
+            return;
+        }
+        for (long long i = 0; i < closure->ncap; i++) {
+            gc_visit_slot(closure->caps[i], visit, context);
+        }
+        return;
+    }
+    case PYRS_GC_GENERATOR: {
+        PyrsGen *generator = object;
+        gc_visit_slot(generator->yield_slot, visit, context);
+        gc_visit_slot(generator->return_slot, visit, context);
+        gc_visit_slot(generator->send_slot, visit, context);
+        visit((uintptr_t)generator->throw_msg, context);
+        if (generator->nlocals < 0) {
+            return;
+        }
+        for (long long i = 0; i < generator->nlocals; i++) {
+            gc_visit_slot(generator->locals[i], visit, context);
+        }
+        return;
+    }
+    case PYRS_GC_CLASS: {
+        /* Closed-world class fields are naturally aligned within the LLVM
+         * struct.  Scan their words conservatively; the leading type_id is
+         * scalar, and candidate validation rejects non-heap bit patterns. */
+        unsigned char *bytes = object;
+        for (size_t offset = sizeof(long long);
+             offset + sizeof(uintptr_t) <= size;
+             offset += sizeof(uintptr_t)) {
+            uintptr_t candidate = 0;
+            memcpy(&candidate, bytes + offset, sizeof(candidate));
+            visit(candidate, context);
+        }
+        return;
+    }
+    case PYRS_GC_UNION_BOX: {
+        PyrsUnionBox *box = object;
+        gc_visit_slot(box->payload, visit, context);
+        return;
+    }
+    case PYRS_GC_BOUND_METHOD: {
+        PyrsBoundMethodBox *box = object;
+        visit((uintptr_t)box->receiver, context);
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+static void gc_visit_array_range(void *start, long long count,
+                                 size_t element_size, PyrsGcRangeFn visit,
+                                 void *context) {
+    if (start == NULL || count <= 0 ||
+        (unsigned long long)count > SIZE_MAX / element_size) {
+        return;
+    }
+    visit(start, (size_t)count * element_size, context);
+}
+
+void pyrs_gc_visit_owned_ranges(int kind, void *object, size_t size,
+                                PyrsGcRangeFn visit, void *context) {
+    (void)size;
+    if (object == NULL || visit == NULL) {
+        return;
+    }
+    switch (kind) {
+    case PYRS_GC_BIGINT: {
+        PyrsInt *integer = object;
+        gc_visit_array_range(integer->limbs, integer->nlimbs,
+                             sizeof(*integer->limbs), visit, context);
+        return;
+    }
+    case PYRS_GC_LIST: {
+        PyrsList *list = object;
+        gc_visit_array_range(list->data, list->cap, sizeof(*list->data),
+                             visit, context);
+        return;
+    }
+    case PYRS_GC_TUPLE: {
+        PyrsTuple *tuple = object;
+        gc_visit_array_range(tuple->data, tuple->len, sizeof(*tuple->data),
+                             visit, context);
+        gc_visit_array_range(tuple->tags, tuple->len, sizeof(*tuple->tags),
+                             visit, context);
+        return;
+    }
+    case PYRS_GC_DICT: {
+        PyrsDict *dict = object;
+        gc_visit_array_range(dict->table, dict->cap, sizeof(*dict->table),
+                             visit, context);
+        gc_visit_array_range(dict->order, dict->order_cap,
+                             sizeof(*dict->order), visit, context);
+        return;
+    }
+    case PYRS_GC_SET: {
+        PyrsSet *set = object;
+        gc_visit_array_range(set->table, set->cap, sizeof(*set->table), visit,
+                             context);
+        gc_visit_array_range(set->order, set->order_cap,
+                             sizeof(*set->order), visit, context);
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+void pyrs_gc_destroy_object(int kind, void *object, size_t size) {
+    (void)size;
+    if (object == NULL) {
+        return;
+    }
+    switch (kind) {
+    case PYRS_GC_BIGINT:
+        free(((PyrsInt *)object)->limbs);
+        return;
+    case PYRS_GC_LIST:
+        free(((PyrsList *)object)->data);
+        return;
+    case PYRS_GC_FILE: {
+        PyrsFile *file = object;
+        if (!file->closed && file->fp != NULL) {
+            fclose(file->fp);
+            file->closed = 1;
+        }
+        return;
+    }
+    case PYRS_GC_TUPLE:
+        free(((PyrsTuple *)object)->data);
+        free(((PyrsTuple *)object)->tags);
+        return;
+    case PYRS_GC_DICT:
+        free(((PyrsDict *)object)->table);
+        free(((PyrsDict *)object)->order);
+        return;
+    case PYRS_GC_SET:
+        free(((PyrsSet *)object)->table);
+        free(((PyrsSet *)object)->order);
+        return;
+    default:
+        return;
+    }
 }
