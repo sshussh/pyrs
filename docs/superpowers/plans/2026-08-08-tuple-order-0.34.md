@@ -15,7 +15,7 @@
 
 - Keyed sort materializes a never-freed auxiliary keys list of length `n`
 - Class `__len__` via bare `key=len`
-- List lexicographic ordering (`[1,2] < [1,3]`) and list min/max without key for nested lists
+- List lexicographic ordering (`[1,2] < [1,3]`) — **done in 0.35**
 
 ## Out of scope (unchanged)
 
