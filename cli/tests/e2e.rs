@@ -2029,8 +2029,13 @@ print(sorted([1, 2], key=two))
 
 #[test]
 fn key_builtin_len_abs_match_python() {
-    // Bare builtins as key=: len, abs, int, str (monomorphic casts).
+    // Bare builtins as key=: len, abs, int, str (monomorphic casts); class __len__.
     let src = "\
+class Box:
+    def __init__(self, n: int):
+        self.n = n
+    def __len__(self) -> int:
+        return self.n
 print(sorted([\"bb\", \"a\", \"ccc\"], key=len))
 print(min([\"bb\", \"a\", \"ccc\"], key=len))
 print(max([\"bb\", \"a\", \"ccc\"], key=len))
@@ -2047,6 +2052,15 @@ ys = [-3, 1, -2]
 ys.sort(key=abs)
 print(ys)
 print(sorted([\"bb\", \"a\", \"ccc\"], key=len, reverse=True))
+# class instances with __len__
+boxes: list[Box] = [Box(3), Box(1), Box(2)]
+for b in sorted(boxes, key=len):
+    print(b.n)
+print(min(boxes, key=len).n)
+print(max(boxes, key=len).n)
+boxes.sort(key=len)
+for b in boxes:
+    print(b.n)
 ";
     let out = run_program("key_builtin", src);
     let py = std::process::Command::new("python3")

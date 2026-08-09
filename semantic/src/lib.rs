@@ -18775,16 +18775,16 @@ fn resolve_builtin_sort_key(
 ) -> SResult<Option<(SortKey, ir::Ty)>> {
     match name {
         "len" => {
-            let ok = matches!(
-                elem_ty,
+            let ok = match elem_ty {
                 ir::Ty::Str
-                    | ir::Ty::List(_)
-                    | ir::Ty::Tuple(_)
-                    | ir::Ty::Dict { .. }
-                    | ir::Ty::Set(_)
-            );
+                | ir::Ty::List(_)
+                | ir::Ty::Tuple(_)
+                | ir::Ty::Dict { .. }
+                | ir::Ty::Set(_) => true,
+                ir::Ty::Class(id) => resolve_method(id, "__len__").is_some(),
+                _ => false,
+            };
             if !ok {
-                // Class with __len__ still needs a wrapper (no ctx method lower here).
                 return Err(err(
                     format!(
                         "key=len is not supported for element type {elem_ty}; \
@@ -18923,7 +18923,12 @@ fn validate_sort_key_closure(
     Ok((SortKey::Closure(clos), key_ty))
 }
 
-fn call_sort_key(key: &SortKey, arg: ir::Expr, arg_span: Span) -> SResult<ir::Expr> {
+fn call_sort_key(
+    key: &SortKey,
+    arg: ir::Expr,
+    arg_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
     match key {
         SortKey::Direct {
             ir_name,
@@ -18960,13 +18965,31 @@ fn call_sort_key(key: &SortKey, arg: ir::Expr, arg_span: Span) -> SResult<ir::Ex
                 },
             })
         }
-        SortKey::Builtin(bk) => call_builtin_sort_key(*bk, arg, arg_span),
+        SortKey::Builtin(bk) => call_builtin_sort_key(*bk, arg, arg_span, ctx),
     }
 }
 
-fn call_builtin_sort_key(bk: BuiltinKey, arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
+fn call_builtin_sort_key(
+    bk: BuiltinKey,
+    arg: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
     match bk {
         BuiltinKey::Len => {
+            if let ir::Ty::Class(id) = arg.ty {
+                if resolve_method(id, "__len__").is_none() {
+                    return Err(err(
+                        format!("object of type '{}' has no len()", arg.ty),
+                        span,
+                    ));
+                }
+                let call = lower_instance_method_call(arg, id, "__len__", span, &[], ctx)?;
+                if call.ty != ir::Ty::Int {
+                    return Err(err("__len__ must return int", span));
+                }
+                return Ok(call);
+            }
             if !matches!(
                 arg.ty,
                 ir::Ty::Str
@@ -19147,7 +19170,7 @@ fn lower_list_sort_key_stmts(
             index: Box::new(i.clone()),
         },
     };
-    let keyed = call_sort_key(&key, elem_i, key_ast.span)?;
+    let keyed = call_sort_key(&key, elem_i, key_ast.span, ctx)?;
     let fill_body = vec![
         ir::Stmt::ListAppendUnchecked {
             list: keys.clone(),
@@ -19525,7 +19548,7 @@ fn lower_min_max_multi_key(
     });
     stmts.push(ir::Stmt::Assign {
         name: best_k_t.clone(),
-        value: call_sort_key(&key, local_expr(best_t.clone(), elem), args[0].span)?,
+        value: call_sort_key(&key, local_expr(best_t.clone(), elem), args[0].span, ctx)?,
     });
 
     let cmp_op = if func == "min" {
@@ -19542,7 +19565,7 @@ fn lower_min_max_multi_key(
         });
         stmts.push(ir::Stmt::Assign {
             name: k_t.clone(),
-            value: call_sort_key(&key, local_expr(x_t.clone(), elem), args[i].span)?,
+            value: call_sort_key(&key, local_expr(x_t.clone(), elem), args[i].span, ctx)?,
         });
         let better = key_cmp(
             cmp_op,
@@ -19663,7 +19686,7 @@ fn lower_min_max_list_key(
         },
         ir::Stmt::Assign {
             name: best_k_t.clone(),
-            value: call_sort_key(&key, local_expr(best_t.clone(), elem), key_ast.span)?,
+            value: call_sort_key(&key, local_expr(best_t.clone(), elem), key_ast.span, ctx)?,
         },
         ir::Stmt::Assign {
             name: i_t.clone(),
@@ -19707,7 +19730,7 @@ fn lower_min_max_list_key(
         },
         ir::Stmt::Assign {
             name: k_t,
-            value: call_sort_key(&key, local_expr(x_t, elem), key_ast.span)?,
+            value: call_sort_key(&key, local_expr(x_t, elem), key_ast.span, ctx)?,
         },
         ir::Stmt::If {
             branches: vec![(better, update)],
@@ -22652,6 +22675,47 @@ v = min([3, 1, 2], key=k)
             panic!();
         };
         assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
+    }
+
+    #[test]
+    fn key_len_on_class_with_len_ok() {
+        let m = analyze_ok(
+            "\
+class C:
+    def __init__(self, n: int):
+        self.n = n
+    def __len__(self) -> int:
+        return self.n
+xs: list[C] = [C(3), C(1), C(2)]
+ys = sorted(xs, key=len)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        // GlobalAssign xs, GlobalAssign ys
+        assert!(entry.body.len() >= 2);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!("{:?}", entry.body);
+        };
+        assert!(matches!(value.ty, ir::Ty::List(_)));
+    }
+
+    #[test]
+    fn key_len_on_class_without_len_rejected() {
+        let e = analyze_err(
+            "\
+class C:
+    def __init__(self, n: int):
+        self.n = n
+xs: list[C] = [C(1)]
+print(sorted(xs, key=len))
+",
+        );
+        assert!(
+            e.message.contains("key=len")
+                && (e.message.contains("C") || e.message.contains("class#")),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
