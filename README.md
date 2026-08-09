@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.35.0)
+## The language (v0.36.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.36.0**, not 1.0) until it is ready for
+milestone after this one is **0.37.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. Core-language growth comes first;
 **GC / heap freeing** remains the last major core feature before 1.0
@@ -114,6 +114,8 @@ A statically-typed Python subset:
   **v0.35:** lexicographic list ordering (`[1,2] < [1,3]`), multi-arg and
   list `min`/`max` over orderable lists, and `sorted`/`list.sort` for
   nested `list[list[…]]` of orderable elements.
+  **v0.36:** bare `key=len` on class instances that define `__len__` → `int`
+  (`sorted` / `list.sort` / `min` / `max`).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -276,7 +278,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.35.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.36.0): `int` is arbitrary precision (tagged small ±2⁶² /
 heap limbs; limbs never freed, no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -289,8 +291,8 @@ error; use the iterable form or a common type); iterable `min`/`max` without
 (empty without `default=` → ValueError like CPython); with monomorphic `key=`
 any `list[T]` is fine; iterable `default=` joins with element type
 (`default=None` → Optional); multi-arg rejects `default=`; bare `key=`
-builtins supported are `len`, `abs`, `int`/`float`/`bool`/`str` (other
-builtins and class `__len__` still need a wrapper); `sorted(..., key=)`
+builtins supported are `len` (containers and classes with `__len__`), `abs`,
+`int`/`float`/`bool`/`str` (other builtins still need a wrapper); `sorted(..., key=)`
 and `list.sort(key=)` materialize a never-freed auxiliary keys list of
 length `n`; `sorted`/`list.sort` `reverse=` uses truthiness (bool/int/str/…);
 `min`/`max` reject `reverse=` as unexpected (CPython has no such
@@ -433,4 +435,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.35.0 && git push origin v0.35.0`.
+Release tags: `git tag v0.36.0 && git push origin v0.36.0`.
