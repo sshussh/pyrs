@@ -211,7 +211,7 @@ value.
 
 | type | representation | notes |
 |------|----------------|-------|
-| `int`   | arbitrary precision | tagged i64 small ints (±2⁶²) or heap limbs (base 2⁶⁴); never freed |
+| `int`   | arbitrary precision | tagged i64 small ints (±2⁶²) or GC-managed heap limbs (base 2⁶⁴) |
 | `float` | IEEE-754 double | |
 | `bool`  | `True` / `False` | assignable where int/float is expected |
 | `str`   | immutable string | heap-allocated, length-prefixed |
@@ -534,7 +534,7 @@ float NaN sorts last on that path (stable total order via runtime
 `int|float|bool|str` — same-module free function, imported free function,
 nested function, lambda with typed/defaulted params, or bare `len` /
 `abs` / `int` / `float` / `bool` / `str`), any `list[T]` is accepted; keys
-are evaluated once into an auxiliary never-freed `list[K]` of length `n`,
+are evaluated once into an auxiliary GC-managed `list[K]` of length `n`,
 then a stable insertion sort rearranges both lists. Float keys use
 ordinary `<`/`>` compares (not the no-key NaN-last order). `reverse=` uses
 CPython truthiness (`True`/`1` reverse, `False`/`0` no-op; stable
@@ -697,7 +697,7 @@ print(inc(2))  # 3
 ### Classes
 
 Closed-world, layout-specialized objects (v0.25). Instances carry a
-`type_id` header (GC-ready); heap objects are still never freed.
+`type_id` header and are managed by the runtime collector.
 
 ```python
 class Point:
@@ -787,7 +787,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, orderable tuple, or orderable list (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple/list: lexicographic; optional monomorphic `key=` over homogeneous positionals; no `default=` |
 | `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple\|orderable list]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs)` | `list[int]` or `list[float]` | element type (`0` / `0.0` if empty; no `start=`) |
-| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str\|orderable tuple\|orderable list]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len` (incl. class `__len__`)/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list; stable reverse-sort-reverse; keyed path materializes never-freed keys list |
+| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str\|orderable tuple\|orderable list]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len` (incl. class `__len__`)/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list; stable reverse-sort-reverse; keyed path materializes a GC-managed keys list |
 | `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` | without `key=`: sortable elem (incl. orderable tuples/lists); with monomorphic `key=`: any `list[T]`; same bare-builtin `key=` surface as `sorted`; `reverse=` is truthy | in-place (statement only); same key/reverse surface as `sorted` |
 | `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
@@ -1203,10 +1203,9 @@ Everything PyRs *does* support behaves like Python — these are the known,
 deliberate exceptions:
 
 1. **`int` is arbitrary precision** (like CPython). Values that fit in
-   ±2⁶² are tagged in an i64 slot; larger values are heap `PyrsInt`
-   limbs (base 2⁶⁴, never freed — same interim memory model as other
-   heaps). Equal bigints are not interned, so `is` is pointer/tag
-   identity, not value identity.
+   ±2⁶² are tagged in an i64 slot; larger values are GC-managed heap
+   `PyrsInt` limbs (base 2⁶⁴). Equal bigints are not interned, so `is` is
+   pointer/tag identity, not value identity.
 2. **`and`/`or` yield an operand** (like CPython), including mixed
    non-numeric pairs typed as a union (e.g. `0 or "x"` → `int | str`).
    Same-type / both-numeric operands keep the previous unify rules.
@@ -1238,11 +1237,13 @@ deliberate exceptions:
    is often caught at compile time.
 8. **str methods use ASCII rules** for case (`upper`/`lower`) and
    whitespace (`strip`/`split`) — Python is Unicode-aware.
-9. **Memory is never freed** (no GC yet); fine for short-lived programs,
-   a known limitation for long-running ones. Explicit `generator.close()`
-   still runs `finally` (GeneratorExit); abandoned gens without `close`
-   do not (no GC finalizers yet). User class instances use a GC-ready
-   `type_id` header but are also never freed.
+9. **GC is nonmoving mark–sweep with conservative native roots.** Unreachable
+   managed objects, including cycles, are reclaimed, but pointer-like values
+   on the native stack can keep an object alive longer than necessary. The
+   collector does not run user finalizers: explicit `generator.close()` still
+   runs `finally` (`GeneratorExit`), while abandoning a generator does not.
+   Use `with open(...)` or explicit `file.close()` for deterministic resource
+   cleanup. See [Garbage collection](GC.md) for architecture and diagnostics.
 9a. **Default object print/str** is `<ClassName object>` without a
     memory address (CPython prints `<__main__.Name object at 0x…>`).
 10. **`float ** float` with a negative base and fractional exponent**
@@ -1320,7 +1321,7 @@ exceptions may be list/tuple elements; `e.args` is `list[str]`; `repr(e)` /
 not yet.
 
 Not implemented yet (clear compile errors): full class dynamism (see
-[Classes](#classes) residuals), GC / heap freeing,
+[Classes](#classes) residuals), a moving generational/Immix GC backend,
 f-string debug form `{x=}` / grouping / types `n`/`c`, unparenthesized
 multi-line expressions inside f-string `{...}` (parenthesize instead),
 same-delimiter triple quotes nested inside an f-string expression,
@@ -1372,10 +1373,10 @@ source ─→ lexer ─→ parser ─→ semantic ─→ ir ─→ codegen ─�
 Each stage is its own crate (`common`, `lexer`, `parser`, `semantic`,
 `ir`, `codegen`, `cli`). The Rust side emits LLVM IR as *text* — run
 `pyrs compile --emit-llvm` to read it — and a thin C++ shim drives LLVM's
-parser, verifier, optimizer, and object emitter. A small C runtime
-(`codegen/runtime/runtime.c`) supplies Python-faithful printing
-(shortest round-trip floats), string/list storage, and the runtime error
-traps; it is compiled and linked into every binary by `cc`.
+parser, verifier, optimizer, and object emitter. A small C runtime and
+collector (`codegen/runtime/runtime.c` and `codegen/runtime/gc.c`) supply
+Python-faithful printing (shortest round-trip floats), managed storage, and
+runtime error traps; they are compiled and linked into every binary by `cc`.
 
 Details and build strategy: [SPECIFICATIONS.md](../SPECIFICATIONS.md).
 Worked examples live in [examples/](../examples), benchmarks in

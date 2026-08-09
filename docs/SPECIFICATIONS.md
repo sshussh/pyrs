@@ -90,13 +90,13 @@ ir::Module           fully typed tree (the contract)
 LLVM IR string
    │  C++ shim       parseIR → verify → opt (O0–O3) → native .o
    ▼
-object file  +  runtime.c  ──cc -lm──►  native executable
+object file  +  runtime.c + gc.c  ──cc -lm──►  native executable
 ```
 
 **Driver (`cli`):** for `compile` / `run`, resolve the import graph
 (`cli/src/modules.rs`), parse every module, run `semantic::analyze_program`,
 emit LLVM IR, optionally write `<output>.ll`, invoke the shim to produce
-an object file, then compile/link `runtime.c` with `cc`.
+an object file, then compile/link `runtime.c` and `gc.c` with `cc`.
 
 **Invariant:** if codegen must “figure out” a type or desugar a construct,
 the design is wrong — that work belongs in **semantic**.
@@ -112,7 +112,7 @@ pyrs/                 Cargo workspace (resolver = "3")
 ├── parser/           AST + recursive descent
 ├── semantic/         typecheck + lower to IR
 ├── ir/               pure data structures (no analysis)
-├── codegen/          emit.rs + runtime.c + CMake shim
+├── codegen/          emit.rs + runtime.c/gc.c + CMake shim
 └── cli/              binary `pyrs`
 ```
 
@@ -231,27 +231,32 @@ Compiler temps use names starting with `.` (illegal as Python identifiers).
 
 ### 5.7 C runtime
 
-- Source: `codegen/runtime/runtime.c`, embedded as `codegen::RUNTIME_C`
-  and written to a temp file at link time by the driver.
+- Sources: `codegen/runtime/runtime.c`, `codegen/runtime/gc.c`, and
+  `codegen/runtime/gc.h`, embedded in the `codegen` crate and written to a
+  temporary directory at link time by the driver.
 - Provides Python-faithful printing (float shortest round-trip repr,
   `True`/`False`, list repr), string and list heap objects, file I/O,
   `input` / `sys.argv` wiring, arithmetic helpers (e.g. floored float
   ops, int pow), and trap messages that match CPython where required.
 - Not every language op hits C: some are pure LLVM (e.g. `abs` on
   int/float). The runtime is the home for layout- and OS-facing work.
-- **Memory:** strings and lists are allocated and **not freed** today
-  (documented limitation). Freeing / GC is required before a 1.0 release.
+- **Memory:** managed objects use a single-threaded, nonmoving mark–sweep
+  collector. Heap traversal is layout-directed; erased payload slots plus
+  native stack and register roots are candidate-checked conservatively, while
+  emitted globals and exception frames are registered explicitly. See
+  [GC.md](GC.md).
 
 ### 5.8 Final link of user programs
 
 The driver runs approximately:
 
 ```text
-cc program.o runtime.c -O2 -lm -o <output>
+cc program.o runtime.c gc.c -O2 -lm -o <output>
 ```
 
 The **compiler** (`pyrs` binary) links the C++ shim and LLVM; **user
-programs** link only the object file from the shim plus `runtime.c`.
+programs** link only the object file from the shim plus `runtime.c` and
+`gc.c`.
 
 ---
 
@@ -382,7 +387,7 @@ programs** link only the object file from the shim plus `runtime.c`.
   `BoundMethod` / `BindMethod` / `CallBoundMethod`; classmethod construct
   via runtime `type_id`; match class patterns; class `with` with
   `__exit__` suppress; `__contains__`; builtin `next`; no multi-base, open
-  `__dict__`, or GC free.
+  `__dict__`, or fully dynamic attributes.
 
 **Direction:**
 
@@ -393,7 +398,8 @@ programs** link only the object file from the shim plus `runtime.c`.
 Documented deviations (non-exhaustive; see GUIDE § Differences): 64-bit
 wrapping ints, `and`/`or` may form unions when operands differ,
 `dict.get` bare form returns `Optional[V]`, ASCII-only string
-case/whitespace rules, no GC, dynamic negative int `**` traps, etc.
+case/whitespace rules, conservative native GC roots, dynamic negative int
+`**` traps, etc.
 
 ---
 
@@ -446,7 +452,7 @@ Rebuild triggers: changes under `codegen/shim/` (listed in
 | User function in LLVM    | `@pyrs_<name>` (after IR naming / module prefix)                               |
 | Module global            | `@g.<name>`                                                                    |
 | Compiler temporary local | name starts with `.`                                                           |
-| Runtime API              | C functions `pyrs_*` declared in emitted IR and defined in `runtime.c`         |
+| Runtime API              | C functions `pyrs_*` declared in emitted IR and defined in `runtime.c` / `gc.c` |
 | LLVM intrinsics          | e.g. `llvm.abs.i64`, `llvm.fabs.f64`, `llvm.pow.f64` — no C body               |
 | String layout            | `{ i64 len, bytes… }` length-prefixed (+ trailing NUL for C interop)           |
 | List layout              | `{ i64 len, i64 cap, i64* data }` with 8-byte value slots                      |
@@ -455,7 +461,7 @@ Rebuild triggers: changes under `codegen/shim/` (listed in
 | Program entry in IR      | synthetic function / module name `__main__` for the root script                  |
 
 Changing a layout or tag encoding requires a coordinated edit of
-**emit.rs** and **runtime.c**.
+**emit.rs**, **runtime.c**, and the matching trace logic in **gc.c**.
 
 ---
 
@@ -487,7 +493,7 @@ These are product constraints that affect design choices:
 | Area             | Current                                              | Direction                                                                 |
 | ---------------- | ---------------------------------------------------- | ------------------------------------------------------------------------- |
 | Modules          | Packages, relative imports, namespace pkgs, `import *` | richer package semantics if needed                                      |
-| Memory           | Never free heap strings/lists                        | GC / freeing **before 1.0**                                               |
+| Memory           | Nonmoving mark–sweep; layout-directed heap tracing + conservative native roots | Moving generational/Immix after precise root representation — see [GC architecture and roadmap](GC.md) |
 | Typing           | Multi-assign join + bare-param body infer + isinstance peels + subclass coercion + limited `Any` | Fuller optional typing + more dynamism                                 |
 | Builtins / kit   | `isinstance` (incl. on `Any`), `any`/`all`, `enumerate`/`zip`/`reversed`, set/dict kit | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
@@ -497,7 +503,7 @@ These are product constraints that affect design choices:
 Features explicitly **out of IR/runtime today** (non-exhaustive): full
 CPython class dynamism (v0.20 has closed-world classes + isinstance peels),
 advanced match patterns, full `yield from` send/throw forwarding,
-f-string `{x=}` / grouping / `n`/`c`, GC. Prefer compile-time rejection with a
+f-string `{x=}` / grouping / `n`/`c`, and a moving generational/Immix GC. Prefer compile-time rejection with a
 clear message over silent wrong behavior. `*args`/`**kwargs` on defs and
 call-site unpacking, `from m import *`, and namespace packages are supported.
 

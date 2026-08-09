@@ -63,11 +63,11 @@ pub enum Ty {
     Generator {
         yield_ty: &'static Ty,
     },
-    /// First-class exception instance (`except E as e`). Heap object with a
-    /// fixed exception type tag and message; never freed. Not a user class.
+    /// First-class exception instance (`except E as e`). GC-managed heap
+    /// object with a fixed exception type tag and message. Not a user class.
     Exception,
     /// User-defined class instance. `ClassId` indexes [`Module::classes`].
-    /// Layout: header `i64 type_id` then fixed fields (never freed; GC-ready).
+    /// Layout: header `i64 type_id` then fixed, collector-traced fields.
     Class(ClassId),
     /// Bound method value (`obj.method` without call). Heap `{ ptr object }`;
     /// call supplies user args after the captured self. `func` is the IR

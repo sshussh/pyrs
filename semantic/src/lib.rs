@@ -19107,7 +19107,7 @@ fn lower_sorted_expr(
 
 /// In-place stable insertion sort by monomorphic `key=` (shared by `sorted` and
 /// `list.sort`). `list` should be a cheap Local — callers bind side-effecting
-/// bases once. Keys are evaluated once into a never-freed auxiliary list.
+/// bases once. Keys are evaluated once into a GC-managed auxiliary list.
 fn lower_list_sort_key_stmts(
     list: ir::Expr,
     elem: ir::Ty,

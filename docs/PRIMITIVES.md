@@ -119,7 +119,7 @@ compiled C runtime. Hot loops should not be a chain of opaque calls.
 | One C call per logical op | Prefer a single `find` over per-character runtime calls |
 | Stdlib must not invent hot primitives silently | New hot path → kit review + benches |
 | Compile user + stdlib together when possible | Helps LLVM inline thin PyRs wrappers |
-| Design APIs for future GC/RC | Never-free is interim; alloc-heavy stdlib will suffer without a plan |
+| Keep allocation GC-aware | Managed objects use `pyrs_gc_alloc`; owned native buffers report their bytes to the collector |
 
 ---
 
@@ -129,7 +129,7 @@ Organize work by **family**, not a flat list of C functions.
 
 | Family | Responsibility | Examples (illustrative) | Body |
 |--------|----------------|-------------------------|------|
-| **Core / memory** | Alloc, ownership rules → GC later | `xmalloc`, future free/RC | C |
+| **Core / memory** | Managed allocation, tracing, owned-buffer accounting | `pyrs_gc_alloc`, mark–sweep, external-byte hooks | C |
 | **Numeric** | Scalar ops beyond pure LLVM | `abs`, `ipow`, floored float ops | IR and/or C |
 | **str** | Immutable strings, ASCII policy today | `concat`, `find`, `split`, `isdigit` | C; index path may IR |
 | **list** | Growable slots, mutators | `push`, `pop`, `insert`, `+`, `==` | C + IR for index/len |
@@ -224,22 +224,21 @@ binary.
 | **0. Catalog** | Families + hot/cold + parity notes | Written checklist (this doc + tracking list) |
 | **1. Finish current types** | str/list/file/numeric builtins completeness | Scripts rarely need new C for text/list/file work |
 | **2. Type primitives** | tuple → dict (→ set) | Data model enough for real programs (**done subset**) |
-| **3. Control plane** | Exceptions; closures/*args growth (no GC yet) | Catchable traps; nested functions usable |
+| **3. Control plane** | Exceptions; closures/*args growth | Catchable traps; nested functions usable |
 | **4. Core language** | Typing/dynamism, narrowing, kit, generators, … | Can write real libraries without compiler stubs |
 | **5. Modules path** | Already: multi-root + embed | `import` loads stdlib `.py` |
 | **6. Stdlib growth** | **Pure PyRs** modules on the kit | C only for primitive families — after phase 4 (may overlap late core) |
-| **7. Final core** | **GC/RC/free** (classes shipped v0.19 subset) | GC remains required before 1.0; grow class dynamism carefully |
-| **8. 1.0** | Real-world readiness | GC done + surface/stability bar |
+| **7. Final core** | **Nonmoving mark–sweep GC shipped** (classes shipped v0.19 subset) | Validate the default collector; investigate a moving generational/Immix successor — see [GC architecture and roadmap](GC.md) |
+| **8. 1.0** | Real-world readiness | GC stress/performance + surface/stability bar |
 
 **Explanation:** Do not grow a large stdlib (especially in C) before the
 core language can host pure-PyRs implementations. Do not implement `json`
 logic in C as a substitute for missing types/dynamism.
 
-**Owner priority:** **classes** shipped (v0.19 closed-world subset).
-Implement **garbage collection / heap freeing** only after other planned
-core-language work the owner prioritizes — GC is the final major core
-feature. Never-free is interim until phase 7; GC remains required for
-**1.0**.
+**Owner priority:** **classes** shipped (v0.19 closed-world subset), followed
+by the first tracing collector. The current nonmoving mark–sweep backend is
+the safe baseline for **1.0** work; a moving generational/Immix backend remains
+a later optimization and requires more precise roots.
 
 ---
 
@@ -270,6 +269,6 @@ below) as symbols are added.
 | Stdlib | **Mostly PyRs** on top of the kit; thin C extensions only |
 | Performance | Kit structure is right; **inline hot paths**; don’t reimplement kit ops in PyRs |
 | `runtime.c` growth | **Finite families only**; no high-level libraries |
-| 1.0 gate | **Real-world readiness** (incl. **memory management**); stay on `0.y` until then; never-free is interim |
+| 1.0 gate | **Real-world readiness** (including GC stress, memory, and performance validation); stay on `0.y` until then |
 
 When unsure, re-run the [decision table](#4-decision-table-use-when-adding-a-symbol) and assign a **family** before writing code.

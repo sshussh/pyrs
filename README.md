@@ -43,12 +43,13 @@ pyrs parse   -i prog.py             # dump the AST
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
 milestone after this one is **0.37.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
-`pyrs --version` match this label. Core-language growth comes first;
-**GC / heap freeing** remains the last major core feature before 1.0
-(never-free is interim; GC is still required for 1.0). Classes remain a
-closed-world subset (v0.21 adds `__str__`/`__repr__`, zero-arg `super()`,
-and more kit — see below). No new stdlib until the language can host
-pure-PyRs libraries.
+`pyrs --version` match this label. PyRs now ships its first default heap
+collector: a **nonmoving mark–sweep** backend with conservative native-root
+discovery. This replaces the old never-free runtime; it is the safe first
+backend, not the eventual moving generational/Immix design. See
+[Garbage collection](docs/GC.md). Classes remain a closed-world subset
+(v0.21 adds `__str__`/`__repr__`, zero-arg `super()`, and more kit — see
+below). No new stdlib until the language can host pure-PyRs libraries.
 
 A statically-typed Python subset:
 
@@ -279,7 +280,7 @@ Python semantics are preserved where it counts:
   assignments (and annotation); bare multi-assign may produce a union
 
 Known limits (v0.36.0): `int` is arbitrary precision (tagged small ±2⁶² /
-heap limbs; limbs never freed, no interning/`is` identity for equal
+GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
 `1.0`, not the int `1`; pure `bool` args print as `0`/`1`); multi-arg and
@@ -293,7 +294,7 @@ any `list[T]` is fine; iterable `default=` joins with element type
 (`default=None` → Optional); multi-arg rejects `default=`; bare `key=`
 builtins supported are `len` (containers and classes with `__len__`), `abs`,
 `int`/`float`/`bool`/`str` (other builtins still need a wrapper); `sorted(..., key=)`
-and `list.sort(key=)` materialize a never-freed auxiliary keys list of
+and `list.sort(key=)` materialize a GC-managed auxiliary keys list of
 length `n`; `sorted`/`list.sort` `reverse=` uses truthiness (bool/int/str/…);
 `min`/`max` reject `reverse=` as unexpected (CPython has no such
 kwarg),
@@ -319,9 +320,11 @@ int exponent traps (a constant like `2 ** -1` works and gives float),
 int↔float comparisons convert the int to float (exactness loss past 2^53),
 list literals coerce mixed numerics to one element type (mixed non-numeric
 literal elements still error unless annotated as a union), `nan in [nan]`
-is False (IEEE equality), str methods use ASCII case/whitespace rules, heap
-memory is never freed, files support text modes "r"/"w"/"a" only, no
-multi-path split namespace packages, no `from sys import *`, a package
+is False (IEEE equality), str methods use ASCII case/whitespace rules, GC is
+nonmoving mark–sweep with conservative native roots (so reclamation can be
+delayed by pointer-like stack values), files support text modes "r"/"w"/"a"
+only and still require `with` or explicit `close()` for deterministic resource
+cleanup; no multi-path split namespace packages, no `from sys import *`, a package
 importing itself by name, or treating modules as first-class values
 beyond attribute/call chains; `os.path` is POSIX only; `*args` /
 `**kwargs` on defs and `*`/`**` unpacking in calls are supported for
@@ -350,8 +353,9 @@ is supported; free captures use cells (late bind; load before assign
 defaults need literals); lambda params without defaults still need
 annotations or defaults for inference; homogeneous closures in
 containers need matching params/ret/capture-env shape; classes are the
-closed-world subset above (no multi-base / open attrs / full dynamism);
-heap objects including class instances are never freed (no GC yet).
+closed-world subset above (no multi-base / open attrs / full dynamism); GC
+does not run user finalizers or implicitly close abandoned generators (see
+[Garbage collection](docs/GC.md)).
 
 Errors come with source snippets:
 
@@ -385,7 +389,7 @@ source ─→ lexer ─→ parser ─→ semantic ─→ ir ─→ codegen ─�
 - **`ir`** — fully typed tree; the contract handed to the backend
 - **`codegen`** — emits LLVM IR text; a thin C++ shim (built via CMake)
   parses, verifies, optimizes and emits object code; a tiny C runtime
-  provides Python-faithful printing and runtime traps
+  provides Python-faithful operations, runtime traps, and nonmoving GC
 - **`cli`** — the driver
 
 ## Benchmarks

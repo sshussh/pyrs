@@ -100,7 +100,7 @@ ir::Module                      (ir/src/lib.rs — fully typed, no sugar)
 LLVM IR string
    │  codegen/shim/src/lib.cc   parse → verify → optimize → object file
    ▼                            (you almost never touch this)
-.o file  + codegen/runtime/runtime.c  ──cc -lm──►  native executable
+.o file  + codegen/runtime/runtime.c + gc.c  ──cc -lm──►  native executable
 ```
 
 **Ground rules:**
@@ -113,7 +113,7 @@ LLVM IR string
    supported constructs.
 4. **New language features almost never need C++ shim changes.** The shim
    compiles whatever LLVM text it is given. Runtime behavior goes in
-   `runtime.c` (or pure LLVM intrinsics from emit).
+   `runtime.c` / `gc.c` (or pure LLVM intrinsics from emit).
 5. **Naming:** user functions → `pyrs_<name>`; runtime → `pyrs_*`; LLVM
    globals → `@g.<name>`; compiler temps → locals starting with `.`.
 
@@ -133,7 +133,7 @@ Multi-file programs: `cli/src/modules.rs` loads the import graph;
 | Builtin function | semantic `lower_call` (+ reserved `BUILTINS` if needed) → `ir` if needed → codegen (IR intrinsic and/or C) |
 | Statement form | parser AST → semantic `lower_stmt` → `ir` only if needed → `emit_stmt` |
 | New type | `ir::Ty` → parser `TypeName` → semantic coercions → codegen slots/print → runtime |
-| Runtime-only fix | `runtime.c` + differential test |
+| Runtime-only fix | `runtime.c` / `gc.c` + differential or stress test |
 | Multi-file resolution | `cli/src/modules.rs` + `semantic` import binding |
 
 Prefer **desugaring into existing IR** over new nodes when possible
@@ -155,12 +155,10 @@ Before adding something large, decide *which layer* it belongs to
 
 Do **not** grow the stdlib while the core language is still the priority
 (owner policy: language first, then pure-PyRs libraries). **Classes**
-shipped as a closed-world subset in **v0.19** (see README/GUIDE). Do
-**not** start **GC / heap freeing** until other core work the owner
-prioritizes is done — GC remains the last major core feature before 1.0
-(see `PRIMITIVES.md` / `AGENTS.md`). Do **not** implement a high-level
-stdlib feature only in `runtime.c` if it could be composed from
-primitives once the language is ready.
+shipped as a closed-world subset in **v0.19**, and the first nonmoving
+mark–sweep collector now manages the raw-pointer ABI (see README/GUIDE/GC).
+Do **not** implement a high-level stdlib feature only in `runtime.c` if it
+could be composed from primitives once the language is ready.
 
 ---
 
@@ -198,7 +196,7 @@ out.push_str("declare i32 @pyrs_str_isdigit(ptr)\n");
 
 The `true` flag means “C returns `i32`, convert to `i1`.”
 
-### 4. `codegen/runtime/runtime.c` — implementation
+### 4. `codegen/runtime/runtime.c` / `gc.c` — implementation
 
 Match CPython edge cases first (`"".isdigit()` is `False`):
 
@@ -466,6 +464,8 @@ Pure data: `Ty`, `Module`, `Function`, `Stmt`, `Expr`, `ExprKind`,
 
 - **`emit.rs`:** `Emitter` builds textual IR.
 - **`runtime/runtime.c`:** C kit linked into *user* programs.
+- **`runtime/gc.c` + `gc.h`:** managed allocation, root discovery, tracing,
+  sweeping, and owned-backing accounting.
 - **`shim/`:** C++ LLVM driver linked into the *compiler* binary only
   (`codegen/build.rs` + CMake).
 
@@ -482,7 +482,7 @@ New runtime symbols need a `declare` line in `finish()`.
 Final user link is roughly:
 
 ```text
-cc program.o runtime.c -O2 -lm -o <output>
+cc program.o runtime.c gc.c -O2 -lm -o <output>
 ```
 
 Touch CLI for new flags or load rules — not for ordinary language ops.
@@ -581,7 +581,9 @@ Print/membership: `int=0`, `float=1`, `bool=2`, `str=3`; list-of-X =
 - Pointers as `ptr`; bools across the C boundary often as `i32` 0/1.
 - Failures call `pyrs_die` (no error-code returns for most APIs).
 - `check_ref` on pointer parameters → UnboundLocalError-style traps.
-- Heap objects are **not freed** today (GC required before 1.0).
+- Managed heap objects use nonmoving mark–sweep. New pointer-bearing layouts
+  require a matching allocation kind and trace/destroy/owned-range handling in
+  `runtime.c`; see [GC.md](GC.md).
 
 ---
 
@@ -608,7 +610,7 @@ cases). Tags keep temp directories unique under parallel tests.
    usually means wrong block edges, phis, or `lty` mismatches.
 3. **Earlier phases:** `pyrs lex`, `pyrs parse`.
 4. **Bisect divergences:** shrink the program; re-`diff` vs CPython.
-5. **Runtime:** link with `-g` / ASan against `runtime.c`; printf is fine.
+5. **Runtime:** link with `-g` / ASan against `runtime.c` and `gc.c`; printf is fine.
 6. **Types:** temporary `eprintln!("{:?}", expr.ty)` — IR is `Debug`.
 
 ---
