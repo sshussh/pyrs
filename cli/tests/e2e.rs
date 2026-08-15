@@ -12480,6 +12480,57 @@ print(d[\"a\"], d[\"b\"])
 }
 
 #[test]
+fn set_inplace_algebra_match_python() {
+    let src = "\
+s = {1, 2, 3}
+s.intersection_update({2, 3, 4})
+print(sorted(list(s)))
+s = {1, 2, 3}
+s &= {2, 3, 4}
+print(sorted(list(s)))
+s = {1, 2, 3}
+s.difference_update({2})
+print(sorted(list(s)))
+s = {1, 2, 3}
+s -= {2}
+print(sorted(list(s)))
+s = {1, 2, 3}
+s.symmetric_difference_update({2, 4})
+print(sorted(list(s)))
+s = {1, 2, 3}
+s ^= {2, 4}
+print(sorted(list(s)))
+a = {1, 2}
+b = a
+a &= {2, 3}
+print(sorted(list(a)), sorted(list(b)))
+s = {1, 2}
+s &= s
+print(sorted(list(s)))
+s -= s
+print(len(s))
+empty: set[int] = set()
+empty &= {1}
+print(len(empty))
+words = {\"a\", \"b\", \"c\"}
+words.difference_update({\"b\"})
+print(sorted(list(words)))
+";
+    let out = run_program("setinpl", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn set_pop_match_python() {
     let src = "\
 s = {1}

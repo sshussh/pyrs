@@ -1343,7 +1343,9 @@ Container notes (v0.20.1):
   supports `**rest`.
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
   `{}` is always an empty dict; `|` / `.union` / `|=` / `.update` and
-  `&` / `-` / `^` for same element type; `==` / `!=`; subset operators
+  `&` / `-` / `^` for same element type; in-place `&=` /
+  `.intersection_update`, `-=` / `.difference_update`, `^=` /
+  `.symmetric_difference_update`; `==` / `!=`; subset operators
   `<` / `<=` / `>` / `>=`; methods `issubset` / `issuperset` / `isdisjoint` / `copy` / `pop`
   (last-inserted; empty → KeyError).
 - **Any (limited):** annotation `Any` / `list[Any]` etc. Values are

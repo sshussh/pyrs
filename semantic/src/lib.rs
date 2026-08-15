@@ -10609,6 +10609,39 @@ fn lower_set_method_stmt(
             Ok(ir::Stmt::SetUpdate {
                 set: base_ir,
                 other,
+                op: ir::SetUpdateOp::Union,
+            })
+        }
+        "intersection_update" | "difference_update" | "symmetric_difference_update" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!(
+                        "{method}() takes exactly one argument ({} given)",
+                        args.len()
+                    ),
+                    method_span,
+                ));
+            }
+            let other = lower_expr(&args[0], ctx)?;
+            let expect = ir::set_of(elem_ty);
+            if other.ty != expect {
+                return Err(err(
+                    format!(
+                        "set.{method}() expects {expect}, found {} (same element type required)",
+                        other.ty
+                    ),
+                    args[0].span,
+                ));
+            }
+            let op = match method {
+                "intersection_update" => ir::SetUpdateOp::Intersect,
+                "difference_update" => ir::SetUpdateOp::Diff,
+                _ => ir::SetUpdateOp::SymDiff,
+            };
+            Ok(ir::Stmt::SetUpdate {
+                set: base_ir,
+                other,
+                op,
             })
         }
         "copy" => {
@@ -10631,7 +10664,8 @@ fn lower_set_method_stmt(
             format!(
                 "set method '{method}' is not supported yet (supported: add, remove, \
                  discard, clear, union, intersection, difference, symmetric_difference, \
-                 issubset, issuperset, isdisjoint, update, copy, pop)"
+                 issubset, issuperset, isdisjoint, update, intersection_update, \
+                 difference_update, symmetric_difference_update, copy, pop)"
             ),
             method_span,
         )),
@@ -12982,6 +13016,39 @@ fn lower_aug_assign(
                 out.push(ir::Stmt::SetUpdate {
                     set: left,
                     other: right,
+                    op: ir::SetUpdateOp::Union,
+                });
+                return Ok(());
+            }
+            if matches!(current_ty, ir::Ty::Set(_))
+                && matches!(
+                    op,
+                    ast::BinOp::BitAnd | ast::BinOp::Sub | ast::BinOp::BitXor
+                )
+            {
+                if right.ty != current_ty {
+                    let op_s = match op {
+                        ast::BinOp::BitAnd => "&=",
+                        ast::BinOp::Sub => "-=",
+                        _ => "^=",
+                    };
+                    return Err(err(
+                        format!(
+                            "set {op_s} requires the same set type on the right, found {}",
+                            right.ty
+                        ),
+                        span,
+                    ));
+                }
+                let set_op = match op {
+                    ast::BinOp::BitAnd => ir::SetUpdateOp::Intersect,
+                    ast::BinOp::Sub => ir::SetUpdateOp::Diff,
+                    _ => ir::SetUpdateOp::SymDiff,
+                };
+                out.push(ir::Stmt::SetUpdate {
+                    set: left,
+                    other: right,
+                    op: set_op,
                 });
                 return Ok(());
             }
@@ -15726,7 +15793,14 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     lower_dict_method(base_ir, *key, *value, method, *method_span, &args, ctx)
                 }
                 ir::Ty::Set(elem) => match method.as_str() {
-                    "add" | "remove" | "discard" | "clear" | "update" => Err(err(
+                    "add"
+                    | "remove"
+                    | "discard"
+                    | "clear"
+                    | "update"
+                    | "intersection_update"
+                    | "difference_update"
+                    | "symmetric_difference_update" => Err(err(
                         format!(
                             "set.{method}(...) returns None and cannot be used in an \
                              expression"
@@ -15787,7 +15861,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         format!(
                             "set method '{method}' is not supported yet (supported: add, \
                              remove, discard, clear, union, intersection, difference, \
-                             symmetric_difference, issubset, issuperset, isdisjoint, update, copy, pop)"
+                             symmetric_difference, issubset, issuperset, isdisjoint, update, \
+                             intersection_update, difference_update, \
+                             symmetric_difference_update, copy, pop)"
                         ),
                         *method_span,
                     )),
@@ -26489,6 +26565,40 @@ print(count([]))
             panic!();
         };
         assert!(matches!(value.kind, ir::ExprKind::SetIsDisjoint { .. }));
+    }
+
+    #[test]
+    fn set_inplace_updates_lower() {
+        let m = analyze_ok(
+            "s = {1, 2, 3}\n\
+             s.intersection_update({2, 3})\n\
+             s.difference_update({3})\n\
+             s.symmetric_difference_update({1})\n\
+             s &= {1, 2}\n\
+             s -= {2}\n\
+             s ^= {1, 4}\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ops = [
+            ir::SetUpdateOp::Intersect,
+            ir::SetUpdateOp::Diff,
+            ir::SetUpdateOp::SymDiff,
+            ir::SetUpdateOp::Intersect,
+            ir::SetUpdateOp::Diff,
+            ir::SetUpdateOp::SymDiff,
+        ];
+        for (i, want) in ops.into_iter().enumerate() {
+            let ir::Stmt::SetUpdate { op, .. } = &entry.body[i + 1] else {
+                panic!("body[{}]: {:?}", i + 1, entry.body[i + 1]);
+            };
+            assert_eq!(*op, want);
+        }
+    }
+
+    #[test]
+    fn set_intersection_update_rejects_expr() {
+        let e = analyze_err("s = {1}\nx = s.intersection_update({1})\n");
+        assert!(e.message.contains("returns None"), "{}", e.message);
     }
 
     #[test]

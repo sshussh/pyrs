@@ -6168,6 +6168,49 @@ void pyrs_set_update(PyrsSet *s, const PyrsSet *other) {
     }
 }
 
+PyrsSet *pyrs_set_diff(const PyrsSet *a, const PyrsSet *b);
+
+void pyrs_set_intersect_update(PyrsSet *s, const PyrsSet *other) {
+    check_ref(s);
+    check_ref(other);
+    if (s == other) {
+        return;
+    }
+    for (long long i = s->order_len - 1; i >= 0; i--) {
+        SetSlot *e = &s->table[s->order[i]];
+        if (e->state == 1 && !pyrs_set_contains(other, e->key, e->key_tag)) {
+            pyrs_set_remove(s, e->key, e->key_tag);
+        }
+    }
+}
+
+void pyrs_set_diff_update(PyrsSet *s, const PyrsSet *other) {
+    check_ref(s);
+    check_ref(other);
+    if (s == other) {
+        pyrs_set_clear(s);
+        return;
+    }
+    for (long long i = s->order_len - 1; i >= 0; i--) {
+        SetSlot *e = &s->table[s->order[i]];
+        if (e->state == 1 && pyrs_set_contains(other, e->key, e->key_tag)) {
+            pyrs_set_remove(s, e->key, e->key_tag);
+        }
+    }
+}
+
+void pyrs_set_symdiff_update(PyrsSet *s, const PyrsSet *other) {
+    check_ref(s);
+    check_ref(other);
+    if (s == other) {
+        pyrs_set_clear(s);
+        return;
+    }
+    PyrsSet *to_add = pyrs_set_diff(other, s);
+    pyrs_set_diff_update(s, other);
+    pyrs_set_update(s, to_add);
+}
+
 /* Remove and return an element (last-inserted). Empty → KeyError. */
 long long pyrs_set_pop(PyrsSet *s) {
     check_ref(s);

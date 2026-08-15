@@ -511,6 +511,15 @@ pub struct Function {
     pub yield_ty: Option<Ty>,
 }
 
+/// In-place set algebra kind for [`Stmt::SetUpdate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetUpdateOp {
+    Union,
+    Intersect,
+    Diff,
+    SymDiff,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     /// Store into a local (params included).
@@ -606,10 +615,12 @@ pub enum Stmt {
     SetClear {
         set: Expr,
     },
-    /// `set |= other` / in-place union; same elem type.
+    /// In-place set algebra (`update` / `|=`, `intersection_update` / `&=`,
+    /// `difference_update` / `-=`, `symmetric_difference_update` / `^=`).
     SetUpdate {
         set: Expr,
         other: Expr,
+        op: SetUpdateOp,
     },
     /// `dict.update(other)` — merge keys from `other` (same K/V types).
     DictUpdate {

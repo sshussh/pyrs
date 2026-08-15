@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use ir::{
-    BinOp, ClassInfo, Expr, ExprKind, FileFn, Function, JsonLoadsKind, MathOp, Module, Stmt, StrFn,
-    Ty, UnOp,
+    BinOp, ClassInfo, Expr, ExprKind, FileFn, Function, JsonLoadsKind, MathOp, Module, SetUpdateOp,
+    Stmt, StrFn, Ty, UnOp,
 };
 
 pub fn emit_llvm_ir(module: &Module) -> String {
@@ -379,9 +379,10 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
             .max(max_try_depth_in_expr(sep))
             .max(max_try_depth_in_expr(end))
             .max(max_try_depth_in_expr(flush)),
-        Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
-            max_try_depth_in_expr(dict).max(max_try_depth_in_expr(other))
-        }
+        Stmt::DictUpdate { dict, other }
+        | Stmt::SetUpdate {
+            set: dict, other, ..
+        } => max_try_depth_in_expr(dict).max(max_try_depth_in_expr(other)),
         Stmt::ListExtend { list, other } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(other))
         }
@@ -658,9 +659,10 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
             index: i, value: v, ..
         } => count_yields_in_expr(i) + count_yields_in_expr(v),
         Stmt::IndexDelete { index: i, .. } => count_yields_in_expr(i),
-        Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
-            count_yields_in_expr(dict) + count_yields_in_expr(other)
-        }
+        Stmt::DictUpdate { dict, other }
+        | Stmt::SetUpdate {
+            set: dict, other, ..
+        } => count_yields_in_expr(dict) + count_yields_in_expr(other),
         Stmt::ListExtend { list, other } => {
             count_yields_in_expr(list) + count_yields_in_expr(other)
         }
@@ -971,6 +973,9 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_set_diff(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_set_symdiff(ptr, ptr)\n");
         out.push_str("declare void @pyrs_set_update(ptr, ptr)\n");
+        out.push_str("declare void @pyrs_set_intersect_update(ptr, ptr)\n");
+        out.push_str("declare void @pyrs_set_diff_update(ptr, ptr)\n");
+        out.push_str("declare void @pyrs_set_symdiff_update(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_set_contains(ptr, i64, i32)\n");
         out.push_str("declare i32 @pyrs_set_eq(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_set_issubset(ptr, ptr, i32)\n");
@@ -3056,10 +3061,16 @@ impl Emitter {
                 let s = self.emit_expr(set);
                 self.line(format!("call void @pyrs_set_clear(ptr {s})"));
             }
-            Stmt::SetUpdate { set, other } => {
+            Stmt::SetUpdate { set, other, op } => {
                 let s = self.emit_expr(set);
                 let o = self.emit_expr(other);
-                self.line(format!("call void @pyrs_set_update(ptr {s}, ptr {o})"));
+                let callee = match op {
+                    SetUpdateOp::Union => "pyrs_set_update",
+                    SetUpdateOp::Intersect => "pyrs_set_intersect_update",
+                    SetUpdateOp::Diff => "pyrs_set_diff_update",
+                    SetUpdateOp::SymDiff => "pyrs_set_symdiff_update",
+                };
+                self.line(format!("call void @{callee}(ptr {s}, ptr {o})"));
             }
             Stmt::UnpackCheck { len, expected } => {
                 let n_t = self.emit_expr(len);
