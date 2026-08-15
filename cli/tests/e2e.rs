@@ -13655,6 +13655,93 @@ print(Q(2) < Q(1))
 }
 
 #[test]
+fn class_sorted_min_max_match_python() {
+    let src = "\
+class P:
+    def __init__(self, x: int, k: int):
+        self.x = x
+        self.k = k
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+xs = [P(3, 0), P(1, 1), P(2, 2), P(1, 3)]
+for p in sorted(xs):
+    print(p.x, p.k)
+xs.sort()
+for p in xs:
+    print(p.x, p.k)
+ys = [P(3, 0), P(1, 1), P(2, 2)]
+ys.sort(reverse=True)
+for p in ys:
+    print(p.x)
+print(min(P(3, 0), P(1, 1), P(2, 2)).x)
+print(max(P(3, 0), P(1, 1), P(2, 2)).x)
+print(min(xs).x, min(xs).k)
+print(max(xs).x)
+empty: list[P] = []
+print(min(empty, default=P(-1, 9)).x)
+class Q(P):
+    pass
+print(min(Q(2, 0), Q(1, 0)).x)
+class R(P):
+    def __lt__(self, other: P) -> bool:
+        return self.x > other.x
+def pick(a: P, b: P) -> P:
+    return min(a, b)
+print(pick(R(1, 0), R(2, 0)).x)
+";
+    let out = run_program("class_sorted_min_max", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_min_empty_traps() {
+    let (code, err) = run_program_expect_fail(
+        "class_min_empty",
+        "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+xs: list[P] = []
+print(min(xs))
+",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("min() iterable argument is empty"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn class_sorted_without_lt_is_compile_error() {
+    let (code, stderr) = run_program_expect_fail(
+        "class_sorted_no_lt",
+        "\
+class A:
+    pass
+print(sorted([A()]))
+",
+    );
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("sort") && stderr.contains("__lt__"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn v025_next_builtin() {
     let src = "\
 class Counter:

@@ -560,9 +560,10 @@ List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
 `count` returns the number of matches (0 if none).
 `reverse()` is in-place (statement only; `reversed(xs)` and `xs[::-1]`
 allocate a copy). `sort()` is in-place (statement only); `sorted(xs)` returns a new sorted
-copy. Without `key=`, element types are `int`, `float`, `bool`, `str`;
-float NaN sorts last on that path (stable total order via runtime
-`ListSort`). With monomorphic `key=f` (`T → K`, `K` in
+copy. Without `key=`, element types are `int`, `float`, `bool`, `str`,
+orderable tuples/lists, or a class that defines `__lt__`;
+float NaN sorts last on the primitive path (stable total order via runtime
+`ListSort`). Class elements use a stable `__lt__` insertion sort. With monomorphic `key=f` (`T → K`, `K` in
 `int|float|bool|str` — same-module free function, imported free function,
 nested function, lambda with typed/defaulted params, or bare `len` /
 `abs` / `int` / `float` / `bool` / `str`), any `list[T]` is accepted; keys
@@ -805,7 +806,9 @@ print(isinstance(d, Animal))  # True
   that method is called (virtual). There is no identity fallback and no
   reflected swap (`b.__gt__(a)` when `a.__lt__` is missing). Non-bool
   returns are coerced with the same truthiness as `__eq__`. `sorted` /
-  `min` / `max` of class instances remain residual
+  `list.sort` / `min` / `max` of class instances work when the element
+  type defines `__lt__` (virtual; CPython uses `<` only). Reflected
+  ordering (`b.__gt__(a)` when `a.__lt__` is missing) stays residual
 - **Class `with`**: `__enter__` / `__exit__` — success path
   `__exit__(None, None, None)`; exception path `__exit__(None, exc, None)`
   (type and traceback args stay `None`); truthy `__exit__` return **suppresses**
@@ -840,11 +843,11 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `hex(n)` / `bin(n)` / `oct(n)` | int or bool (`True` → 1) | `str` with lowercase prefix (`'0xff'`, `'-0xa'`, `'0b1010'`, `'0o10'`); same as `format(n, '#x')` / `'#b'` / `'#o'` |
 | `divmod(a, b)` | int, float, bool (2 args; mixed numeric promotes) | `tuple[T, T]` of `(a // b, a % b)`; operands evaluated once; zero divisor → `ZeroDivisionError` |
 | `pow(base, exp[, mod])` | 2-arg: same as `**` (int/float/bool); 3-arg: all integers | 2-arg: `base ** exp`; 3-arg: `base**exp % mod` (negative `exp` → modular inverse; `mod==0` or non-invertible → `ValueError`) |
-| `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, orderable tuple, or orderable list (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple/list: lexicographic; optional monomorphic `key=` over homogeneous positionals; no `default=` |
-| `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple\|orderable list]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
+| `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, orderable tuple, orderable list, or class with `__lt__` (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple/list: lexicographic; class: virtual `__lt__`; optional monomorphic `key=` over homogeneous positionals; no `default=` |
+| `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple\|orderable list\|class with __lt__]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs[, start])` | `list[int]` or `list[float]`; optional numeric `start` (positional or `start=`) | `elem ⊔ start` (`bool`→`int`→`float`); empty yields `start` (default `0` / `0.0`) |
-| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str\|orderable tuple\|orderable list]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len` (incl. class `__len__`)/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list; stable reverse-sort-reverse; keyed path materializes a GC-managed keys list |
-| `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` | without `key=`: sortable elem (incl. orderable tuples/lists); with monomorphic `key=`: any `list[T]`; same bare-builtin `key=` surface as `sorted`; `reverse=` is truthy | in-place (statement only); same key/reverse surface as `sorted` |
+| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str\|orderable tuple\|orderable list\|class with __lt__]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len` (incl. class `__len__`)/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list; stable reverse-sort-reverse; class path is a `__lt__` insertion sort; keyed path materializes a GC-managed keys list |
+| `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` | without `key=`: sortable elem (incl. orderable tuples/lists and classes with `__lt__`); with monomorphic `key=`: any `list[T]`; same bare-builtin `key=` surface as `sorted`; `reverse=` is truthy | in-place (statement only); same key/reverse surface as `sorted` |
 | `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
 | `range(...)` | 1–3 ints | only as a `for` iterable |
 | `set()` | empty only; needs annotation | `s: set[int] = set()` |

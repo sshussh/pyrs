@@ -8763,8 +8763,13 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                                     ctx,
                                 )?);
                             } else {
-                                ensure_sortable_list_elem(*elem, *method_span)?;
-                                stmts.push(ir::Stmt::ListSort { list: xs.clone() });
+                                push_plain_list_sort(
+                                    &mut stmts,
+                                    xs.clone(),
+                                    *elem,
+                                    *method_span,
+                                    ctx,
+                                )?;
                             }
                             push_maybe_reverse(&mut stmts, &rev_mode, &xs, *elem, ctx);
                             out.extend(stmts);
@@ -10132,6 +10137,23 @@ fn lower_method_stmt(
                         ),
                         method_span,
                     ));
+                }
+                if class_defines_lt(*elem) {
+                    let list_ty = base_ir.ty;
+                    let xs_t = ctx.fresh_temp("lsort", list_ty);
+                    let xs = local_expr(xs_t.clone(), list_ty);
+                    let mut stmts = vec![ir::Stmt::Assign {
+                        name: xs_t,
+                        value: base_ir,
+                    }];
+                    stmts.extend(lower_list_sort_class_stmts(xs, *elem, method_span, ctx)?);
+                    return Ok(ir::Stmt::ExprStmt(ir::Expr {
+                        ty: ir::Ty::None,
+                        kind: ir::ExprKind::Block {
+                            stmts,
+                            result: Box::new(const_none()),
+                        },
+                    }));
                 }
                 ensure_sortable_list_elem(*elem, method_span)?;
                 Ok(ir::Stmt::ListSort { list: base_ir })
@@ -12099,18 +12121,152 @@ fn lower_list_pop(
     })
 }
 
+fn class_defines_lt(ty: ir::Ty) -> bool {
+    match ty {
+        ir::Ty::Class(id) => resolve_method(id, "__lt__").is_some(),
+        _ => false,
+    }
+}
+
 fn ensure_sortable_list_elem(elem: ir::Ty, span: Span) -> SResult<()> {
     match elem {
         ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => Ok(()),
         ir::Ty::Tuple(_) | ir::Ty::List(_) if is_orderable_ty(elem) => Ok(()),
+        ir::Ty::Class(_) if class_defines_lt(elem) => Ok(()),
         other => Err(err(
             format!(
                 "sort is only supported for list[int], list[float], list[bool], \
-                 list[str], and lists of orderable tuples/lists, found list[{other}]"
+                 list[str], lists of orderable tuples/lists, and lists of classes \
+                 that define __lt__, found list[{other}]"
             ),
             span,
         )),
     }
+}
+
+/// In-place `list.sort` / `sorted` without `key=`: primitive `ListSort`, or a
+/// stable insertion sort that calls virtual `__lt__` on class elements.
+fn push_plain_list_sort(
+    stmts: &mut Vec<ir::Stmt>,
+    list: ir::Expr,
+    elem: ir::Ty,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<()> {
+    ensure_sortable_list_elem(elem, span)?;
+    if class_defines_lt(elem) {
+        stmts.extend(lower_list_sort_class_stmts(list, elem, span, ctx)?);
+    } else {
+        stmts.push(ir::Stmt::ListSort { list });
+    }
+    Ok(())
+}
+
+/// Stable insertion sort of class instances using only `__lt__` (`cur < prev`).
+fn lower_list_sort_class_stmts(
+    list: ir::Expr,
+    elem: ir::Ty,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<Vec<ir::Stmt>> {
+    let n_t = ctx.fresh_temp("csort.n", ir::Ty::Int);
+    let i_t = ctx.fresh_temp("csort.i", ir::Ty::Int);
+    let j_t = ctx.fresh_temp("csort.j", ir::Ty::Int);
+    let cur_t = ctx.fresh_temp("csort.cur", elem);
+
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    let j = local_expr(j_t.clone(), ir::Ty::Int);
+    let cur = local_expr(cur_t.clone(), elem);
+
+    let mut stmts = vec![
+        ir::Stmt::Assign {
+            name: n_t,
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(list.clone())),
+            },
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(1),
+        },
+    ];
+
+    let sort_cond = key_cmp(ir::BinOp::Lt, i.clone(), n);
+    let cur_load = ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Index {
+            base: Box::new(list.clone()),
+            index: Box::new(i.clone()),
+        },
+    };
+    let j_gt0 = key_cmp(ir::BinOp::Gt, j.clone(), int_const(0));
+    let j_m1 = ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Binary {
+            op: ir::BinOp::Sub,
+            left: Box::new(j.clone()),
+            right: Box::new(int_const(1)),
+        },
+    };
+    let prev = ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Index {
+            base: Box::new(list.clone()),
+            index: Box::new(j_m1.clone()),
+        },
+    };
+    let lt = lower_class_compare(ast::BinOp::Lt, cur.clone(), prev.clone(), span, ctx)?;
+    let shift_cond = bool_and(j_gt0, lt);
+    let shift_body = vec![
+        ir::Stmt::IndexAssign {
+            base: list.clone(),
+            index: j.clone(),
+            value: prev,
+        },
+        ir::Stmt::Assign {
+            name: j_t.clone(),
+            value: j_m1,
+        },
+    ];
+    let outer_body = vec![
+        ir::Stmt::Assign {
+            name: cur_t,
+            value: cur_load,
+        },
+        ir::Stmt::Assign {
+            name: j_t,
+            value: i.clone(),
+        },
+        ir::Stmt::While {
+            cond: shift_cond,
+            body: shift_body,
+            step: vec![],
+        },
+        ir::Stmt::IndexAssign {
+            base: list,
+            index: j,
+            value: cur,
+        },
+        ir::Stmt::Assign {
+            name: i_t,
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(i),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+    ];
+    stmts.push(ir::Stmt::While {
+        cond: sort_cond,
+        body: outer_body,
+        step: vec![],
+    });
+    Ok(stmts)
 }
 
 fn as_seq_index_bound(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
@@ -20784,8 +20940,7 @@ fn lower_sorted_expr(
     if let Some(key_ast) = sk.key {
         stmts.extend(lower_list_sort_key_stmts(out.clone(), elem, key_ast, ctx)?);
     } else {
-        ensure_sortable_list_elem(elem, args[0].span)?;
-        stmts.push(ir::Stmt::ListSort { list: out.clone() });
+        push_plain_list_sort(&mut stmts, out.clone(), elem, args[0].span, ctx)?;
     }
     push_maybe_reverse(&mut stmts, &rev_mode, &out, elem, ctx);
     Ok(ir::Expr {
@@ -21049,7 +21204,8 @@ fn lower_min_max_expr(
     if let Some(key_ast) = key_ast {
         return lower_min_max_list_key(func, arg, elem, key_ast, default_ir, args[0].span, ctx);
     }
-    // No key=: numbers, str, orderable tuples/lists (MinList/MaxList), optional default=.
+    // No key=: numbers, str, orderable tuples/lists (MinList/MaxList),
+    // classes with __lt__ (desugared scan), optional default=.
     match elem {
         ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => {
             lower_min_max_list_plain(func, arg, elem, default_ir, span, ctx)
@@ -21057,11 +21213,14 @@ fn lower_min_max_expr(
         ir::Ty::Tuple(_) | ir::Ty::List(_) if is_orderable_ty(elem) => {
             lower_min_max_list_plain(func, arg, elem, default_ir, span, ctx)
         }
+        ir::Ty::Class(_) if class_defines_lt(elem) => {
+            lower_min_max_list_class(func, arg, elem, default_ir, span, ctx)
+        }
         other => Err(err(
             format!(
                 "{func}() is only supported for list[int], list[float], \
-                 list[bool], list[str], and lists of orderable tuples/lists without key=; \
-                 found list[{other}]"
+                 list[bool], list[str], lists of orderable tuples/lists, and lists of \
+                 classes that define __lt__ without key=; found list[{other}]"
             ),
             args[0].span,
         )),
@@ -21102,6 +21261,28 @@ fn lower_min_max_multi_plain(
             acc = ir::Expr { ty: first_ty, kind };
         }
         return Ok(acc);
+    }
+    // Homogeneous class instances with __lt__: linear scan (CPython uses < only).
+    if matches!(first_ty, ir::Ty::Class(_)) {
+        for (i, e) in lowered.iter().enumerate().skip(1) {
+            if e.ty != first_ty {
+                return Err(err(
+                    format!(
+                        "{func}() multi-arg form requires all arguments to have \
+                         the same type (found {first_ty} and {})",
+                        e.ty
+                    ),
+                    args[i].span,
+                ));
+            }
+        }
+        if !class_defines_lt(first_ty) {
+            return Err(err(
+                format!("{func}() is not supported for class instances without __lt__"),
+                span,
+            ));
+        }
+        return lower_min_max_multi_class(func, lowered, span, ctx);
     }
     // Numeric form: fold Min/Max with unify_numeric (bool → int → float).
     let mut acc = lowered.remove(0);
@@ -21189,6 +21370,194 @@ fn lower_min_max_list_plain(
             }],
         },
     ];
+    Ok(ir::Expr {
+        ty: ret_ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(out_t, ret_ty)),
+        },
+    })
+}
+
+/// Multi-arg `min(a, b[, c…])` / `max` over class instances that define `__lt__`.
+/// CPython only uses `<`: min updates when `x < best`, max when `best < x`.
+fn lower_min_max_multi_class(
+    func: &str,
+    lowered: Vec<ir::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    debug_assert!(lowered.len() >= 2);
+    let elem = lowered[0].ty;
+    let best_t = ctx.fresh_temp("mm.best", elem);
+    let mut stmts = vec![ir::Stmt::Assign {
+        name: best_t.clone(),
+        value: lowered[0].clone(),
+    }];
+    for val in lowered.into_iter().skip(1) {
+        let x_t = ctx.fresh_temp("mm.x", elem);
+        stmts.push(ir::Stmt::Assign {
+            name: x_t.clone(),
+            value: val,
+        });
+        let x = local_expr(x_t.clone(), elem);
+        let best = local_expr(best_t.clone(), elem);
+        let better = if func == "min" {
+            lower_class_compare(ast::BinOp::Lt, x, best, span, ctx)?
+        } else {
+            lower_class_compare(ast::BinOp::Lt, best, x, span, ctx)?
+        };
+        stmts.push(ir::Stmt::If {
+            branches: vec![(
+                better,
+                vec![ir::Stmt::Assign {
+                    name: best_t.clone(),
+                    value: local_expr(x_t, elem),
+                }],
+            )],
+            orelse: vec![],
+        });
+    }
+    Ok(ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(best_t, elem)),
+        },
+    })
+}
+
+/// `min(xs)` / `max(xs)` over `list[C]` where `C` defines `__lt__`.
+fn lower_min_max_list_class(
+    func: &str,
+    arg: ir::Expr,
+    elem: ir::Ty,
+    default_ir: Option<ir::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let list_ty = arg.ty;
+    let ret_ty = match &default_ir {
+        Some(d) => join_types(elem, d.ty),
+        None => elem,
+    };
+
+    let xs_t = ctx.fresh_temp("mm.xs", list_ty);
+    let n_t = ctx.fresh_temp("mm.n", ir::Ty::Int);
+    let i_t = ctx.fresh_temp("mm.i", ir::Ty::Int);
+    let best_t = ctx.fresh_temp("mm.best", elem);
+    let x_t = ctx.fresh_temp("mm.x", elem);
+    let out_t = ctx.fresh_temp("mm.out", ret_ty);
+
+    let xs = local_expr(xs_t.clone(), list_ty);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+
+    let empty_msg = if func == "min" {
+        "min() iterable argument is empty"
+    } else {
+        "max() iterable argument is empty"
+    };
+
+    let stmts_head = vec![
+        ir::Stmt::Assign {
+            name: xs_t,
+            value: arg,
+        },
+        ir::Stmt::Assign {
+            name: n_t,
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Len(Box::new(xs.clone())),
+            },
+        },
+    ];
+
+    let x_load = ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Index {
+            base: Box::new(xs.clone()),
+            index: Box::new(i.clone()),
+        },
+    };
+    let x = local_expr(x_t.clone(), elem);
+    let best = local_expr(best_t.clone(), elem);
+    let better = if func == "min" {
+        lower_class_compare(ast::BinOp::Lt, x, best, span, ctx)?
+    } else {
+        lower_class_compare(ast::BinOp::Lt, best, x, span, ctx)?
+    };
+    let scan_body = vec![
+        ir::Stmt::Assign {
+            name: x_t.clone(),
+            value: x_load,
+        },
+        ir::Stmt::If {
+            branches: vec![(
+                better,
+                vec![ir::Stmt::Assign {
+                    name: best_t.clone(),
+                    value: local_expr(x_t, elem),
+                }],
+            )],
+            orelse: vec![],
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(i),
+                    right: Box::new(int_const(1)),
+                },
+            },
+        },
+    ];
+    let mut nonempty_body = vec![
+        ir::Stmt::Assign {
+            name: best_t.clone(),
+            value: ir::Expr {
+                ty: elem,
+                kind: ir::ExprKind::Index {
+                    base: Box::new(xs),
+                    index: Box::new(int_const(0)),
+                },
+            },
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(1),
+        },
+        ir::Stmt::While {
+            cond: key_cmp(ir::BinOp::Lt, local_expr(i_t, ir::Ty::Int), n.clone()),
+            body: scan_body,
+            step: vec![],
+        },
+    ];
+    nonempty_body.push(ir::Stmt::Assign {
+        name: out_t.clone(),
+        value: coerce(local_expr(best_t, elem), ret_ty, span, &format!("{func}()"))?,
+    });
+
+    let empty_body = if let Some(default_ir) = default_ir {
+        vec![ir::Stmt::Assign {
+            name: out_t.clone(),
+            value: coerce(default_ir, ret_ty, span, &format!("{func}() default="))?,
+        }]
+    } else {
+        vec![ir::Stmt::Raise {
+            exc: ir::ExcType::ValueError,
+            message: const_str(empty_msg),
+        }]
+    };
+
+    let mut stmts = stmts_head;
+    stmts.push(ir::Stmt::If {
+        branches: vec![(key_cmp(ir::BinOp::Eq, n, int_const(0)), empty_body)],
+        orelse: nonempty_body,
+    });
+
     Ok(ir::Expr {
         ty: ret_ty,
         kind: ir::ExprKind::Block {
@@ -23244,6 +23613,8 @@ fn lower_bitwise(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
 /// when both sides are class instances (CPython default). Ordering has
 /// no identity fallback — missing dunders are compile errors. Reflected
 /// operators (`b.__gt__(a)` when `a.__lt__` is missing) are residual.
+/// `sorted` / `list.sort` / `min` / `max` of class instances desugar to
+/// these `__lt__` calls (see `push_plain_list_sort`).
 fn lower_class_compare(
     op: ast::BinOp,
     l: ir::Expr,
@@ -26972,6 +27343,88 @@ print(P(1) > P(2))
         );
         assert!(
             e.message.contains("operator '>'") && e.message.contains("__gt__"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn class_sorted_and_min_max_desugar() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+xs = [P(3), P(1), P(2)]
+ys = sorted(xs)
+xs.sort()
+a = min(P(3), P(1), P(2))
+b = max(xs)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!("expected sorted assign, got {:?}", entry.body[1]);
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Class(0)));
+        let ir::ExprKind::Block { stmts, .. } = &value.kind else {
+            panic!("sorted should desugar to a Block");
+        };
+        assert!(
+            !stmts.iter().any(|s| matches!(s, ir::Stmt::ListSort { .. })),
+            "class sorted must not use primitive ListSort"
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(s, ir::Stmt::While { .. })),
+            "class sorted should insertion-sort with While"
+        );
+        assert!(
+            !entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::ListSort { .. })),
+            "class list.sort must not use primitive ListSort"
+        );
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[3] else {
+            panic!("expected min assign, got {:?}", entry.body[3]);
+        };
+        assert!(matches!(value.ty, ir::Ty::Class(_)));
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[4] else {
+            panic!("expected max assign, got {:?}", entry.body[4]);
+        };
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn class_sorted_without_lt_rejected() {
+        let e = analyze_err(
+            "\
+class A:
+    pass
+print(sorted([A()]))
+",
+        );
+        assert!(
+            e.message.contains("sort") && e.message.contains("__lt__"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn class_min_without_lt_rejected() {
+        let e = analyze_err(
+            "\
+class A:
+    pass
+print(min(A(), A()))
+",
+        );
+        assert!(
+            e.message.contains("min()") && e.message.contains("__lt__"),
             "{}",
             e.message
         );
