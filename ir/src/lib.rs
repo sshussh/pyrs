@@ -1332,6 +1332,10 @@ pub enum StrFn {
     Upper,
     /// `s.lower()` → str
     Lower,
+    /// `s.capitalize()` / `s.title()` / `s.swapcase()` → str (ASCII)
+    Capitalize,
+    Title,
+    SwapCase,
     /// `s.strip()` / `s.lstrip()` / `s.rstrip()` → str
     Strip,
     Lstrip,

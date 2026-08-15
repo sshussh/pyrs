@@ -378,7 +378,7 @@ String methods (ASCII case/whitespace rules):
 
 ```python
 "  hi  ".strip()          # also lstrip / rstrip
-"abc".upper()             # "ABC"; .lower() too
+"abc".upper()             # "ABC"; .lower() / .capitalize() / .title() / .swapcase() too
 "hello".startswith("he")  # True; .endswith too; tuple of strs and start/end ok
 "banana".find("an")       # 1, or -1 when absent; optional start/end
 "banana".index("an")      # like find, but ValueError if missing

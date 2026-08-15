@@ -11110,6 +11110,9 @@ fn lower_str_method(
     let (func, ret, str_args): (ir::StrFn, ir::Ty, usize) = match method {
         "upper" => (Upper, ir::Ty::Str, 0),
         "lower" => (Lower, ir::Ty::Str, 0),
+        "capitalize" => (Capitalize, ir::Ty::Str, 0),
+        "title" => (Title, ir::Ty::Str, 0),
+        "swapcase" => (SwapCase, ir::Ty::Str, 0),
         "strip" => (Strip, ir::Ty::Str, 0),
         "lstrip" => (Lstrip, ir::Ty::Str, 0),
         "rstrip" => (Rstrip, ir::Ty::Str, 0),
@@ -11189,7 +11192,7 @@ fn lower_str_method(
             return Err(err(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
-                     upper, lower, strip, lstrip, rstrip, startswith, \
+                     upper, lower, capitalize, title, swapcase, strip, lstrip, rstrip, startswith, \
                      endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
                      removeprefix, removesuffix, partition, rpartition, rsplit, \
@@ -23442,6 +23445,43 @@ print(f())
             &value.kind,
             ir::ExprKind::StrCall {
                 func: ir::StrFn::RemovePrefix,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn str_capitalize_title_swapcase_lower() {
+        let m = analyze_ok("a = \"hi\".capitalize()\nb = \"hi\".title()\nc = \"Hi\".swapcase()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::Capitalize,
+                ..
+            }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::Title,
+                ..
+            }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::SwapCase,
                 ..
             }
         ));

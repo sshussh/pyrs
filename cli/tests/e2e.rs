@@ -2461,6 +2461,30 @@ print(\", \".join(csv.split(\",\")))
 }
 
 #[test]
+fn str_capitalize_title_swapcase_match_python() {
+    let src = "\
+print(\"hello WORLD\".capitalize(), \"123abc\".capitalize(), \"\".capitalize(), \"A\".capitalize())
+print(\"hello world\".title(), \"they're bill's friends from the UK\".title())
+print(\"hello-world\".title(), \"123abc\".title(), \"\".title(), \"HELLO\".title())
+print(\"Hello World\".swapcase(), \"123\".swapcase(), \"\".swapcase())
+print(\"aBc\".capitalize(), \"aBc\".title(), \"aBc\".swapcase())
+print(\"  hi\".capitalize(), \"a_b\".title())
+";
+    let out = run_program("strcase", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_splitlines_match_python() {
     let src = "\
 print(\"\".splitlines())

@@ -2557,6 +2557,64 @@ PyrsStr *pyrs_str_lower(const PyrsStr *s) {
     return r;
 }
 
+static char ascii_upper(char c) {
+    return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+}
+
+static char ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+}
+
+static int ascii_is_letter(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+PyrsStr *pyrs_str_capitalize(const PyrsStr *s) {
+    check_ref(s);
+    PyrsStr *r = str_alloc(s->len);
+    if (s->len == 0) {
+        return r;
+    }
+    r->data[0] = ascii_upper(s->data[0]);
+    for (long long i = 1; i < s->len; i++) {
+        r->data[i] = ascii_lower(s->data[i]);
+    }
+    return r;
+}
+
+PyrsStr *pyrs_str_title(const PyrsStr *s) {
+    check_ref(s);
+    PyrsStr *r = str_alloc(s->len);
+    int prev_letter = 0;
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (ascii_is_letter(c)) {
+            r->data[i] = prev_letter ? ascii_lower(c) : ascii_upper(c);
+            prev_letter = 1;
+        } else {
+            r->data[i] = c;
+            prev_letter = 0;
+        }
+    }
+    return r;
+}
+
+PyrsStr *pyrs_str_swapcase(const PyrsStr *s) {
+    check_ref(s);
+    PyrsStr *r = str_alloc(s->len);
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c >= 'a' && c <= 'z') {
+            r->data[i] = (char)(c - 32);
+        } else if (c >= 'A' && c <= 'Z') {
+            r->data[i] = (char)(c + 32);
+        } else {
+            r->data[i] = c;
+        }
+    }
+    return r;
+}
+
 static int is_py_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }
