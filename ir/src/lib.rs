@@ -1341,10 +1341,14 @@ pub enum StrFn {
     Count,
     /// `s.replace(old, new)` → str
     Replace,
-    /// `s.split()` → list[str] (whitespace runs, no empty parts)
+    /// `s.split()` / `s.split(None[, maxsplit])` — whitespace runs; last arg is maxsplit (`-1` unlimited)
     SplitWs,
-    /// `s.split(sep)` → list[str] (empty parts kept; sep must be nonempty)
+    /// `s.split(sep[, maxsplit])` — empty parts kept; sep must be nonempty; last arg is maxsplit
     Split,
+    /// `s.rsplit()` / `s.rsplit(None[, maxsplit])` — whitespace from the right; last arg is maxsplit
+    RSplitWs,
+    /// `s.rsplit(sep[, maxsplit])` — last `maxsplit` splits from the right
+    RSplit,
     /// `sep.join(parts)` → str
     Join,
     /// `s.isdigit()` -> bool (ASCII digits)

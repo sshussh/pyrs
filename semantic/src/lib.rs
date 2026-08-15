@@ -3365,9 +3365,9 @@ fn collect_param_constraints_expr(
                             out.push(ir::set_of(t));
                         }
                     }
-                    "upper" | "lower" | "strip" | "split" | "startswith" | "endswith" | "find"
-                    | "replace" | "join" | "removeprefix" | "removesuffix" | "partition"
-                    | "rpartition" => {
+                    "upper" | "lower" | "strip" | "split" | "rsplit" | "startswith"
+                    | "endswith" | "find" | "replace" | "join" | "removeprefix"
+                    | "removesuffix" | "partition" | "rpartition" => {
                         out.push(ir::Ty::Str);
                     }
                     "keys" | "values" | "items" | "get" | "update" => {}
@@ -11121,7 +11121,10 @@ fn lower_str_method(
         "count" => (Count, ir::Ty::Int, 1),
         "replace" => (Replace, ir::Ty::Str, 2),
         "split" => {
-            return lower_str_split(base_ir, args, method_span, ctx);
+            return lower_str_split_family("split", false, base_ir, args, method_span, ctx);
+        }
+        "rsplit" => {
+            return lower_str_split_family("rsplit", true, base_ir, args, method_span, ctx);
         }
         "join" => {
             if args.len() != 1 {
@@ -11169,7 +11172,7 @@ fn lower_str_method(
                      upper, lower, strip, lstrip, rstrip, startswith, \
                      endswith, find, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
-                     removeprefix, removesuffix, partition, rpartition)"
+                     removeprefix, removesuffix, partition, rpartition, rsplit)"
                 ),
                 method_span,
             ));
@@ -11210,34 +11213,68 @@ fn lower_str_method(
     })
 }
 
-fn lower_str_split(
+fn lower_str_split_family(
+    name: &str,
+    from_right: bool,
     base_ir: ir::Expr,
     args: &[ast::Expr],
     method_span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    let (func, call_args) = match args {
-        [] => (ir::StrFn::SplitWs, vec![base_ir]),
-        [sep] => {
-            let s = lower_expr(sep, ctx)?;
-            if s.ty != ir::Ty::Str {
+    if args.len() > 2 {
+        return Err(err(
+            format!("{name}() takes at most 2 arguments ({} given)", args.len()),
+            method_span,
+        ));
+    }
+    let mut sep: Option<ir::Expr> = None;
+    if !args.is_empty() {
+        let s = lower_expr(&args[0], ctx)?;
+        match s.ty {
+            ir::Ty::None => {}
+            ir::Ty::Str => {
+                if matches!(&s.kind, ir::ExprKind::ConstStr(c) if c.is_empty()) {
+                    return Err(err("empty separator", args[0].span));
+                }
+                sep = Some(s);
+            }
+            other => {
                 return Err(err(
-                    format!("split() separator must be a str, found {}", s.ty),
-                    sep.span,
+                    format!("{name}() separator must be a str or None, found {other}"),
+                    args[0].span,
                 ));
             }
-            if matches!(&s.kind, ir::ExprKind::ConstStr(c) if c.is_empty()) {
-                return Err(err("empty separator", sep.span));
+        }
+    }
+    let maxsplit = if args.len() == 2 {
+        let m = lower_expr(&args[1], ctx)?;
+        match m.ty {
+            ir::Ty::Bool => ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::BoolToInt(Box::new(m)),
+            },
+            ir::Ty::Int => m,
+            other => {
+                return Err(err(
+                    format!("'{other}' object cannot be interpreted as an integer"),
+                    args[1].span,
+                ));
             }
-            (ir::StrFn::Split, vec![base_ir, s])
         }
-        _ => {
-            return Err(err(
-                format!("split() takes at most one argument ({} given)", args.len()),
-                method_span,
-            ));
-        }
+    } else {
+        int_const(-1)
     };
+    let func = match (from_right, sep.is_some()) {
+        (false, false) => ir::StrFn::SplitWs,
+        (false, true) => ir::StrFn::Split,
+        (true, false) => ir::StrFn::RSplitWs,
+        (true, true) => ir::StrFn::RSplit,
+    };
+    let mut call_args = vec![base_ir];
+    if let Some(s) = sep {
+        call_args.push(s);
+    }
+    call_args.push(maxsplit);
     Ok(ir::Expr {
         ty: ir::list_of(ir::Ty::Str),
         kind: ir::ExprKind::StrCall {
@@ -22910,6 +22947,44 @@ print(f())
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Bool);
+    }
+
+    #[test]
+    fn str_rsplit_lowers() {
+        let m = analyze_ok("xs = \"a,b,c\".rsplit(\",\", 1)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Str));
+        let ir::ExprKind::StrCall { func, args } = &value.kind else {
+            panic!();
+        };
+        assert_eq!(*func, ir::StrFn::RSplit);
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn str_split_ws_lowers_with_unlimited_maxsplit() {
+        let m = analyze_ok("xs = \"a b\".split()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        let ir::ExprKind::StrCall { func, args } = &value.kind else {
+            panic!();
+        };
+        assert_eq!(*func, ir::StrFn::SplitWs);
+        assert_eq!(args.len(), 2);
+        assert!(matches!(&args[1].kind, ir::ExprKind::ConstInt(n) if *n == -1));
+    }
+
+    #[test]
+    fn str_split_empty_sep_is_error() {
+        let e = analyze_err("xs = \"a\".split(\"\")\n");
+        assert!(e.message.contains("empty separator"), "{}", e.message);
+        let e = analyze_err("xs = \"a\".rsplit(\"\")\n");
+        assert!(e.message.contains("empty separator"), "{}", e.message);
     }
 
     #[test]

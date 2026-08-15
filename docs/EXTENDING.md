@@ -538,7 +538,8 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 
 `Upper`, `Lower`, `Strip`, `Lstrip`, `Rstrip`, `StartsWith`, `EndsWith`,
 `RemovePrefix`, `RemoveSuffix`, `Partition`, `RPartition`,
-`Find`, `RFind`, `RIndex`, `Count`, `Replace`, `SplitWs`, `Split`, `Join`,
+`Find`, `RFind`, `RIndex`, `Count`, `Replace`, `SplitWs`, `Split`,
+`RSplitWs`, `RSplit`, `Join`,
 `IsDigit`, `IsAlpha`, `IsSpace`, `IsUpper`, `IsLower`.
 
 ### `FileFn` (current)

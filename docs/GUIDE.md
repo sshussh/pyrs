@@ -387,6 +387,8 @@ String methods (ASCII case/whitespace rules):
 "banana".replace("an", "-")   # "b--a"
 "a,b,,c".split(",")       # ['a', 'b', '', 'c'] — keeps empty parts
 "a b  c".split()          # ['a', 'b', 'c']    — whitespace runs
+"a,b,c".split(",", 1)     # ['a', 'b,c']; rsplit(",", 1) is ['a,b', 'c']
+"a b c".rsplit(None, 1)   # ['a b', 'c'] — None sep is whitespace
 "-".join(["a", "b"])      # "a-b"
 "123".isdigit()           # True; "" and non-digits are False
 "abc".isalpha()           # True; ASCII letters only

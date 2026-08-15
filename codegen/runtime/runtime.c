@@ -2424,29 +2424,69 @@ PyrsStr *pyrs_str_replace(const PyrsStr *s, const PyrsStr *old, const PyrsStr *n
     return r;
 }
 
-/* split on whitespace runs, skipping empty parts (Python's s.split()) */
-PyrsList *pyrs_str_split_ws(const PyrsStr *s) {
+static void list_reverse_slots(PyrsList *l) {
+    for (long long i = 0, j = l->len - 1; i < j; i++, j--) {
+        long long t = l->data[i];
+        l->data[i] = l->data[j];
+        l->data[j] = t;
+    }
+}
+
+/* maxsplit < 0 means unlimited. */
+PyrsList *pyrs_str_split_ws(const PyrsStr *s, long long maxsplit) {
     check_ref(s);
     PyrsList *r = pyrs_list_new(4);
     long long i = 0;
+    long long n = 0;
     while (i < s->len) {
         while (i < s->len && is_py_space(s->data[i])) {
             i++;
         }
+        if (i >= s->len) {
+            break;
+        }
         long long start = i;
+        if (maxsplit >= 0 && n == maxsplit) {
+            pyrs_list_push(r, (long long)str_sub(s, start, s->len - start));
+            break;
+        }
         while (i < s->len && !is_py_space(s->data[i])) {
             i++;
         }
-        if (i > start) {
-            pyrs_list_push(r, (long long)str_sub(s, start, i - start));
-        }
+        pyrs_list_push(r, (long long)str_sub(s, start, i - start));
+        n++;
     }
     return r;
 }
 
-/* split on a nonempty separator, keeping empty parts (Python's
- * s.split(sep)) */
-PyrsList *pyrs_str_split(const PyrsStr *s, const PyrsStr *sep) {
+PyrsList *pyrs_str_rsplit_ws(const PyrsStr *s, long long maxsplit) {
+    check_ref(s);
+    PyrsList *r = pyrs_list_new(4);
+    long long i = s->len;
+    long long n = 0;
+    while (i > 0) {
+        while (i > 0 && is_py_space(s->data[i - 1])) {
+            i--;
+        }
+        if (i == 0) {
+            break;
+        }
+        long long end = i;
+        if (maxsplit >= 0 && n == maxsplit) {
+            pyrs_list_push(r, (long long)str_sub(s, 0, end));
+            break;
+        }
+        while (i > 0 && !is_py_space(s->data[i - 1])) {
+            i--;
+        }
+        pyrs_list_push(r, (long long)str_sub(s, i, end - i));
+        n++;
+    }
+    list_reverse_slots(r);
+    return r;
+}
+
+PyrsList *pyrs_str_split(const PyrsStr *s, const PyrsStr *sep, long long maxsplit) {
     check_ref(s);
     check_ref(sep);
     if (sep->len == 0) {
@@ -2455,16 +2495,49 @@ PyrsList *pyrs_str_split(const PyrsStr *s, const PyrsStr *sep) {
     PyrsList *r = pyrs_list_new(4);
     long long start = 0;
     long long i = 0;
+    long long n = 0;
     while (i + sep->len <= s->len) {
+        if (maxsplit >= 0 && n == maxsplit) {
+            break;
+        }
         if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {
             pyrs_list_push(r, (long long)str_sub(s, start, i - start));
             i += sep->len;
             start = i;
+            n++;
         } else {
             i++;
         }
     }
     pyrs_list_push(r, (long long)str_sub(s, start, s->len - start));
+    return r;
+}
+
+PyrsList *pyrs_str_rsplit(const PyrsStr *s, const PyrsStr *sep, long long maxsplit) {
+    check_ref(s);
+    check_ref(sep);
+    if (sep->len == 0) {
+        pyrs_die("ValueError: empty separator");
+    }
+    PyrsList *r = pyrs_list_new(4);
+    long long end = s->len;
+    long long n = 0;
+    long long i = end - sep->len;
+    while (i >= 0) {
+        if (maxsplit >= 0 && n == maxsplit) {
+            break;
+        }
+        if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {
+            pyrs_list_push(r, (long long)str_sub(s, i + sep->len, end - (i + sep->len)));
+            end = i;
+            i -= sep->len;
+            n++;
+        } else {
+            i--;
+        }
+    }
+    pyrs_list_push(r, (long long)str_sub(s, 0, end));
+    list_reverse_slots(r);
     return r;
 }
 

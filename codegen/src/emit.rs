@@ -963,8 +963,10 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_str_rindex(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_str_count(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_replace(ptr, ptr, ptr)\n");
-        out.push_str("declare ptr @pyrs_str_split_ws(ptr)\n");
-        out.push_str("declare ptr @pyrs_str_split(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_split_ws(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_str_split(ptr, ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_str_rsplit_ws(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_str_rsplit(ptr, ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_join(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_str_isdigit(ptr)\n");
         out.push_str("declare i32 @pyrs_str_isalpha(ptr)\n");
@@ -3682,6 +3684,36 @@ impl Emitter {
                 t
             }
             ExprKind::StrCall { func, args } => {
+                if matches!(
+                    func,
+                    StrFn::Split | StrFn::SplitWs | StrFn::RSplit | StrFn::RSplitWs
+                ) {
+                    let s = self.emit_expr(&args[0]);
+                    let (callee, has_sep) = match func {
+                        StrFn::SplitWs => ("pyrs_str_split_ws", false),
+                        StrFn::RSplitWs => ("pyrs_str_rsplit_ws", false),
+                        StrFn::Split => ("pyrs_str_split", true),
+                        StrFn::RSplit => ("pyrs_str_rsplit", true),
+                        _ => unreachable!(),
+                    };
+                    let max_i = if has_sep { 2 } else { 1 };
+                    let sep_v = if has_sep {
+                        Some(self.emit_expr(&args[1]))
+                    } else {
+                        None
+                    };
+                    let ms = self.emit_expr(&args[max_i]);
+                    let ms = self.emit_unbox_i64(&ms);
+                    let t = self.tmp();
+                    if let Some(sep) = sep_v {
+                        self.line(format!(
+                            "{t} = call ptr @{callee}(ptr {s}, ptr {sep}, i64 {ms})"
+                        ));
+                    } else {
+                        self.line(format!("{t} = call ptr @{callee}(ptr {s}, i64 {ms})"));
+                    }
+                    return t;
+                }
                 let vals: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
                 // (runtime symbol, returns i1-via-i32, returns i64)
                 let (callee, is_bool, is_int) = match func {
@@ -3697,8 +3729,9 @@ impl Emitter {
                     StrFn::RIndex => ("pyrs_str_rindex", false, true),
                     StrFn::Count => ("pyrs_str_count", false, true),
                     StrFn::Replace => ("pyrs_str_replace", false, false),
-                    StrFn::SplitWs => ("pyrs_str_split_ws", false, false),
-                    StrFn::Split => ("pyrs_str_split", false, false),
+                    StrFn::SplitWs | StrFn::Split | StrFn::RSplitWs | StrFn::RSplit => {
+                        unreachable!("split family handled above")
+                    }
                     StrFn::Join => ("pyrs_str_join", false, false),
                     StrFn::IsDigit => ("pyrs_str_isdigit", true, false),
                     StrFn::IsAlpha => ("pyrs_str_isalpha", true, false),

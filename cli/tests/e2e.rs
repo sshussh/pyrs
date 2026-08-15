@@ -2402,6 +2402,53 @@ fn str_partition_empty_sep_is_valueerror() {
 }
 
 #[test]
+fn str_split_rsplit_maxsplit_match_python() {
+    let src = "\
+print(\"a,b,c,d\".split(\",\"))
+print(\"a,b,c,d\".split(\",\", 1))
+print(\"a,b,c,d\".rsplit(\",\"))
+print(\"a,b,c,d\".rsplit(\",\", 1))
+print(\"a,b,c\".split(\",\", 0))
+print(\"  a  b  c  \".split())
+print(\"  a  b  c  \".rsplit())
+print(\"  a  b  c  \".split(None, 1))
+print(\"  a  b  c  \".rsplit(None, 1))
+print(\"a b c d\".rsplit(None, 2))
+print(\"x--y--z\".rsplit(\"--\", 1))
+print(\"\".split(), \"\".split(\",\"), \"\".rsplit(\",\"))
+print(\"a,,b\".rsplit(\",\", 1))
+print(\"a,b,c\".split(\",\", -1))
+print(\"   \".split(), \"   \".rsplit())
+print(\"a,b,c\".split(\",\", True))
+";
+    let out = run_program("strrsplit", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn str_split_empty_sep_is_error() {
+    let (_, stderr) = run_program_expect_fail("split_empty", "print(\"a\".split(\"\"))\n");
+    assert!(stderr.contains("empty separator"), "stderr={stderr}");
+    let (code, stderr) =
+        run_program_expect_fail("split_empty_dyn", "s = \"\"\nprint(\"a\".rsplit(s))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: empty separator"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn str_isdigit_matches_python() {
     let out = run_program(
         "isdigit",
