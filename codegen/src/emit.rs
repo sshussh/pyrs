@@ -969,6 +969,7 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_str_index_of(ptr, ptr, i64, i64)\n");
         out.push_str("declare i64 @pyrs_str_rindex(ptr, ptr, i64, i64)\n");
         out.push_str("declare i64 @pyrs_str_count(ptr, ptr)\n");
+        out.push_str("declare i64 @pyrs_str_count_slice(ptr, ptr, i64, i64)\n");
         out.push_str("declare ptr @pyrs_str_replace(ptr, ptr, ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_split_ws(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_split(ptr, ptr, i64)\n");
@@ -3696,7 +3697,7 @@ impl Emitter {
             ExprKind::StrCall { func, args } => {
                 if matches!(
                     func,
-                    StrFn::Find | StrFn::Index | StrFn::RFind | StrFn::RIndex
+                    StrFn::Find | StrFn::Index | StrFn::RFind | StrFn::RIndex | StrFn::Count
                 ) {
                     let s = self.emit_expr(&args[0]);
                     let t = self.emit_expr(&args[1]);
@@ -3707,6 +3708,7 @@ impl Emitter {
                         StrFn::Index => "pyrs_str_index_of",
                         StrFn::RFind => "pyrs_str_rfind_slice",
                         StrFn::RIndex => "pyrs_str_rindex",
+                        StrFn::Count => "pyrs_str_count_slice",
                         _ => unreachable!(),
                     };
                     let raw = self.tmp();
@@ -3778,10 +3780,9 @@ impl Emitter {
                     StrFn::Rstrip => ("pyrs_str_rstrip", false, false),
                     StrFn::StartsWith => ("pyrs_str_startswith", true, false),
                     StrFn::EndsWith => ("pyrs_str_endswith", true, false),
-                    StrFn::Find | StrFn::Index | StrFn::RFind | StrFn::RIndex => {
+                    StrFn::Find | StrFn::Index | StrFn::RFind | StrFn::RIndex | StrFn::Count => {
                         unreachable!("find family handled above")
                     }
-                    StrFn::Count => ("pyrs_str_count", false, true),
                     StrFn::Replace => unreachable!("replace handled above"),
                     StrFn::SplitWs | StrFn::Split | StrFn::RSplitWs | StrFn::RSplit => {
                         unreachable!("split family handled above")

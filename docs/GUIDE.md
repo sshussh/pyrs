@@ -385,7 +385,7 @@ String methods (ASCII case/whitespace rules):
 "banana".rfind("an")      # 3 (last occurrence); "".rfind is -1; empty needle -> len
 "banana".rindex("an")     # like rfind, but ValueError if missing
 "banana".find("an", 2)    # 3; None start/end and negatives are CPython slice bounds
-"banana".count("an")      # 2 (non-overlapping)
+"banana".count("an")      # 2 (non-overlapping); optional start/end like find
 "banana".replace("an", "-")   # "b--a"; replace("an", "-", 1) is "b-ana"
 "a,b,,c".split(",")       # ['a', 'b', '', 'c'] — keeps empty parts
 "a b  c".split()          # ['a', 'b', 'c']    — whitespace runs

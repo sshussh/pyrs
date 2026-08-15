@@ -3362,6 +3362,30 @@ print(\"banana\".rindex(\"an\", 0, 5), \"banana\".index(\"a\", True))
 }
 
 #[test]
+fn str_count_bounds_match_python() {
+    let src = "\
+print(\"banana\".count(\"an\"), \"banana\".count(\"an\", 2), \"banana\".count(\"an\", 2, 4))
+print(\"aaa\".count(\"aa\"), \"aaa\".count(\"a\", 1), \"aaa\".count(\"a\", 1, 2))
+print(\"abc\".count(\"\"), \"abc\".count(\"\", 1), \"abc\".count(\"\", 1, 2), \"abc\".count(\"\", 3), \"abc\".count(\"\", 4))
+print(\"abc\".count(\"\", 2, 1), \"banana\".count(\"an\", -5), \"banana\".count(\"an\", -2), \"banana\".count(\"x\"))
+print(\"banana\".count(\"an\", None), \"banana\".count(\"an\", None, None), \"banana\".count(\"an\", 0, None))
+print(\"\".count(\"\"), \"\".count(\"a\"), \"hello\".count(\"l\", True))
+";
+    let out = run_program("strcntbnd", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_isalpha_isspace_case_match_python_ascii() {
     // ASCII-only rules (documented); cases chosen to match CPython on ASCII.
     let out = run_program(

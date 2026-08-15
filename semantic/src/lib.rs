@@ -11127,7 +11127,9 @@ fn lower_str_method(
         "rindex" => {
             return lower_str_find_family("rindex", RIndex, base_ir, args, method_span, ctx);
         }
-        "count" => (Count, ir::Ty::Int, 1),
+        "count" => {
+            return lower_str_find_family("count", Count, base_ir, args, method_span, ctx);
+        }
         "replace" => {
             return lower_str_replace(base_ir, args, method_span, ctx);
         }
@@ -11319,7 +11321,7 @@ fn lower_str_replace(
     })
 }
 
-/// `s.find/index/rfind/rindex(sub[, start[, end]])` — CPython slice bounds.
+/// `s.find/index/rfind/rindex/count(sub[, start[, end]])` — CPython slice bounds.
 /// Missing `end` is `i64::MIN` (codegen/runtime treat it as `len(s)`).
 fn lower_str_find_family(
     name: &str,
@@ -23464,6 +23466,23 @@ print(f())
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn str_count_bounds_lower() {
+        let m = analyze_ok("n = \"banana\".count(\"an\", 2)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::Count,
+                args,
+            } if args.len() == 4
+        ));
     }
 
     #[test]

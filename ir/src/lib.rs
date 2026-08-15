@@ -1347,7 +1347,7 @@ pub enum StrFn {
     RFind,
     /// `s.rindex(t[, start[, end]])` → int (traps with ValueError when absent)
     RIndex,
-    /// `s.count(t)` → int (non-overlapping)
+    /// `s.count(t[, start[, end]])` → int (non-overlapping; empty needle → slice_len+1)
     Count,
     /// `s.replace(old, new[, count])` → str; last arg is count (`-1` unlimited)
     Replace,

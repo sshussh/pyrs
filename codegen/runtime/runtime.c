@@ -2721,16 +2721,24 @@ long long pyrs_str_rindex(const PyrsStr *s, const PyrsStr *t, long long start,
     return i;
 }
 
-/* non-overlapping occurrences; Python counts len+1 for an empty needle */
-long long pyrs_str_count(const PyrsStr *s, const PyrsStr *t) {
+/* non-overlapping occurrences in [start, end); empty needle → slice_len+1 */
+long long pyrs_str_count_slice(const PyrsStr *s, const PyrsStr *t, long long start,
+                               long long end) {
     check_ref(s);
     check_ref(t);
+    str_adjust_bounds(s->len, &start, &end);
+    if (start > end) {
+        return 0;
+    }
     if (t->len == 0) {
-        return s->len + 1;
+        return end - start + 1;
+    }
+    if (t->len > end - start) {
+        return 0;
     }
     long long n = 0;
-    long long i = 0;
-    while (i + t->len <= s->len) {
+    long long i = start;
+    while (i + t->len <= end) {
         if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
             n++;
             i += t->len;
@@ -2739,6 +2747,11 @@ long long pyrs_str_count(const PyrsStr *s, const PyrsStr *t) {
         }
     }
     return n;
+}
+
+/* non-overlapping occurrences; Python counts len+1 for an empty needle */
+long long pyrs_str_count(const PyrsStr *s, const PyrsStr *t) {
+    return pyrs_str_count_slice(s, t, 0, LLONG_MIN);
 }
 
 /* count < 0 means replace all (CPython). */
