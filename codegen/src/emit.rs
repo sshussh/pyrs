@@ -388,6 +388,10 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         Unary { operand, .. }
         | ToBool(operand)
         | Abs(operand)
+        | Round {
+            value: operand,
+            ndigits: None,
+        }
         | Len(operand)
         | IntToFloat(operand)
         | BoolToInt(operand)
@@ -428,6 +432,10 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
             max_try_depth_in_expr(value).max(max_try_depth_in_expr(spec))
         }
         Sum { list, start } => max_try_depth_in_expr(list).max(max_try_depth_in_expr(start)),
+        Round {
+            value,
+            ndigits: Some(n),
+        } => max_try_depth_in_expr(value).max(max_try_depth_in_expr(n)),
         GeneratorNext { generator, send } => {
             max_try_depth_in_expr(generator).max(max_try_depth_in_expr(send))
         }
@@ -633,6 +641,10 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         Unary { operand, .. }
         | ToBool(operand)
         | Abs(operand)
+        | Round {
+            value: operand,
+            ndigits: None,
+        }
         | Len(operand)
         | IntToFloat(operand)
         | BoolToInt(operand)
@@ -667,6 +679,10 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | JsonLoads { arg: operand, .. }
         | MathCall { arg: operand, .. } => count_yields_in_expr(operand),
         Sum { list, start } => count_yields_in_expr(list) + count_yields_in_expr(start),
+        Round {
+            value,
+            ndigits: Some(n),
+        } => count_yields_in_expr(value) + count_yields_in_expr(n),
         FormatValue { value, spec } => count_yields_in_expr(value) + count_yields_in_expr(spec),
         GeneratorNext { generator, send } => {
             count_yields_in_expr(generator) + count_yields_in_expr(send)
@@ -969,6 +985,9 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_int_neg(i64)\n");
         out.push_str("declare i64 @pyrs_int_invert(i64)\n");
         out.push_str("declare i64 @pyrs_int_abs(i64)\n");
+        out.push_str("declare i64 @pyrs_int_round(i64, i64)\n");
+        out.push_str("declare i64 @pyrs_float_round_to_int(double)\n");
+        out.push_str("declare double @pyrs_float_round_digits(double, i64)\n");
         out.push_str("declare double @pyrs_ffloordiv(double, double)\n");
         out.push_str("declare double @pyrs_fmod_floored(double, double)\n");
         out.push_str("declare double @llvm.fabs.f64(double)\n");
@@ -1320,6 +1339,35 @@ impl Emitter {
 
         self.start_block(&end_l);
         acc
+    }
+
+    fn emit_round(&mut self, value: &Expr, ndigits: Option<&Expr>) -> String {
+        let v = self.emit_expr(value);
+        match (value.ty, ndigits) {
+            (Ty::Int, None) => v,
+            (Ty::Float, None) => {
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i64 @pyrs_float_round_to_int(double {v})"
+                ));
+                t
+            }
+            (Ty::Int, Some(n)) => {
+                let nd = self.emit_expr(n);
+                let t = self.tmp();
+                self.line(format!("{t} = call i64 @pyrs_int_round(i64 {v}, i64 {nd})"));
+                t
+            }
+            (Ty::Float, Some(n)) => {
+                let nd = self.emit_expr(n);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call double @pyrs_float_round_digits(double {v}, i64 {nd})"
+                ));
+                t
+            }
+            other => unreachable!("round on {other:?}"),
+        }
     }
 
     /// `min(xs)` / `max(xs)` over a numeric or str list; empty → ValueError.
@@ -3980,6 +4028,7 @@ impl Emitter {
                 }
                 t
             }
+            ExprKind::Round { value, ndigits } => self.emit_round(value, ndigits.as_deref()),
             // Python min/max: if right is strictly less/greater, take right;
             // otherwise left (ties and NaN comparisons keep the left operand).
             ExprKind::Min { left, right } => self.emit_min_max(false, left, right),

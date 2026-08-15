@@ -1572,7 +1572,7 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 18] = [
+const BUILTINS: [&str; 19] = [
     "print",
     "len",
     "range",
@@ -1591,6 +1591,7 @@ const BUILTINS: [&str; 18] = [
     "zip",
     "reversed",
     "next",
+    "round",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -3267,7 +3268,11 @@ fn collect_param_constraints_expr(
                 }
                 out.push(ir::closure_of(&ptys, ir::Ty::Int));
             }
-            if (func == "len" || func == "abs" || func == "sum" || func == "sorted")
+            if (func == "len"
+                || func == "abs"
+                || func == "sum"
+                || func == "sorted"
+                || func == "round")
                 && let Some(ast::PosArg::Pos(ae)) = args.first()
                 && matches!(&ae.kind, ast::ExprKind::Name(n) if n == name)
             {
@@ -3275,7 +3280,7 @@ fn collect_param_constraints_expr(
                     "len" => {
                         // Ambiguous container — do not constrain alone.
                     }
-                    "abs" | "sum" => out.push(ir::Ty::Int),
+                    "abs" | "sum" | "round" => out.push(ir::Ty::Int),
                     "sorted" => out.push(ir::list_of(ir::Ty::Int)),
                     _ => {}
                 }
@@ -17862,9 +17867,12 @@ fn lower_call(
     if kwargs.is_some() {
         return Err(err(format!("'{func}()' does not take **kwargs"), span));
     }
-    // Builtin keywords we accept: enumerate/sum(start=), sorted/min/max(key=).
-    if !matches!(func, "enumerate" | "sorted" | "min" | "max" | "sum")
-        && let Some(kw) = keywords.first()
+    // Builtin keywords we accept: enumerate/sum(start=), sorted/min/max(key=),
+    // round(ndigits=).
+    if !matches!(
+        func,
+        "enumerate" | "sorted" | "min" | "max" | "sum" | "round"
+    ) && let Some(kw) = keywords.first()
     {
         return Err(err(
             format!("'{func}()' does not take keyword arguments"),
@@ -17978,6 +17986,7 @@ fn lower_call(
                     kind: ir::ExprKind::Len(Box::new(arg)),
                 })
             }
+            "round" => lower_round_expr(&args, keywords, span, ctx),
             "abs" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -20017,6 +20026,103 @@ fn lower_min_max_list_key(
         kind: ir::ExprKind::Block {
             stmts,
             result: Box::new(local_expr(out_t, ret_ty)),
+        },
+    })
+}
+
+fn lower_round_expr(
+    args: &[&ast::Expr],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.is_empty() {
+        return Err(err(
+            "round() missing required argument 'number' (pos 1)",
+            span,
+        ));
+    }
+    if args.len() > 2 {
+        return Err(err(
+            format!(
+                "round() takes at most 2 positional arguments ({} given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let mut ndigits_kw = None;
+    for kw in keywords {
+        if kw.name == "ndigits" {
+            if ndigits_kw.is_some() {
+                return Err(err(
+                    "round() got multiple values for keyword argument 'ndigits'",
+                    kw.name_span,
+                ));
+            }
+            ndigits_kw = Some(kw);
+        } else {
+            return Err(err(
+                format!("round() got an unexpected keyword argument '{}'", kw.name),
+                kw.name_span,
+            ));
+        }
+    }
+    if args.len() == 2
+        && let Some(kw) = ndigits_kw
+    {
+        return Err(err(
+            "round() got multiple values for argument 'ndigits'",
+            kw.name_span,
+        ));
+    }
+    let value = lower_expr(args[0], ctx)?;
+    let value = match value.ty {
+        ir::Ty::Bool => ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::BoolToInt(Box::new(value)),
+        },
+        ir::Ty::Int | ir::Ty::Float => value,
+        other => {
+            return Err(err(
+                format!("type {} doesn't define __round__ method", other),
+                args[0].span,
+            ));
+        }
+    };
+    let ndigits = if args.len() == 2 {
+        Some(args[1])
+    } else {
+        ndigits_kw.map(|kw| &kw.value)
+    };
+    let ndigits = if let Some(nd) = ndigits {
+        let n = lower_expr(nd, ctx)?;
+        let n = match n.ty {
+            ir::Ty::Bool => ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::BoolToInt(Box::new(n)),
+            },
+            ir::Ty::Int => n,
+            other => {
+                return Err(err(
+                    format!("'{other}' object cannot be interpreted as an integer"),
+                    nd.span,
+                ));
+            }
+        };
+        Some(n)
+    } else {
+        None
+    };
+    let ret_ty = match (value.ty, ndigits.is_some()) {
+        (ir::Ty::Float, true) => ir::Ty::Float,
+        _ => ir::Ty::Int,
+    };
+    Ok(ir::Expr {
+        ty: ret_ty,
+        kind: ir::ExprKind::Round {
+            value: Box::new(value),
+            ndigits: ndigits.map(Box::new),
         },
     })
 }
@@ -22385,6 +22491,50 @@ print(f())
         let e = analyze_err("x = abs(\"nope\")\n");
         assert!(
             e.message.contains("bad operand type for abs()"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn round_lowers() {
+        let m =
+            analyze_ok("a = round(-2.5)\nb = round(7)\nc = round(1.25, 1)\nd = round(15, -1)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Round { ndigits: None, .. }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Round {
+                ndigits: Some(_),
+                ..
+            }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[3] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+    }
+
+    #[test]
+    fn round_rejects_str() {
+        let e = analyze_err("x = round(\"nope\")\n");
+        assert!(
+            e.message.contains("__round__") || e.message.contains("str"),
             "{}",
             e.message
         );

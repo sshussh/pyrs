@@ -949,6 +949,12 @@ pub enum ExprKind {
     /// `abs(x)` for int or float (bool is promoted to int first).
     /// Result type matches the operand. `abs(i64::MIN)` wraps (no bigints).
     Abs(Box<Expr>),
+    /// `round(x)` / `round(x, ndigits)`. One-arg always yields `int` (ties to
+    /// even). Two-arg: `int` stays `int`; `float` stays `float`.
+    Round {
+        value: Box<Expr>,
+        ndigits: Option<Box<Expr>>,
+    },
     /// `min(a, b)` - operands share a numeric type; on ties return the left.
     Min {
         left: Box<Expr>,

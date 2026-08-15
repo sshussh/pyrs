@@ -1351,6 +1351,66 @@ long long pyrs_ipow(long long base, long long exp) {
     return pyrs_int_pow(base, exp);
 }
 
+long long pyrs_float_round_to_int(double v) {
+    if (isnan(v)) {
+        pyrs_die("ValueError: cannot convert float NaN to integer");
+    }
+    if (isinf(v)) {
+        pyrs_die("OverflowError: cannot convert float infinity to integer");
+    }
+    return pyrs_int_from_float(nearbyint(v));
+}
+
+double pyrs_float_round_digits(double v, long long ndigits_tag) {
+    if (!pyrs_int_is_small(ndigits_tag)) {
+        /* Huge ndigits: no change if positive; signed zero if negative. */
+        if (pyrs_int_cmp(ndigits_tag, pyrs_int_tag_small(0)) >= 0) {
+            return v;
+        }
+        return copysign(0.0, v);
+    }
+    long long nd = pyrs_int_small_val(ndigits_tag);
+    if (nd > 22) {
+        return v;
+    }
+    if (nd < -22) {
+        return copysign(0.0, v);
+    }
+    if (isnan(v) || isinf(v)) {
+        return v;
+    }
+    double p = pow(10.0, (double)nd);
+    return nearbyint(v * p) / p;
+}
+
+long long pyrs_int_round(long long n, long long ndigits) {
+    if (pyrs_int_cmp(ndigits, pyrs_int_tag_small(0)) >= 0) {
+        return n;
+    }
+    long long neg_nd = pyrs_int_sub(pyrs_int_tag_small(0), ndigits);
+    /* 10 ** |ndigits|; huge exponents collapse to 0. */
+    if (!pyrs_int_is_small(neg_nd) || pyrs_int_small_val(neg_nd) > 4000) {
+        return pyrs_int_tag_small(0);
+    }
+    long long factor = pyrs_int_pow(pyrs_int_tag_small(10), neg_nd);
+    int neg = pyrs_int_cmp(n, pyrs_int_tag_small(0)) < 0;
+    long long absn = neg ? pyrs_int_sub(pyrs_int_tag_small(0), n) : n;
+    long long q = pyrs_int_floordiv(absn, factor);
+    long long r = pyrs_int_mod(absn, factor);
+    long long half = pyrs_int_floordiv(factor, pyrs_int_tag_small(2));
+    int cmp = pyrs_int_cmp(r, half);
+    long long two = pyrs_int_tag_small(2);
+    int q_odd = pyrs_int_cmp(pyrs_int_mod(q, two), pyrs_int_tag_small(0)) != 0;
+    if (cmp > 0 || (cmp == 0 && q_odd)) {
+        q = pyrs_int_add(q, pyrs_int_tag_small(1));
+    }
+    long long result = pyrs_int_mul(q, factor);
+    if (neg) {
+        result = pyrs_int_sub(pyrs_int_tag_small(0), result);
+    }
+    return result;
+}
+
 /* Two's complement bit ops: convert to infinite sign-extended limb form. */
 
 static void to_twos(long long t, unsigned long long **limbs, long long *n,

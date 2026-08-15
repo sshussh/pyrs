@@ -803,6 +803,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `print(a, b, ...)` | any values, any count | space-separated, newline at end |
 | `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
+| `round(x[, ndigits])` | int, float, bool; optional int `ndigits` (positional or `ndigits=`) | one-arg → `int` (ties to even); two-arg `int` stays `int`; two-arg `float` stays `float` |
 | `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, orderable tuple, or orderable list (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple/list: lexicographic; optional monomorphic `key=` over homogeneous positionals; no `default=` |
 | `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple\|orderable list]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs[, start])` | `list[int]` or `list[float]`; optional numeric `start` (positional or `start=`) | `elem ⊔ start` (`bool`→`int`→`float`); empty yields `start` (default `0` / `0.0`) |

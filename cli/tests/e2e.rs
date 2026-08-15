@@ -1238,6 +1238,40 @@ fn int_of_nan_and_inf_trap_like_python() {
     );
 }
 
+#[test]
+fn round_matches_python() {
+    let src = "\
+print(round(2.5), round(3.5), round(-2.5), round(-3.5))
+print(round(7), round(True), round(-0.0))
+print(round(1.234, 2), round(2.5, 0), round(3.5, 0))
+print(round(15, -1), round(25, -1), round(-15, -1))
+print(round(1234, 2), round(1234, 0))
+print(round(1.25, 1), round(-1.25, 1))
+";
+    let out = run_program("round", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn round_nan_inf_trap_like_python() {
+    let (code, stderr) = run_program_expect_fail("roundinf", "v = 1e308 * 10\nprint(round(v))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("OverflowError: cannot convert float infinity to integer"),
+        "stderr: {stderr}"
+    );
+}
+
 // ---- v0.3: slicing, in/not in, pop, f-strings ----
 
 #[test]
