@@ -6168,6 +6168,25 @@ void pyrs_set_update(PyrsSet *s, const PyrsSet *other) {
     }
 }
 
+/* Remove and return an element (last-inserted). Empty → KeyError. */
+long long pyrs_set_pop(PyrsSet *s) {
+    check_ref(s);
+    for (long long i = s->order_len - 1; i >= 0; i--) {
+        SetSlot *e = &s->table[s->order[i]];
+        if (e->state != 1) {
+            continue;
+        }
+        long long key = e->key;
+        e->state = 2;
+        s->len--;
+        memmove(&s->order[i], &s->order[i + 1],
+                (size_t)(s->order_len - i - 1) * sizeof(long long));
+        s->order_len--;
+        return key;
+    }
+    pyrs_die("KeyError: 'pop from an empty set'");
+}
+
 /* Shallow set copy. */
 PyrsSet *pyrs_set_copy(const PyrsSet *s) {
     check_ref(s);

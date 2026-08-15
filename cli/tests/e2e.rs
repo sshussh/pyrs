@@ -12480,6 +12480,43 @@ print(d[\"a\"], d[\"b\"])
 }
 
 #[test]
+fn set_pop_match_python() {
+    let src = "\
+s = {1}
+print(s.pop(), len(s), 1 in s)
+t = {1, 2}
+a = t.pop()
+b = t.pop()
+print(sorted([a, b]), len(t))
+u = {\"x\"}
+print(u.pop(), len(u))
+";
+    let out = run_program("setpop", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn set_pop_empty_is_keyerror() {
+    let (code, stderr) =
+        run_program_expect_fail("setpopempty", "e: set[int] = set()\nprint(e.pop())\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("KeyError: 'pop from an empty set'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn set_copy_match_python() {
     let src = "\
 s = {1, 2}

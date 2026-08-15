@@ -10623,15 +10623,37 @@ fn lower_set_method_stmt(
                 kind: ir::ExprKind::SetCopy(Box::new(base_ir)),
             }))
         }
+        "pop" => {
+            let p = lower_set_pop(base_ir, elem_ty, args, method_span)?;
+            Ok(ir::Stmt::ExprStmt(p))
+        }
         _ => Err(err(
             format!(
                 "set method '{method}' is not supported yet (supported: add, remove, \
                  discard, clear, union, intersection, difference, symmetric_difference, \
-                 issubset, issuperset, isdisjoint, update, copy)"
+                 issubset, issuperset, isdisjoint, update, copy, pop)"
             ),
             method_span,
         )),
     }
+}
+
+fn lower_set_pop(
+    set: ir::Expr,
+    elem_ty: ir::Ty,
+    args: &[ast::Expr],
+    method_span: Span,
+) -> SResult<ir::Expr> {
+    if !args.is_empty() {
+        return Err(err(
+            format!("pop() takes no arguments ({} given)", args.len()),
+            method_span,
+        ));
+    }
+    Ok(ir::Expr {
+        ty: elem_ty,
+        kind: ir::ExprKind::SetPop(Box::new(set)),
+    })
 }
 
 fn lower_set_relation(l: ir::Expr, r: ir::Expr, span: Span, name: &str) -> SResult<ir::Expr> {
@@ -15760,11 +15782,12 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                             kind: ir::ExprKind::SetCopy(Box::new(base_ir)),
                         })
                     }
+                    "pop" => lower_set_pop(base_ir, *elem, &args, *method_span),
                     _ => Err(err(
                         format!(
                             "set method '{method}' is not supported yet (supported: add, \
                              remove, discard, clear, union, intersection, difference, \
-                             symmetric_difference, issubset, issuperset, isdisjoint, update, copy)"
+                             symmetric_difference, issubset, issuperset, isdisjoint, update, copy, pop)"
                         ),
                         *method_span,
                     )),
@@ -26466,6 +26489,24 @@ print(count([]))
             panic!();
         };
         assert!(matches!(value.kind, ir::ExprKind::SetIsDisjoint { .. }));
+    }
+
+    #[test]
+    fn set_pop_lowers() {
+        let m = analyze_ok("s = {1, 2}\nx = s.pop()\ns.pop()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::SetPop(_)));
+        assert!(matches!(entry.body[2], ir::Stmt::ExprStmt(_)));
+    }
+
+    #[test]
+    fn set_pop_rejects_args() {
+        let e = analyze_err("s = {1}\nprint(s.pop(1))\n");
+        assert!(e.message.contains("no arguments"), "{}", e.message);
     }
 
     #[test]

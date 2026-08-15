@@ -436,6 +436,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | ListFromStr(operand)
         | DictCopy(operand)
         | SetCopy(operand)
+        | SetPop(operand)
         | SetFromStr(operand)
         | MinList(operand)
         | MaxList(operand)
@@ -727,6 +728,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | ListFromStr(operand)
         | DictCopy(operand)
         | SetCopy(operand)
+        | SetPop(operand)
         | SetFromStr(operand)
         | MinList(operand)
         | MaxList(operand)
@@ -978,6 +980,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_set_from_list(ptr, i32)\n");
         out.push_str("declare ptr @pyrs_set_from_str(ptr)\n");
         out.push_str("declare ptr @pyrs_set_copy(ptr)\n");
+        out.push_str("declare i64 @pyrs_set_pop(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_copy(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_from_pairs(ptr, i32, i32)\n");
         out.push_str("declare ptr @pyrs_str_concat(ptr, ptr)\n");
@@ -5372,6 +5375,12 @@ impl Emitter {
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_set_copy(ptr {v})"));
                 t
+            }
+            ExprKind::SetPop(s) => {
+                let v = self.emit_expr(s);
+                let slot = self.tmp();
+                self.line(format!("{slot} = call i64 @pyrs_set_pop(ptr {v})"));
+                self.value_from_slot(&slot, expr.ty)
             }
             ExprKind::SetFromList { list, elem } => {
                 let v = self.emit_expr(list);

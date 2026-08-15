@@ -927,6 +927,8 @@ pub enum ExprKind {
     DictCopy(Box<Expr>),
     /// Shallow copy of a set (`set.copy()`).
     SetCopy(Box<Expr>),
+    /// `set.pop()` — remove and return an element (last-inserted); empty → KeyError.
+    SetPop(Box<Expr>),
     /// `set(xs)` from a homogeneous list of int/str.
     SetFromList {
         list: Box<Expr>,
