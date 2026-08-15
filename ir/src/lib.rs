@@ -1342,6 +1342,8 @@ pub enum StrFn {
     Center,
     LJust,
     RJust,
+    /// `s.expandtabs([tabsize])` → str; last arg is tabsize (default 8)
+    ExpandTabs,
     /// `s.strip()` / `s.lstrip()` / `s.rstrip()` → str
     Strip,
     Lstrip,

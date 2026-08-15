@@ -11125,6 +11125,9 @@ fn lower_str_method(
         "rjust" => {
             return lower_str_pad("rjust", ir::StrFn::RJust, base_ir, args, method_span, ctx);
         }
+        "expandtabs" => {
+            return lower_str_expandtabs(base_ir, args, method_span, ctx);
+        }
         "strip" => (Strip, ir::Ty::Str, 0),
         "lstrip" => (Lstrip, ir::Ty::Str, 0),
         "rstrip" => (Rstrip, ir::Ty::Str, 0),
@@ -11213,7 +11216,7 @@ fn lower_str_method(
                      join, isdigit, isalpha, isspace, isupper, islower, \
                      isalnum, istitle, isascii, \
                      removeprefix, removesuffix, partition, rpartition, rsplit, \
-                     splitlines)"
+                     splitlines, expandtabs)"
                 ),
                 method_span,
             ));
@@ -11320,6 +11323,35 @@ fn as_fillchar(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         ));
     }
     Ok(f)
+}
+
+fn lower_str_expandtabs(
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() > 1 {
+        return Err(err(
+            format!(
+                "expandtabs() takes at most 1 argument ({} given)",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+    let tabsize = if args.is_empty() {
+        int_const(8)
+    } else {
+        as_str_width(&args[0], ctx)?
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::StrCall {
+            func: ir::StrFn::ExpandTabs,
+            args: vec![base_ir, tabsize],
+        },
+    })
 }
 
 fn lower_str_zfill(
@@ -23556,6 +23588,41 @@ print(f())
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn str_expandtabs_lowers() {
+        let m = analyze_ok("s = \"a\\tb\".expandtabs()\nt = \"a\\tb\".expandtabs(4)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        let ir::ExprKind::StrCall { func, args } = &value.kind else {
+            panic!();
+        };
+        assert_eq!(*func, ir::StrFn::ExpandTabs);
+        assert_eq!(args.len(), 2);
+        assert!(matches!(&args[1].kind, ir::ExprKind::ConstInt(n) if *n == 8));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        let ir::ExprKind::StrCall { args, .. } = &value.kind else {
+            panic!();
+        };
+        assert!(matches!(&args[1].kind, ir::ExprKind::ConstInt(n) if *n == 4));
+    }
+
+    #[test]
+    fn str_expandtabs_rejects_bad_tabsize() {
+        let e = analyze_err("print(\"a\".expandtabs(\"x\"))\n");
+        assert!(
+            e.message.contains("cannot be interpreted as an integer"),
+            "{}",
+            e.message
+        );
+        let e = analyze_err("print(\"a\".expandtabs(1, 2))\n");
+        assert!(e.message.contains("at most 1 argument"), "{}", e.message);
     }
 
     #[test]

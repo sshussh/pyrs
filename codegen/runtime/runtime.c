@@ -2679,6 +2679,66 @@ PyrsStr *pyrs_str_zfill(const PyrsStr *s, long long width) {
     return r;
 }
 
+PyrsStr *pyrs_str_expandtabs(const PyrsStr *s, long long tabsize) {
+    check_ref(s);
+    long long n = 0;
+    long long col = 0;
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c == '\t') {
+            if (tabsize <= 0) {
+                continue;
+            }
+            long long pad = tabsize - (col % tabsize);
+            if (pad <= 0) {
+                pad = tabsize;
+            }
+            if (n > LLONG_MAX - pad) {
+                pyrs_die("MemoryError: expandtabs result too large");
+            }
+            n += pad;
+            col += pad;
+        } else {
+            if (n == LLONG_MAX) {
+                pyrs_die("MemoryError: expandtabs result too large");
+            }
+            n++;
+            if (c == '\n' || c == '\r') {
+                col = 0;
+            } else {
+                col++;
+            }
+        }
+    }
+    PyrsStr *r = str_alloc(n);
+    long long o = 0;
+    col = 0;
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        if (c == '\t') {
+            if (tabsize <= 0) {
+                continue;
+            }
+            long long pad = tabsize - (col % tabsize);
+            if (pad <= 0) {
+                pad = tabsize;
+            }
+            for (long long k = 0; k < pad; k++) {
+                r->data[o++] = ' ';
+            }
+            col += pad;
+        } else {
+            r->data[o++] = c;
+            if (c == '\n' || c == '\r') {
+                col = 0;
+            } else {
+                col++;
+            }
+        }
+    }
+    return r;
+}
+
 static int is_py_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }

@@ -2461,6 +2461,36 @@ print(\", \".join(csv.split(\",\")))
 }
 
 #[test]
+fn str_expandtabs_match_python() {
+    let src = "\
+print(\"a\\tb\".expandtabs())
+print(\"a\\tb\".expandtabs(4))
+print(\"\\t\".expandtabs(4))
+print(\"abcd\\te\".expandtabs(4))
+print(\"abc\\tde\".expandtabs(4))
+print(\"a\\tb\".expandtabs(0), \"a\\tb\".expandtabs(-1), \"a\\tb\".expandtabs(1))
+print(\"    \\tx\".expandtabs(4))
+print(\"a\\r\\tb\".expandtabs(4))
+print(\"a\\n\\tb\".expandtabs(4))
+print(\"\\t\\t\".expandtabs(3))
+print(\"\".expandtabs(), \"no tabs\".expandtabs(4))
+print(\"a\\tb\".expandtabs(True), \"a\\tb\".expandtabs(False))
+";
+    let out = run_program("strexpand", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_zfill_center_ljust_rjust_match_python() {
     let src = "\
 print(\"42\".zfill(5), \"-42\".zfill(5), \"+42\".zfill(5), \"42\".zfill(2), \"42\".zfill(0), \"42\".zfill(-1))

@@ -961,6 +961,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_title(ptr)\n");
         out.push_str("declare ptr @pyrs_str_swapcase(ptr)\n");
         out.push_str("declare ptr @pyrs_str_zfill(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_str_expandtabs(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_center(ptr, i64, ptr)\n");
         out.push_str("declare ptr @pyrs_str_ljust(ptr, i64, ptr)\n");
         out.push_str("declare ptr @pyrs_str_rjust(ptr, i64, ptr)\n");
@@ -3757,6 +3758,16 @@ impl Emitter {
                     ));
                     return self.emit_box_i64(&raw);
                 }
+                if matches!(func, StrFn::ExpandTabs) {
+                    let s = self.emit_expr(&args[0]);
+                    let w = self.emit_expr(&args[1]);
+                    let w = self.emit_unbox_i64(&w);
+                    let t = self.tmp();
+                    self.line(format!(
+                        "{t} = call ptr @pyrs_str_expandtabs(ptr {s}, i64 {w})"
+                    ));
+                    return t;
+                }
                 if matches!(func, StrFn::ZFill) {
                     let s = self.emit_expr(&args[0]);
                     let w = self.emit_expr(&args[1]);
@@ -3846,6 +3857,7 @@ impl Emitter {
                     StrFn::ZFill | StrFn::Center | StrFn::LJust | StrFn::RJust => {
                         unreachable!("pad family handled above")
                     }
+                    StrFn::ExpandTabs => unreachable!("expandtabs handled above"),
                     StrFn::Strip => ("pyrs_str_strip", false, false),
                     StrFn::Lstrip => ("pyrs_str_lstrip", false, false),
                     StrFn::Rstrip => ("pyrs_str_rstrip", false, false),

@@ -541,7 +541,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 `StartsWithTuple`, `EndsWithTuple`,
 `RemovePrefix`, `RemoveSuffix`, `Partition`, `RPartition`,
 `Find`, `Index`, `RFind`, `RIndex`, `Count`, `Replace`, `SplitWs`, `Split`,
-`RSplitWs`, `RSplit`, `SplitLines`, `Join`,
+`RSplitWs`, `RSplit`, `SplitLines`, `ExpandTabs`, `Join`,
 `IsDigit`, `IsAlpha`, `IsSpace`, `IsUpper`, `IsLower`, `IsAlnum`, `IsTitle`,
 `IsAscii`.
 
