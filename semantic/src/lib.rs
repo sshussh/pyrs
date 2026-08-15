@@ -10193,6 +10193,20 @@ fn lower_method_stmt(
                 method_span,
             )),
         },
+        ir::Ty::Tuple(elems) => match method {
+            "index" => {
+                let idx = lower_tuple_index_of(base_ir, elems, args, method_span, ctx)?;
+                Ok(ir::Stmt::ExprStmt(idx))
+            }
+            "count" => {
+                let n = lower_tuple_count(base_ir, elems, args, method_span, ctx)?;
+                Ok(ir::Stmt::ExprStmt(n))
+            }
+            _ => Err(err(
+                format!("tuple method '{method}' is not supported yet (supported: index, count)"),
+                method_span,
+            )),
+        },
         ir::Ty::Str => {
             let call = lower_str_method(base_ir, method, method_span, args, ctx)?;
             Ok(ir::Stmt::ExprStmt(call))
@@ -11829,6 +11843,92 @@ fn lower_list_count(
         ty: ir::Ty::Int,
         kind: ir::ExprKind::ListCount {
             list: Box::new(list),
+            value: Box::new(value),
+        },
+    })
+}
+
+/// Needle for tuple `in` / `index` / `count`: coerce when homogeneous;
+/// otherwise keep as-is if comparable to any element (runtime matches tags).
+fn lower_tuple_search_needle(
+    needle: ir::Expr,
+    elems: &[ir::Ty],
+    span: Span,
+    what: &str,
+) -> SResult<ir::Expr> {
+    let mut uniq: Vec<ir::Ty> = Vec::new();
+    for e in elems {
+        if !uniq.iter().any(|u| u == e) {
+            uniq.push(*e);
+        }
+    }
+    if uniq.len() == 1 {
+        return coerce(needle, uniq[0], span, what);
+    }
+    let ok = uniq.iter().any(|e| {
+        needle.ty == *e
+            || matches!(
+                (needle.ty, *e),
+                (ir::Ty::Bool, ir::Ty::Int)
+                    | (ir::Ty::Int, ir::Ty::Float)
+                    | (ir::Ty::Bool, ir::Ty::Float)
+            )
+    });
+    if !ok && !uniq.is_empty() {
+        return Err(err(
+            format!(
+                "{what} type {} is not compatible with any element type",
+                needle.ty
+            ),
+            span,
+        ));
+    }
+    Ok(needle)
+}
+
+fn lower_tuple_index_of(
+    tuple: ir::Expr,
+    elems: &[ir::Ty],
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!("index() takes exactly one argument ({} given)", args.len()),
+            method_span,
+        ));
+    }
+    let value = lower_expr(&args[0], ctx)?;
+    let value = lower_tuple_search_needle(value, elems, args[0].span, "index() argument")?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::TupleIndexOf {
+            tuple: Box::new(tuple),
+            value: Box::new(value),
+        },
+    })
+}
+
+fn lower_tuple_count(
+    tuple: ir::Expr,
+    elems: &[ir::Ty],
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!("count() takes exactly one argument ({} given)", args.len()),
+            method_span,
+        ));
+    }
+    let value = lower_expr(&args[0], ctx)?;
+    let value = lower_tuple_search_needle(value, elems, args[0].span, "count() argument")?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::TupleCount {
+            tuple: Box::new(tuple),
             value: Box::new(value),
         },
     })
@@ -15363,6 +15463,16 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     }
                     _ => Err(err(
                         format!("'{}' has no method '{method}'", base_ir.ty),
+                        *method_span,
+                    )),
+                },
+                ir::Ty::Tuple(elems) => match method.as_str() {
+                    "index" => lower_tuple_index_of(base_ir, elems, &args, *method_span, ctx),
+                    "count" => lower_tuple_count(base_ir, elems, &args, *method_span, ctx),
+                    _ => Err(err(
+                        format!(
+                            "tuple method '{method}' is not supported yet (supported: index, count)"
+                        ),
                         *method_span,
                     )),
                 },
@@ -22907,40 +23017,7 @@ fn lower_contains(
         ir::Ty::List(elem) => coerce(l, *elem, span, "'in' operand")?,
         ir::Ty::Dict { key, .. } => coerce(l, *key, span, "'in' dict key")?,
         ir::Ty::Set(elem) => coerce(l, *elem, span, "'in' set element")?,
-        ir::Ty::Tuple(elems) => {
-            // Homogeneous: coerce to that elem type. Heterogeneous: keep needle
-            // as-is; runtime only compares elements with a matching tag.
-            let mut uniq: Vec<ir::Ty> = Vec::new();
-            for e in elems.iter() {
-                if !uniq.iter().any(|u| u == e) {
-                    uniq.push(*e);
-                }
-            }
-            if uniq.len() == 1 {
-                coerce(l, uniq[0], span, "'in' tuple operand")?
-            } else {
-                // Accept needle if it is comparable to any element type.
-                let ok = uniq.iter().any(|e| {
-                    l.ty == *e
-                        || matches!(
-                            (l.ty, *e),
-                            (ir::Ty::Bool, ir::Ty::Int)
-                                | (ir::Ty::Int, ir::Ty::Float)
-                                | (ir::Ty::Bool, ir::Ty::Float)
-                        )
-                });
-                if !ok && !uniq.is_empty() {
-                    return Err(err(
-                        format!(
-                            "'in' tuple operand type {} is not compatible with any element type",
-                            l.ty
-                        ),
-                        span,
-                    ));
-                }
-                l
-            }
-        }
+        ir::Ty::Tuple(elems) => lower_tuple_search_needle(l, elems, span, "'in' tuple operand")?,
         other => {
             return Err(err(format!("'{other}' does not support 'in'"), span));
         }
@@ -26447,6 +26524,39 @@ print(f())
             has,
             "expected Contains for tuple membership: {:?}",
             entry.body
+        );
+    }
+
+    #[test]
+    fn tuple_count_and_index_lower() {
+        let m = analyze_ok("n = (1, 2, 1).count(1)\ni = (1, 2, 1).index(2)\n(1, 2).count(9)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::TupleCount { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::TupleIndexOf { .. }));
+        assert!(matches!(entry.body[2], ir::Stmt::ExprStmt(_)));
+    }
+
+    #[test]
+    fn tuple_index_rejects_extra_arg() {
+        let e = analyze_err("print((1, 2).index(1, 0))\n");
+        assert!(e.message.contains("exactly one argument"), "{}", e.message);
+    }
+
+    #[test]
+    fn tuple_count_rejects_incompatible_needle() {
+        let e = analyze_err("print((1, 2).count(\"a\"))\n");
+        assert!(
+            e.message.contains("not compatible") || e.message.contains("type mismatch"),
+            "{}",
+            e.message
         );
     }
 

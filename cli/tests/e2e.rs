@@ -5828,6 +5828,47 @@ print(p[0] + p[1])
 }
 
 #[test]
+fn tuple_count_and_index_match_python() {
+    let src = "\
+t = (1, 2, 1, 3)
+print(t.count(1), t.count(2), t.count(9))
+print(t.index(1), t.index(2), t.index(3))
+print((1,).count(1), (1,).index(1))
+print(().count(0))
+print((1, \"a\", 1).count(1), (1, \"a\", 1).count(\"a\"), (1, \"a\", 1).index(\"a\"))
+print(((1, 2), (3,), (1, 2)).count((1, 2)))
+print(((1, 2), (3,)).index((3,)))
+empty: tuple[()] = ()
+print(empty.count(1))
+t.count(1)
+t.index(2)
+print((True, False, True).count(True), (True, False).index(False))
+";
+    let out = run_program("tupcntidx", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn tuple_index_miss_matches_python() {
+    let (code, stderr) = run_program_expect_fail("tupidxmiss", "print((1, 2).index(9))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: tuple.index(x): x not in tuple"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn tuple_index_error() {
     // dynamic index so the trap is at runtime (constant OOB is a compile error)
     let (code, err) = run_program_expect_fail("tuple_idx", "t = (1, 2)\ni = 5\nprint(t[i])\n");

@@ -534,9 +534,15 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         DictFromPairs { pairs, .. } => max_try_depth_in_expr(pairs),
         ListPop { list, index }
         | ListIndexOf { list, value: index }
-        | ListCount { list, value: index } => {
-            max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
+        | ListCount { list, value: index }
+        | TupleIndexOf {
+            tuple: list,
+            value: index,
         }
+        | TupleCount {
+            tuple: list,
+            value: index,
+        } => max_try_depth_in_expr(list).max(max_try_depth_in_expr(index)),
         DictGet { dict, key, default } | DictSetDefault { dict, key, default } => {
             max_try_depth_in_expr(dict)
                 .max(max_try_depth_in_expr(key))
@@ -787,9 +793,15 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         DictFromPairs { pairs, .. } => count_yields_in_expr(pairs),
         ListPop { list, index }
         | ListIndexOf { list, value: index }
-        | ListCount { list, value: index } => {
-            count_yields_in_expr(list) + count_yields_in_expr(index)
+        | ListCount { list, value: index }
+        | TupleIndexOf {
+            tuple: list,
+            value: index,
         }
+        | TupleCount {
+            tuple: list,
+            value: index,
+        } => count_yields_in_expr(list) + count_yields_in_expr(index),
         DictGet { dict, key, default } | DictSetDefault { dict, key, default } => {
             count_yields_in_expr(dict) + count_yields_in_expr(key) + count_yields_in_expr(default)
         }
@@ -869,6 +881,8 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_tuple_eq(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_tuple_cmp(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_tuple_contains(ptr, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_tuple_index(ptr, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_tuple_count(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_unpack_check(i64, i64)\n");
         out.push_str("declare void @pyrs_unpack_check_min(i64, i64)\n");
         out.push_str("declare ptr @pyrs_cell_new(i64)\n");
@@ -4246,6 +4260,28 @@ impl Emitter {
                 let machine = self.tmp();
                 self.line(format!(
                     "{machine} = call i64 @pyrs_list_count(ptr {l}, i64 {slot}, i32 {})",
+                    elem_tag(&value.ty)
+                ));
+                self.emit_box_i64(&machine)
+            }
+            ExprKind::TupleIndexOf { tuple, value } => {
+                let t = self.emit_expr(tuple);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                let machine = self.tmp();
+                self.line(format!(
+                    "{machine} = call i64 @pyrs_tuple_index(ptr {t}, i64 {slot}, i32 {})",
+                    elem_tag(&value.ty)
+                ));
+                self.emit_box_i64(&machine)
+            }
+            ExprKind::TupleCount { tuple, value } => {
+                let t = self.emit_expr(tuple);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                let machine = self.tmp();
+                self.line(format!(
+                    "{machine} = call i64 @pyrs_tuple_count(ptr {t}, i64 {slot}, i32 {})",
                     elem_tag(&value.ty)
                 ));
                 self.emit_box_i64(&machine)

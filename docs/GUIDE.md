@@ -219,7 +219,7 @@ value.
 | `T \| U` / `Optional[T]` | tagged union `{tag, payload}` | members flattened/sorted; no nested unions |
 | `file`  | open file handle | from `open(...)`; usable in params/returns; not in lists |
 | `list[T]` | growable homogeneous list | `T` is any type incl. another list or Optional; not `file` |
-| `tuple[T1, …]` | fixed-arity heterogeneous tuple | empty `tuple[()]`; index / len / unpack / iterate (homogeneous) |
+| `tuple[T1, …]` | fixed-arity heterogeneous tuple | empty `tuple[()]`; index / len / unpack / iterate (homogeneous); `count`/`index` |
 | `dict[K, V]` | hash map, insertion order | `K` is `int` or `str`; `V` may be Optional/union; empty `{}` needs annotation |
 | `set[T]` | hash set, insertion order | `T` is `int` or `str`; empty via `s: set[int] = set()` |
 
@@ -1326,7 +1326,8 @@ deliberate exceptions:
 Container notes (v0.20.1):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
-  traps), `len`, unpack, `==`/`!=`, homogeneous `for`, membership `in`
+  traps), `len`, unpack, `==`/`!=`, `count(x)` / `index(x)` (same
+  equality as `in`; missing `index` is `ValueError`), homogeneous `for`, membership `in`
   (compatible element tags only for heterogeneous tuples). Homogeneous
   closures (same params/ret and capture env shape) and generators may be
   tuple/list elements; call via `t[i](args)`.
@@ -1388,7 +1389,7 @@ multi-line expressions inside f-string `{...}` (parenthesize instead),
 same-delimiter triple quotes nested inside an f-string expression,
 `__doc__` attribute access, dynamic `json.loads`, multi-path split
 namespace packages, `from sys import *`, and most remaining methods on
-tuple/dict/set. Generator exhaustion is **Optional None** (not raised
+dict/set (tuples have `count`/`index`). Generator exhaustion is **Optional None** (not raised
 `StopIteration`) by design for this subset.
 `match`/`case` is a documented subset (literals, capture, `or`, sequence
 with optional `*rest`, mapping with str keys and optional `**rest`, `as`

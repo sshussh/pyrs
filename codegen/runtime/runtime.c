@@ -5259,6 +5259,27 @@ int pyrs_tuple_contains(const PyrsTuple *t, long long slot, int tag) {
     return 0;
 }
 
+long long pyrs_tuple_index(const PyrsTuple *t, long long slot, int tag) {
+    check_ref(t);
+    for (long long i = 0; i < t->len; i++) {
+        if (t->tags[i] == tag && slot_eq(t->data[i], slot, tag)) {
+            return i;
+        }
+    }
+    pyrs_die("ValueError: tuple.index(x): x not in tuple");
+}
+
+long long pyrs_tuple_count(const PyrsTuple *t, long long slot, int tag) {
+    check_ref(t);
+    long long n = 0;
+    for (long long i = 0; i < t->len; i++) {
+        if (t->tags[i] == tag && slot_eq(t->data[i], slot, tag)) {
+            n++;
+        }
+    }
+    return n;
+}
+
 void pyrs_unpack_check(long long got, long long expected) {
     if (got < expected) {
         char buf[128];

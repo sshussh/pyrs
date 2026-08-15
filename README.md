@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.69.0)
+## The language (v0.70.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.70.0**, not 1.0) until it is ready for
+milestone after this one is **0.71.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -188,6 +188,8 @@ A statically-typed Python subset:
   **v0.69:** `str.isdecimal` / `isnumeric` / `isidentifier` / `isprintable`
   (ASCII: decimal/numeric match `isdigit`; identifiers are
   `[A-Za-z_][A-Za-z0-9_]*`; printable is `0x20..=0x7E`, empty is True).
+  **v0.70:** `tuple.count(x)` / `tuple.index(x)` — same tag+equality as `in`
+  (homogeneous coerces; miss is `ValueError: tuple.index(x): x not in tuple`).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -277,7 +279,8 @@ A statically-typed Python subset:
   lists, same recursive equality as `==`), `len`, iteration;
   assignment aliases like Python
 - **Tuples:** fixed-arity, heterogeneous; literals `(a, b)`, `(a,)`,
-  `()`; index (incl. negative); `len`; unpacking; print like CPython
+  `()`; index (incl. negative); `len`; unpacking; `count`/`index` (same
+  equality as `in`; miss is ValueError); print like CPython
 - **Dicts:** `dict[K, V]` with `K` in `{int, str}`; literal `{k: v}`,
   `{}` (needs annotation); get/set, `del d[k]`, `in` on keys, `len`,
   insertion-order key iteration; methods `get` (with default, or bare
@@ -361,7 +364,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.69.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.70.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -523,4 +526,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.69.0 && git push origin v0.69.0`.
+Release tags: `git tag v0.70.0 && git push origin v0.70.0`.

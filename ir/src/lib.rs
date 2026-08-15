@@ -856,6 +856,16 @@ pub enum ExprKind {
         list: Box<Expr>,
         value: Box<Expr>,
     },
+    /// `tuple.index(value)` — first match (tag + slot_eq); traps if missing.
+    TupleIndexOf {
+        tuple: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// `tuple.count(value)` — number of matches (tag + slot_eq). Result is `int`.
+    TupleCount {
+        tuple: Box<Expr>,
+        value: Box<Expr>,
+    },
     /// A list literal; `ty` is `List(elem)` and items are already coerced.
     ListLit(Vec<Expr>),
     /// A fresh empty list with the given capacity (comprehension results).
