@@ -2461,6 +2461,43 @@ print(\", \".join(csv.split(\",\")))
 }
 
 #[test]
+fn str_splitlines_match_python() {
+    let src = "\
+print(\"\".splitlines())
+print(\"a\".splitlines())
+print(\"a\\nb\".splitlines())
+print(\"a\\nb\\n\".splitlines())
+print(\"a\\nb\\n\".splitlines(True))
+print(\"a\\r\\nb\\rc\".splitlines())
+print(\"a\\r\\nb\".splitlines(True))
+print(\"\\n\".splitlines(), \"\\n\".splitlines(True), \"\\n\\n\".splitlines())
+print(\"a\\nb\".splitlines(1), \"a\\nb\".splitlines(0), \"a\\nb\".splitlines(None))
+print((\"a\" + chr(11) + \"b\").splitlines())
+print((\"a\" + chr(12) + \"b\").splitlines())
+print((\"a\" + chr(28) + \"b\").splitlines())
+print((\"a\" + chr(133) + \"b\").splitlines())
+print((\"a\" + chr(8232) + \"b\").splitlines())
+print((\"a\" + chr(8233) + \"b\").splitlines())
+print(len((\"a\" + chr(8232) + \"b\").splitlines(True)), (\"a\" + chr(8232) + \"b\").splitlines(True)[1])
+s = \"line1\\nline2\\r\\nline3\\r\"
+print(s.splitlines())
+print(s.splitlines(True))
+";
+    let out = run_program("strsplines", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_replace_count_match_python() {
     let src = "\
 print(\"aaa\".replace(\"a\", \"b\"), \"aaa\".replace(\"a\", \"b\", 0), \"aaa\".replace(\"a\", \"b\", 1), \"aaa\".replace(\"a\", \"b\", 2))

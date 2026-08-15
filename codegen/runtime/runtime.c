@@ -2860,6 +2860,57 @@ PyrsList *pyrs_str_rsplit_ws(const PyrsStr *s, long long maxsplit) {
     return r;
 }
 
+/* CPython splitlines: \n \r \r\n \v \f \x1c \x1d \x1e, plus UTF-8 U+0085 /
+ * U+2028 / U+2029. `keepends` is CPython truthiness (already lowered). */
+static long long linebreak_len(const char *p, long long i, long long n) {
+    unsigned char c = (unsigned char)p[i];
+    if (c == '\r') {
+        if (i + 1 < n && p[i + 1] == '\n') {
+            return 2;
+        }
+        return 1;
+    }
+    if (c == '\n' || c == '\v' || c == '\f' || c == 0x1c || c == 0x1d ||
+        c == 0x1e) {
+        return 1;
+    }
+    /* U+0085 NEL */
+    if (c == 0xc2 && i + 1 < n && (unsigned char)p[i + 1] == 0x85) {
+        return 2;
+    }
+    /* U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR */
+    if (c == 0xe2 && i + 2 < n && (unsigned char)p[i + 1] == 0x80 &&
+        ((unsigned char)p[i + 2] == 0xa8 || (unsigned char)p[i + 2] == 0xa9)) {
+        return 3;
+    }
+    return 0;
+}
+
+PyrsList *pyrs_str_splitlines(const PyrsStr *s, int keepends) {
+    check_ref(s);
+    PyrsList *r = pyrs_list_new(4);
+    long long i = 0;
+    while (i < s->len) {
+        long long start = i;
+        long long blen = 0;
+        while (i < s->len) {
+            blen = linebreak_len(s->data, i, s->len);
+            if (blen > 0) {
+                break;
+            }
+            i++;
+        }
+        if (i >= s->len) {
+            pyrs_list_push(r, (long long)str_sub(s, start, s->len - start));
+            break;
+        }
+        long long n = keepends ? (i + blen - start) : (i - start);
+        pyrs_list_push(r, (long long)str_sub(s, start, n));
+        i += blen;
+    }
+    return r;
+}
+
 PyrsList *pyrs_str_split(const PyrsStr *s, const PyrsStr *sep, long long maxsplit) {
     check_ref(s);
     check_ref(sep);

@@ -1359,6 +1359,8 @@ pub enum StrFn {
     RSplitWs,
     /// `s.rsplit(sep[, maxsplit])` — last `maxsplit` splits from the right
     RSplit,
+    /// `s.splitlines([keepends])` → `list[str]`; last arg is bool keepends
+    SplitLines,
     /// `sep.join(parts)` → str
     Join,
     /// `s.isdigit()` -> bool (ASCII digits)

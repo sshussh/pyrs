@@ -11137,6 +11137,9 @@ fn lower_str_method(
         "rsplit" => {
             return lower_str_split_family("rsplit", true, base_ir, args, method_span, ctx);
         }
+        "splitlines" => {
+            return lower_str_splitlines(base_ir, args, method_span, ctx);
+        }
         "join" => {
             if args.len() != 1 {
                 return Err(err(
@@ -11183,7 +11186,8 @@ fn lower_str_method(
                      upper, lower, strip, lstrip, rstrip, startswith, \
                      endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
-                     removeprefix, removesuffix, partition, rpartition, rsplit)"
+                     removeprefix, removesuffix, partition, rpartition, rsplit, \
+                     splitlines)"
                 ),
                 method_span,
             ));
@@ -11220,6 +11224,37 @@ fn lower_str_method(
         kind: ir::ExprKind::StrCall {
             func,
             args: call_args,
+        },
+    })
+}
+
+/// `s.splitlines([keepends])` — CPython line boundaries; `keepends` is truthy.
+fn lower_str_splitlines(
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() > 1 {
+        return Err(err(
+            format!(
+                "splitlines() takes at most 1 argument ({} given)",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+    let keepends = if args.is_empty() {
+        const_bool_expr(false)
+    } else {
+        let v = lower_expr(&args[0], ctx)?;
+        to_bool(v, args[0].span, ctx)?
+    };
+    Ok(ir::Expr {
+        ty: ir::list_of(ir::Ty::Str),
+        kind: ir::ExprKind::StrCall {
+            func: ir::StrFn::SplitLines,
+            args: vec![base_ir, keepends],
         },
     })
 }
@@ -23233,6 +23268,35 @@ print(f())
         assert_eq!(*func, ir::StrFn::SplitWs);
         assert_eq!(args.len(), 2);
         assert!(matches!(&args[1].kind, ir::ExprKind::ConstInt(n) if *n == -1));
+    }
+
+    #[test]
+    fn str_splitlines_lowers() {
+        let m = analyze_ok("xs = \"a\\nb\".splitlines()\nys = \"a\\nb\".splitlines(True)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Str));
+        let ir::ExprKind::StrCall { func, args } = &value.kind else {
+            panic!();
+        };
+        assert_eq!(*func, ir::StrFn::SplitLines);
+        assert_eq!(args.len(), 2);
+        assert!(matches!(&args[1].kind, ir::ExprKind::ConstBool(false)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        let ir::ExprKind::StrCall { args, .. } = &value.kind else {
+            panic!();
+        };
+        assert!(matches!(&args[1].kind, ir::ExprKind::ConstBool(true)));
+    }
+
+    #[test]
+    fn str_splitlines_rejects_arity() {
+        let e = analyze_err("print(\"a\".splitlines(1, 2))\n");
+        assert!(e.message.contains("at most 1 argument"), "{}", e.message);
     }
 
     #[test]

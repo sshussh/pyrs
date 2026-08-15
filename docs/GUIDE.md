@@ -391,6 +391,7 @@ String methods (ASCII case/whitespace rules):
 "a b  c".split()          # ['a', 'b', 'c']    — whitespace runs
 "a,b,c".split(",", 1)     # ['a', 'b,c']; rsplit(",", 1) is ['a,b', 'c']
 "a b c".rsplit(None, 1)   # ['a b', 'c'] — None sep is whitespace
+"a\nb\n".splitlines()     # ['a', 'b']; splitlines(True) keeps endings
 "-".join(["a", "b"])      # "a-b"
 "123".isdigit()           # True; "" and non-digits are False
 "abc".isalpha()           # True; ASCII letters only

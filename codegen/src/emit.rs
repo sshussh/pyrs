@@ -972,6 +972,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_replace(ptr, ptr, ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_split_ws(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_split(ptr, ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_str_splitlines(ptr, i32)\n");
         out.push_str("declare ptr @pyrs_str_rsplit_ws(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_rsplit(ptr, ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_join(ptr, ptr)\n");
@@ -3726,6 +3727,17 @@ impl Emitter {
                     ));
                     return t;
                 }
+                if matches!(func, StrFn::SplitLines) {
+                    let s = self.emit_expr(&args[0]);
+                    let ke = self.emit_expr(&args[1]);
+                    let ke32 = self.tmp();
+                    self.line(format!("{ke32} = zext i1 {ke} to i32"));
+                    let t = self.tmp();
+                    self.line(format!(
+                        "{t} = call ptr @pyrs_str_splitlines(ptr {s}, i32 {ke32})"
+                    ));
+                    return t;
+                }
                 if matches!(
                     func,
                     StrFn::Split | StrFn::SplitWs | StrFn::RSplit | StrFn::RSplitWs
@@ -3774,6 +3786,7 @@ impl Emitter {
                     StrFn::SplitWs | StrFn::Split | StrFn::RSplitWs | StrFn::RSplit => {
                         unreachable!("split family handled above")
                     }
+                    StrFn::SplitLines => unreachable!("splitlines handled above"),
                     StrFn::Join => ("pyrs_str_join", false, false),
                     StrFn::IsDigit => ("pyrs_str_isdigit", true, false),
                     StrFn::IsAlpha => ("pyrs_str_isalpha", true, false),
