@@ -10138,7 +10138,7 @@ fn lower_method_stmt(
                         method_span,
                     ));
                 }
-                if class_defines_lt(*elem) {
+                if class_supports_lt(*elem) {
                     let list_ty = base_ir.ty;
                     let xs_t = ctx.fresh_temp("lsort", list_ty);
                     let xs = local_expr(xs_t.clone(), list_ty);
@@ -12121,10 +12121,26 @@ fn lower_list_pop(
     })
 }
 
-fn class_defines_lt(ty: ir::Ty) -> bool {
+/// `a < b` is lowerable when the class defines `__lt__` or the reflected `__gt__`.
+fn class_supports_lt(ty: ir::Ty) -> bool {
+    class_has_method(ty, "__lt__") || class_has_method(ty, "__gt__")
+}
+
+fn class_has_method(ty: ir::Ty, method: &str) -> bool {
     match ty {
-        ir::Ty::Class(id) => resolve_method(id, "__lt__").is_some(),
+        ir::Ty::Class(id) => resolve_method(id, method).is_some(),
         _ => false,
+    }
+}
+
+/// Reflected rich-compare slot for ordering (`a < b` → `b.__gt__(a)`, …).
+fn class_reflected_order_method(op: ast::BinOp) -> Option<&'static str> {
+    match op {
+        ast::BinOp::Lt => Some("__gt__"),
+        ast::BinOp::LtEq => Some("__ge__"),
+        ast::BinOp::Gt => Some("__lt__"),
+        ast::BinOp::GtEq => Some("__le__"),
+        _ => None,
     }
 }
 
@@ -12132,12 +12148,12 @@ fn ensure_sortable_list_elem(elem: ir::Ty, span: Span) -> SResult<()> {
     match elem {
         ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => Ok(()),
         ir::Ty::Tuple(_) | ir::Ty::List(_) if is_orderable_ty(elem) => Ok(()),
-        ir::Ty::Class(_) if class_defines_lt(elem) => Ok(()),
+        ir::Ty::Class(_) if class_supports_lt(elem) => Ok(()),
         other => Err(err(
             format!(
                 "sort is only supported for list[int], list[float], list[bool], \
                  list[str], lists of orderable tuples/lists, and lists of classes \
-                 that define __lt__, found list[{other}]"
+                 that define __lt__ or __gt__, found list[{other}]"
             ),
             span,
         )),
@@ -12154,7 +12170,7 @@ fn push_plain_list_sort(
     ctx: &mut FnCtx,
 ) -> SResult<()> {
     ensure_sortable_list_elem(elem, span)?;
-    if class_defines_lt(elem) {
+    if class_supports_lt(elem) {
         stmts.extend(lower_list_sort_class_stmts(list, elem, span, ctx)?);
     } else {
         stmts.push(ir::Stmt::ListSort { list });
@@ -21213,14 +21229,14 @@ fn lower_min_max_expr(
         ir::Ty::Tuple(_) | ir::Ty::List(_) if is_orderable_ty(elem) => {
             lower_min_max_list_plain(func, arg, elem, default_ir, span, ctx)
         }
-        ir::Ty::Class(_) if class_defines_lt(elem) => {
+        ir::Ty::Class(_) if class_supports_lt(elem) => {
             lower_min_max_list_class(func, arg, elem, default_ir, span, ctx)
         }
         other => Err(err(
             format!(
                 "{func}() is only supported for list[int], list[float], \
                  list[bool], list[str], lists of orderable tuples/lists, and lists of \
-                 classes that define __lt__ without key=; found list[{other}]"
+                 classes that define __lt__ or __gt__ without key=; found list[{other}]"
             ),
             args[0].span,
         )),
@@ -21276,9 +21292,9 @@ fn lower_min_max_multi_plain(
                 ));
             }
         }
-        if !class_defines_lt(first_ty) {
+        if !class_supports_lt(first_ty) {
             return Err(err(
-                format!("{func}() is not supported for class instances without __lt__"),
+                format!("{func}() is not supported for class instances without __lt__ or __gt__"),
                 span,
             ));
         }
@@ -23611,10 +23627,12 @@ fn lower_bitwise(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
 /// (`__eq__` / `__lt__` / `__le__` / `__gt__` / `__ge__`), call it
 /// (virtual). `==` / `!=` without `__eq__` fall back to pointer identity
 /// when both sides are class instances (CPython default). Ordering has
-/// no identity fallback — missing dunders are compile errors. Reflected
-/// operators (`b.__gt__(a)` when `a.__lt__` is missing) are residual.
-/// `sorted` / `list.sort` / `min` / `max` of class instances desugar to
-/// these `__lt__` calls (see `push_plain_list_sort`).
+/// no identity fallback — missing dunders are compile errors unless the
+/// right operand provides the reflected slot (`b.__gt__(a)` for `a < b`).
+/// If the right type is a proper subclass of the left and defines that
+/// reflected method, it is tried first (CPython subclass-first).
+/// There is no `NotImplemented` fallthrough. `sorted` / `list.sort` /
+/// `min` / `max` desugar to `<` (see `push_plain_list_sort`).
 fn lower_class_compare(
     op: ast::BinOp,
     l: ir::Expr,
@@ -23636,11 +23654,30 @@ fn lower_class_compare(
         }
     };
     let invert = matches!(op, ast::BinOp::NotEq);
+    let reflected = class_reflected_order_method(op);
+
+    // CPython: if the right type is a proper subtype of the left and has the
+    // reflected slot, try `right.reflected(left)` first.
+    if let (ir::Ty::Class(lid), ir::Ty::Class(rid), Some(refl)) = (l.ty, r.ty, reflected)
+        && lid != rid
+        && class_is_subclass(rid, lid)
+        && resolve_method(rid, refl).is_some()
+    {
+        return lower_class_cmp_call(r, rid, l, refl, invert, span, ctx);
+    }
+
     if let ir::Ty::Class(id) = l.ty
         && resolve_method(id, method).is_some()
     {
         return lower_class_cmp_call(l, id, r, method, invert, span, ctx);
     }
+
+    if let (ir::Ty::Class(id), Some(refl)) = (r.ty, reflected)
+        && resolve_method(id, refl).is_some()
+    {
+        return lower_class_cmp_call(r, id, l, refl, invert, span, ctx);
+    }
+
     if matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) {
         if matches!((l.ty, r.ty), (ir::Ty::Class(_), ir::Ty::Class(_))) {
             return Ok(ir::Expr {
@@ -23660,8 +23697,12 @@ fn lower_class_compare(
             span,
         ));
     }
+    let hint = match reflected {
+        Some(refl) => format!("define {method} or reflected {refl}"),
+        None => format!("define {method}"),
+    };
     Err(err(
-        format!("operator '{op}' is not supported for class instances (define {method})"),
+        format!("operator '{op}' is not supported for class instances ({hint})"),
         span,
     ))
 }
@@ -27330,7 +27371,47 @@ b = Q(1) < Q(2)
     }
 
     #[test]
-    fn class_gt_without_dunder_rejected() {
+    fn class_gt_reflects_to_lt() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+b = P(1) > P(2)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn class_lt_reflects_to_gt() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __gt__(self, other: P) -> bool:
+        return self.x > other.x
+b = P(1) < P(2)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn class_ge_without_le_rejected() {
         let e = analyze_err(
             "\
 class P:
@@ -27338,11 +27419,12 @@ class P:
         self.x = x
     def __lt__(self, other: P) -> bool:
         return self.x < other.x
-print(P(1) > P(2))
+print(P(1) >= P(2))
 ",
         );
         assert!(
-            e.message.contains("operator '>'") && e.message.contains("__gt__"),
+            e.message.contains("operator '>='")
+                && (e.message.contains("__ge__") || e.message.contains("__le__")),
             "{}",
             e.message
         );

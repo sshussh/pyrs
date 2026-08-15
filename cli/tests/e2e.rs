@@ -13655,6 +13655,81 @@ print(Q(2) < Q(1))
 }
 
 #[test]
+fn class_order_reflected_matches_python() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+print(P(1) > P(2))
+print(P(2) > P(1))
+print(P(1) < P(2))
+class Q:
+    def __init__(self, x: int):
+        self.x = x
+    def __gt__(self, other: Q) -> bool:
+        return self.x > other.x
+print(Q(1) < Q(2))
+print(Q(2) < Q(1))
+print(Q(1) > Q(2))
+xs = [Q(3), Q(1), Q(2)]
+for q in sorted(xs):
+    print(q.x)
+class N:
+    def __init__(self, x: int):
+        self.x = x
+    def __gt__(self, other: int) -> bool:
+        return self.x > other
+print(1 < N(2))
+print(3 < N(2))
+class A:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: A) -> bool:
+        return self.x < other.x
+class B(A):
+    def __gt__(self, other: A) -> bool:
+        return False
+print(A(1) < B(2))
+print(B(1) < A(2))
+";
+    let out = run_program("class_order_reflected", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_ge_without_le_is_compile_error() {
+    let (code, stderr) = run_program_expect_fail(
+        "class_ge_no_le",
+        "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+print(P(1) >= P(2))
+",
+    );
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("operator '>='")
+            && (stderr.contains("__ge__") || stderr.contains("__le__")),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn class_sorted_min_max_match_python() {
     let src = "\
 class P:

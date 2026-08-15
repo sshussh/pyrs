@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.79.0)
+## The language (v0.80.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.80.0**, not 1.0) until it is ready for
+milestone after this one is **0.81.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -207,10 +207,15 @@ A statically-typed Python subset:
   int or str, or a `str` (chars); omitted value is `None`.
   **v0.78:** class `<` / `<=` / `>` / `>=` — `__lt__` / `__le__` / `__gt__` /
   `__ge__` when defined on the left class (virtual, including inherited);
-  no identity fallback; reflected ops remain residual.
+  no identity fallback.
   **v0.79:** `sorted` / `list.sort` / `min` / `max` of class instances that
   define `__lt__` (virtual, including inherited; CPython uses `<` only);
   empty iterable `min`/`max` matches the usual ValueError / `default=`.
+  **v0.80:** reflected class ordering — `a < b` tries `b.__gt__(a)` when the
+  left type has no `__lt__` (and the other swap pairs); subclass-first when
+  the right type is a proper subclass and defines the reflected slot.
+  No `NotImplemented` fallthrough. `sorted` / `min` / `max` accept `__gt__`
+  as well as `__lt__`.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -256,7 +261,7 @@ A statically-typed Python subset:
   `int()`/`float()`/`bool()`/`str()` (including `int(s[, base])` / `float(s)`
   from strings), `len()`, `abs()`, `round()`, `hex()`/`bin()`/`oct()`, `divmod()`, `pow()`, `min()`/`max()`
   (two-or-more numeric args, or one list: without `key=`
-  `list[int|float|bool|str|orderable tuple|orderable list|class with __lt__]`;
+  `list[int|float|bool|str|orderable tuple|orderable list|class with __lt__ or __gt__]`;
   with monomorphic `key=` any `list[T]` or
   multi-arg homogeneous candidates),
   `sum()` on `list[int]`/`list[float]` (optional numeric `start=` /
@@ -296,7 +301,7 @@ A statically-typed Python subset:
   `append`/`pop`/`insert`/`remove`/`index` (optional start/end)/`count`/`clear`/`reverse`/`sort`/`extend`/`copy` (homogeneous
   list arg), `list(iterable)`, `sorted(xs)` / `sorted(xs, key=f)` /
   `sorted(xs, reverse=…)` / `sorted(xs, key=f, reverse=…)`
-  (class elements need `__lt__` when `key=` is omitted),
+  (class elements need `__lt__` or `__gt__` when `key=` is omitted),
   `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` (and both kwargs),
   `+`/`*` (concat / repeat), `==`/`!=`, `in` / `not in` (including nested
   lists, same recursive equality as `==`), `len`, iteration;
@@ -388,16 +393,16 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.79.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.80.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
 `1.0`, not the int `1`; pure `bool` args print as `0`/`1`); multi-arg and
 iterable form also accept homogeneous `str`, orderable tuples, orderable
-lists (lexicographic), and class instances that define `__lt__`; multi-arg with
+lists (lexicographic), and class instances that define `__lt__` or `__gt__`; multi-arg with
 monomorphic `key=` requires homogeneous positionals (mixed types → compile
 error; use the iterable form or a common type); iterable `min`/`max` without
-`key=` is for `list[int|float|bool|str|orderable tuple|orderable list|class with __lt__]`
+`key=` is for `list[int|float|bool|str|orderable tuple|orderable list|class with __lt__ or __gt__]`
 (empty without `default=` → ValueError like CPython); with monomorphic `key=`
 any `list[T]` is fine; iterable `default=` joins with element type
 (`default=None` → Optional); multi-arg rejects `default=`; bare `key=`
@@ -550,4 +555,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.79.0 && git push origin v0.79.0`.
+Release tags: `git tag v0.80.0 && git push origin v0.80.0`.
