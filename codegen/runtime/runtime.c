@@ -2741,38 +2741,56 @@ long long pyrs_str_count(const PyrsStr *s, const PyrsStr *t) {
     return n;
 }
 
-PyrsStr *pyrs_str_replace(const PyrsStr *s, const PyrsStr *old, const PyrsStr *new_s) {
+/* count < 0 means replace all (CPython). */
+PyrsStr *pyrs_str_replace(const PyrsStr *s, const PyrsStr *old, const PyrsStr *new_s,
+                          long long count) {
     check_ref(s);
     check_ref(old);
     check_ref(new_s);
-    /* Python: an empty old inserts new between every character */
-    if (old->len == 0) {
-        long long n = s->len + (s->len + 1) * new_s->len;
-        PyrsStr *r = str_alloc(n);
-        char *p = r->data;
-        for (long long i = 0; i < s->len; i++) {
-            memcpy(p, new_s->data, (size_t)new_s->len);
-            p += new_s->len;
-            *p++ = s->data[i];
-        }
-        memcpy(p, new_s->data, (size_t)new_s->len);
-        return r;
-    }
-    long long count = pyrs_str_count(s, old);
     if (count == 0) {
-        /* immutable, so sharing is safe — but return a copy of the header
-         * shape anyway to keep ownership simple */
         return str_sub(s, 0, s->len);
     }
-    long long n = s->len + count * (new_s->len - old->len);
+    /* Python: an empty old inserts new between every character (and at ends). */
+    if (old->len == 0) {
+        long long max_ins = s->len + 1;
+        long long nins = (count < 0 || count >= max_ins) ? max_ins : count;
+        if (nins == 0) {
+            return str_sub(s, 0, s->len);
+        }
+        long long n = s->len + nins * new_s->len;
+        PyrsStr *r = str_alloc(n);
+        char *p = r->data;
+        long long inserted = 0;
+        for (long long i = 0; i < s->len; i++) {
+            if (inserted < nins) {
+                memcpy(p, new_s->data, (size_t)new_s->len);
+                p += new_s->len;
+                inserted++;
+            }
+            *p++ = s->data[i];
+        }
+        if (inserted < nins) {
+            memcpy(p, new_s->data, (size_t)new_s->len);
+        }
+        return r;
+    }
+    long long avail = pyrs_str_count(s, old);
+    long long nrep = count < 0 ? avail : (count < avail ? count : avail);
+    if (nrep == 0) {
+        return str_sub(s, 0, s->len);
+    }
+    long long n = s->len + nrep * (new_s->len - old->len);
     PyrsStr *r = str_alloc(n);
     char *p = r->data;
     long long i = 0;
+    long long done = 0;
     while (i < s->len) {
-        if (i + old->len <= s->len && memcmp(s->data + i, old->data, (size_t)old->len) == 0) {
+        if (done < nrep && i + old->len <= s->len &&
+            memcmp(s->data + i, old->data, (size_t)old->len) == 0) {
             memcpy(p, new_s->data, (size_t)new_s->len);
             p += new_s->len;
             i += old->len;
+            done++;
         } else {
             *p++ = s->data[i++];
         }

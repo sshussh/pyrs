@@ -11128,7 +11128,9 @@ fn lower_str_method(
             return lower_str_find_family("rindex", RIndex, base_ir, args, method_span, ctx);
         }
         "count" => (Count, ir::Ty::Int, 1),
-        "replace" => (Replace, ir::Ty::Str, 2),
+        "replace" => {
+            return lower_str_replace(base_ir, args, method_span, ctx);
+        }
         "split" => {
             return lower_str_split_family("split", false, base_ir, args, method_span, ctx);
         }
@@ -11218,6 +11220,66 @@ fn lower_str_method(
         kind: ir::ExprKind::StrCall {
             func,
             args: call_args,
+        },
+    })
+}
+
+/// `s.replace(old, new[, count])` — `count < 0` is unlimited (CPython).
+fn lower_str_replace(
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() < 2 {
+        return Err(err(
+            format!("replace expected at least 2 arguments, got {}", args.len()),
+            method_span,
+        ));
+    }
+    if args.len() > 3 {
+        return Err(err(
+            format!("replace expected at most 3 arguments, got {}", args.len()),
+            method_span,
+        ));
+    }
+    let old = lower_expr(&args[0], ctx)?;
+    let new = lower_expr(&args[1], ctx)?;
+    if old.ty != ir::Ty::Str {
+        return Err(err(
+            format!("replace() argument 1 must be str, not {}", old.ty),
+            args[0].span,
+        ));
+    }
+    if new.ty != ir::Ty::Str {
+        return Err(err(
+            format!("replace() argument 2 must be str, not {}", new.ty),
+            args[1].span,
+        ));
+    }
+    let count = if args.len() == 3 {
+        let c = lower_expr(&args[2], ctx)?;
+        match c.ty {
+            ir::Ty::Bool => ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::BoolToInt(Box::new(c)),
+            },
+            ir::Ty::Int => c,
+            other => {
+                return Err(err(
+                    format!("'{other}' object cannot be interpreted as an integer"),
+                    args[2].span,
+                ));
+            }
+        }
+    } else {
+        int_const(-1)
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::StrCall {
+            func: ir::StrFn::Replace,
+            args: vec![base_ir, old, new, count],
         },
     })
 }
@@ -23171,6 +23233,43 @@ print(f())
         assert_eq!(*func, ir::StrFn::SplitWs);
         assert_eq!(args.len(), 2);
         assert!(matches!(&args[1].kind, ir::ExprKind::ConstInt(n) if *n == -1));
+    }
+
+    #[test]
+    fn str_replace_count_lowers() {
+        let m = analyze_ok("s = \"aaa\".replace(\"a\", \"b\", 1)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        let ir::ExprKind::StrCall { func, args } = &value.kind else {
+            panic!();
+        };
+        assert_eq!(*func, ir::StrFn::Replace);
+        assert_eq!(args.len(), 4);
+        assert!(matches!(&args[3].kind, ir::ExprKind::ConstInt(n) if *n == 1));
+        let m = analyze_ok("s = \"aaa\".replace(\"a\", \"b\")\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        let ir::ExprKind::StrCall { args, .. } = &value.kind else {
+            panic!();
+        };
+        assert!(matches!(&args[3].kind, ir::ExprKind::ConstInt(n) if *n == -1));
+    }
+
+    #[test]
+    fn str_replace_rejects_bad_count() {
+        let e = analyze_err("print(\"a\".replace(\"a\", \"b\", \"x\"))\n");
+        assert!(
+            e.message.contains("cannot be interpreted as an integer"),
+            "{}",
+            e.message
+        );
+        let e = analyze_err("print(\"a\".replace(\"a\"))\n");
+        assert!(e.message.contains("at least 2 arguments"), "{}", e.message);
     }
 
     #[test]

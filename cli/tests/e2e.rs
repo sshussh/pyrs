@@ -2461,6 +2461,33 @@ print(\", \".join(csv.split(\",\")))
 }
 
 #[test]
+fn str_replace_count_match_python() {
+    let src = "\
+print(\"aaa\".replace(\"a\", \"b\"), \"aaa\".replace(\"a\", \"b\", 0), \"aaa\".replace(\"a\", \"b\", 1), \"aaa\".replace(\"a\", \"b\", 2))
+print(\"aaa\".replace(\"a\", \"b\", -1), \"aaa\".replace(\"a\", \"b\", -5), \"aaa\".replace(\"a\", \"b\", True))
+print(\"abc\".replace(\"\", \"-\"), \"abc\".replace(\"\", \"-\", 0), \"abc\".replace(\"\", \"-\", 1), \"abc\".replace(\"\", \"-\", 2))
+print(\"abc\".replace(\"\", \"-\", 3), \"abc\".replace(\"\", \"-\", 4), \"abc\".replace(\"\", \"-\", 100))
+print(\"\".replace(\"\", \"x\"), \"\".replace(\"\", \"x\", 0), \"\".replace(\"\", \"x\", 1))
+print(\"banana\".replace(\"an\", \"-\"), \"banana\".replace(\"an\", \"-\", 1), \"banana\".replace(\"xx\", \"y\", 5))
+print(\"ababab\".replace(\"ab\", \"X\", 2), \"hello\".replace(\"l\", \"\", 1))
+s = \"mississippi\"
+print(s.replace(\"ss\", \"S\", 1), s.replace(\"i\", \"I\", False))
+";
+    let out = run_program("strrepcnt", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_removeprefix_removesuffix_match_python() {
     let src = "\
 print(\"hello\".removeprefix(\"he\"), \"hello\".removeprefix(\"x\"), \"hello\".removeprefix(\"\"))

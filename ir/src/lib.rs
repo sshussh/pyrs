@@ -1349,7 +1349,7 @@ pub enum StrFn {
     RIndex,
     /// `s.count(t)` → int (non-overlapping)
     Count,
-    /// `s.replace(old, new)` → str
+    /// `s.replace(old, new[, count])` → str; last arg is count (`-1` unlimited)
     Replace,
     /// `s.split()` / `s.split(None[, maxsplit])` — whitespace runs; last arg is maxsplit (`-1` unlimited)
     SplitWs,

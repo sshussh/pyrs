@@ -969,7 +969,7 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_str_index_of(ptr, ptr, i64, i64)\n");
         out.push_str("declare i64 @pyrs_str_rindex(ptr, ptr, i64, i64)\n");
         out.push_str("declare i64 @pyrs_str_count(ptr, ptr)\n");
-        out.push_str("declare ptr @pyrs_str_replace(ptr, ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_replace(ptr, ptr, ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_split_ws(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_split(ptr, ptr, i64)\n");
         out.push_str("declare ptr @pyrs_str_rsplit_ws(ptr, i64)\n");
@@ -3714,6 +3714,18 @@ impl Emitter {
                     ));
                     return self.emit_box_i64(&raw);
                 }
+                if matches!(func, StrFn::Replace) {
+                    let s = self.emit_expr(&args[0]);
+                    let old = self.emit_expr(&args[1]);
+                    let new = self.emit_expr(&args[2]);
+                    let count = self.emit_expr(&args[3]);
+                    let count = self.emit_unbox_i64(&count);
+                    let t = self.tmp();
+                    self.line(format!(
+                        "{t} = call ptr @pyrs_str_replace(ptr {s}, ptr {old}, ptr {new}, i64 {count})"
+                    ));
+                    return t;
+                }
                 if matches!(
                     func,
                     StrFn::Split | StrFn::SplitWs | StrFn::RSplit | StrFn::RSplitWs
@@ -3758,7 +3770,7 @@ impl Emitter {
                         unreachable!("find family handled above")
                     }
                     StrFn::Count => ("pyrs_str_count", false, true),
-                    StrFn::Replace => ("pyrs_str_replace", false, false),
+                    StrFn::Replace => unreachable!("replace handled above"),
                     StrFn::SplitWs | StrFn::Split | StrFn::RSplitWs | StrFn::RSplit => {
                         unreachable!("split family handled above")
                     }
