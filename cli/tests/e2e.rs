@@ -2461,6 +2461,37 @@ print(\", \".join(csv.split(\",\")))
 }
 
 #[test]
+fn str_strip_chars_match_python() {
+    let src = "\
+print(\"  hello  \".strip(), \"  hello  \".strip(None))
+print(\"xxhelloxx\".strip(\"x\"), \"xyhelloyx\".strip(\"xy\"))
+print(\"hello\".strip(\"\"), \"abc\".strip(\"d\"), \"xxx\".strip(\"x\"), \"\".strip(\"x\"))
+print(\"www.example.com\".strip(\"cmowz.\"))
+print(\"   spacious   \".lstrip(), \"   spacious   \".lstrip(None))
+print(\"www.example.com\".lstrip(\"cmowz.\"), \"mississippi\".lstrip(\"ims\"))
+print(\"   spacious   \".rstrip(), \"mississippi\".rstrip(\"ipz\"))
+print(\"ababhelloabab\".strip(\"ab\"), \"ababhelloabab\".lstrip(\"ab\"), \"ababhelloabab\".rstrip(\"ab\"))
+print(\" \\t hi \\n\".strip(), \"xx  hi  xx\".strip(\"x\"))
+c = \"x\"
+n = None
+print(\"xxhi\".strip(c), \"  hi  \".strip(n), \"hixx\".rstrip(c), \"xxhi\".lstrip(c))
+print(\"hello\".lstrip(\"\"), \"hello\".rstrip(\"\"))
+";
+    let out = run_program("strstrip", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_expandtabs_match_python() {
     let src = "\
 print(\"a\\tb\".expandtabs())

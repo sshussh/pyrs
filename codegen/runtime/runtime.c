@@ -2770,6 +2770,54 @@ PyrsStr *pyrs_str_rstrip(const PyrsStr *s) {
     return strip_impl(s, 0, 1);
 }
 
+static int byte_in_set(unsigned char c, const unsigned char set[32]) {
+    return (set[c >> 3] >> (c & 7)) & 1;
+}
+
+static void fill_byte_set(const PyrsStr *chars, unsigned char set[32]) {
+    memset(set, 0, 32);
+    for (long long i = 0; i < chars->len; i++) {
+        unsigned char c = (unsigned char)chars->data[i];
+        set[c >> 3] |= (unsigned char)(1u << (c & 7));
+    }
+}
+
+static PyrsStr *strip_chars_impl(const PyrsStr *s, const PyrsStr *chars, int left, int right) {
+    check_ref(s);
+    check_ref(chars);
+    if (chars->len == 0 || s->len == 0) {
+        return (PyrsStr *)s;
+    }
+    unsigned char set[32];
+    fill_byte_set(chars, set);
+    long long b = 0;
+    long long e = s->len;
+    if (left) {
+        while (b < e && byte_in_set((unsigned char)s->data[b], set)) {
+            b++;
+        }
+    }
+    if (right) {
+        while (e > b && byte_in_set((unsigned char)s->data[e - 1], set)) {
+            e--;
+        }
+    }
+    if (b == 0 && e == s->len) {
+        return (PyrsStr *)s;
+    }
+    return str_sub(s, b, e - b);
+}
+
+PyrsStr *pyrs_str_strip_chars(const PyrsStr *s, const PyrsStr *chars) {
+    return strip_chars_impl(s, chars, 1, 1);
+}
+PyrsStr *pyrs_str_lstrip_chars(const PyrsStr *s, const PyrsStr *chars) {
+    return strip_chars_impl(s, chars, 1, 0);
+}
+PyrsStr *pyrs_str_rstrip_chars(const PyrsStr *s, const PyrsStr *chars) {
+    return strip_chars_impl(s, chars, 0, 1);
+}
+
 int pyrs_str_startswith(const PyrsStr *s, const PyrsStr *pre) {
     check_ref(s);
     check_ref(pre);

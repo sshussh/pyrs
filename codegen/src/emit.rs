@@ -968,6 +968,9 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_strip(ptr)\n");
         out.push_str("declare ptr @pyrs_str_lstrip(ptr)\n");
         out.push_str("declare ptr @pyrs_str_rstrip(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_strip_chars(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_lstrip_chars(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_rstrip_chars(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_str_startswith(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_str_endswith(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_str_startswith_slice(ptr, ptr, i64, i64)\n");
@@ -3861,6 +3864,9 @@ impl Emitter {
                     StrFn::Strip => ("pyrs_str_strip", false, false),
                     StrFn::Lstrip => ("pyrs_str_lstrip", false, false),
                     StrFn::Rstrip => ("pyrs_str_rstrip", false, false),
+                    StrFn::StripChars => ("pyrs_str_strip_chars", false, false),
+                    StrFn::LstripChars => ("pyrs_str_lstrip_chars", false, false),
+                    StrFn::RstripChars => ("pyrs_str_rstrip_chars", false, false),
                     StrFn::StartsWith
                     | StrFn::EndsWith
                     | StrFn::StartsWithTuple

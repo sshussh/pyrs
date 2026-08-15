@@ -11128,9 +11128,39 @@ fn lower_str_method(
         "expandtabs" => {
             return lower_str_expandtabs(base_ir, args, method_span, ctx);
         }
-        "strip" => (Strip, ir::Ty::Str, 0),
-        "lstrip" => (Lstrip, ir::Ty::Str, 0),
-        "rstrip" => (Rstrip, ir::Ty::Str, 0),
+        "strip" => {
+            return lower_str_strip_family(
+                "strip",
+                Strip,
+                StripChars,
+                base_ir,
+                args,
+                method_span,
+                ctx,
+            );
+        }
+        "lstrip" => {
+            return lower_str_strip_family(
+                "lstrip",
+                Lstrip,
+                LstripChars,
+                base_ir,
+                args,
+                method_span,
+                ctx,
+            );
+        }
+        "rstrip" => {
+            return lower_str_strip_family(
+                "rstrip",
+                Rstrip,
+                RstripChars,
+                base_ir,
+                args,
+                method_span,
+                ctx,
+            );
+        }
         "startswith" => {
             return lower_str_affix_family("startswith", false, base_ir, args, method_span, ctx);
         }
@@ -11211,7 +11241,7 @@ fn lower_str_method(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
                      upper, lower, capitalize, title, swapcase, zfill, center, ljust, rjust, \
-                     strip, lstrip, rstrip, startswith, \
+                     strip, lstrip, rstrip (optional chars/None), startswith, \
                      endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
                      isalnum, istitle, isascii, \
@@ -11323,6 +11353,54 @@ fn as_fillchar(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         ));
     }
     Ok(f)
+}
+
+/// `s.strip([chars])` / `lstrip` / `rstrip` — omitted or `None` is whitespace.
+fn lower_str_strip_family(
+    name: &str,
+    ws: ir::StrFn,
+    chars_fn: ir::StrFn,
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() > 1 {
+        return Err(err(
+            format!("{name}() takes at most 1 argument ({} given)", args.len()),
+            method_span,
+        ));
+    }
+    if args.is_empty() {
+        return Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::StrCall {
+                func: ws,
+                args: vec![base_ir],
+            },
+        });
+    }
+    let chars = lower_expr(&args[0], ctx)?;
+    match chars.ty {
+        ir::Ty::None => Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::StrCall {
+                func: ws,
+                args: vec![base_ir],
+            },
+        }),
+        ir::Ty::Str => Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::StrCall {
+                func: chars_fn,
+                args: vec![base_ir, chars],
+            },
+        }),
+        other => Err(err(
+            format!("{name} arg must be None or str, found {other}"),
+            args[0].span,
+        )),
+    }
 }
 
 fn lower_str_expandtabs(
@@ -23588,6 +23666,46 @@ print(f())
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn str_strip_chars_lowers() {
+        let m = analyze_ok(
+            "a = \"xxhi\".strip(\"x\")\n\
+             b = \"  hi  \".strip()\n\
+             c = \"  hi  \".strip(None)\n\
+             d = \"xxhi\".lstrip(\"x\")\n\
+             e = \"hixx\".rstrip(\"x\")\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let want = [
+            (ir::StrFn::StripChars, 2usize),
+            (ir::StrFn::Strip, 1),
+            (ir::StrFn::Strip, 1),
+            (ir::StrFn::LstripChars, 2),
+            (ir::StrFn::RstripChars, 2),
+        ];
+        for (i, (func, nargs)) in want.into_iter().enumerate() {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!("body[{i}]");
+            };
+            assert_eq!(value.ty, ir::Ty::Str);
+            let ir::ExprKind::StrCall { func: got, args } = &value.kind else {
+                panic!("body[{i}] not StrCall");
+            };
+            assert_eq!(*got, func);
+            assert_eq!(args.len(), nargs);
+        }
+    }
+
+    #[test]
+    fn str_strip_rejects_bad_chars() {
+        let e = analyze_err("print(\"a\".strip(1))\n");
+        assert!(e.message.contains("must be None or str"), "{}", e.message);
+        let e = analyze_err("print(\"a\".strip(\"x\", \"y\"))\n");
+        assert!(e.message.contains("at most 1 argument"), "{}", e.message);
+        let e = analyze_err("print(\"a\".lstrip(True))\n");
+        assert!(e.message.contains("must be None or str"), "{}", e.message);
     }
 
     #[test]

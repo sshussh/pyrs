@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.67.0)
+## The language (v0.68.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.68.0**, not 1.0) until it is ready for
+milestone after this one is **0.69.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -183,6 +183,8 @@ A statically-typed Python subset:
   (empty `isalnum`/`istitle` are False; empty `isascii` is True).
   **v0.67:** `str.expandtabs([tabsize])` — tab stops (default 8);
   `\\n`/`\\r` reset the column; `tabsize <= 0` deletes tabs.
+  **v0.68:** `str.strip` / `lstrip` / `rstrip` accept optional `chars`
+  (`None` or omitted is ASCII whitespace; empty `chars` is a no-op).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -252,7 +254,7 @@ A statically-typed Python subset:
   `*` repeat, lexicographic comparisons, indexing, slicing, `in`,
   iteration, `len()`, `str(x)` conversions, and methods: `upper` `lower`
   `capitalize` `title` `swapcase` `zfill` `center` `ljust` `rjust`
-  `strip` `lstrip` `rstrip` `startswith` `endswith` `find` `index` `rfind`
+  `strip`/`lstrip`/`rstrip` (optional `chars`) `startswith` `endswith` `find` `index` `rfind`
   `rindex` `count` `replace` `split` `rsplit` `join` `isdigit` `isalpha`
   `isspace` `isupper` `islower` `isalnum` `istitle` `isascii` `removeprefix` `removesuffix`
   `partition` `rpartition` `splitlines` `expandtabs`
@@ -355,7 +357,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.67.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.68.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -517,4 +519,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.67.0 && git push origin v0.67.0`.
+Release tags: `git tag v0.68.0 && git push origin v0.68.0`.

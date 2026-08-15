@@ -1344,10 +1344,14 @@ pub enum StrFn {
     RJust,
     /// `s.expandtabs([tabsize])` → str; last arg is tabsize (default 8)
     ExpandTabs,
-    /// `s.strip()` / `s.lstrip()` / `s.rstrip()` → str
+    /// `s.strip()` / `s.lstrip()` / `s.rstrip()` → str (ASCII whitespace)
     Strip,
     Lstrip,
     Rstrip,
+    /// `s.strip(chars)` / `s.lstrip(chars)` / `s.rstrip(chars)` — any of those bytes
+    StripChars,
+    LstripChars,
+    RstripChars,
     /// `s.startswith(t[, start[, end]])` / `s.endswith(...)` → bool
     StartsWith,
     EndsWith,
