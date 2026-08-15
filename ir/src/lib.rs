@@ -630,8 +630,13 @@ pub enum Stmt {
     Return(Option<Expr>),
     /// Evaluate and discard (calls with side effects).
     ExprStmt(Expr),
-    /// The `print` builtin: space-separated values, trailing newline.
-    Print(Vec<Expr>),
+    /// The `print` builtin: values joined by `sep`, then `end`.
+    /// Both `sep` and `end` are `str` (defaults `" "` and `"\n"`).
+    Print {
+        args: Vec<Expr>,
+        sep: Expr,
+        end: Expr,
+    },
     /// Abort with a runtime error message (exit code 1), or raise into a
     /// surrounding try frame when one is active.
     Die(String),

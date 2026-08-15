@@ -366,7 +366,13 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
             value: v,
             ..
         } => max_try_depth_in_expr(o).max(max_try_depth_in_expr(v)),
-        Stmt::Print(args) => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
+        Stmt::Print { args, sep, end } => args
+            .iter()
+            .map(max_try_depth_in_expr)
+            .max()
+            .unwrap_or(0)
+            .max(max_try_depth_in_expr(sep))
+            .max(max_try_depth_in_expr(end)),
         Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
             max_try_depth_in_expr(dict).max(max_try_depth_in_expr(other))
         }
@@ -586,7 +592,11 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
                 + count_yields_in_stmts(orelse)
                 + count_yields_in_stmts(finally)
         }
-        Stmt::Print(args) => args.iter().map(count_yields_in_expr).sum(),
+        Stmt::Print { args, sep, end } => {
+            args.iter().map(count_yields_in_expr).sum::<i64>()
+                + count_yields_in_expr(sep)
+                + count_yields_in_expr(end)
+        }
         Stmt::ExprStmt(e)
         | Stmt::Assign { value: e, .. }
         | Stmt::GlobalAssign { value: e, .. }
@@ -3326,15 +3336,24 @@ impl Emitter {
                 // with phase=handler and runs finally.
                 self.emit_die(message);
             }
-            Stmt::Print(args) => {
-                for (i, arg) in args.iter().enumerate() {
-                    if i > 0 {
-                        self.line("call void @pyrs_print_sep()");
-                    }
+            Stmt::Print { args, sep, end } => {
+                // Evaluate objects first (CPython), then sep/end. Keyword
+                // side effects that must precede the other kw are already
+                // bound to temps in semantic.
+                let mut printed = Vec::with_capacity(args.len());
+                for arg in args {
                     let v = self.emit_expr(arg);
-                    self.emit_print_value(&v, arg.ty);
+                    printed.push((v, arg.ty));
                 }
-                self.line("call void @pyrs_print_end()");
+                let sep_v = self.emit_expr(sep);
+                let end_v = self.emit_expr(end);
+                for (i, (v, ty)) in printed.iter().enumerate() {
+                    if i > 0 {
+                        self.line(format!("call void @pyrs_print_str(ptr {sep_v})"));
+                    }
+                    self.emit_print_value(v, *ty);
+                }
+                self.line(format!("call void @pyrs_print_str(ptr {end_v})"));
             }
             Stmt::Break => {
                 // Only run try finally when the try is nested *inside* the loop

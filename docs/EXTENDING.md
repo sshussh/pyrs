@@ -505,7 +505,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `While { cond, body, step }` | all loops; `continue` → `step` | multi-block loop |
 | `Return` | return | `ret` |
 | `ExprStmt` | evaluate, discard | — |
-| `Print` | `print(...)` | typed print helpers + sep/end |
+| `Print { args, sep, end }` | `print(..., sep=, end=)` | typed print helpers; `sep`/`end` are `str` (`pyrs_print_str`) |
 | `Die(msg)` | runtime trap | `pyrs_die` + `unreachable` |
 | `Break` / `Continue` | loop control | `br` to loop targets |
 

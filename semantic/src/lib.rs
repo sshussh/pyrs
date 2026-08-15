@@ -8569,12 +8569,6 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 && func == "print"
                 && !ctx.funcs().contains_key("print")
             {
-                if !keywords.is_empty() {
-                    return Err(err(
-                        "print() keyword arguments are not supported yet",
-                        keywords[0].name_span,
-                    ));
-                }
                 if kwargs.is_some() {
                     return Err(err("print() does not take **kwargs", e.span));
                 }
@@ -8602,7 +8596,79 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     // None, unions, tuples/dicts/sets/lists/scalars are printable
                     lowered_args.push(a);
                 }
-                out.push(ir::Stmt::Print(lowered_args));
+                let mut sep = const_str_expr(" ");
+                let mut end = const_str_expr("\n");
+                let mut seen_sep = false;
+                let mut seen_end = false;
+                for kw in keywords {
+                    match kw.name.as_str() {
+                        "sep" => {
+                            if seen_sep {
+                                return Err(err(
+                                    "print() got multiple values for keyword argument 'sep'",
+                                    kw.name_span,
+                                ));
+                            }
+                            seen_sep = true;
+                            let v = lower_expr(&kw.value, ctx)?;
+                            let v = coerce_print_sep_end(v, "sep", kw.value.span)?;
+                            // Bind in source order so `end=` before `sep=` still
+                            // evaluates left-to-right like CPython.
+                            let tmp = ctx.fresh_temp("printsep", ir::Ty::Str);
+                            out.push(ir::Stmt::Assign {
+                                name: tmp.clone(),
+                                value: v,
+                            });
+                            sep = ir::Expr {
+                                ty: ir::Ty::Str,
+                                kind: ir::ExprKind::Local(tmp),
+                            };
+                        }
+                        "end" => {
+                            if seen_end {
+                                return Err(err(
+                                    "print() got multiple values for keyword argument 'end'",
+                                    kw.name_span,
+                                ));
+                            }
+                            seen_end = true;
+                            let v = lower_expr(&kw.value, ctx)?;
+                            let v = coerce_print_sep_end(v, "end", kw.value.span)?;
+                            let tmp = ctx.fresh_temp("printend", ir::Ty::Str);
+                            out.push(ir::Stmt::Assign {
+                                name: tmp.clone(),
+                                value: v,
+                            });
+                            end = ir::Expr {
+                                ty: ir::Ty::Str,
+                                kind: ir::ExprKind::Local(tmp),
+                            };
+                        }
+                        "file" => {
+                            return Err(err(
+                                "print() keyword argument 'file=' is not supported yet",
+                                kw.name_span,
+                            ));
+                        }
+                        "flush" => {
+                            return Err(err(
+                                "print() keyword argument 'flush=' is not supported yet",
+                                kw.name_span,
+                            ));
+                        }
+                        other => {
+                            return Err(err(
+                                format!("print() got an unexpected keyword argument '{other}'"),
+                                kw.name_span,
+                            ));
+                        }
+                    }
+                }
+                out.push(ir::Stmt::Print {
+                    args: lowered_args,
+                    sep,
+                    end,
+                });
                 return Ok(());
             }
             // xs.append(v) is a statement in the IR
@@ -16340,6 +16406,25 @@ fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
 }
 
 /// Require plain (non-`*`) positional args — used by builtins and methods.
+fn const_str_expr(s: &str) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::ConstStr(s.to_string()),
+    }
+}
+
+/// `print` `sep=` / `end=`: CPython accepts `str` or `None` (None → default).
+fn coerce_print_sep_end(value: ir::Expr, which: &str, span: Span) -> SResult<ir::Expr> {
+    match value.ty {
+        ir::Ty::Str => Ok(value),
+        ir::Ty::None => Ok(const_str_expr(if which == "sep" { " " } else { "\n" })),
+        other => Err(err(
+            format!("print() {which} must be None or a string, not {other}"),
+            span,
+        )),
+    }
+}
+
 fn require_plain_args<'a>(
     args: &'a [ast::PosArg],
     what: &str,
@@ -22311,7 +22396,63 @@ print(fib(10))
         let fib = find_func(&m, "fib");
         assert_eq!(fib.ret, ir::Ty::Int);
         let entry = find_func(&m, ENTRY_NAME);
-        assert!(matches!(entry.body[0], ir::Stmt::Print(_)));
+        assert!(matches!(entry.body[0], ir::Stmt::Print { .. }));
+    }
+
+    #[test]
+    fn print_sep_end_lower() {
+        let m = analyze_ok("print(1, 2, sep=\",\", end=\"!\")\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        // sep/end bind to temps (source-order eval) then Print.
+        let print = entry
+            .body
+            .iter()
+            .find(|s| matches!(s, ir::Stmt::Print { .. }))
+            .expect("print stmt");
+        let ir::Stmt::Print { args, sep, end } = print else {
+            panic!("{print:?}");
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(sep.ty, ir::Ty::Str);
+        assert_eq!(end.ty, ir::Ty::Str);
+        assert!(matches!(sep.kind, ir::ExprKind::Local(_)));
+        assert!(matches!(end.kind, ir::ExprKind::Local(_)));
+    }
+
+    #[test]
+    fn print_sep_none_uses_default() {
+        let m = analyze_ok("print(1, sep=None)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let print = entry
+            .body
+            .iter()
+            .find(|s| matches!(s, ir::Stmt::Print { .. }))
+            .expect("print stmt");
+        let ir::Stmt::Print { sep, .. } = print else {
+            panic!("{print:?}");
+        };
+        // Temp bound to the coerced default `" "`.
+        assert_eq!(sep.ty, ir::Ty::Str);
+    }
+
+    #[test]
+    fn print_sep_wrong_type_is_error() {
+        let e = analyze_err("print(1, sep=1)\n");
+        assert!(
+            e.message.contains("sep must be None or a string"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn print_file_kw_is_residual() {
+        let e = analyze_err("print(1, file=1)\n");
+        assert!(
+            e.message.contains("file=") && e.message.contains("not supported yet"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
@@ -23870,7 +24011,7 @@ print(f(1, b=3))
         let entry = find_func(&m, ENTRY_NAME);
         assert!(matches!(
             &entry.body[0],
-            ir::Stmt::Print(args) if args.len() == 1
+            ir::Stmt::Print { args, .. } if args.len() == 1
                 && matches!(args[0].kind, ir::ExprKind::Call { ref args, .. } if args.len() == 2)
         ));
     }
@@ -24572,10 +24713,12 @@ except Exception:
         }
         fn walk_stmt(s: &ir::Stmt, f: &mut dyn FnMut(&ir::Expr)) {
             match s {
-                ir::Stmt::Print(args) => {
+                ir::Stmt::Print { args, sep, end } => {
                     for a in args {
                         walk_expr(a, f);
                     }
+                    walk_expr(sep, f);
+                    walk_expr(end, f);
                 }
                 ir::Stmt::Try {
                     body,
@@ -24683,7 +24826,7 @@ print(f())
         let m = analyze_ok("print(1 in (1, 2))\n");
         let entry = find_func(&m, ENTRY_NAME);
         let has = entry.body.iter().any(|s| match s {
-            ir::Stmt::Print(args) => args
+            ir::Stmt::Print { args, .. } => args
                 .iter()
                 .any(|a| matches!(a.kind, ir::ExprKind::Contains { .. })),
             _ => false,
@@ -24699,7 +24842,7 @@ print(f())
     fn isinstance_bool_is_int() {
         let m = analyze_ok("print(isinstance(True, int))\n");
         let entry = find_func(&m, ENTRY_NAME);
-        let ir::Stmt::Print(args) = &entry.body[0] else {
+        let ir::Stmt::Print { args, .. } = &entry.body[0] else {
             panic!("{:?}", entry.body);
         };
         assert!(
@@ -24975,7 +25118,7 @@ except (OverflowError, ValueError):
         // Re-exported call should target origin IR name pkg.mod.f
         let entry = find_func(&m, ENTRY_NAME);
         let has_origin_call = entry.body.iter().any(|s| match s {
-            ir::Stmt::Print(args) => args.iter().any(|a| {
+            ir::Stmt::Print { args, .. } => args.iter().any(|a| {
                 matches!(
                     &a.kind,
                     ir::ExprKind::Call { func, .. } if func == "pkg.mod.f"
@@ -24991,7 +25134,7 @@ except (OverflowError, ValueError):
             has_origin_call
                 || entry.body.iter().any(|s| matches!(
                     s,
-                    ir::Stmt::Print(args) if args.iter().any(|a| matches!(
+                    ir::Stmt::Print { args, .. } if args.iter().any(|a| matches!(
                         &a.kind,
                         ir::ExprKind::Call { func, .. } if func.contains("f")
                     ))

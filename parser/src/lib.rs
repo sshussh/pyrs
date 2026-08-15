@@ -78,6 +78,33 @@ impl Parser {
             .unwrap_or(&Token::EOF)
     }
 
+    /// Soft keyword names that are lexer tokens (type names) but valid
+    /// Python identifiers — so `print(..., file=x)` / `f(list=1)` parse.
+    fn type_token_ident(tok: &Token) -> Option<&'static str> {
+        match tok {
+            Token::Int => Some("int"),
+            Token::Float => Some("float"),
+            Token::Bool => Some("bool"),
+            Token::Str => Some("str"),
+            Token::File => Some("file"),
+            Token::List => Some("list"),
+            Token::Tuple => Some("tuple"),
+            Token::Dict => Some("dict"),
+            Token::Set => Some("set"),
+            _ => None,
+        }
+    }
+
+    fn peek_kwarg_name(&self) -> Option<String> {
+        if *self.peek2() != Token::Eq {
+            return None;
+        }
+        match self.peek() {
+            Token::Ident(name) => Some(name.clone()),
+            other => Self::type_token_ident(other).map(str::to_string),
+        }
+    }
+
     fn peek_span(&self) -> Span {
         self.tokens
             .get(self.pos)
@@ -1843,10 +1870,8 @@ impl Parser {
                     }
                     break;
                 }
-                // keyword: IDENT '=' expr (not `==`)
-                if let Token::Ident(name) = self.peek().clone()
-                    && *self.peek2() == Token::Eq
-                {
+                // keyword: IDENT '=' expr (not `==`); type-name tokens too
+                if let Some(name) = self.peek_kwarg_name() {
                     if kwargs.is_some() {
                         return Err(self.error("arguments cannot follow ** unpacking"));
                     }
@@ -3267,6 +3292,20 @@ mod tests {
         assert_eq!(f.ret, Some(TypeName::Int));
         assert_eq!(f.body.len(), 1);
         assert!(matches!(f.body[0].kind, StmtKind::Return(Some(_))));
+    }
+
+    #[test]
+    fn parses_type_name_keyword_args() {
+        let m = parse_ok("print(1, file=x, sep=\",\")\n");
+        let StmtKind::ExprStmt(e) = &m.body[0].kind else {
+            panic!("expected ExprStmt");
+        };
+        let ExprKind::Call { keywords, .. } = &e.kind else {
+            panic!("expected Call, got {:?}", e.kind);
+        };
+        assert_eq!(keywords.len(), 2);
+        assert_eq!(keywords[0].name, "file");
+        assert_eq!(keywords[1].name, "sep");
     }
 
     #[test]

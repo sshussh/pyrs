@@ -327,6 +327,69 @@ print(\"escaped\\ttab\")
 }
 
 #[test]
+fn print_sep_end_match_python() {
+    let src = "\
+print(1, 2, 3, sep=\",\")
+print(1, 2, sep=\"-\", end=\"!\\n\")
+print(\"a\", \"b\", sep=\"\")
+print(1, end=\"\")
+print(\"|done\")
+print(sep=\":\")
+print(1, 2, sep=None, end=None)
+s = \",\"
+e = \"\\n\"
+print(4, 5, sep=s, end=e)
+print(1, 2, end=\"X\", sep=\"Y\")
+def tag(n: int) -> str:
+    print(f\"t{n}\")
+    return \",\"
+print(8, 9, end=tag(1), sep=tag(2))
+print(\"z\")
+";
+    let out = run_program("printsep", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn print_sep_end_errors() {
+    let (_, stderr) = run_program_expect_fail("print_sep_int", "print(1, sep=1)\n");
+    assert!(
+        stderr.contains("sep must be None or a string"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("print_end_int", "print(1, end=2)\n");
+    assert!(
+        stderr.contains("end must be None or a string"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("print_file", "print(1, file=1)\n");
+    assert!(
+        stderr.contains("file=") && stderr.contains("not supported yet"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("print_flush", "print(1, flush=True)\n");
+    assert!(
+        stderr.contains("flush=") && stderr.contains("not supported yet"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("print_foo", "print(1, foo=1)\n");
+    assert!(
+        stderr.contains("unexpected keyword argument 'foo'"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn functions_promote_arguments() {
     let out = run_program(
         "promote",

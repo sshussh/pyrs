@@ -807,7 +807,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 
 | builtin | accepts | returns |
 |---------|---------|---------|
-| `print(a, b, ...)` | any values, any count | space-separated, newline at end |
+| `print(a, b, ..., sep=..., end=...)` | any values, any count; `sep`/`end` are `str` or `None` | join with `sep` (default space); then `end` (default newline); `file=` / `flush=` not supported yet |
 | `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
 | `round(x[, ndigits])` | int, float, bool; optional int `ndigits` (positional or `ndigits=`) | one-arg → `int` (ties to even); two-arg `int` stays `int`; two-arg `float` stays `float` |
@@ -1223,7 +1223,7 @@ character, bad indentation), `parse` (syntax), `semantic` (names, types,
 return paths), `codegen` (internal — you should never see one; it means a
 compiler bug). Unsupported Python features produce parse/semantic errors
 that name the feature: `two-arg super() is not supported yet`,
-`reverse= is not supported yet`, and so on.
+`print() keyword argument 'file=' is not supported yet`, and so on.
 Compilation stops at the
 first error.
 
