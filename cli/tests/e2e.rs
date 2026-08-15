@@ -2315,6 +2315,44 @@ fn str_removeprefix_wrong_type_is_compile_error() {
 }
 
 #[test]
+fn str_partition_rpartition_match_python() {
+    let src = "\
+print(\"a,b,c\".partition(\",\"))
+print(\"a,b,c\".rpartition(\",\"))
+print(\"abc\".partition(\",\"))
+print(\"abc\".rpartition(\",\"))
+print(\"aaa\".partition(\"aa\"), \"aaa\".rpartition(\"aa\"))
+head, sep, tail = \"x=1\".partition(\"=\")
+print(head, sep, tail)
+";
+    let out = run_program("strpart", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn str_partition_empty_sep_is_valueerror() {
+    let (_, stderr) = run_program_expect_fail("part_empty", "print(\"a\".partition(\"\"))\n");
+    assert!(stderr.contains("empty separator"), "stderr={stderr}");
+    let (code, stderr) =
+        run_program_expect_fail("part_empty_dyn", "s = \"\"\nprint(\"a\".rpartition(s))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: empty separator"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn str_isdigit_matches_python() {
     let out = run_program(
         "isdigit",

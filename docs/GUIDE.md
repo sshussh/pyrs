@@ -395,6 +395,7 @@ String methods (ASCII case/whitespace rules):
 "a1".islower()            # True if all letters are lower and >=1 letter
 "hello".removeprefix("he")  # "llo"; missing prefix is a no-op
 "hello".removesuffix("lo")  # "hel"; empty affix is a no-op
+"a,b,c".partition(",")    # ('a', ',', 'b,c'); rpartition uses the last match
 ord("é")                  # 233 — Unicode code point
 chr(233)                  # "é"; chr(True) is "\x01"
 ```

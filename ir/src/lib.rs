@@ -1354,6 +1354,9 @@ pub enum StrFn {
     /// `s.removeprefix(pre)` / `s.removesuffix(suf)` → str
     RemovePrefix,
     RemoveSuffix,
+    /// `s.partition(sep)` / `s.rpartition(sep)` → `tuple[str, str, str]`
+    Partition,
+    RPartition,
 }
 
 #[cfg(test)]

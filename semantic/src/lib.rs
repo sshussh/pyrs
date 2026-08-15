@@ -3364,7 +3364,8 @@ fn collect_param_constraints_expr(
                         }
                     }
                     "upper" | "lower" | "strip" | "split" | "startswith" | "endswith" | "find"
-                    | "replace" | "join" | "removeprefix" | "removesuffix" => {
+                    | "replace" | "join" | "removeprefix" | "removesuffix" | "partition"
+                    | "rpartition" => {
                         out.push(ir::Ty::Str);
                     }
                     "keys" | "values" | "items" | "get" | "update" => {}
@@ -11149,6 +11150,16 @@ fn lower_str_method(
         "islower" => (IsLower, ir::Ty::Bool, 0),
         "removeprefix" => (RemovePrefix, ir::Ty::Str, 1),
         "removesuffix" => (RemoveSuffix, ir::Ty::Str, 1),
+        "partition" => (
+            Partition,
+            ir::tuple_of(&[ir::Ty::Str, ir::Ty::Str, ir::Ty::Str]),
+            1,
+        ),
+        "rpartition" => (
+            RPartition,
+            ir::tuple_of(&[ir::Ty::Str, ir::Ty::Str, ir::Ty::Str]),
+            1,
+        ),
         _ => {
             return Err(err(
                 format!(
@@ -11156,7 +11167,7 @@ fn lower_str_method(
                      upper, lower, strip, lstrip, rstrip, startswith, \
                      endswith, find, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
-                     removeprefix, removesuffix)"
+                     removeprefix, removesuffix, partition, rpartition)"
                 ),
                 method_span,
             ));
@@ -11182,6 +11193,11 @@ fn lower_str_method(
             ));
         }
         call_args.push(a);
+    }
+    if matches!(func, Partition | RPartition)
+        && matches!(&call_args[1].kind, ir::ExprKind::ConstStr(c) if c.is_empty())
+    {
+        return Err(err("empty separator", args[0].span));
     }
     Ok(ir::Expr {
         ty: ret,
@@ -22810,6 +22826,26 @@ print(f())
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Bool);
+    }
+
+    #[test]
+    fn str_partition_lowers() {
+        let m = analyze_ok("t = \"a,b\".partition(\",\")\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(
+            value.ty,
+            ir::tuple_of(&[ir::Ty::Str, ir::Ty::Str, ir::Ty::Str])
+        );
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::Partition,
+                ..
+            }
+        ));
     }
 
     #[test]

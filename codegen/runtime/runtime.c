@@ -4113,6 +4113,51 @@ void pyrs_tuple_set(PyrsTuple *t, long long i, long long slot, int tag) {
     t->tags[i] = tag;
 }
 
+static PyrsStr *str_slice_copy(const PyrsStr *s, long long lo, long long hi) {
+    long long n = hi - lo;
+    PyrsStr *r = str_alloc(n);
+    memcpy(r->data, s->data + lo, (size_t)n);
+    return r;
+}
+
+static PyrsTuple *str_parts3(PyrsStr *a, PyrsStr *b, PyrsStr *c) {
+    PyrsTuple *t = pyrs_tuple_new(3);
+    pyrs_tuple_set(t, 0, (long long)(uintptr_t)a, TAG_STR);
+    pyrs_tuple_set(t, 1, (long long)(uintptr_t)b, TAG_STR);
+    pyrs_tuple_set(t, 2, (long long)(uintptr_t)c, TAG_STR);
+    return t;
+}
+
+PyrsTuple *pyrs_str_partition(const PyrsStr *s, const PyrsStr *sep) {
+    check_ref(s);
+    check_ref(sep);
+    if (sep->len == 0) {
+        pyrs_die("ValueError: empty separator");
+    }
+    long long idx = pyrs_str_find(s, sep);
+    if (idx < 0) {
+        PyrsStr *empty = str_alloc(0);
+        return str_parts3((PyrsStr *)s, empty, empty);
+    }
+    return str_parts3(str_slice_copy(s, 0, idx), (PyrsStr *)sep,
+                      str_slice_copy(s, idx + sep->len, s->len));
+}
+
+PyrsTuple *pyrs_str_rpartition(const PyrsStr *s, const PyrsStr *sep) {
+    check_ref(s);
+    check_ref(sep);
+    if (sep->len == 0) {
+        pyrs_die("ValueError: empty separator");
+    }
+    long long idx = pyrs_str_rfind(s, sep);
+    if (idx < 0) {
+        PyrsStr *empty = str_alloc(0);
+        return str_parts3(empty, empty, (PyrsStr *)s);
+    }
+    return str_parts3(str_slice_copy(s, 0, idx), (PyrsStr *)sep,
+                      str_slice_copy(s, idx + sep->len, s->len));
+}
+
 long long pyrs_tuple_get(const PyrsTuple *t, long long i) {
     check_ref(t);
     if (i < 0) {
