@@ -13567,6 +13567,46 @@ print(cmp(P(1), P(1)))
 }
 
 #[test]
+fn class_eq_reflected_matches_python() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __eq__(self, other: int) -> bool:
+        return self.x == other
+print(1 == P(1))
+print(2 == P(1))
+print(1 != P(1))
+print(2 != P(1))
+print(P(1) == 1)
+print(P(1) != 2)
+class A:
+    def __init__(self, x: int):
+        self.x = x
+    def __eq__(self, other: A) -> bool:
+        return True
+class B(A):
+    def __eq__(self, other: A) -> bool:
+        return False
+print(A(1) == B(1))
+print(B(1) == A(1))
+print(A(1) != B(1))
+";
+    let out = run_program("class_eq_reflected", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn class_lt_is_compile_error() {
     let (code, stderr) = run_program_expect_fail(
         "class_lt",

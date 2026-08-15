@@ -12133,14 +12133,91 @@ fn class_has_method(ty: ir::Ty, method: &str) -> bool {
     }
 }
 
-/// Reflected rich-compare slot for ordering (`a < b` → `b.__gt__(a)`, …).
-fn class_reflected_order_method(op: ast::BinOp) -> Option<&'static str> {
+/// Reflected rich-compare slot (`a < b` → `b.__gt__(a)`, `a == b` → `b.__eq__(a)`).
+fn class_reflected_method(op: ast::BinOp) -> Option<&'static str> {
     match op {
+        ast::BinOp::Eq | ast::BinOp::NotEq => Some("__eq__"),
         ast::BinOp::Lt => Some("__gt__"),
         ast::BinOp::LtEq => Some("__ge__"),
         ast::BinOp::Gt => Some("__lt__"),
         ast::BinOp::GtEq => Some("__le__"),
         _ => None,
+    }
+}
+
+fn lookup_method_sig(class_id: ir::ClassId, method: &str, ctx: &FnCtx) -> Option<FuncSig> {
+    let name = resolve_method(class_id, method)?;
+    ctx.mctx
+        .funcs
+        .get(&name)
+        .cloned()
+        .or_else(|| method_sig_lookup(&name))
+        .or_else(|| {
+            for data in ctx.mctx.mods.values() {
+                if let Some(s) = data.funcs.get(&name) {
+                    return Some(s.clone());
+                }
+            }
+            None
+        })
+}
+
+/// Whether `src` can be passed as a method argument of type `dst` (same rules
+/// as `coerce`, without building IR).
+fn ty_can_pass_as(src: ir::Ty, dst: ir::Ty) -> bool {
+    if src == dst {
+        return true;
+    }
+    if dst == ir::Ty::Any {
+        return can_box_as_any(src);
+    }
+    if src == ir::Ty::Any {
+        return can_box_as_any(dst);
+    }
+    match (src, dst) {
+        (ir::Ty::Bool, ir::Ty::Int | ir::Ty::Float) => true,
+        (ir::Ty::Int, ir::Ty::Float) => true,
+        (ir::Ty::Class(a), ir::Ty::Class(b)) if class_is_subclass(a, b) => true,
+        _ => {
+            matches!(dst, ir::Ty::Union(_))
+                && ir::flatten_union_members(dst)
+                    .iter()
+                    .any(|m| ty_can_pass_as(src, *m))
+        }
+    }
+}
+
+/// Reflected `__eq__` is used only when the left type is assignable to
+/// `other` — otherwise identity (both classes) or a type error (mixed).
+fn class_eq_accepts(class_id: ir::ClassId, arg_ty: ir::Ty, ctx: &FnCtx) -> bool {
+    if resolve_method(class_id, "__eq__").is_none() {
+        return false;
+    }
+    match lookup_method_sig(class_id, "__eq__", ctx) {
+        Some(sig) => match sig.params.get(1) {
+            Some(p) => ty_can_pass_as(arg_ty, p.ty),
+            None => sig.vararg.is_some(),
+        },
+        None => true,
+    }
+}
+
+fn class_reflected_usable(
+    op: ast::BinOp,
+    class_id: ir::ClassId,
+    arg_ty: ir::Ty,
+    ctx: &FnCtx,
+) -> bool {
+    let Some(refl) = class_reflected_method(op) else {
+        return false;
+    };
+    if resolve_method(class_id, refl).is_none() {
+        return false;
+    }
+    if matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) {
+        class_eq_accepts(class_id, arg_ty, ctx)
+    } else {
+        true
     }
 }
 
@@ -23625,14 +23702,15 @@ fn lower_bitwise(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
 ///
 /// If the left class (or a parent) defines the matching dunder
 /// (`__eq__` / `__lt__` / `__le__` / `__gt__` / `__ge__`), call it
-/// (virtual). `==` / `!=` without `__eq__` fall back to pointer identity
-/// when both sides are class instances (CPython default). Ordering has
-/// no identity fallback — missing dunders are compile errors unless the
-/// right operand provides the reflected slot (`b.__gt__(a)` for `a < b`).
-/// If the right type is a proper subclass of the left and defines that
-/// reflected method, it is tried first (CPython subclass-first).
-/// There is no `NotImplemented` fallthrough. `sorted` / `list.sort` /
-/// `min` / `max` desugar to `<` (see `push_plain_list_sort`).
+/// (virtual). Otherwise the right operand's reflected slot is tried
+/// (`b.__eq__(a)` for `a == b`, `b.__gt__(a)` for `a < b`). Reflected
+/// `__eq__` is used only when the left type is assignable to `other`;
+/// otherwise `==` / `!=` fall back to pointer identity when both sides
+/// are class instances (CPython default when neither side defines `__eq__`).
+/// Ordering has no identity fallback. If the right type is a proper
+/// subclass of the left and defines the reflected method, it is tried
+/// first (CPython subclass-first). There is no `NotImplemented`
+/// fallthrough. `sorted` / `list.sort` / `min` / `max` desugar to `<`.
 fn lower_class_compare(
     op: ast::BinOp,
     l: ir::Expr,
@@ -23654,14 +23732,14 @@ fn lower_class_compare(
         }
     };
     let invert = matches!(op, ast::BinOp::NotEq);
-    let reflected = class_reflected_order_method(op);
+    let reflected = class_reflected_method(op);
 
     // CPython: if the right type is a proper subtype of the left and has the
     // reflected slot, try `right.reflected(left)` first.
     if let (ir::Ty::Class(lid), ir::Ty::Class(rid), Some(refl)) = (l.ty, r.ty, reflected)
         && lid != rid
         && class_is_subclass(rid, lid)
-        && resolve_method(rid, refl).is_some()
+        && class_reflected_usable(op, rid, l.ty, ctx)
     {
         return lower_class_cmp_call(r, rid, l, refl, invert, span, ctx);
     }
@@ -23673,7 +23751,7 @@ fn lower_class_compare(
     }
 
     if let (ir::Ty::Class(id), Some(refl)) = (r.ty, reflected)
-        && resolve_method(id, refl).is_some()
+        && class_reflected_usable(op, id, l.ty, ctx)
     {
         return lower_class_cmp_call(r, id, l, refl, invert, span, ctx);
     }
@@ -27526,6 +27604,54 @@ print(A() == 1)
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn class_eq_reflected_from_int() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __eq__(self, other: int) -> bool:
+        return self.x == other
+b = 1 == P(1)
+c = 2 != P(1)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        for i in 0..2 {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!("expected GlobalAssign at {i}");
+            };
+            assert_eq!(value.ty, ir::Ty::Bool);
+            assert!(
+                matches!(value.kind, ir::ExprKind::Block { .. }),
+                "reflected ==/!= should lower to a method-call block"
+            );
+        }
+    }
+
+    #[test]
+    fn class_eq_unrelated_without_compatible_eq_is_identity() {
+        let m = analyze_ok(
+            "\
+class A:
+    pass
+class B:
+    def __eq__(self, other: B) -> bool:
+        return True
+x = A() == B()
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::IsIdentity { not: false, .. }
+        ));
     }
 
     #[test]

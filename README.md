@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.80.0)
+## The language (v0.81.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.81.0**, not 1.0) until it is ready for
+milestone after this one is **0.82.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -216,6 +216,10 @@ A statically-typed Python subset:
   the right type is a proper subclass and defines the reflected slot.
   No `NotImplemented` fallthrough. `sorted` / `min` / `max` accept `__gt__`
   as well as `__lt__`.
+  **v0.81:** reflected class `==` / `!=` — `1 == P()` calls `P.__eq__(1)`
+  when the left type has no `__eq__` and the left type is assignable to
+  `other` (subclass-first when the right type is a proper subclass).
+  Identity remains only when neither side provides a usable `__eq__`.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -393,7 +397,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.80.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.81.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -555,4 +559,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.80.0 && git push origin v0.80.0`.
+Release tags: `git tag v0.81.0 && git push origin v0.81.0`.

@@ -799,9 +799,14 @@ print(isinstance(d, Animal))  # True
   builtin **`next(it)`** / **`next(it, default)`** (user iterators and generators)
 - **`__contains__`** for user-class `in` / `not in`
 - **`==` / `!=`:** if the left class (or a parent) defines `__eq__`, that
-  method is called (virtual); otherwise comparison is pointer identity
-  (CPython default). `list[C] == list[C]` still uses identity of elements
-  even when `C` defines `__eq__`
+  method is called (virtual). If it does not, the right operand's `__eq__`
+  is tried when the left type is assignable to that method's `other`
+  parameter (`1 == P()` → `P.__eq__(1)`). A proper subclass on the right
+  that defines `__eq__` is tried first. Otherwise both-class `==` / `!=`
+  is pointer identity (CPython default when neither side has `__eq__`).
+  `list[C] == list[C]` still uses identity of elements even when `C`
+  defines `__eq__`. There is no `NotImplemented` fallthrough and no
+  separate `__ne__` slot (`!=` inverts `__eq__`)
 - **Ordering (`<` / `<=` / `>` / `>=`):** if the left class (or a parent)
   defines the matching dunder (`__lt__` / `__le__` / `__gt__` / `__ge__`),
   that method is called (virtual). If it does not, the right operand's
