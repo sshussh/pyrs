@@ -21109,6 +21109,20 @@ fn lower_binary(
     if matches!(l.ty, ir::Ty::Tuple(_)) || matches!(r.ty, ir::Ty::Tuple(_)) {
         return lower_tuple_binary(op, l, r, span);
     }
+    // ---- class == / != (identity, or __eq__ when defined) ----
+    if matches!(l.ty, ir::Ty::Class(_)) || matches!(r.ty, ir::Ty::Class(_)) {
+        match op {
+            ast::BinOp::Eq
+            | ast::BinOp::NotEq
+            | ast::BinOp::Lt
+            | ast::BinOp::LtEq
+            | ast::BinOp::Gt
+            | ast::BinOp::GtEq => {
+                return lower_class_compare(op, l, r, span, ctx);
+            }
+            _ => {}
+        }
+    }
 
     match op {
         ast::BinOp::Add
@@ -21311,6 +21325,100 @@ fn lower_bitwise(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
     } else {
         Ok(result)
     }
+}
+
+/// Class instance `==` / `!=`. If the left class (or a parent) defines
+/// `__eq__`, call it (virtual). Otherwise both sides must be class
+/// instances and comparison is pointer identity (CPython default).
+fn lower_class_compare(
+    op: ast::BinOp,
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if !matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) {
+        return Err(err(
+            format!("operator '{op}' is not supported for class instances"),
+            span,
+        ));
+    }
+    let not = matches!(op, ast::BinOp::NotEq);
+    if let ir::Ty::Class(id) = l.ty
+        && resolve_method(id, "__eq__").is_some()
+    {
+        return lower_class_eq_call(l, id, r, not, span, ctx);
+    }
+    if matches!((l.ty, r.ty), (ir::Ty::Class(_), ir::Ty::Class(_))) {
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::IsIdentity {
+                left: Box::new(l),
+                right: Box::new(r),
+                not,
+            },
+        });
+    }
+    Err(err(
+        format!(
+            "cannot compare {} and {} with '{op}' (define __eq__ or use 'is')",
+            l.ty, r.ty
+        ),
+        span,
+    ))
+}
+
+fn lower_class_eq_call(
+    left: ir::Expr,
+    class_id: ir::ClassId,
+    right: ir::Expr,
+    not: bool,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let left_t = ctx.fresh_temp("eq.l", left.ty);
+    let right_t = ctx.fresh_temp("eq.r", right.ty);
+    let left_ir = ir::Expr {
+        ty: left.ty,
+        kind: ir::ExprKind::Local(left_t.clone()),
+    };
+    let right_name = ast::Expr {
+        kind: ast::ExprKind::Name(right_t.clone()),
+        span,
+    };
+    let call = lower_instance_method_call(left_ir, class_id, "__eq__", span, &[right_name], ctx)?;
+    let call = if call.ty == ir::Ty::Bool {
+        call
+    } else {
+        to_bool(call, span, ctx)?
+    };
+    let result = if not {
+        ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Unary {
+                op: ir::UnOp::Not,
+                operand: Box::new(call),
+            },
+        }
+    } else {
+        call
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Block {
+            stmts: vec![
+                ir::Stmt::Assign {
+                    name: left_t,
+                    value: left,
+                },
+                ir::Stmt::Assign {
+                    name: right_t,
+                    value: right,
+                },
+            ],
+            result: Box::new(result),
+        },
+    })
 }
 
 fn comparison_ir_op(op: ast::BinOp) -> ir::BinOp {
@@ -23704,6 +23812,87 @@ print(p.sum())
             m.funcs
                 .iter()
                 .any(|f| f.name == "Point.sum" || f.name.ends_with("Point.sum"))
+        );
+    }
+
+    #[test]
+    fn class_eq_identity_lowers() {
+        let m = analyze_ok(
+            "\
+class A:
+    pass
+a = A()
+b = a == a
+c = a != A()
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::IsIdentity { not: false, .. }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::IsIdentity { not: true, .. }
+        ));
+    }
+
+    #[test]
+    fn class_eq_dunder_lowers() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __eq__(self, other: P) -> bool:
+        return self.x == other.x
+b = P(1) == P(1)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn class_lt_rejected() {
+        let e = analyze_err(
+            "\
+class A:
+    pass
+print(A() < A())
+",
+        );
+        assert!(
+            e.message.contains("operator '<'") && e.message.contains("class"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn class_eq_int_without_dunder_rejected() {
+        let e = analyze_err(
+            "\
+class A:
+    pass
+print(A() == 1)
+",
+        );
+        assert!(
+            e.message.contains("cannot compare") || e.message.contains("__eq__"),
+            "{}",
+            e.message
         );
     }
 

@@ -765,6 +765,11 @@ print(isinstance(d, Animal))  # True
 - **`__iter__` / `__next__`** for user for-loops; **`__len__` / `__bool__`**;
   builtin **`next(it)`** / **`next(it, default)`** (user iterators and generators)
 - **`__contains__`** for user-class `in` / `not in`
+- **`==` / `!=`:** if the left class (or a parent) defines `__eq__`, that
+  method is called (virtual); otherwise comparison is pointer identity
+  (CPython default). Ordering (`<` / `<=` / `>` / `>=`) is still
+  unsupported. `list[C] == list[C]` still uses identity of elements even
+  when `C` defines `__eq__`
 - **Class `with`**: `__enter__` / `__exit__` — success path
   `__exit__(None, None, None)`; exception path `__exit__(None, exc, None)`
   (type and traceback args stay `None`); truthy `__exit__` return **suppresses**
@@ -778,7 +783,7 @@ metaclasses, `__new__`, `__slots__`, open `__dict__` / `__getattr__`,
 nested classes, class decorators, stacked custom decorators, two-arg
 `super()`, class-body attributes, dotted bases (`class D(pkg.C)` —
 import the base first), first-class class objects as values (use as
-constructor/type only), `==` between instances (use `is` for identity).
+constructor/type only).
 Mixed non-numeric **list literals** still error unless annotated
 (`xs: list[Dog | Cat] = [Dog(), Cat()]`). Empty `xs = []` plus later
 appends join element types; unannotated empty lists with no append/insert

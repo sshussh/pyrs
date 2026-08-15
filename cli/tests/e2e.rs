@@ -12027,6 +12027,87 @@ print(9 not in b)
 }
 
 #[test]
+fn class_eq_identity_matches_python() {
+    let src = "\
+class A:
+    pass
+class B(A):
+    pass
+a = A()
+print(a == a)
+print(a != a)
+print(a == A())
+print(A() != A())
+b = B()
+x: A = b
+print(x == b)
+print(a == b)
+";
+    let out = run_program("class_eq_id", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_eq_dunder_matches_python() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __eq__(self, other: P) -> bool:
+        return self.x == other.x
+print(P(1) == P(1))
+print(P(1) == P(2))
+print(P(1) != P(2))
+class Q(P):
+    def __eq__(self, other: P) -> bool:
+        return False
+def cmp(a: P, b: P) -> bool:
+    return a == b
+print(cmp(Q(1), P(1)))
+print(cmp(P(1), P(1)))
+";
+    let out = run_program("class_eq_dunder", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_lt_is_compile_error() {
+    let (code, stderr) = run_program_expect_fail(
+        "class_lt",
+        "\
+class A:
+    pass
+print(A() < A())
+",
+    );
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("operator '<'") && stderr.contains("class"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn v025_next_builtin() {
     let src = "\
 class Counter:
