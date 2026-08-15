@@ -379,7 +379,7 @@ String methods (ASCII case/whitespace rules):
 ```python
 "  hi  ".strip()          # also lstrip / rstrip
 "abc".upper()             # "ABC"; .lower() too
-"hello".startswith("he")  # True; .endswith too
+"hello".startswith("he")  # True; .endswith too; tuple of strs and start/end ok
 "banana".find("an")       # 1, or -1 when absent; optional start/end
 "banana".index("an")      # like find, but ValueError if missing
 "banana".rfind("an")      # 3 (last occurrence); "".rfind is -1; empty needle -> len

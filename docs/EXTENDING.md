@@ -538,6 +538,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 ### `StrFn` (current)
 
 `Upper`, `Lower`, `Strip`, `Lstrip`, `Rstrip`, `StartsWith`, `EndsWith`,
+`StartsWithTuple`, `EndsWithTuple`,
 `RemovePrefix`, `RemoveSuffix`, `Partition`, `RPartition`,
 `Find`, `Index`, `RFind`, `RIndex`, `Count`, `Replace`, `SplitWs`, `Split`,
 `RSplitWs`, `RSplit`, `SplitLines`, `Join`,

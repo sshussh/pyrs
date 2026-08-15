@@ -11113,8 +11113,12 @@ fn lower_str_method(
         "strip" => (Strip, ir::Ty::Str, 0),
         "lstrip" => (Lstrip, ir::Ty::Str, 0),
         "rstrip" => (Rstrip, ir::Ty::Str, 0),
-        "startswith" => (StartsWith, ir::Ty::Bool, 1),
-        "endswith" => (EndsWith, ir::Ty::Bool, 1),
+        "startswith" => {
+            return lower_str_affix_family("startswith", false, base_ir, args, method_span, ctx);
+        }
+        "endswith" => {
+            return lower_str_affix_family("endswith", true, base_ir, args, method_span, ctx);
+        }
         "find" => {
             return lower_str_find_family("find", Find, base_ir, args, method_span, ctx);
         }
@@ -11317,6 +11321,66 @@ fn lower_str_replace(
         kind: ir::ExprKind::StrCall {
             func: ir::StrFn::Replace,
             args: vec![base_ir, old, new, count],
+        },
+    })
+}
+
+/// `s.startswith/endswith(affix[, start[, end]])` — affix is str or tuple of str.
+fn lower_str_affix_family(
+    name: &str,
+    from_end: bool,
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(err(
+            format!(
+                "{name}() takes from 1 to 3 positional arguments but {} were given",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+    let affix = lower_expr(&args[0], ctx)?;
+    let func = match affix.ty {
+        ir::Ty::Str => {
+            if from_end {
+                ir::StrFn::EndsWith
+            } else {
+                ir::StrFn::StartsWith
+            }
+        }
+        ir::Ty::Tuple(elems) if elems.iter().all(|e| *e == ir::Ty::Str) => {
+            if from_end {
+                ir::StrFn::EndsWithTuple
+            } else {
+                ir::StrFn::StartsWithTuple
+            }
+        }
+        other => {
+            return Err(err(
+                format!("{name} first arg must be str or a tuple of str, not {other}"),
+                args[0].span,
+            ));
+        }
+    };
+    let start = if args.len() >= 2 {
+        as_str_slice_bound(&args[1], ctx, 0)?
+    } else {
+        int_const(0)
+    };
+    let end = if args.len() >= 3 {
+        as_str_slice_bound(&args[2], ctx, i64::MIN)?
+    } else {
+        int_const(i64::MIN)
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::StrCall {
+            func,
+            args: vec![base_ir, affix, start, end],
         },
     })
 }
@@ -23483,6 +23547,42 @@ print(f())
                 args,
             } if args.len() == 4
         ));
+    }
+
+    #[test]
+    fn str_startswith_tuple_and_bounds_lower() {
+        let m = analyze_ok(
+            "a = \"hello\".startswith((\"x\", \"he\"))\n\
+             b = \"hello\".endswith(\".py\", 0, 4)\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::StartsWithTuple,
+                args,
+            } if args.len() == 4
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::EndsWith,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn str_startswith_rejects_list() {
+        let e = analyze_err("print(\"a\".startswith([\"a\"]))\n");
+        assert!(e.message.contains("str or a tuple of str"), "{}", e.message);
     }
 
     #[test]

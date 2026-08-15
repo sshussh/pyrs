@@ -3362,6 +3362,33 @@ print(\"banana\".rindex(\"an\", 0, 5), \"banana\".index(\"a\", True))
 }
 
 #[test]
+fn str_startswith_endswith_tuple_bounds_match_python() {
+    let src = "\
+print(\"hello\".startswith(\"he\"), \"hello\".startswith((\"x\", \"he\")), \"hello\".startswith(()))
+print(\"a.py\".endswith((\".py\", \".rs\")), \"a.c\".endswith((\".py\", \".rs\")))
+print(\"hello\".startswith(\"e\", 1), \"hello\".startswith((\"e\", \"x\"), 1))
+print(\"hello\".startswith(\"he\", 0, 1), \"hello\".startswith(\"h\", 0, 1))
+print(\"hello\".endswith(\"lo\", 0, 4), \"hello\".endswith(\"ll\", 0, 4))
+print(\"abc\".startswith(\"\", 3), \"abc\".startswith(\"\", 4), \"abc\".endswith(\"\", 3), \"abc\".endswith(\"\", 4))
+print(\"hello\".startswith(\"he\", None), \"hello\".endswith(\"lo\", 0, None))
+print(\"aaa\".startswith(\"a\", True), \"hello\".endswith((\"LO\", \"lo\"), -2))
+print(\"hello\".startswith((\"hello\",)), \"\".endswith(()))
+";
+    let out = run_program("straffix", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_count_bounds_match_python() {
     let src = "\
 print(\"banana\".count(\"an\"), \"banana\".count(\"an\", 2), \"banana\".count(\"an\", 2, 4))

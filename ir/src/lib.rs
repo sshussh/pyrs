@@ -1336,9 +1336,12 @@ pub enum StrFn {
     Strip,
     Lstrip,
     Rstrip,
-    /// `s.startswith(t)` / `s.endswith(t)` → bool
+    /// `s.startswith(t[, start[, end]])` / `s.endswith(...)` → bool
     StartsWith,
     EndsWith,
+    /// `s.startswith((t, …)[, start[, end]])` / `s.endswith(...)` — any of the strs
+    StartsWithTuple,
+    EndsWithTuple,
     /// `s.find(t[, start[, end]])` → int (-1 when absent)
     Find,
     /// `s.index(t[, start[, end]])` → int (ValueError when absent)

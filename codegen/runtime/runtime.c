@@ -2651,6 +2651,36 @@ static void str_adjust_bounds(long long len, long long *start, long long *end) {
     *end = e;
 }
 
+static int str_affix_in_slice(const PyrsStr *s, const PyrsStr *aff, long long start,
+                              long long end, int from_end) {
+    check_ref(s);
+    check_ref(aff);
+    str_adjust_bounds(s->len, &start, &end);
+    if (start > end) {
+        return 0;
+    }
+    if (aff->len == 0) {
+        return 1;
+    }
+    if (aff->len > end - start) {
+        return 0;
+    }
+    if (from_end) {
+        return memcmp(s->data + end - aff->len, aff->data, (size_t)aff->len) == 0;
+    }
+    return memcmp(s->data + start, aff->data, (size_t)aff->len) == 0;
+}
+
+int pyrs_str_startswith_slice(const PyrsStr *s, const PyrsStr *pre, long long start,
+                              long long end) {
+    return str_affix_in_slice(s, pre, start, end, 0);
+}
+
+int pyrs_str_endswith_slice(const PyrsStr *s, const PyrsStr *suf, long long start,
+                            long long end) {
+    return str_affix_in_slice(s, suf, start, end, 1);
+}
+
 static long long str_find_bounds(const PyrsStr *s, const PyrsStr *t, long long start,
                                  long long end, int from_right) {
     check_ref(s);
@@ -4665,6 +4695,35 @@ struct PyrsTuple {
     long long *data;
     int *tags;
 };
+
+static int str_affix_tuple(const PyrsStr *s, const PyrsTuple *t, long long start, long long end,
+                           int from_end, const char *name) {
+    check_ref(s);
+    check_ref(t);
+    for (long long i = 0; i < t->len; i++) {
+        if (t->tags[i] != TAG_STR) {
+            char buf[96];
+            snprintf(buf, sizeof buf,
+                     "TypeError: tuple for %s must only contain str, not other", name);
+            pyrs_die(buf);
+        }
+        const PyrsStr *aff = (const PyrsStr *)(uintptr_t)t->data[i];
+        if (str_affix_in_slice(s, aff, start, end, from_end)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int pyrs_str_startswith_tuple(const PyrsStr *s, const PyrsTuple *t, long long start,
+                              long long end) {
+    return str_affix_tuple(s, t, start, end, 0, "startswith");
+}
+
+int pyrs_str_endswith_tuple(const PyrsStr *s, const PyrsTuple *t, long long start,
+                            long long end) {
+    return str_affix_tuple(s, t, start, end, 1, "endswith");
+}
 
 PyrsTuple *pyrs_tuple_new(long long n) {
     if (n < 0) {

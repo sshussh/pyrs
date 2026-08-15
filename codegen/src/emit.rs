@@ -962,6 +962,10 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_rstrip(ptr)\n");
         out.push_str("declare i32 @pyrs_str_startswith(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_str_endswith(ptr, ptr)\n");
+        out.push_str("declare i32 @pyrs_str_startswith_slice(ptr, ptr, i64, i64)\n");
+        out.push_str("declare i32 @pyrs_str_endswith_slice(ptr, ptr, i64, i64)\n");
+        out.push_str("declare i32 @pyrs_str_startswith_tuple(ptr, ptr, i64, i64)\n");
+        out.push_str("declare i32 @pyrs_str_endswith_tuple(ptr, ptr, i64, i64)\n");
         out.push_str("declare i64 @pyrs_str_find(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_str_rfind(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_str_find_slice(ptr, ptr, i64, i64)\n");
@@ -3697,6 +3701,32 @@ impl Emitter {
             ExprKind::StrCall { func, args } => {
                 if matches!(
                     func,
+                    StrFn::StartsWith
+                        | StrFn::EndsWith
+                        | StrFn::StartsWithTuple
+                        | StrFn::EndsWithTuple
+                ) {
+                    let s = self.emit_expr(&args[0]);
+                    let aff = self.emit_expr(&args[1]);
+                    let start = self.emit_slice_bound(&args[2]);
+                    let end = self.emit_slice_bound(&args[3]);
+                    let callee = match func {
+                        StrFn::StartsWith => "pyrs_str_startswith_slice",
+                        StrFn::EndsWith => "pyrs_str_endswith_slice",
+                        StrFn::StartsWithTuple => "pyrs_str_startswith_tuple",
+                        StrFn::EndsWithTuple => "pyrs_str_endswith_tuple",
+                        _ => unreachable!(),
+                    };
+                    let raw = self.tmp();
+                    self.line(format!(
+                        "{raw} = call i32 @{callee}(ptr {s}, ptr {aff}, i64 {start}, i64 {end})"
+                    ));
+                    let b = self.tmp();
+                    self.line(format!("{b} = icmp ne i32 {raw}, 0"));
+                    return b;
+                }
+                if matches!(
+                    func,
                     StrFn::Find | StrFn::Index | StrFn::RFind | StrFn::RIndex | StrFn::Count
                 ) {
                     let s = self.emit_expr(&args[0]);
@@ -3778,8 +3808,12 @@ impl Emitter {
                     StrFn::Strip => ("pyrs_str_strip", false, false),
                     StrFn::Lstrip => ("pyrs_str_lstrip", false, false),
                     StrFn::Rstrip => ("pyrs_str_rstrip", false, false),
-                    StrFn::StartsWith => ("pyrs_str_startswith", true, false),
-                    StrFn::EndsWith => ("pyrs_str_endswith", true, false),
+                    StrFn::StartsWith
+                    | StrFn::EndsWith
+                    | StrFn::StartsWithTuple
+                    | StrFn::EndsWithTuple => {
+                        unreachable!("affix family handled above")
+                    }
                     StrFn::Find | StrFn::Index | StrFn::RFind | StrFn::RIndex | StrFn::Count => {
                         unreachable!("find family handled above")
                     }
