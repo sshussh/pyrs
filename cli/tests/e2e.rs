@@ -6261,6 +6261,47 @@ fn dict_setdefault_errors() {
 }
 
 #[test]
+fn dict_popitem_match_python() {
+    let src = "\
+d: dict[str, int] = {}
+d[\"a\"] = 1
+d[\"b\"] = 2
+d[\"c\"] = 3
+print(d.popitem())
+print(d.popitem())
+print(sorted(d.keys()), d[\"a\"])
+e: dict[int, str] = {1: \"one\"}
+k, v = e.popitem()
+print(k, v, len(e))
+";
+    let out = run_program("dictpopitem", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn dict_popitem_empty_is_keyerror() {
+    let (code, stderr) = run_program_expect_fail(
+        "popitem_empty",
+        "d: dict[str, int] = {}\nprint(d.popitem())\n",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("KeyError: 'popitem(): dictionary is empty'"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn stdlib_math_matches_python() {
     let out = run_program(
         "stdlib_math",

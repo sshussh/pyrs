@@ -950,6 +950,8 @@ pub enum ExprKind {
     DictValues(Box<Expr>),
     /// `d.items()` → list of `(key, value)` tuples.
     DictItems(Box<Expr>),
+    /// `d.popitem()` → last-inserted `(key, value)` pair (LIFO); empty → KeyError.
+    DictPopItem(Box<Expr>),
     /// Materialize set elements as a list (for iteration).
     SetToList(Box<Expr>),
     /// Statements evaluated for effect, then a result expression — the

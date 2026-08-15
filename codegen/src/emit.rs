@@ -429,6 +429,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | DictKeys(operand)
         | DictValues(operand)
         | DictItems(operand)
+        | DictPopItem(operand)
         | SetToList(operand)
         | ListCopy(operand)
         | ListFromStr(operand)
@@ -696,6 +697,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | DictKeys(operand)
         | DictValues(operand)
         | DictItems(operand)
+        | DictPopItem(operand)
         | SetToList(operand)
         | ListCopy(operand)
         | ListFromStr(operand)
@@ -907,6 +909,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_dict_keys(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_values(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_items(ptr)\n");
+        out.push_str("declare ptr @pyrs_dict_popitem(ptr)\n");
         out.push_str("declare ptr @pyrs_set_new()\n");
         out.push_str("declare void @pyrs_set_add(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_set_remove(ptr, i64, i32)\n");
@@ -4997,6 +5000,12 @@ impl Emitter {
                 let v = self.emit_expr(d);
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_dict_items(ptr {v})"));
+                t
+            }
+            ExprKind::DictPopItem(d) => {
+                let v = self.emit_expr(d);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_dict_popitem(ptr {v})"));
                 t
             }
             ExprKind::SetToList(s) => {

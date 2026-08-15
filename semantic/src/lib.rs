@@ -10436,14 +10436,14 @@ fn lower_dict_method_stmt(
                 other,
             })
         }
-        "get" | "pop" | "keys" | "values" | "items" | "setdefault" => {
+        "get" | "pop" | "keys" | "values" | "items" | "setdefault" | "popitem" => {
             let call = lower_dict_method(base_ir, key_ty, val_ty, method, method_span, args, ctx)?;
             Ok(ir::Stmt::ExprStmt(call))
         }
         _ => Err(err(
             format!(
                 "dict method '{method}' is not supported yet (supported: get, pop, \
-                 keys, values, items, clear, update, setdefault)"
+                 keys, values, items, clear, update, setdefault, popitem)"
             ),
             method_span,
         )),
@@ -10997,6 +10997,18 @@ fn lower_dict_method(
                 kind: ir::ExprKind::DictItems(Box::new(base_ir)),
             })
         }
+        "popitem" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("dict.popitem() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::tuple_of(&[key_ty, val_ty]),
+                kind: ir::ExprKind::DictPopItem(Box::new(base_ir)),
+            })
+        }
         "clear" => Err(err(
             "dict.clear() returns None and cannot be used in an expression",
             method_span,
@@ -11016,7 +11028,7 @@ fn lower_dict_method(
         _ => Err(err(
             format!(
                 "dict method '{method}' is not supported yet (supported: get, pop, \
-                 keys, values, items, clear, copy, setdefault)"
+                 keys, values, items, clear, copy, setdefault, popitem)"
             ),
             method_span,
         )),
@@ -24726,6 +24738,27 @@ print(count([]))
         let e = analyze_err("d: dict[str, int] = {}\nprint(d.setdefault(\"a\"))\n");
         assert!(
             e.message.contains("setdefault") && e.message.contains("None"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn dict_popitem_lowers() {
+        let m = analyze_ok("d: dict[str, int] = {\"a\": 1}\np = d.popitem()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!("{:?}", entry.body);
+        };
+        assert_eq!(value.ty, ir::tuple_of(&[ir::Ty::Str, ir::Ty::Int]));
+        assert!(matches!(value.kind, ir::ExprKind::DictPopItem(_)));
+    }
+
+    #[test]
+    fn dict_popitem_rejects_args() {
+        let e = analyze_err("d: dict[str, int] = {\"a\": 1}\nprint(d.popitem(1))\n");
+        assert!(
+            e.message.contains("popitem") && e.message.contains("no arguments"),
             "{}",
             e.message
         );

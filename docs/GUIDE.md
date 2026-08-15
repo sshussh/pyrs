@@ -1187,7 +1187,7 @@ pop the catch frame before leaving (CPython-compatible).
 | `IndexError: list assignment index out of range` | out-of-bounds `xs[i] = v` or `del xs[i]` |
 | `IndexError: tuple index out of range` | out-of-bounds `t[i]` |
 | `IndexError: pop from empty list` / `pop index out of range` | `xs.pop(...)` |
-| `KeyError: ...` | missing dict key / `set.remove` of absent element |
+| `KeyError: ...` | missing dict key / `set.remove` of absent element / empty `dict.popitem()` |
 | `ValueError: not enough/too many values to unpack` | unpack length mismatch |
 | `ValueError: range() arg 3 must not be zero` | zero range step at runtime |
 | `ValueError: slice step cannot be zero` | zero slice step at runtime |
@@ -1310,6 +1310,7 @@ Container notes (v0.20.1):
   `Optional[V]` (`None` on miss); `get(k, default)` keeps value type;
   `setdefault(k, default)` inserts on miss and returns `V`; bare
   `setdefault(k)` requires `V` to include `None`;
+  `popitem()` returns and removes the last-inserted `(k, v)` (empty → KeyError);
   `keys`/`values`/`items` return lists (not views); `update(other)` merges
   same-typed dicts; insertion-order iteration over keys; mapping match
   supports `**rest`.

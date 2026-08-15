@@ -4579,6 +4579,28 @@ PyrsList *pyrs_dict_values(const PyrsDict *d) {
     return r;
 }
 
+/* LIFO last-inserted pair; empty → KeyError like CPython. */
+PyrsTuple *pyrs_dict_popitem(PyrsDict *d) {
+    check_ref(d);
+    for (long long i = d->order_len - 1; i >= 0; i--) {
+        DictSlot *s = &d->table[d->order[i]];
+        if (s->state != 1) {
+            continue;
+        }
+        PyrsTuple *t = pyrs_tuple_new(2);
+        pyrs_tuple_set(t, 0, s->key, s->key_tag);
+        pyrs_tuple_set(t, 1, s->val, s->val_tag);
+        s->state = 2;
+        d->len--;
+        memmove(&d->order[i], &d->order[i + 1],
+                (size_t)(d->order_len - i - 1) * sizeof(long long));
+        d->order_len--;
+        return t;
+    }
+    pyrs_die("KeyError: 'popitem(): dictionary is empty'");
+    return NULL;
+}
+
 /* items: list of 2-tuples */
 PyrsList *pyrs_dict_items(const PyrsDict *d) {
     check_ref(d);
