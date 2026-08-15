@@ -798,6 +798,11 @@ print(isinstance(d, Animal))  # True
 - **`__iter__` / `__next__`** for user for-loops; **`__len__` / `__bool__`**;
   builtin **`next(it)`** / **`next(it, default)`** (user iterators and generators)
 - **`__contains__`** for user-class `in` / `not in`
+- **`__getitem__` / `__setitem__` / `__delitem__`** for `obj[k]`, `obj[k] = v`,
+  and `del obj[k]` (virtual, including inherited). `obj[k] += v` loads via
+  `__getitem__` and stores via `__setitem__` (base and key evaluated once).
+  Key/value types follow the method signatures. Slice syntax on a class
+  (`obj[a:b]`) is still a compile error (no slice object)
 - **`==` / `!=`:** if the left class (or a parent) defines `__eq__`, that
   method is called (virtual). If it does not, the right operand's `__eq__`
   is tried when the left type is assignable to that method's `other`

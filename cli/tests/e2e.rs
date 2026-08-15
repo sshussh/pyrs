@@ -13607,6 +13607,144 @@ print(A(1) != B(1))
 }
 
 #[test]
+fn class_getitem_is_compile_error() {
+    let (code, stderr) = run_program_expect_fail(
+        "class_getitem",
+        "\
+class A:
+    pass
+print(A()[0])
+",
+    );
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("not subscriptable") && stderr.contains("__getitem__"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_setitem_is_compile_error() {
+    let (code, stderr) = run_program_expect_fail(
+        "class_setitem",
+        "\
+class A:
+    pass
+A()[0] = 1
+",
+    );
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("item assignment") && stderr.contains("__setitem__"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn class_delitem_is_compile_error() {
+    let (code, stderr) = run_program_expect_fail(
+        "class_delitem",
+        "\
+class A:
+    pass
+del A()[0]
+",
+    );
+    assert_ne!(code, 0);
+    assert!(stderr.contains("__delitem__"), "stderr: {stderr}");
+}
+
+#[test]
+fn class_index_dunders_match_python() {
+    let src = "\
+class Box:
+    def __init__(self, xs: list[int]):
+        self.xs = xs
+    def __getitem__(self, i: int) -> int:
+        return self.xs[i]
+    def __setitem__(self, i: int, v: int) -> None:
+        self.xs[i] = v
+    def __delitem__(self, i: int) -> None:
+        del self.xs[i]
+b = Box([1, 2, 3])
+print(b[0])
+print(b[-1])
+b[1] = 9
+print(b[1])
+b[0] += 5
+print(b[0])
+del b[2]
+print(b[0], b[1])
+";
+    let out = run_program("class_index_dunders", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_getitem_inherited_matches_python() {
+    let src = "\
+class Box:
+    def __init__(self, xs: list[int]):
+        self.xs = xs
+    def __getitem__(self, i: int) -> int:
+        return self.xs[i]
+class Child(Box):
+    pass
+print(Child([7, 8])[1])
+";
+    let out = run_program("class_getitem_inh", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_getitem_virtual_matches_python() {
+    let src = "\
+class Base:
+    def __getitem__(self, i: int) -> int:
+        return 1
+class Child(Base):
+    def __getitem__(self, i: int) -> int:
+        return 2
+def get(o: Base, i: int) -> int:
+    return o[i]
+print(get(Base(), 0))
+print(get(Child(), 0))
+";
+    let out = run_program("class_getitem_virt", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn class_lt_is_compile_error() {
     let (code, stderr) = run_program_expect_fail(
         "class_lt",

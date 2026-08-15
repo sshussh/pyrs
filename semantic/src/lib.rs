@@ -121,6 +121,12 @@ fn class_info(id: ir::ClassId) -> Option<ir::ClassInfo> {
     with_class_env(|e| e.infos.get(id as usize).cloned())
 }
 
+fn class_display_name(id: ir::ClassId) -> String {
+    class_info(id)
+        .map(|c| c.name)
+        .unwrap_or_else(|| format!("class#{id}"))
+}
+
 fn method_sig_lookup(ir_name: &str) -> Option<FuncSig> {
     with_class_env(|e| e.method_sigs.get(ir_name).cloned())
 }
@@ -12644,7 +12650,11 @@ fn lower_assign_ir(
                     value_span,
                 ));
             }
-            let (base_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
+            let base_ir = lower_expr(base, ctx)?;
+            if let ir::Ty::Class(id) = base_ir.ty {
+                return lower_class_setitem(base_ir, id, index, value_ir, value_span, ctx, out);
+            }
+            let (base_ir, elem, index_ir) = lower_index_target_on(base_ir, index, ctx)?;
             let value_ir = coerce(value_ir, elem, value_span, "item assignment")?;
             out.push(ir::Stmt::IndexAssign {
                 base: base_ir,
@@ -12791,9 +12801,10 @@ fn lower_delete(
                     });
                     Ok(())
                 }
+                ir::Ty::Class(id) => lower_class_delitem(base_ir, id, index, span, ctx, out),
                 other => Err(err(
                     format!(
-                        "'del' on '{other}' is not supported yet (only list indices, slices, and dict keys)"
+                        "'del' on '{other}' is not supported yet (only list indices, slices, dict keys, and classes with __delitem__)"
                     ),
                     span,
                 )),
@@ -13110,13 +13121,174 @@ fn lower_unpack(
     }
 }
 
+/// `obj[key]` → virtual `__getitem__(key)` when the class defines it.
+fn lower_class_getitem(
+    base_ir: ir::Expr,
+    class_id: ir::ClassId,
+    index: &ast::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if resolve_method(class_id, "__getitem__").is_none() {
+        return Err(err(
+            format!(
+                "'{}' object is not subscriptable (need __getitem__)",
+                class_display_name(class_id)
+            ),
+            span,
+        ));
+    }
+    lower_instance_method_call(
+        base_ir,
+        class_id,
+        "__getitem__",
+        span,
+        std::slice::from_ref(index),
+        ctx,
+    )
+}
+
+/// `obj[key] = value` → virtual `__setitem__(key, value)`.
+fn lower_class_setitem(
+    base_ir: ir::Expr,
+    class_id: ir::ClassId,
+    index: &ast::Expr,
+    value_ir: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    if resolve_method(class_id, "__setitem__").is_none() {
+        return Err(err(
+            format!(
+                "'{}' object does not support item assignment (need __setitem__)",
+                class_display_name(class_id)
+            ),
+            span,
+        ));
+    }
+    let val_t = ctx.fresh_temp("setitem.v", value_ir.ty);
+    let val_name = ast::Expr {
+        kind: ast::ExprKind::Name(val_t.clone()),
+        span,
+    };
+    let call = lower_instance_method_call(
+        base_ir,
+        class_id,
+        "__setitem__",
+        span,
+        &[index.clone(), val_name],
+        ctx,
+    )?;
+    out.push(ir::Stmt::Assign {
+        name: val_t,
+        value: value_ir,
+    });
+    out.push(ir::Stmt::ExprStmt(call));
+    Ok(())
+}
+
+/// `del obj[key]` → virtual `__delitem__(key)`.
+fn lower_class_delitem(
+    base_ir: ir::Expr,
+    class_id: ir::ClassId,
+    index: &ast::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    if resolve_method(class_id, "__delitem__").is_none() {
+        return Err(err(
+            format!(
+                "'{}' object does not support item deletion (need __delitem__)",
+                class_display_name(class_id)
+            ),
+            span,
+        ));
+    }
+    let call = lower_instance_method_call(
+        base_ir,
+        class_id,
+        "__delitem__",
+        span,
+        std::slice::from_ref(index),
+        ctx,
+    )?;
+    out.push(ir::Stmt::ExprStmt(call));
+    Ok(())
+}
+
+/// `obj[key] op= rhs` → `__getitem__` then binary then `__setitem__`.
+/// Base and index are evaluated once.
+fn lower_class_aug_index(
+    base_ir: ir::Expr,
+    index: &ast::Expr,
+    op: ast::BinOp,
+    value: &ast::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    let ir::Ty::Class(class_id) = base_ir.ty else {
+        unreachable!("lower_class_aug_index requires a class instance");
+    };
+    if resolve_method(class_id, "__getitem__").is_none() {
+        return Err(err(
+            format!(
+                "'{}' object is not subscriptable (need __getitem__)",
+                class_display_name(class_id)
+            ),
+            span,
+        ));
+    }
+    if resolve_method(class_id, "__setitem__").is_none() {
+        return Err(err(
+            format!(
+                "'{}' object does not support item assignment (need __setitem__)",
+                class_display_name(class_id)
+            ),
+            span,
+        ));
+    }
+    let base_ty = base_ir.ty;
+    let base_t = ctx.fresh_temp("aug.base", base_ty);
+    out.push(ir::Stmt::Assign {
+        name: base_t.clone(),
+        value: base_ir,
+    });
+    let base_local = ir::Expr {
+        ty: base_ty,
+        kind: ir::ExprKind::Local(base_t),
+    };
+    let index_ir = lower_expr(index, ctx)?;
+    let idx_t = ctx.fresh_temp("aug.idx", index_ir.ty);
+    out.push(ir::Stmt::Assign {
+        name: idx_t.clone(),
+        value: index_ir,
+    });
+    let idx_name = ast::Expr {
+        kind: ast::ExprKind::Name(idx_t),
+        span,
+    };
+    let current = lower_instance_method_call(
+        base_local.clone(),
+        class_id,
+        "__getitem__",
+        span,
+        std::slice::from_ref(&idx_name),
+        ctx,
+    )?;
+    let right = lower_expr(value, ctx)?;
+    let combined = lower_binary(op, current, right, span, ctx)?;
+    lower_class_setitem(base_local, class_id, &idx_name, combined, span, ctx, out)
+}
+
 /// Check and lower the target of `base[index] = ...` (list or dict).
-fn lower_index_target(
-    base: &ast::Expr,
+fn lower_index_target_on(
+    base_ir: ir::Expr,
     index: &ast::Expr,
     ctx: &mut FnCtx,
 ) -> SResult<(ir::Expr, ir::Ty, ir::Expr)> {
-    let base_ir = lower_expr(base, ctx)?;
     match base_ir.ty {
         ir::Ty::List(e) => {
             let index_ir = lower_expr(index, ctx)?;
@@ -13131,15 +13303,15 @@ fn lower_index_target(
         ir::Ty::Str => Err(err(
             "'str' object does not support item assignment (strings are \
              immutable)",
-            base.span,
+            index.span,
         )),
         ir::Ty::Tuple(_) => Err(err(
             "'tuple' object does not support item assignment",
-            base.span,
+            index.span,
         )),
         other => Err(err(
             format!("'{other}' object does not support item assignment"),
-            base.span,
+            index.span,
         )),
     }
 }
@@ -13404,7 +13576,11 @@ fn lower_aug_assign(
         }
         // `xs[i] op= v`: evaluate base and index once via temps
         ast::AssignTarget::Index { base, index } => {
-            let (list_ir, elem, index_ir) = lower_index_target(base, index, ctx)?;
+            let base_ir = lower_expr(base, ctx)?;
+            if matches!(base_ir.ty, ir::Ty::Class(_)) {
+                return lower_class_aug_index(base_ir, index, op, value, span, ctx, out);
+            }
+            let (list_ir, elem, index_ir) = lower_index_target_on(base_ir, index, ctx)?;
             let list_ty = list_ir.ty;
             let idx_ty = index_ir.ty;
             let base_t = ctx.fresh_temp("aug.base", list_ty);
@@ -15690,6 +15866,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         },
                     })
                 }
+                ir::Ty::Class(id) => lower_class_getitem(base_ir, id, index, expr.span, ctx),
                 other => Err(err(
                     format!("'{other}' object is not subscriptable"),
                     base.span,
@@ -27652,6 +27829,163 @@ x = A() == B()
             value.kind,
             ir::ExprKind::IsIdentity { not: false, .. }
         ));
+    }
+
+    #[test]
+    fn class_getitem_rejected() {
+        let e = analyze_err(
+            "\
+class A:
+    pass
+print(A()[0])
+",
+        );
+        assert!(
+            e.message.contains("not subscriptable") && e.message.contains("__getitem__"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn class_getitem_lowers() {
+        let m = analyze_ok(
+            "\
+class Box:
+    def __init__(self, xs: list[int]):
+        self.xs = xs
+    def __getitem__(self, i: int) -> int:
+        return self.xs[i]
+x = Box([1, 2])[0]
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(
+            matches!(
+                value.kind,
+                ir::ExprKind::Call { .. } | ir::ExprKind::CallMethod { .. }
+            ),
+            "expected __getitem__ call, got {:?}",
+            value.kind
+        );
+    }
+
+    #[test]
+    fn class_setitem_rejected() {
+        let e = analyze_err(
+            "\
+class A:
+    pass
+A()[0] = 1
+",
+        );
+        assert!(
+            e.message.contains("item assignment") && e.message.contains("__setitem__"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn class_setitem_lowers() {
+        let m = analyze_ok(
+            "\
+class Box:
+    def __init__(self, xs: list[int]):
+        self.xs = xs
+    def __setitem__(self, i: int, v: int) -> None:
+        self.xs[i] = v
+Box([1])[0] = 2
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(
+            entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::ExprStmt(_))),
+            "expected __setitem__ as ExprStmt, body={:?}",
+            entry.body
+        );
+    }
+
+    #[test]
+    fn class_delitem_rejected() {
+        let e = analyze_err(
+            "\
+class A:
+    pass
+del A()[0]
+",
+        );
+        assert!(e.message.contains("__delitem__"), "{}", e.message);
+    }
+
+    #[test]
+    fn class_delitem_lowers() {
+        let m = analyze_ok(
+            "\
+class Box:
+    def __init__(self, xs: list[int]):
+        self.xs = xs
+    def __delitem__(self, i: int) -> None:
+        del self.xs[i]
+del Box([1, 2])[0]
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(
+            entry
+                .body
+                .iter()
+                .any(|s| matches!(s, ir::Stmt::ExprStmt(_))),
+            "expected __delitem__ as ExprStmt, body={:?}",
+            entry.body
+        );
+    }
+
+    #[test]
+    fn class_getitem_inherited_lowers() {
+        let m = analyze_ok(
+            "\
+class Box:
+    def __init__(self, xs: list[int]):
+        self.xs = xs
+    def __getitem__(self, i: int) -> int:
+        return self.xs[i]
+class Child(Box):
+    pass
+x = Child([7, 8])[1]
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+    }
+
+    #[test]
+    fn class_getitem_wrong_key_rejected() {
+        let e = analyze_err(
+            "\
+class Box:
+    def __getitem__(self, i: int) -> int:
+        return i
+print(Box()[\"x\"])
+",
+        );
+        assert!(
+            e.message.contains("int")
+                || e.message.contains("str")
+                || e.message.contains("argument"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
