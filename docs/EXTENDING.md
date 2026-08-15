@@ -500,7 +500,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `IndexAssign` | `xs[i] = v` | bounds check + store |
 | `ListAppend` | `xs.append(v)` | `pyrs_list_push` |
 | `ListAppendUnchecked` | append with known capacity | inline store + len bump |
-| `ListInsert` / `ListRemove` / `ListClear` | list mutators | `pyrs_list_insert` / `remove` / `clear` |
+| `ListInsert` / `ListRemove` / `ListClear` / `ListReverse` | list mutators | `pyrs_list_insert` / `remove` / `clear` / `reverse` |
 | `If` | if/elif/else | branch tree |
 | `While { cond, body, step }` | all loops; `continue` → `step` | multi-block loop |
 | `Return` | return | `ret` |

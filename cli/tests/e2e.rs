@@ -1372,6 +1372,53 @@ fn list_count_type_mismatch_is_compile_error() {
 }
 
 #[test]
+fn list_reverse_matches_python() {
+    let src = "\
+xs = [1, 2, 3, 4]
+xs.reverse()
+print(xs)
+ys = [1]
+ys.reverse()
+print(ys)
+empty: list[int] = []
+empty.reverse()
+print(empty)
+nested = [[1], [2], [3]]
+nested.reverse()
+print(nested)
+a = [1, 2, 3]
+b = a
+b.reverse()
+print(a)
+odd = [\"a\", \"b\", \"c\"]
+odd.reverse()
+print(odd)
+";
+    let out = run_program("list_reverse", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn list_reverse_expression_is_compile_error() {
+    let (code, stderr) = run_program_expect_fail("list_reverse_expr", "print([1, 2].reverse())\n");
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("reverse") && stderr.contains("returns None"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn list_pop_matches_python() {
     let out = run_program(
         "pop",

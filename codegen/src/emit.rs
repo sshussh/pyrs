@@ -326,6 +326,7 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         | Stmt::RaiseExc { value: e }
         | Stmt::GenClose { generator: e }
         | Stmt::ListClear { list: e }
+        | Stmt::ListReverse { list: e }
         | Stmt::ListSort { list: e }
         | Stmt::DictClear { dict: e }
         | Stmt::SetClear { set: e }
@@ -893,6 +894,7 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_list_index(ptr, i64, i32)\n");
         out.push_str("declare i64 @pyrs_list_count(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_list_clear(ptr)\n");
+        out.push_str("declare void @pyrs_list_reverse(ptr)\n");
         out.push_str("declare void @pyrs_list_sort(ptr, i32)\n");
         out.push_str("declare void @pyrs_list_extend(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_list_copy(ptr)\n");
@@ -3115,6 +3117,10 @@ impl Emitter {
             Stmt::ListClear { list } => {
                 let l = self.emit_expr(list);
                 self.line(format!("call void @pyrs_list_clear(ptr {l})"));
+            }
+            Stmt::ListReverse { list } => {
+                let l = self.emit_expr(list);
+                self.line(format!("call void @pyrs_list_reverse(ptr {l})"));
             }
             Stmt::ListSort { list } => {
                 let l = self.emit_expr(list);

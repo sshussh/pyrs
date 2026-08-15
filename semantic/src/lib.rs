@@ -3326,7 +3326,7 @@ fn collect_param_constraints_expr(
             if matches!(&base.kind, ast::ExprKind::Name(n) if n == name) {
                 match method.as_str() {
                     "append" | "pop" | "insert" | "remove" | "clear" | "sort" | "index"
-                    | "count" => {
+                    | "count" | "reverse" => {
                         if let Some(ast::PosArg::Pos(a0)) = args.first() {
                             if let Some(t) = try_type_ast_expr(a0, params, &HashMap::new()) {
                                 out.push(ir::list_of(t));
@@ -9968,6 +9968,15 @@ fn lower_method_stmt(
                 }
                 Ok(ir::Stmt::ListClear { list: base_ir })
             }
+            "reverse" => {
+                if !args.is_empty() {
+                    return Err(err(
+                        format!("reverse() takes no arguments ({} given)", args.len()),
+                        method_span,
+                    ));
+                }
+                Ok(ir::Stmt::ListReverse { list: base_ir })
+            }
             "sort" => {
                 if !args.is_empty() {
                     return Err(err(
@@ -10042,7 +10051,7 @@ fn lower_method_stmt(
             _ => Err(err(
                 format!(
                     "list method '{method}' is not supported yet (supported: \
-                     append, pop, insert, remove, index, count, clear, sort, extend, copy)"
+                     append, pop, insert, remove, index, count, clear, reverse, sort, extend, copy)"
                 ),
                 method_span,
             )),
@@ -14418,13 +14427,15 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     "pop" => lower_list_pop(base_ir, *elem, &args, *method_span, ctx),
                     "index" => lower_list_index_of(base_ir, *elem, &args, *method_span, ctx),
                     "count" => lower_list_count(base_ir, *elem, &args, *method_span, ctx),
-                    "append" | "insert" | "remove" | "clear" | "sort" | "extend" => Err(err(
-                        format!(
-                            "list.{method}(...) returns None and cannot be used \
-                             in an expression"
-                        ),
-                        *method_span,
-                    )),
+                    "append" | "insert" | "remove" | "clear" | "reverse" | "sort" | "extend" => {
+                        Err(err(
+                            format!(
+                                "list.{method}(...) returns None and cannot be used \
+                                 in an expression"
+                            ),
+                            *method_span,
+                        ))
+                    }
                     "copy" => {
                         if !args.is_empty() {
                             return Err(err(
@@ -22326,6 +22337,29 @@ print(f(B()))
         assert_eq!(value.ty, ir::Ty::Int);
         assert!(matches!(value.kind, ir::ExprKind::ListIndexOf { .. }));
         assert!(matches!(entry.body[4], ir::Stmt::ListClear { .. }));
+    }
+
+    #[test]
+    fn list_reverse_lowers() {
+        let m = analyze_ok("xs = [1, 2, 3]\nxs.reverse()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(matches!(entry.body[1], ir::Stmt::ListReverse { .. }));
+    }
+
+    #[test]
+    fn list_reverse_rejects_args() {
+        let e = analyze_err("xs = [1]\nxs.reverse(1)\n");
+        assert!(e.message.contains("no arguments"), "{}", e.message);
+    }
+
+    #[test]
+    fn list_reverse_rejects_expression_position() {
+        let e = analyze_err("xs = [1, 2]\ny = xs.reverse()\n");
+        assert!(
+            e.message.contains("returns None") && e.message.contains("reverse"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

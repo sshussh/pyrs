@@ -527,10 +527,11 @@ m.append(["a", "b"])
 ```
 
 List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
-`index(v)`, `count(v)`, `clear()`, `sort()`. `insert` clamps the index like CPython;
+`index(v)`, `count(v)`, `clear()`, `reverse()`, `sort()`. `insert` clamps the index like CPython;
 `remove` / `index` trap with `ValueError` when the value is missing;
 `count` returns the number of matches (0 if none).
-`sort()` is in-place (statement only); `sorted(xs)` returns a new sorted
+`reverse()` is in-place (statement only; `reversed(xs)` and `xs[::-1]`
+allocate a copy). `sort()` is in-place (statement only); `sorted(xs)` returns a new sorted
 copy. Without `key=`, element types are `int`, `float`, `bool`, `str`;
 float NaN sorts last on that path (stable total order via runtime
 `ListSort`). With monomorphic `key=f` (`T → K`, `K` in

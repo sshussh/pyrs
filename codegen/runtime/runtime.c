@@ -3485,6 +3485,19 @@ void pyrs_list_clear(PyrsList *l) {
     l->len = 0;
 }
 
+void pyrs_list_reverse(PyrsList *l) {
+    check_ref(l);
+    long long i = 0;
+    long long j = l->len - 1;
+    while (i < j) {
+        long long tmp = l->data[i];
+        l->data[i] = l->data[j];
+        l->data[j] = tmp;
+        i++;
+        j--;
+    }
+}
+
 /* qsort needs a tag; single-threaded compiler runtime is fine */
 static int sort_elem_tag;
 /* Forward: defined with tuple helpers below (used by list_sort for tag 5). */
