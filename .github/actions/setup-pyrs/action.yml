@@ -8,6 +8,10 @@ inputs:
     description: LLVM major version to install from Ubuntu packages
     required: false
     default: "18"
+  python-version:
+    description: CPython version for e2e parity (3.14+ has deferred annotations)
+    required: false
+    default: "3.14"
   rust-components:
     description: Extra rustup components (space-separated)
     required: false
@@ -71,8 +75,14 @@ runs:
         llvm-config --prefix
         test -d "${LLVM_DIR}"
 
+    - name: Install Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      # No `toolchain:` input — use the repo rust-toolchain.toml pin.
+      uses: dtolnay/rust-toolchain@master
       with:
         components: ${{ inputs.rust-components }}
 

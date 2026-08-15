@@ -119,18 +119,13 @@ fn parse_gc_stat(line: &str, key: &str) -> u64 {
 }
 
 fn parse_gc_stats(stderr: &str) -> GcStats {
-    let mut lines = stderr.lines().filter(|line| !line.trim().is_empty());
-    let line = lines
-        .next()
-        .unwrap_or_else(|| panic!("missing PYRS_GC_STATS output"));
-    assert!(
-        lines.next().is_none(),
-        "PYRS_GC_STATS must emit exactly one stderr line, got:\n{stderr}"
-    );
-    assert!(
-        line.starts_with("[pyrs-gc] "),
-        "unexpected PYRS_GC_STATS prefix in: {line}"
-    );
+    // Ignore compiler chatter (Ubuntu gcc -Wformat-truncation on runtime.c)
+    // and take the collector's one-line report.
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("[pyrs-gc] "))
+        .unwrap_or_else(|| panic!("missing PYRS_GC_STATS output, stderr:\n{stderr}"));
     GcStats {
         collections: parse_gc_stat(line, "collections"),
         allocated: parse_gc_stat(line, "allocated"),

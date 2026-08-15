@@ -92,21 +92,23 @@ ci: fmt-check clippy test examples ## Full gate: format + lints + tests + exampl
 examples: release ## Run every example and diff its output against python3
 	@fail=0; \
 	for ex in examples/*.py examples/modules/*.py examples/packages/main.py; do \
-	    got=$$($(PYRS) run -i $$ex 2>&1); \
-	    want=$$($(PYTHON) $$ex 2>&1); \
+	    got=$$($(PYRS) run -i $$ex); \
+	    want=$$($(PYTHON) $$ex); \
 	    if [ "$$got" = "$$want" ]; then \
 	        printf '  \033[32mMATCH\033[0m  %s\n' "$$ex"; \
 	    else \
 	        printf '  \033[31mDIFFER\033[0m %s\n' "$$ex"; \
+	        diff -u <(printf '%s\n' "$$want") <(printf '%s\n' "$$got") || true; \
 	        fail=1; \
 	    fi; \
 	done; \
-	got=$$($(PYRS) run -i examples/risksim/main.py -- examples/risksim/data/balanced.scenario 2>&1); \
-	want=$$($(PYTHON) examples/risksim/main.py examples/risksim/data/balanced.scenario 2>&1); \
+	got=$$($(PYRS) run -i examples/risksim/main.py -- examples/risksim/data/balanced.scenario); \
+	want=$$($(PYTHON) examples/risksim/main.py examples/risksim/data/balanced.scenario); \
 	if [ "$$got" = "$$want" ]; then \
 	    printf '  \033[32mMATCH\033[0m  %s\n' "examples/risksim/main.py"; \
 	else \
 	    printf '  \033[31mDIFFER\033[0m %s\n' "examples/risksim/main.py"; \
+	    diff -u <(printf '%s\n' "$$want") <(printf '%s\n' "$$got") || true; \
 	    fail=1; \
 	fi; \
 	exit $$fail

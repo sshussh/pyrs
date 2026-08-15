@@ -113,16 +113,21 @@ fn compile(input: &Path, output: &Path, opt_level: u8, emit_llvm: bool) -> Resul
         fs::write(&gc_header, codegen::GC_H)
             .map_err(|e| format!("failed to write collector header: {e}"))?;
 
-        let status = process::Command::new("cc")
+        // Honor `CC` so CI clang is used instead of Ubuntu's gcc. gcc's
+        // `-Wformat-truncation` on `runtime.c` otherwise leaks onto stderr
+        // and breaks GC-stat parsing plus `make examples` (which diffs 2>&1).
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        let status = process::Command::new(&cc)
             .arg(&object)
             .arg(&runtime)
             .arg(&gc)
             .arg("-O2")
+            .arg("-Wno-format-truncation")
             .arg("-lm")
             .arg("-o")
             .arg(output)
             .status()
-            .map_err(|e| format!("failed to invoke the system linker 'cc': {e}"))?;
+            .map_err(|e| format!("failed to invoke the C compiler '{cc}': {e}"))?;
         if !status.success() {
             return Err("linking failed (see 'cc' output above)".to_string());
         }

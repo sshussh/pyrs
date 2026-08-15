@@ -556,7 +556,7 @@ GitHub Actions (see `.github/workflows/`):
 
 | Workflow | When | What |
 |----------|------|------|
-| **CI** | push/PR to `main` | `fmt`, clippy, tests, example parity, opt-level smoke |
+| **CI** | push/PR to `main` | `fmt`, clippy, tests, example parity, opt-level smoke (Ubuntu, LLVM 18, CPython 3.14) |
 | **Benchmarks** | weekly / manual / bench-related pushes | `benchmarks/run.sh` (artifact log) |
 | **Release** | tags `v*.*.*` | Linux `x86_64` tarball + checksum + GitHub Release |
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |

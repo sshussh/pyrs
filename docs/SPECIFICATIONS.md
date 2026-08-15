@@ -478,8 +478,11 @@ Changing a layout or tag encoding requires a coordinated edit of
 4. **`make examples`:** globs `examples/*.py`, `examples/modules/*.py`,
    and `examples/packages/main.py` (package tree entry point), plus the
    RiskSim showcase with `examples/risksim/data/balanced.scenario`.
-5. **GitHub Actions:** `.github/workflows/ci.yml` mirrors `make ci`;
-   separate workflows exist for benches, docs, and releases.
+5. **GitHub Actions:** `.github/workflows/ci.yml` mirrors `make ci` on
+   Ubuntu 24.04 with LLVM 18, the `rust-toolchain.toml` pin, and
+   **CPython 3.14** (deferred annotations so class-body `Any` / `-> P`
+   match the local parity suite). Separate workflows exist for benches,
+   docs, and releases.
 6. **Benchmarks:** `benchmarks/run.sh` verifies byte-identical output
    before timing; results may be summarized in the README.
 

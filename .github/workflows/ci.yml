@@ -29,10 +29,10 @@ jobs:
     name: Format
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust (rustfmt only)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
           components: rustfmt
 
@@ -47,12 +47,13 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [] # parallel with fmt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup PyRs toolchain
         uses: ./.github/actions/setup-pyrs
         with:
           llvm-version: "18"
+          python-version: "3.14"
           rust-components: rustfmt clippy
 
       - name: Doctor
@@ -66,7 +67,7 @@ jobs:
 
       - name: Upload test failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-target-${{ github.run_id }}
           path: |
@@ -81,12 +82,13 @@ jobs:
     name: Example parity
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup PyRs toolchain
         uses: ./.github/actions/setup-pyrs
         with:
           llvm-version: "18"
+          python-version: "3.14"
 
       - name: Build release pyrs
         run: cargo build --release -p pyrs
@@ -99,8 +101,8 @@ jobs:
         run: |
           set -euo pipefail
           PYRS="${GITHUB_WORKSPACE}/target/release/pyrs"
-          got="$("$PYRS" run -i shapes.py 2>&1)"
-          want="$(python3 shapes.py 2>&1)"
+          got="$("$PYRS" run -i shapes.py)"
+          want="$(python3 shapes.py)"
           if [ "$got" = "$want" ]; then
             echo "MATCH  examples/modules/shapes.py"
           else
@@ -119,12 +121,13 @@ jobs:
     name: Compile smoke (O0/O2/O3)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup PyRs toolchain
         uses: ./.github/actions/setup-pyrs
         with:
           llvm-version: "18"
+          python-version: "3.14"
 
       - name: Build release pyrs
         run: cargo build --release -p pyrs
