@@ -345,7 +345,7 @@ line = "-" * 20                # repetition (either operand order)
 print("apple" < "banana")      # lexicographic comparison (all six ops)
 print(s[0], s[-1])             # indexing, negative from the end
 print(s[6:], s[:5], s[::-1])   # slicing with steps (see below)
-print(len(s))                  # length
+print(len(s))                  # length (bytes; see note below)
 for c in s:                    # iterate characters (each is a 1-char str)
     print(c)
 label = str(42)                # str() converts int/float/bool
@@ -393,7 +393,14 @@ String methods (ASCII case/whitespace rules):
 " \\t".isspace()          # True; same whitespace set as strip/split
 "ABC".isupper()           # True; "AbC" / digits-only are False
 "a1".islower()            # True if all letters are lower and >=1 letter
+ord("é")                  # 233 — Unicode code point
+chr(233)                  # "é"; chr(True) is "\x01"
 ```
+
+`len` / indexing / slicing on `str` are **byte**-based (`len("é")` is
+`2`). `ord` / `chr` follow CPython and count **Unicode characters**
+(`ord("é")` is `233`; `ord("éé")` is a TypeError for length 2). Do not
+mix `len(chr(n))` with CPython when `n` is non-ASCII.
 
 ### f-strings
 
@@ -804,6 +811,8 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
 | `round(x[, ndigits])` | int, float, bool; optional int `ndigits` (positional or `ndigits=`) | one-arg → `int` (ties to even); two-arg `int` stays `int`; two-arg `float` stays `float` |
+| `ord(s)` | one-character `str` (Unicode code point, not byte length) | `int`; empty / multi-char → `TypeError` |
+| `chr(n)` | int or bool (`True` → 1) in `0 ..= 0x10FFFF` | one-character `str`; out of range → `ValueError` |
 | `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, orderable tuple, or orderable list (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple/list: lexicographic; optional monomorphic `key=` over homogeneous positionals; no `default=` |
 | `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple\|orderable list]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs[, start])` | `list[int]` or `list[float]`; optional numeric `start` (positional or `start=`) | `elem ⊔ start` (`bool`→`int`→`float`); empty yields `start` (default `0` / `0.0`) |

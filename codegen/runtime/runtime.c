@@ -3071,6 +3071,65 @@ static int utf8_next(const PyrsStr *s, long long i, unsigned int *cp) {
     return 1;
 }
 
+long long pyrs_str_ord(const PyrsStr *s) {
+    check_ref(s);
+    if (s->len == 0) {
+        pyrs_die("TypeError: ord() expected a character, but string of length 0 found");
+    }
+    long long i = 0;
+    long long nchars = 0;
+    unsigned int last = 0;
+    while (i < s->len) {
+        unsigned int cp = 0;
+        i += utf8_next(s, i, &cp);
+        nchars++;
+        last = cp;
+    }
+    if (nchars != 1) {
+        char buf[96];
+        snprintf(buf, sizeof buf,
+                 "TypeError: ord() expected a character, but string of length %lld found",
+                 nchars);
+        pyrs_die(buf);
+    }
+    return pyrs_int_from_i64((long long)last);
+}
+
+PyrsStr *pyrs_chr(long long n) {
+    if (!pyrs_int_is_small(n)) {
+        pyrs_die("ValueError: chr() arg not in range(0x110000)");
+    }
+    long long v = pyrs_int_small_val(n);
+    if (v < 0 || v > 0x10ffff) {
+        pyrs_die("ValueError: chr() arg not in range(0x110000)");
+    }
+    unsigned int cp = (unsigned int)v;
+    if (cp < 0x80) {
+        return single_char((unsigned char)cp);
+    }
+    char buf[4];
+    int nbytes;
+    if (cp < 0x800) {
+        buf[0] = (char)(0xc0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3f));
+        nbytes = 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (char)(0xe0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        buf[2] = (char)(0x80 | (cp & 0x3f));
+        nbytes = 3;
+    } else {
+        buf[0] = (char)(0xf0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        buf[3] = (char)(0x80 | (cp & 0x3f));
+        nbytes = 4;
+    }
+    PyrsStr *r = str_alloc(nbytes);
+    memcpy(r->data, buf, (size_t)nbytes);
+    return r;
+}
+
 /* ascii(): like repr but non-ASCII codepoints escaped (\xHH / \uXXXX / \UXXXXXXXX).
  * Source strings are UTF-8 bytes; we decode so café → 'caf\xe9' like CPython. */
 PyrsStr *pyrs_str_ascii(const PyrsStr *s) {

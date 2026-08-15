@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.45.0)
+## The language (v0.46.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.46.0**, not 1.0) until it is ready for
+milestone after this one is **0.47.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -135,6 +135,9 @@ A statically-typed Python subset:
   `issubset` / `issuperset` / `isdisjoint`.
   **v0.45:** `round(x)` / `round(x, ndigits)` — ties to even; one-arg yields
   `int`; two-arg keeps `int` or `float`.
+  **v0.46:** `ord(s)` / `chr(n)` — Unicode code point of a one-character
+  string, and the inverse (`chr` accepts `0 ..= 0x10FFFF`; `bool` → `int`).
+  String `len`/index stay byte-based.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -301,7 +304,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.45.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.46.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -342,7 +345,9 @@ int exponent traps (a constant like `2 ** -1` works and gives float),
 int↔float comparisons convert the int to float (exactness loss past 2^53),
 list literals coerce mixed numerics to one element type (mixed non-numeric
 literal elements still error unless annotated as a union), `nan in [nan]`
-is False (IEEE equality), str methods use ASCII case/whitespace rules, GC is
+is False (IEEE equality), str methods use ASCII case/whitespace rules,
+`len`/index/slice on `str` are byte-based (`len("é")` is 2) while `ord`/`chr`
+count Unicode characters, GC is
 nonmoving mark–sweep with conservative native roots (so reclamation can be
 delayed by pointer-like stack values), files support text modes "r"/"w"/"a"
 only and still require `with` or explicit `close()` for deterministic resource
@@ -461,4 +466,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.45.0 && git push origin v0.45.0`.
+Release tags: `git tag v0.46.0 && git push origin v0.46.0`.

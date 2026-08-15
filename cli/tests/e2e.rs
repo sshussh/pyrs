@@ -1272,6 +1272,113 @@ fn round_nan_inf_trap_like_python() {
     );
 }
 
+#[test]
+fn ord_chr_match_python() {
+    // Unicode code points, not PyRs byte `len`. Do not assert len() of
+    // non-ASCII here — `len("é")` is 2 in PyRs and 1 in CPython.
+    let src = "\
+print(ord(\"A\"), ord(\"z\"), ord(\"0\"), ord(\" \"))
+print(ord(\"é\"), ord(\"😀\"))
+print(chr(65), chr(233), chr(128512))
+print(ord(chr(233)), chr(ord(\"é\")))
+print(ord(chr(0)), ord(chr(True)), ord(chr(1114111)))
+print(chr(65) + chr(66))
+s = \"é\"
+n = 233
+print(ord(s), chr(n))
+";
+    let out = run_program("ordchr", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn ord_empty_and_multi_char_are_type_error() {
+    let (code, stderr) = run_program_expect_fail("ord_empty", "print(ord(\"\"))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("TypeError: ord() expected a character, but string of length 0 found"),
+        "stderr: {stderr}"
+    );
+    let (code, stderr) = run_program_expect_fail("ord_ab", "print(ord(\"ab\"))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("TypeError: ord() expected a character, but string of length 2 found"),
+        "stderr: {stderr}"
+    );
+    // Two Unicode characters, even though UTF-8 is 4 bytes.
+    let (code, stderr) = run_program_expect_fail("ord_ee", "print(ord(\"éé\"))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("TypeError: ord() expected a character, but string of length 2 found"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn chr_out_of_range_is_value_error() {
+    let (code, stderr) = run_program_expect_fail("chr_neg", "print(chr(-1))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: chr() arg not in range(0x110000)"),
+        "stderr: {stderr}"
+    );
+    let (code, stderr) = run_program_expect_fail("chr_hi", "print(chr(1114112))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: chr() arg not in range(0x110000)"),
+        "stderr: {stderr}"
+    );
+    let (code, stderr) = run_program_expect_fail("chr_big", "print(chr(2 ** 70))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: chr() arg not in range(0x110000)"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn ord_chr_wrong_type_is_compile_error() {
+    let dir = TempDir::new("ord_bad");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "print(ord(1))\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ord() expected string of length 1"),
+        "stderr: {stderr}"
+    );
+
+    let dir = TempDir::new("chr_bad");
+    let src = dir.0.join("prog.py");
+    fs::write(&src, "print(chr(\"A\"))\n").unwrap();
+    let out = Command::new(PYRS)
+        .args(["compile", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("'str' object cannot be interpreted as an integer"),
+        "stderr: {stderr}"
+    );
+}
+
 // ---- v0.3: slicing, in/not in, pop, f-strings ----
 
 #[test]

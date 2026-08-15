@@ -388,6 +388,8 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         Unary { operand, .. }
         | ToBool(operand)
         | Abs(operand)
+        | Ord(operand)
+        | Chr(operand)
         | Round {
             value: operand,
             ndigits: None,
@@ -641,6 +643,8 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         Unary { operand, .. }
         | ToBool(operand)
         | Abs(operand)
+        | Ord(operand)
+        | Chr(operand)
         | Round {
             value: operand,
             ndigits: None,
@@ -985,6 +989,8 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_int_neg(i64)\n");
         out.push_str("declare i64 @pyrs_int_invert(i64)\n");
         out.push_str("declare i64 @pyrs_int_abs(i64)\n");
+        out.push_str("declare i64 @pyrs_str_ord(ptr)\n");
+        out.push_str("declare ptr @pyrs_chr(i64)\n");
         out.push_str("declare i64 @pyrs_int_round(i64, i64)\n");
         out.push_str("declare i64 @pyrs_float_round_to_int(double)\n");
         out.push_str("declare double @pyrs_float_round_digits(double, i64)\n");
@@ -4026,6 +4032,18 @@ impl Emitter {
                     Ty::Float => self.line(format!("{t} = call double @llvm.fabs.f64(double {v})")),
                     other => unreachable!("Abs on {other:?}"),
                 }
+                t
+            }
+            ExprKind::Ord(inner) => {
+                let v = self.emit_expr(inner);
+                let t = self.tmp();
+                self.line(format!("{t} = call i64 @pyrs_str_ord(ptr {v})"));
+                t
+            }
+            ExprKind::Chr(inner) => {
+                let v = self.emit_expr(inner);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_chr(i64 {v})"));
                 t
             }
             ExprKind::Round { value, ndigits } => self.emit_round(value, ndigits.as_deref()),

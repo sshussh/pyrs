@@ -949,6 +949,10 @@ pub enum ExprKind {
     /// `abs(x)` for int or float (bool is promoted to int first).
     /// Result type matches the operand. `abs(i64::MIN)` wraps (no bigints).
     Abs(Box<Expr>),
+    /// `ord(s)` — Unicode code point of a one-character string. Result is `int`.
+    Ord(Box<Expr>),
+    /// `chr(n)` — one-character string for code point `n` (0..=0x10FFFF).
+    Chr(Box<Expr>),
     /// `round(x)` / `round(x, ndigits)`. One-arg always yields `int` (ties to
     /// even). Two-arg: `int` stays `int`; `float` stays `float`.
     Round {

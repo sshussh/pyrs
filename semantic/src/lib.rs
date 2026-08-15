@@ -1572,7 +1572,7 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 19] = [
+const BUILTINS: [&str; 21] = [
     "print",
     "len",
     "range",
@@ -1592,6 +1592,8 @@ const BUILTINS: [&str; 19] = [
     "reversed",
     "next",
     "round",
+    "ord",
+    "chr",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -3272,7 +3274,9 @@ fn collect_param_constraints_expr(
                 || func == "abs"
                 || func == "sum"
                 || func == "sorted"
-                || func == "round")
+                || func == "round"
+                || func == "ord"
+                || func == "chr")
                 && let Some(ast::PosArg::Pos(ae)) = args.first()
                 && matches!(&ae.kind, ast::ExprKind::Name(n) if n == name)
             {
@@ -3281,6 +3285,8 @@ fn collect_param_constraints_expr(
                         // Ambiguous container — do not constrain alone.
                     }
                     "abs" | "sum" | "round" => out.push(ir::Ty::Int),
+                    "ord" => out.push(ir::Ty::Str),
+                    "chr" => out.push(ir::Ty::Int),
                     "sorted" => out.push(ir::list_of(ir::Ty::Int)),
                     _ => {}
                 }
@@ -17987,6 +17993,51 @@ fn lower_call(
                 })
             }
             "round" => lower_round_expr(&args, keywords, span, ctx),
+            "ord" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("ord() takes exactly one argument ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(args[0], ctx)?;
+                if arg.ty != ir::Ty::Str {
+                    return Err(err(
+                        format!("ord() expected string of length 1, but {} found", arg.ty),
+                        args[0].span,
+                    ));
+                }
+                Ok(ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Ord(Box::new(arg)),
+                })
+            }
+            "chr" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("chr() takes exactly one argument ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(args[0], ctx)?;
+                let arg = match arg.ty {
+                    ir::Ty::Bool => ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::BoolToInt(Box::new(arg)),
+                    },
+                    ir::Ty::Int => arg,
+                    other => {
+                        return Err(err(
+                            format!("'{other}' object cannot be interpreted as an integer"),
+                            args[0].span,
+                        ));
+                    }
+                };
+                Ok(ir::Expr {
+                    ty: ir::Ty::Str,
+                    kind: ir::ExprKind::Chr(Box::new(arg)),
+                })
+            }
             "abs" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -22535,6 +22586,91 @@ print(f())
         let e = analyze_err("x = round(\"nope\")\n");
         assert!(
             e.message.contains("__round__") || e.message.contains("str"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn ord_lowers_str_to_int() {
+        let m = analyze_ok("a = ord(\"A\")\nb = ord(\"é\")\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Ord(_)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Ord(_)));
+    }
+
+    #[test]
+    fn ord_rejects_non_str() {
+        let e = analyze_err("x = ord(1)\n");
+        assert!(
+            e.message.contains("ord() expected string of length 1"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn ord_rejects_wrong_arity() {
+        let e = analyze_err("x = ord()\n");
+        assert!(
+            e.message.contains("ord() takes exactly one argument"),
+            "{}",
+            e.message
+        );
+        let e = analyze_err("x = ord(\"a\", \"b\")\n");
+        assert!(
+            e.message.contains("ord() takes exactly one argument"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn chr_lowers_int_and_bool_to_str() {
+        let m = analyze_ok("a = chr(65)\nb = chr(True)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(value.kind, ir::ExprKind::Chr(_)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(value.kind, ir::ExprKind::Chr(_)));
+    }
+
+    #[test]
+    fn chr_rejects_non_int() {
+        let e = analyze_err("x = chr(\"A\")\n");
+        assert!(
+            e.message
+                .contains("'str' object cannot be interpreted as an integer"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn chr_rejects_wrong_arity() {
+        let e = analyze_err("x = chr()\n");
+        assert!(
+            e.message.contains("chr() takes exactly one argument"),
+            "{}",
+            e.message
+        );
+        let e = analyze_err("x = chr(1, 2)\n");
+        assert!(
+            e.message.contains("chr() takes exactly one argument"),
             "{}",
             e.message
         );

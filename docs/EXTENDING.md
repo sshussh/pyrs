@@ -523,6 +523,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `ListPop` / `ListIndexOf` / `ListCount` / `ListLit` / `ListNew` / `Len` | list ops |
 | `Block { stmts, result }` | statements inside expressions (comprehensions) |
 | `Abs` | `abs(x)` via LLVM abs/fabs |
+| `Ord` / `Chr` | `ord(s)` / `chr(n)` via `pyrs_str_ord` / `pyrs_chr` (Unicode code points) |
 | `Min` / `Max` | 2-arg `min`/`max` (numeric; select on compare) |
 | `MinList` / `MaxList` | 1-arg `min`/`max` over list (empty → ValueError) |
 | `Sum { list, start }` | `sum(list[int\|float][, start])` open-coded loop |
