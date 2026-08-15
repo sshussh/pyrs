@@ -631,11 +631,13 @@ pub enum Stmt {
     /// Evaluate and discard (calls with side effects).
     ExprStmt(Expr),
     /// The `print` builtin: values joined by `sep`, then `end`.
-    /// Both `sep` and `end` are `str` (defaults `" "` and `"\n"`).
+    /// `sep`/`end` are `str` (defaults `" "` and `"\n"`). `flush` is `bool`
+    /// (CPython truthiness; default false).
     Print {
         args: Vec<Expr>,
         sep: Expr,
         end: Expr,
+        flush: Expr,
     },
     /// Abort with a runtime error message (exit code 1), or raise into a
     /// surrounding try frame when one is active.

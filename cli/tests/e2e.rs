@@ -361,6 +361,32 @@ print(\"z\")
 }
 
 #[test]
+fn print_flush_match_python() {
+    // flush= does not change stdout bytes; it must still match CPython
+    // and accept CPython truthiness (1 / 0 / None).
+    let src = "\
+print(1, flush=True)
+print(2, flush=False)
+print(3, flush=1)
+print(4, flush=0)
+print(5, flush=None)
+print(\"a\", \"b\", sep=\",\", end=\"!\\n\", flush=True)
+";
+    let out = run_program("printflush", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn print_sep_end_errors() {
     let (_, stderr) = run_program_expect_fail("print_sep_int", "print(1, sep=1)\n");
     assert!(
@@ -375,11 +401,6 @@ fn print_sep_end_errors() {
     let (_, stderr) = run_program_expect_fail("print_file", "print(1, file=1)\n");
     assert!(
         stderr.contains("file=") && stderr.contains("not supported yet"),
-        "stderr={stderr}"
-    );
-    let (_, stderr) = run_program_expect_fail("print_flush", "print(1, flush=True)\n");
-    assert!(
-        stderr.contains("flush=") && stderr.contains("not supported yet"),
         "stderr={stderr}"
     );
     let (_, stderr) = run_program_expect_fail("print_foo", "print(1, foo=1)\n");

@@ -8606,8 +8606,10 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 }
                 let mut sep = const_str_expr(" ");
                 let mut end = const_str_expr("\n");
+                let mut flush = const_bool_expr(false);
                 let mut seen_sep = false;
                 let mut seen_end = false;
+                let mut seen_flush = false;
                 for kw in keywords {
                     match kw.name.as_str() {
                         "sep" => {
@@ -8652,15 +8654,29 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                                 kind: ir::ExprKind::Local(tmp),
                             };
                         }
+                        "flush" => {
+                            if seen_flush {
+                                return Err(err(
+                                    "print() got multiple values for keyword argument 'flush'",
+                                    kw.name_span,
+                                ));
+                            }
+                            seen_flush = true;
+                            let v = lower_expr(&kw.value, ctx)?;
+                            let v = to_bool(v, kw.value.span, ctx)?;
+                            let tmp = ctx.fresh_temp("printflush", ir::Ty::Bool);
+                            out.push(ir::Stmt::Assign {
+                                name: tmp.clone(),
+                                value: v,
+                            });
+                            flush = ir::Expr {
+                                ty: ir::Ty::Bool,
+                                kind: ir::ExprKind::Local(tmp),
+                            };
+                        }
                         "file" => {
                             return Err(err(
                                 "print() keyword argument 'file=' is not supported yet",
-                                kw.name_span,
-                            ));
-                        }
-                        "flush" => {
-                            return Err(err(
-                                "print() keyword argument 'flush=' is not supported yet",
                                 kw.name_span,
                             ));
                         }
@@ -8676,6 +8692,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     args: lowered_args,
                     sep,
                     end,
+                    flush,
                 });
                 return Ok(());
             }
@@ -16465,6 +16482,13 @@ fn const_str_expr(s: &str) -> ir::Expr {
     }
 }
 
+fn const_bool_expr(v: bool) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::ConstBool(v),
+    }
+}
+
 /// `hex` / `bin` / `oct`: CPython `format(n, "#x")` / `"#b"` / `"#o"`.
 fn lower_int_prefix_expr(
     name: &str,
@@ -22565,14 +22589,36 @@ print(fib(10))
             .iter()
             .find(|s| matches!(s, ir::Stmt::Print { .. }))
             .expect("print stmt");
-        let ir::Stmt::Print { args, sep, end } = print else {
+        let ir::Stmt::Print {
+            args,
+            sep,
+            end,
+            flush,
+        } = print
+        else {
             panic!("{print:?}");
         };
         assert_eq!(args.len(), 2);
         assert_eq!(sep.ty, ir::Ty::Str);
         assert_eq!(end.ty, ir::Ty::Str);
+        assert_eq!(flush.ty, ir::Ty::Bool);
         assert!(matches!(sep.kind, ir::ExprKind::Local(_)));
         assert!(matches!(end.kind, ir::ExprKind::Local(_)));
+    }
+
+    #[test]
+    fn print_flush_lowers() {
+        let m = analyze_ok("print(1, flush=True)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let print = entry
+            .body
+            .iter()
+            .find(|s| matches!(s, ir::Stmt::Print { .. }))
+            .expect("print stmt");
+        let ir::Stmt::Print { flush, .. } = print else {
+            panic!("{print:?}");
+        };
+        assert_eq!(flush.ty, ir::Ty::Bool);
     }
 
     #[test]
@@ -24976,12 +25022,18 @@ except Exception:
         }
         fn walk_stmt(s: &ir::Stmt, f: &mut dyn FnMut(&ir::Expr)) {
             match s {
-                ir::Stmt::Print { args, sep, end } => {
+                ir::Stmt::Print {
+                    args,
+                    sep,
+                    end,
+                    flush,
+                } => {
                     for a in args {
                         walk_expr(a, f);
                     }
                     walk_expr(sep, f);
                     walk_expr(end, f);
+                    walk_expr(flush, f);
                 }
                 ir::Stmt::Try {
                     body,

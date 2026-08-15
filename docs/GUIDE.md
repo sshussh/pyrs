@@ -807,7 +807,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 
 | builtin | accepts | returns |
 |---------|---------|---------|
-| `print(a, b, ..., sep=..., end=...)` | any values, any count; `sep`/`end` are `str` or `None` | join with `sep` (default space); then `end` (default newline); `file=` / `flush=` not supported yet |
+| `print(a, b, ..., sep=..., end=..., flush=...)` | any values, any count; `sep`/`end` are `str` or `None`; `flush` is truthy | join with `sep` (default space); then `end` (default newline); truthy `flush` calls `fflush(stdout)`; `file=` not supported yet |
 | `len(x)` | str, list, tuple, dict, set | int |
 | `abs(x)` | int, float, bool | same numeric type (`bool` → `int`; `abs(True)` is `1`) |
 | `round(x[, ndigits])` | int, float, bool; optional int `ndigits` (positional or `ndigits=`) | one-arg → `int` (ties to even); two-arg `int` stays `int`; two-arg `float` stays `float` |

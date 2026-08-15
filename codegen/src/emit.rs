@@ -366,13 +366,19 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
             value: v,
             ..
         } => max_try_depth_in_expr(o).max(max_try_depth_in_expr(v)),
-        Stmt::Print { args, sep, end } => args
+        Stmt::Print {
+            args,
+            sep,
+            end,
+            flush,
+        } => args
             .iter()
             .map(max_try_depth_in_expr)
             .max()
             .unwrap_or(0)
             .max(max_try_depth_in_expr(sep))
-            .max(max_try_depth_in_expr(end)),
+            .max(max_try_depth_in_expr(end))
+            .max(max_try_depth_in_expr(flush)),
         Stmt::DictUpdate { dict, other } | Stmt::SetUpdate { set: dict, other } => {
             max_try_depth_in_expr(dict).max(max_try_depth_in_expr(other))
         }
@@ -594,10 +600,16 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
                 + count_yields_in_stmts(orelse)
                 + count_yields_in_stmts(finally)
         }
-        Stmt::Print { args, sep, end } => {
+        Stmt::Print {
+            args,
+            sep,
+            end,
+            flush,
+        } => {
             args.iter().map(count_yields_in_expr).sum::<i64>()
                 + count_yields_in_expr(sep)
                 + count_yields_in_expr(end)
+                + count_yields_in_expr(flush)
         }
         Stmt::ExprStmt(e)
         | Stmt::Assign { value: e, .. }
@@ -808,6 +820,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_float(double)\n");
         out.push_str("declare void @pyrs_print_bool(i32)\n");
         out.push_str("declare void @pyrs_print_str(ptr)\n");
+        out.push_str("declare void @pyrs_flush_if(i32)\n");
         out.push_str("declare void @pyrs_print_list(ptr, i32)\n");
         out.push_str("declare void @pyrs_print_tuple(ptr)\n");
         out.push_str("declare void @pyrs_print_dict(ptr)\n");
@@ -3339,10 +3352,15 @@ impl Emitter {
                 // with phase=handler and runs finally.
                 self.emit_die(message);
             }
-            Stmt::Print { args, sep, end } => {
-                // Evaluate objects first (CPython), then sep/end. Keyword
-                // side effects that must precede the other kw are already
-                // bound to temps in semantic.
+            Stmt::Print {
+                args,
+                sep,
+                end,
+                flush,
+            } => {
+                // Evaluate objects first (CPython), then sep/end/flush.
+                // Keyword side effects that must precede the other kw are
+                // already bound to temps in semantic.
                 let mut printed = Vec::with_capacity(args.len());
                 for arg in args {
                     let v = self.emit_expr(arg);
@@ -3350,6 +3368,7 @@ impl Emitter {
                 }
                 let sep_v = self.emit_expr(sep);
                 let end_v = self.emit_expr(end);
+                let flush_v = self.emit_expr(flush);
                 for (i, (v, ty)) in printed.iter().enumerate() {
                     if i > 0 {
                         self.line(format!("call void @pyrs_print_str(ptr {sep_v})"));
@@ -3357,6 +3376,11 @@ impl Emitter {
                     self.emit_print_value(v, *ty);
                 }
                 self.line(format!("call void @pyrs_print_str(ptr {end_v})"));
+                if !matches!(flush.kind, ExprKind::ConstBool(false)) {
+                    let ext = self.tmp();
+                    self.line(format!("{ext} = zext i1 {flush_v} to i32"));
+                    self.line(format!("call void @pyrs_flush_if(i32 {ext})"));
+                }
             }
             Stmt::Break => {
                 // Only run try finally when the try is nested *inside* the loop

@@ -2014,6 +2014,12 @@ void pyrs_print_end(void) {
     fputc('\n', stdout);
 }
 
+void pyrs_flush_if(int on) {
+    if (on) {
+        fflush(stdout);
+    }
+}
+
 /* ---- shared ---- */
 
 /* str and list both lead with their length */
