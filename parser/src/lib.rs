@@ -1978,6 +1978,45 @@ impl Parser {
                 if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
                     let ty = self.parse_type_name("")?;
                     self.expect(Token::LParen, &format!("after '{ty}' (cast)"))?;
+                    // `int()` / `int(x, base)` / `float()` need call-style args.
+                    // One positional and no keywords stays a Cast (existing path).
+                    if matches!(ty, TypeName::Int | TypeName::Float) {
+                        let (args, keywords, kwargs) = self.parse_call_args()?;
+                        let close = self.expect(Token::RParen, "after cast argument")?;
+                        if kwargs.is_some() {
+                            return Err(self.error(format!("{ty}() does not take **kwargs")));
+                        }
+                        let one_plain = keywords.is_empty()
+                            && args.len() == 1
+                            && matches!(args[0], PosArg::Pos(_));
+                        if one_plain {
+                            let PosArg::Pos(arg) = args.into_iter().next().unwrap() else {
+                                unreachable!()
+                            };
+                            return Ok(Expr {
+                                kind: ExprKind::Cast {
+                                    ty,
+                                    arg: Box::new(arg),
+                                },
+                                span: span.to(close),
+                            });
+                        }
+                        let func = match ty {
+                            TypeName::Int => "int",
+                            TypeName::Float => "float",
+                            _ => unreachable!(),
+                        };
+                        return Ok(Expr {
+                            kind: ExprKind::Call {
+                                func: func.to_string(),
+                                func_span: span,
+                                args,
+                                keywords,
+                                kwargs: None,
+                            },
+                            span: span.to(close),
+                        });
+                    }
                     let arg = self.parse_expr()?;
                     let close = self.expect(Token::RParen, "after cast argument")?;
                     Ok(Expr {
@@ -3898,6 +3937,33 @@ else:
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_int_float_zero_arg_and_base() {
+        let m = parse_ok("a = int()\nb = float()\nc = int(\"10\", 16)\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        assert!(matches!(
+            value.kind,
+            ExprKind::Call { ref func, .. } if func == "int"
+        ));
+        let StmtKind::Assign { value, .. } = &m.body[1].kind else {
+            panic!("expected Assign");
+        };
+        assert!(matches!(
+            value.kind,
+            ExprKind::Call { ref func, .. } if func == "float"
+        ));
+        let StmtKind::Assign { value, .. } = &m.body[2].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::Call { func, args, .. } = &value.kind else {
+            panic!("expected Call, got {:?}", value.kind);
+        };
+        assert_eq!(func, "int");
+        assert_eq!(args.len(), 2);
     }
 
     #[test]

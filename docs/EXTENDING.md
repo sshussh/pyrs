@@ -533,6 +533,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `Sum { list, start }` | `sum(list[int\|float][, start])` open-coded loop |
 | `MathCall { op, arg }` | `math.*` unary intrinsics (float; floor/ceil → int) |
 | Numeric / string casts / `ToBool` | `int`/`float`/`bool`/`str` and truthiness |
+| `StrToInt` / `StrToFloat` | `int(s[, base])` / `float(s)` via `pyrs_int_from_pystr` / `pyrs_float_from_pystr` |
 
 ### `StrFn` (current)
 

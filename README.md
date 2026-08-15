@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.57.0)
+## The language (v0.58.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.58.0**, not 1.0) until it is ready for
+milestone after this one is **0.59.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -161,6 +161,8 @@ A statically-typed Python subset:
   exponentiation (ints; negative exp is modular inverse).
   **v0.57:** `str.rsplit` and optional `maxsplit` on `split`/`rsplit`
   (`None` sep is whitespace; `maxsplit < 0` is unlimited).
+  **v0.58:** `int(s[, base])` and `float(s)` parse strings (CPython rules;
+  ASCII whitespace; `int` bases 0 and 2..=36; `float` accepts `inf`/`nan`).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -203,7 +205,8 @@ A statically-typed Python subset:
   `and`/`or`/`not`
   (short-circuit; `and`/`or` return an operand, not always `bool`, and
   may yield a union when operands differ, e.g. `0 or "x"`), casts
-  `int()`/`float()`/`bool()`/`str()`, `len()`, `abs()`, `round()`, `hex()`/`bin()`/`oct()`, `divmod()`, `pow()`, `min()`/`max()`
+  `int()`/`float()`/`bool()`/`str()` (including `int(s[, base])` / `float(s)`
+  from strings), `len()`, `abs()`, `round()`, `hex()`/`bin()`/`oct()`, `divmod()`, `pow()`, `min()`/`max()`
   (two-or-more numeric args, or one list: without `key=` only
   `list[int|float|bool]`; with monomorphic `key=` any `list[T]` or
   multi-arg homogeneous candidates),
@@ -331,7 +334,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.57.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.58.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -493,4 +496,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.57.0 && git push origin v0.57.0`.
+Release tags: `git tag v0.58.0 && git push origin v0.58.0`.

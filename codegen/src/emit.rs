@@ -410,6 +410,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | IntToFloat(operand)
         | BoolToInt(operand)
         | FloatToInt(operand)
+        | StrToFloat(operand)
         | IntToStr(operand)
         | FloatToStr(operand)
         | BoolToStr(operand)
@@ -446,6 +447,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         FormatValue { value, spec } => {
             max_try_depth_in_expr(value).max(max_try_depth_in_expr(spec))
         }
+        StrToInt { value, base } => max_try_depth_in_expr(value).max(max_try_depth_in_expr(base)),
         Sum { list, start } => max_try_depth_in_expr(list).max(max_try_depth_in_expr(start)),
         Round {
             value,
@@ -681,6 +683,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | IntToFloat(operand)
         | BoolToInt(operand)
         | FloatToInt(operand)
+        | StrToFloat(operand)
         | IntToStr(operand)
         | FloatToStr(operand)
         | BoolToStr(operand)
@@ -717,6 +720,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
             ndigits: Some(n),
         } => count_yields_in_expr(value) + count_yields_in_expr(n),
         FormatValue { value, spec } => count_yields_in_expr(value) + count_yields_in_expr(spec),
+        StrToInt { value, base } => count_yields_in_expr(value) + count_yields_in_expr(base),
         GeneratorNext { generator, send } => {
             count_yields_in_expr(generator) + count_yields_in_expr(send)
         }
@@ -1010,6 +1014,8 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_ipow(i64, i64)\n");
         out.push_str("declare i64 @pyrs_int_from_i64(i64)\n");
         out.push_str("declare i64 @pyrs_int_from_str(ptr, i64)\n");
+        out.push_str("declare i64 @pyrs_int_from_pystr(ptr, i64)\n");
+        out.push_str("declare double @pyrs_float_from_pystr(ptr)\n");
         out.push_str("declare i64 @pyrs_int_as_i64(i64)\n");
         out.push_str("declare double @pyrs_int_to_float(i64)\n");
         out.push_str("declare i64 @pyrs_int_from_float(double)\n");
@@ -4244,6 +4250,21 @@ impl Emitter {
                 let v = self.emit_expr(inner);
                 let t = self.tmp();
                 self.line(format!("{t} = call i64 @pyrs_int_from_float(double {v})"));
+                t
+            }
+            ExprKind::StrToInt { value, base } => {
+                let s = self.emit_expr(value);
+                let b = self.emit_expr(base);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i64 @pyrs_int_from_pystr(ptr {s}, i64 {b})"
+                ));
+                t
+            }
+            ExprKind::StrToFloat(inner) => {
+                let s = self.emit_expr(inner);
+                let t = self.tmp();
+                self.line(format!("{t} = call double @pyrs_float_from_pystr(ptr {s})"));
                 t
             }
             ExprKind::BoolToInt(inner) => {

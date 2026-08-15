@@ -833,8 +833,8 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |
 | `open(path[, mode])` | str path, mode "r"/"w"/"a" | file value with read/readline/readlines/write/close |
 | `sys.argv` | needs `import sys` | list[str]; `[0]` is the binary path |
-| `int(x)` | int, float (truncates toward zero), bool | int |
-| `float(x)` | int, float, bool | float |
+| `int(x[, base])` | int, float (truncates toward zero), bool; `str` (optional `base` 0 or 2..=36, positional or `base=`) | int; no-arg `int()` is `0`; string parse is CPython (sign, underscores, prefixes when base allows); ASCII whitespace only |
+| `float(x)` | int, float, bool, `str` | float; no-arg `float()` is `0.0`; string parse is CPython (`inf`/`nan`/scientific/underscores); ASCII whitespace only |
 | `bool(x)` | int, float, bool, str, list, tuple, dict, set | bool |
 | `str(x)` | int, float, bool, str | str |
 
@@ -1202,6 +1202,9 @@ pop the catch frame before leaving (CPython-compatible).
 | `FileNotFoundError: [Errno 2] ...` / `PermissionError` / `IsADirectoryError` | `open()` failures |
 | `ValueError: I/O operation on closed file.` | using a closed file |
 | `io.UnsupportedOperation: not readable` / `not writable` | wrong-mode file operations |
+| `ValueError: invalid literal for int() with base N: '…'` | `int(s)` / `int(s, base)` when `s` is not a valid integer literal |
+| `ValueError: int() base must be >= 2 and <= 36, or 0` | `int(s, base)` with a base outside `{0} ∪ {2..=36}` |
+| `ValueError: could not convert string to float: '…'` | `float(s)` when `s` is not a valid float literal |
 | `ValueError: cannot convert float NaN to integer` | `int(nan)` |
 | `OverflowError: cannot convert float infinity to integer` | `int(inf)` |
 | `ValueError: integer to a negative power...` | `x ** e` with a dynamic negative int `e` |
@@ -1275,7 +1278,8 @@ deliberate exceptions:
    (`UnboundLocalError` / `NameError`). Straight-line use-before-assignment
    is often caught at compile time.
 8. **str methods use ASCII rules** for case (`upper`/`lower`) and
-   whitespace (`strip`/`split`) — Python is Unicode-aware.
+   whitespace (`strip`/`split`) — Python is Unicode-aware. `int(s)` /
+   `float(s)` also strip **ASCII** whitespace only (same set as `strip`).
 9. **GC is nonmoving mark–sweep with conservative native roots.** Unreachable
    managed objects, including cycles, are reclaimed, but pointer-like values
    on the native stack can keep an object alive longer than necessary. The

@@ -18285,6 +18285,12 @@ fn lower_call(
     if kwargs.is_some() {
         return Err(err(format!("'{func}()' does not take **kwargs"), span));
     }
+    if func == "int" {
+        return lower_int_call(args, keywords, span, ctx);
+    }
+    if func == "float" {
+        return lower_float_call(args, keywords, span, ctx);
+    }
     // Builtin keywords we accept: enumerate/sum(start=), sorted/min/max(key=),
     // round(ndigits=).
     if !matches!(
@@ -21395,6 +21401,113 @@ fn lower_reversed_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SRes
     }
 }
 
+fn as_int_base(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
+    match value.ty {
+        ir::Ty::Bool => Ok(ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::BoolToInt(Box::new(value)),
+        }),
+        ir::Ty::Int => Ok(value),
+        other => Err(err(
+            format!("'{other}' object cannot be interpreted as an integer"),
+            span,
+        )),
+    }
+}
+
+/// `int()` / `int(x, base)` / `int(x, base=n)` — 1-arg form is a Cast.
+fn lower_int_call(
+    args: &[ast::PosArg],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let plain = require_plain_args(args, "int", span)?;
+    let mut base_kw = None;
+    for kw in keywords {
+        if kw.name == "base" {
+            if base_kw.is_some() {
+                return Err(err(
+                    "int() got multiple values for keyword argument 'base'",
+                    kw.name_span,
+                ));
+            }
+            base_kw = Some(kw);
+        } else {
+            return Err(err(
+                format!("int() got an unexpected keyword argument '{}'", kw.name),
+                kw.name_span,
+            ));
+        }
+    }
+    if plain.len() > 2 {
+        return Err(err(
+            format!("int expected at most 2 arguments, got {}", plain.len()),
+            span,
+        ));
+    }
+    if plain.len() == 2 && base_kw.is_some() {
+        return Err(err("int() takes at most 2 arguments (3 given)", span));
+    }
+    if plain.is_empty() {
+        if base_kw.is_some() {
+            return Err(err("int() missing string argument", span));
+        }
+        return Ok(int_const(0));
+    }
+    let value = lower_expr(plain[0], ctx)?;
+    let base_src = if plain.len() == 2 {
+        Some(plain[1])
+    } else {
+        base_kw.map(|kw| &kw.value)
+    };
+    if let Some(b) = base_src {
+        if value.ty != ir::Ty::Str {
+            return Err(err(
+                "int() can't convert non-string with explicit base",
+                plain[0].span,
+            ));
+        }
+        let base = lower_expr(b, ctx)?;
+        let base = as_int_base(base, b.span)?;
+        return Ok(ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::StrToInt {
+                value: Box::new(value),
+                base: Box::new(base),
+            },
+        });
+    }
+    lower_cast(ast::TypeName::Int, value, plain[0].span)
+}
+
+/// `float()` / extra-arity `float(...)` — 1-arg form is a Cast.
+fn lower_float_call(
+    args: &[ast::PosArg],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if let Some(kw) = keywords.first() {
+        return Err(err("float() takes no keyword arguments", kw.name_span));
+    }
+    let plain = require_plain_args(args, "float", span)?;
+    if plain.is_empty() {
+        return Ok(ir::Expr {
+            ty: ir::Ty::Float,
+            kind: ir::ExprKind::ConstFloat(0.0),
+        });
+    }
+    if plain.len() > 1 {
+        return Err(err(
+            format!("float expected at most 1 argument, got {}", plain.len()),
+            span,
+        ));
+    }
+    let value = lower_expr(plain[0], ctx)?;
+    lower_cast(ast::TypeName::Float, value, plain[0].span)
+}
+
 fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Expr> {
     match ty {
         ast::TypeName::Int => match value.ty {
@@ -21406,6 +21519,13 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             ir::Ty::Bool => Ok(ir::Expr {
                 ty: ir::Ty::Int,
                 kind: ir::ExprKind::BoolToInt(Box::new(value)),
+            }),
+            ir::Ty::Str => Ok(ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::StrToInt {
+                    value: Box::new(value),
+                    base: Box::new(int_const(10)),
+                },
             }),
             other => Err(err(format!("int() cannot convert {other}"), span)),
         },
@@ -21425,6 +21545,10 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
                     kind: ir::ExprKind::IntToFloat(Box::new(as_int)),
                 })
             }
+            ir::Ty::Str => Ok(ir::Expr {
+                ty: ir::Ty::Float,
+                kind: ir::ExprKind::StrToFloat(Box::new(value)),
+            }),
             other => Err(err(format!("float() cannot convert {other}"), span)),
         },
         ast::TypeName::Bool => match value.ty {
@@ -23631,6 +23755,52 @@ v = min(3, 1, 4, key=k)
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Int);
+    }
+
+    #[test]
+    fn int_float_from_str_lower() {
+        let m = analyze_ok("a = int(\"42\")\nb = float(\"1.5\")\nc = int(\"ff\", 16)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::StrToInt { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+        assert!(matches!(value.kind, ir::ExprKind::StrToFloat(_)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::StrToInt { .. }));
+    }
+
+    #[test]
+    fn int_zero_arg_is_zero() {
+        let m = analyze_ok("a = int()\nb = float()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(value.kind, ir::ExprKind::ConstInt(0)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(value.kind, ir::ExprKind::ConstFloat(_)));
+    }
+
+    #[test]
+    fn int_explicit_base_rejects_non_str() {
+        let e = analyze_err("print(int(3.5, 10))\n");
+        assert!(
+            e.message
+                .contains("can't convert non-string with explicit base"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

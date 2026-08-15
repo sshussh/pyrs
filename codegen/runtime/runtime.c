@@ -735,6 +735,308 @@ long long pyrs_int_from_str(const char *s, long long len) {
     return int_from_sign_limbs(sign, limbs, nlimbs);
 }
 
+PyrsStr *pyrs_str_repr(const PyrsStr *s);
+
+static int is_int_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
+static int int_digit_val(unsigned char c) {
+    if (c >= '0' && c <= '9') {
+        return (int)(c - '0');
+    }
+    if (c >= 'a' && c <= 'z') {
+        return (int)(c - 'a' + 10);
+    }
+    if (c >= 'A' && c <= 'Z') {
+        return (int)(c - 'A' + 10);
+    }
+    return -1;
+}
+
+static void die_invalid_int_literal(const PyrsStr *s, long long base) {
+    PyrsStr *r = pyrs_str_repr(s);
+    char head[96];
+    int hn = snprintf(head, sizeof head,
+                      "ValueError: invalid literal for int() with base %lld: ",
+                      base);
+    if (hn < 0) {
+        pyrs_die("ValueError: invalid literal for int()");
+    }
+    size_t n = (size_t)hn + (size_t)r->len + 1;
+    char *buf = xmalloc(n);
+    memcpy(buf, head, (size_t)hn);
+    memcpy(buf + hn, r->data, (size_t)r->len);
+    buf[hn + r->len] = '\0';
+    pyrs_die(buf);
+}
+
+/* CPython `int(s[, base])` for a PyrsStr. `base_tag` is a tagged PyRs int. */
+long long pyrs_int_from_pystr(const PyrsStr *s, long long base_tag) {
+    check_ref(s);
+    long long given_base;
+    if (pyrs_int_is_small(base_tag)) {
+        given_base = pyrs_int_small_val(base_tag);
+    } else {
+        pyrs_die("OverflowError: Python int too large to convert to C ssize_t");
+    }
+    if (given_base != 0 && (given_base < 2 || given_base > 36)) {
+        pyrs_die("ValueError: int() base must be >= 2 and <= 36, or 0");
+    }
+
+    const char *p = s->data;
+    long long n = s->len;
+    long long i = 0;
+    long long end = n;
+    while (i < end && is_int_space(p[i])) {
+        i++;
+    }
+    while (end > i && is_int_space(p[end - 1])) {
+        end--;
+    }
+    if (i >= end) {
+        die_invalid_int_literal(s, given_base);
+    }
+
+    int sign = 1;
+    if (p[i] == '+') {
+        i++;
+    } else if (p[i] == '-') {
+        sign = -1;
+        i++;
+    }
+    if (i >= end) {
+        die_invalid_int_literal(s, given_base);
+    }
+
+    int saw_prefix = 0;
+    long long effective = given_base;
+    if (end - i >= 2 && p[i] == '0') {
+        char k = p[i + 1];
+        int pref = 0;
+        if (k == 'x' || k == 'X') {
+            pref = 16;
+        } else if (k == 'b' || k == 'B') {
+            pref = 2;
+        } else if (k == 'o' || k == 'O') {
+            pref = 8;
+        }
+        if (pref && (given_base == 0 || given_base == pref)) {
+            effective = pref;
+            i += 2;
+            saw_prefix = 1;
+        }
+    }
+    if (given_base == 0 && !saw_prefix) {
+        effective = 10;
+        if (p[i] == '0') {
+            for (long long j = i + 1; j < end; j++) {
+                if (p[j] == '_') {
+                    continue;
+                }
+                if (p[j] != '0') {
+                    die_invalid_int_literal(s, given_base);
+                }
+            }
+        }
+    }
+    if (effective == 0) {
+        effective = 10;
+    }
+
+    unsigned long long *limbs = NULL;
+    long long nlimbs = 0;
+    long long cap = 0;
+    int got_digit = 0;
+    int last_us = 0;
+    int allow_us = saw_prefix;
+    for (; i < end; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (c == '_') {
+            if (last_us || (!got_digit && !allow_us)) {
+                free(limbs);
+                die_invalid_int_literal(s, given_base);
+            }
+            last_us = 1;
+            allow_us = 0;
+            continue;
+        }
+        allow_us = 0;
+        last_us = 0;
+        int d = int_digit_val(c);
+        if (d < 0 || (long long)d >= effective) {
+            free(limbs);
+            die_invalid_int_literal(s, given_base);
+        }
+        got_digit = 1;
+        unsigned long long carry = (unsigned long long)d;
+        for (long long k = 0; k < nlimbs; k++) {
+            __uint128_t prod =
+                (__uint128_t)limbs[k] * (unsigned long long)effective + carry;
+            limbs[k] = (unsigned long long)prod;
+            carry = (unsigned long long)(prod >> 64);
+        }
+        if (carry) {
+            if (nlimbs == cap) {
+                long long ncap = cap == 0 ? 2 : cap * 2;
+                unsigned long long *nl =
+                    xmalloc((size_t)ncap * sizeof(unsigned long long));
+                if (limbs) {
+                    memcpy(nl, limbs, (size_t)nlimbs * sizeof(unsigned long long));
+                    free(limbs);
+                }
+                limbs = nl;
+                cap = ncap;
+            }
+            limbs[nlimbs++] = carry;
+        }
+    }
+    if (last_us || !got_digit) {
+        free(limbs);
+        die_invalid_int_literal(s, given_base);
+    }
+    if (nlimbs == 0) {
+        free(limbs);
+        return pyrs_int_tag_small(0);
+    }
+    return int_from_sign_limbs(sign, limbs, nlimbs);
+}
+
+static void die_invalid_float_literal(const PyrsStr *s) {
+    PyrsStr *r = pyrs_str_repr(s);
+    const char *head = "ValueError: could not convert string to float: ";
+    size_t hn = strlen(head);
+    size_t n = hn + (size_t)r->len + 1;
+    char *buf = xmalloc(n);
+    memcpy(buf, head, hn);
+    memcpy(buf + hn, r->data, (size_t)r->len);
+    buf[hn + r->len] = '\0';
+    pyrs_die(buf);
+}
+
+static int ascii_ieq(const char *p, long long n, const char *lit) {
+    long long i = 0;
+    for (; lit[i] != '\0'; i++) {
+        if (i >= n) {
+            return 0;
+        }
+        char c = p[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c + 32);
+        }
+        char d = lit[i];
+        if (d >= 'A' && d <= 'Z') {
+            d = (char)(d + 32);
+        }
+        if (c != d) {
+            return 0;
+        }
+    }
+    return i == n;
+}
+
+static int is_dec_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static int float_syntax_ok(const char *b, long long n) {
+    long long j = 0;
+    int got_digit = 0;
+    while (j < n && is_dec_digit(b[j])) {
+        got_digit = 1;
+        j++;
+    }
+    if (j < n && b[j] == '.') {
+        j++;
+        while (j < n && is_dec_digit(b[j])) {
+            got_digit = 1;
+            j++;
+        }
+    }
+    if (!got_digit) {
+        return 0;
+    }
+    if (j < n && (b[j] == 'e' || b[j] == 'E')) {
+        j++;
+        if (j < n && (b[j] == '+' || b[j] == '-')) {
+            j++;
+        }
+        int exp_digit = 0;
+        while (j < n && is_dec_digit(b[j])) {
+            exp_digit = 1;
+            j++;
+        }
+        if (!exp_digit) {
+            return 0;
+        }
+    }
+    return j == n;
+}
+
+double pyrs_float_from_pystr(const PyrsStr *s) {
+    check_ref(s);
+    const char *p = s->data;
+    long long n = s->len;
+    long long i = 0;
+    long long end = n;
+    while (i < end && is_int_space(p[i])) {
+        i++;
+    }
+    while (end > i && is_int_space(p[end - 1])) {
+        end--;
+    }
+    if (i >= end) {
+        die_invalid_float_literal(s);
+    }
+    int sign = 1;
+    if (p[i] == '+') {
+        i++;
+    } else if (p[i] == '-') {
+        sign = -1;
+        i++;
+    }
+    if (i >= end) {
+        die_invalid_float_literal(s);
+    }
+    if (ascii_ieq(p + i, end - i, "inf") || ascii_ieq(p + i, end - i, "infinity")) {
+        return sign < 0 ? -INFINITY : INFINITY;
+    }
+    if (ascii_ieq(p + i, end - i, "nan")) {
+        return NAN;
+    }
+
+    char *buf = xmalloc((size_t)(end - i) + 1);
+    long long blen = 0;
+    for (long long j = i; j < end; j++) {
+        if (p[j] == '_') {
+            if (j == i || j + 1 >= end || !is_dec_digit(p[j - 1]) ||
+                !is_dec_digit(p[j + 1])) {
+                free(buf);
+                die_invalid_float_literal(s);
+            }
+            continue;
+        }
+        buf[blen++] = p[j];
+    }
+    buf[blen] = '\0';
+    if (!float_syntax_ok(buf, blen)) {
+        free(buf);
+        die_invalid_float_literal(s);
+    }
+    char *endp = NULL;
+    errno = 0;
+    double v = strtod(buf, &endp);
+    if (endp != buf + blen) {
+        free(buf);
+        die_invalid_float_literal(s);
+    }
+    free(buf);
+    if (sign < 0) {
+        v = -v;
+    }
+    return v;
+}
+
 long long pyrs_int_as_i64(long long t) {
     if (pyrs_int_is_small(t)) {
         return pyrs_int_small_val(t);

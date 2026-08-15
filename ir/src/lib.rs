@@ -1022,6 +1022,14 @@ pub enum ExprKind {
     FloatToInt(Box<Expr>),
     /// bool → int (zext)
     BoolToInt(Box<Expr>),
+    /// `int(s)` / `int(s, base)` — parse a string (CPython rules; ASCII ws).
+    /// `base` is a tagged int (0 or 2..=36); default for the 1-arg form is 10.
+    StrToInt {
+        value: Box<Expr>,
+        base: Box<Expr>,
+    },
+    /// `float(s)` — parse a string (CPython rules; ASCII ws; inf/nan/scientific).
+    StrToFloat(Box<Expr>),
     /// `str(x)` conversions
     IntToStr(Box<Expr>),
     FloatToStr(Box<Expr>),

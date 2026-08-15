@@ -1539,6 +1539,136 @@ print(hex(255) + bin(2))
 }
 
 #[test]
+fn int_float_from_str_match_python() {
+    let src = "\
+print(int(\"42\"), int(\"  42  \"), int(\"+42\"), int(\"-42\"))
+print(int(\"1_000\"), int(\"00042\"), int(\"0\"), int(\"  -0  \"))
+print(int(\"1_0_0\"), int(\"\\n42\\n\"), int(\"\\t-7\\t\"))
+print(int(\"10\", 2), int(\"ff\", 16), int(\"FF\", 16), int(\"z\", 36))
+print(int(\"0x10\", 16), int(\"0x10\", 0), int(\"0b101\", 0), int(\"0o17\", 0))
+print(int(\"10\", 0), int(\"-0x10\", 16), int(\"  -0b1010  \", 0))
+print(int(\"0x_10\", 16), int(\"0X10\", 0), int(\"0B101\", 2), int(\"0O17\", 8))
+print(int(\"+0x10\", 0), int(\"0x010\", 0), int(\"00\", 0), int(\"0_0\", 0))
+print(int(\"0b10\", 16), int(\"10\", False))
+print(int(), float())
+print(float(\"1.5\"), float(\"  -2.5  \"), float(\"1e3\"), float(\"1E-2\"))
+print(float(\".5\"), float(\"5.\"), float(\"+1.0\"), float(\"1_000.5\"))
+print(float(\"1.5e+2\"), float(\"-.5\"), float(\"1.\"), float(\"1_0e2\"))
+print(float(\"inf\"), float(\"-inf\"), float(\"INF\"), float(\"infinity\"))
+print(float(\"  inf  \"), float(\"+Infinity\"))
+print(float(\"NaN\"), float(\"+nan\"), float(\"-nan\"))
+print(int(\"9\" * 20))
+print(int(\"-\" + \"9\" * 20))
+print(int(\"10\", base=16))
+s = \"42\"
+print(int(s) + 1, float(s) + 0.5)
+";
+    let out = run_program("intfloatstr", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn int_float_from_str_errors_match_python() {
+    let cases = [
+        (
+            "int(\"\")\n",
+            "ValueError: invalid literal for int() with base 10: ''",
+        ),
+        (
+            "print(int(\"12a\"))\n",
+            "ValueError: invalid literal for int() with base 10: '12a'",
+        ),
+        (
+            "print(int(\"_1\"))\n",
+            "ValueError: invalid literal for int() with base 10: '_1'",
+        ),
+        (
+            "print(int(\"1_\"))\n",
+            "ValueError: invalid literal for int() with base 10: '1_'",
+        ),
+        (
+            "print(int(\"1__0\"))\n",
+            "ValueError: invalid literal for int() with base 10: '1__0'",
+        ),
+        (
+            "print(int(\"0x10\"))\n",
+            "ValueError: invalid literal for int() with base 10: '0x10'",
+        ),
+        (
+            "print(int(\"010\", 0))\n",
+            "ValueError: invalid literal for int() with base 0: '010'",
+        ),
+        (
+            "print(int(\"0x\", 16))\n",
+            "ValueError: invalid literal for int() with base 16: '0x'",
+        ),
+        (
+            "print(int(\"10\", 1))\n",
+            "ValueError: int() base must be >= 2 and <= 36, or 0",
+        ),
+        (
+            "print(int(\"10\", 37))\n",
+            "ValueError: int() base must be >= 2 and <= 36, or 0",
+        ),
+        (
+            "print(int(\"g\", 16))\n",
+            "ValueError: invalid literal for int() with base 16: 'g'",
+        ),
+        (
+            "print(float(\"\"))\n",
+            "ValueError: could not convert string to float: ''",
+        ),
+        (
+            "print(float(\"abc\"))\n",
+            "ValueError: could not convert string to float: 'abc'",
+        ),
+        (
+            "print(float(\".\"))\n",
+            "ValueError: could not convert string to float: '.'",
+        ),
+        (
+            "print(float(\"1e\"))\n",
+            "ValueError: could not convert string to float: '1e'",
+        ),
+        (
+            "print(float(\"1_.5\"))\n",
+            "ValueError: could not convert string to float: '1_.5'",
+        ),
+        (
+            "print(float(\"0x1.0p1\"))\n",
+            "ValueError: could not convert string to float: '0x1.0p1'",
+        ),
+    ];
+    for (i, (src, needle)) in cases.iter().enumerate() {
+        let (code, stderr) = run_program_expect_fail(&format!("intflerr{i}"), src);
+        assert_eq!(code, 1, "src={src:?} stderr={stderr}");
+        assert!(
+            stderr.contains(needle),
+            "src={src:?}\nwant {needle:?}\nstderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn int_explicit_base_on_non_str_is_compile_error() {
+    let (_, stderr) = run_program_expect_fail("intbaseflt", "print(int(3.5, 10))\n");
+    assert!(
+        stderr.contains("can't convert non-string with explicit base"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn hex_bin_oct_wrong_type_is_compile_error() {
     let (_, stderr) = run_program_expect_fail("hex_str", "print(hex(\"ff\"))\n");
     assert!(
