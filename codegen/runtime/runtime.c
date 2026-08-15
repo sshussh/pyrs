@@ -2229,6 +2229,30 @@ int pyrs_str_endswith(const PyrsStr *s, const PyrsStr *suf) {
            memcmp(s->data + s->len - suf->len, suf->data, (size_t)suf->len) == 0;
 }
 
+PyrsStr *pyrs_str_removeprefix(const PyrsStr *s, const PyrsStr *pre) {
+    check_ref(s);
+    check_ref(pre);
+    if (pre->len > 0 && pyrs_str_startswith(s, pre)) {
+        long long n = s->len - pre->len;
+        PyrsStr *r = str_alloc(n);
+        memcpy(r->data, s->data + pre->len, (size_t)n);
+        return r;
+    }
+    return (PyrsStr *)s;
+}
+
+PyrsStr *pyrs_str_removesuffix(const PyrsStr *s, const PyrsStr *suf) {
+    check_ref(s);
+    check_ref(suf);
+    if (suf->len > 0 && pyrs_str_endswith(s, suf)) {
+        long long n = s->len - suf->len;
+        PyrsStr *r = str_alloc(n);
+        memcpy(r->data, s->data, (size_t)n);
+        return r;
+    }
+    return (PyrsStr *)s;
+}
+
 /* first index of t in s, or -1; the empty needle is found at 0 */
 long long pyrs_str_find(const PyrsStr *s, const PyrsStr *t) {
     check_ref(s);

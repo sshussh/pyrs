@@ -393,6 +393,8 @@ String methods (ASCII case/whitespace rules):
 " \\t".isspace()          # True; same whitespace set as strip/split
 "ABC".isupper()           # True; "AbC" / digits-only are False
 "a1".islower()            # True if all letters are lower and >=1 letter
+"hello".removeprefix("he")  # "llo"; missing prefix is a no-op
+"hello".removesuffix("lo")  # "hel"; empty affix is a no-op
 ord("é")                  # 233 — Unicode code point
 chr(233)                  # "é"; chr(True) is "\x01"
 ```

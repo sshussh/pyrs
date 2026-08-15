@@ -3364,7 +3364,7 @@ fn collect_param_constraints_expr(
                         }
                     }
                     "upper" | "lower" | "strip" | "split" | "startswith" | "endswith" | "find"
-                    | "replace" | "join" => {
+                    | "replace" | "join" | "removeprefix" | "removesuffix" => {
                         out.push(ir::Ty::Str);
                     }
                     "keys" | "values" | "items" | "get" | "update" => {}
@@ -11147,13 +11147,16 @@ fn lower_str_method(
         "isspace" => (IsSpace, ir::Ty::Bool, 0),
         "isupper" => (IsUpper, ir::Ty::Bool, 0),
         "islower" => (IsLower, ir::Ty::Bool, 0),
+        "removeprefix" => (RemovePrefix, ir::Ty::Str, 1),
+        "removesuffix" => (RemoveSuffix, ir::Ty::Str, 1),
         _ => {
             return Err(err(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
                      upper, lower, strip, lstrip, rstrip, startswith, \
                      endswith, find, rfind, rindex, count, replace, split, \
-                     join, isdigit, isalpha, isspace, isupper, islower)"
+                     join, isdigit, isalpha, isspace, isupper, islower, \
+                     removeprefix, removesuffix)"
                 ),
                 method_span,
             ));
@@ -22807,6 +22810,23 @@ print(f())
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Bool);
+    }
+
+    #[test]
+    fn str_removeprefix_lowers() {
+        let m = analyze_ok("s = \"hello\".removeprefix(\"he\")\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::RemovePrefix,
+                ..
+            }
+        ));
     }
 
     #[test]

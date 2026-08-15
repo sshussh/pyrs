@@ -2282,6 +2282,39 @@ print(\", \".join(csv.split(\",\")))
 }
 
 #[test]
+fn str_removeprefix_removesuffix_match_python() {
+    let src = "\
+print(\"hello\".removeprefix(\"he\"), \"hello\".removeprefix(\"x\"), \"hello\".removeprefix(\"\"))
+print(\"hello\".removesuffix(\"lo\"), \"hello\".removesuffix(\"x\"), \"hello\".removesuffix(\"\"))
+print(\"aaa\".removeprefix(\"aa\"), \"aaa\".removesuffix(\"aa\"))
+print(\"http://x\".removeprefix(\"http://\").removesuffix(\".py\"))
+p = \"Test\"
+print(p.removeprefix(\"te\"), p.removeprefix(\"Te\"))
+";
+    let out = run_program("strrmpre", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn str_removeprefix_wrong_type_is_compile_error() {
+    let (_, stderr) = run_program_expect_fail("rmpre_int", "print(\"hello\".removeprefix(1))\n");
+    assert!(
+        stderr.contains("removeprefix") || stderr.contains("str"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn str_isdigit_matches_python() {
     let out = run_program(
         "isdigit",

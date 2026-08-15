@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.53.0)
+## The language (v0.54.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.54.0**, not 1.0) until it is ready for
+milestone after this one is **0.55.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -153,6 +153,8 @@ A statically-typed Python subset:
   stdout after writing; `False`/`0`/`None` no-op); `file=` still residual.
   **v0.53:** `dict.popitem()` — LIFO last-inserted `(k, v)` pair; empty dict
   raises `KeyError: 'popitem(): dictionary is empty'`.
+  **v0.54:** `str.removeprefix` / `str.removesuffix` — drop an exact prefix or
+  suffix when present (empty affix is a no-op).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -222,7 +224,7 @@ A statically-typed Python subset:
   iteration, `len()`, `str(x)` conversions, and methods: `upper` `lower`
   `strip` `lstrip` `rstrip` `startswith` `endswith` `find` `rfind`
   `rindex` `count` `replace` `split` `join` `isdigit` `isalpha`
-  `isspace` `isupper` `islower`
+  `isspace` `isupper` `islower` `removeprefix` `removesuffix`
 - **Lists:** homogeneous, growable; literals, comprehensions
   (`[x * x for x in xs if x > 0]`, multi-`for` / multi-`if`, unpack
   targets `[a+b for a, b in pairs]`; simple names use Python 3 scoping
@@ -322,7 +324,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.53.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.54.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -484,4 +486,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.53.0 && git push origin v0.53.0`.
+Release tags: `git tag v0.54.0 && git push origin v0.54.0`.

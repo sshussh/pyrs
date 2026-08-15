@@ -1351,6 +1351,9 @@ pub enum StrFn {
     IsUpper,
     /// `s.islower()` -> bool (ASCII: >=1 letter, all letters lower)
     IsLower,
+    /// `s.removeprefix(pre)` / `s.removesuffix(suf)` → str
+    RemovePrefix,
+    RemoveSuffix,
 }
 
 #[cfg(test)]

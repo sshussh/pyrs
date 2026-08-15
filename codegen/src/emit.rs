@@ -965,6 +965,8 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_str_isspace(ptr)\n");
         out.push_str("declare i32 @pyrs_str_isupper(ptr)\n");
         out.push_str("declare i32 @pyrs_str_islower(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_removeprefix(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_removesuffix(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_list_new(i64)\n");
         out.push_str("declare void @pyrs_list_push(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_list_concat(ptr, ptr)\n");
@@ -3694,6 +3696,8 @@ impl Emitter {
                     StrFn::IsSpace => ("pyrs_str_isspace", true, false),
                     StrFn::IsUpper => ("pyrs_str_isupper", true, false),
                     StrFn::IsLower => ("pyrs_str_islower", true, false),
+                    StrFn::RemovePrefix => ("pyrs_str_removeprefix", false, false),
+                    StrFn::RemoveSuffix => ("pyrs_str_removesuffix", false, false),
                 };
                 let args_str = vals
                     .iter()
