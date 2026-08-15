@@ -380,9 +380,11 @@ String methods (ASCII case/whitespace rules):
 "  hi  ".strip()          # also lstrip / rstrip
 "abc".upper()             # "ABC"; .lower() too
 "hello".startswith("he")  # True; .endswith too
-"banana".find("an")       # 1, or -1 when absent
+"banana".find("an")       # 1, or -1 when absent; optional start/end
+"banana".index("an")      # like find, but ValueError if missing
 "banana".rfind("an")      # 3 (last occurrence); "".rfind is -1; empty needle -> len
 "banana".rindex("an")     # like rfind, but ValueError if missing
+"banana".find("an", 2)    # 3; None start/end and negatives are CPython slice bounds
 "banana".count("an")      # 2 (non-overlapping)
 "banana".replace("an", "-")   # "b--a"
 "a,b,,c".split(",")       # ['a', 'b', '', 'c'] — keeps empty parts
@@ -1198,6 +1200,7 @@ pop the catch frame before leaving (CPython-compatible).
 | `ValueError: range() arg 3 must not be zero` | zero range step at runtime |
 | `ValueError: slice step cannot be zero` | zero slice step at runtime |
 | `ValueError: empty separator` | `s.split("")` |
+| `ValueError: substring not found` | `s.index` / `s.rindex` when the needle is absent in the slice |
 | `EOFError: EOF when reading a line` | `input()` at end of stdin |
 | `FileNotFoundError: [Errno 2] ...` / `PermissionError` / `IsADirectoryError` | `open()` failures |
 | `ValueError: I/O operation on closed file.` | using a closed file |

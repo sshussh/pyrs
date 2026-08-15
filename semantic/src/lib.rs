@@ -11115,9 +11115,18 @@ fn lower_str_method(
         "rstrip" => (Rstrip, ir::Ty::Str, 0),
         "startswith" => (StartsWith, ir::Ty::Bool, 1),
         "endswith" => (EndsWith, ir::Ty::Bool, 1),
-        "find" => (Find, ir::Ty::Int, 1),
-        "rfind" => (RFind, ir::Ty::Int, 1),
-        "rindex" => (RIndex, ir::Ty::Int, 1),
+        "find" => {
+            return lower_str_find_family("find", Find, base_ir, args, method_span, ctx);
+        }
+        "index" => {
+            return lower_str_find_family("index", Index, base_ir, args, method_span, ctx);
+        }
+        "rfind" => {
+            return lower_str_find_family("rfind", RFind, base_ir, args, method_span, ctx);
+        }
+        "rindex" => {
+            return lower_str_find_family("rindex", RIndex, base_ir, args, method_span, ctx);
+        }
         "count" => (Count, ir::Ty::Int, 1),
         "replace" => (Replace, ir::Ty::Str, 2),
         "split" => {
@@ -11170,7 +11179,7 @@ fn lower_str_method(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
                      upper, lower, strip, lstrip, rstrip, startswith, \
-                     endswith, find, rfind, rindex, count, replace, split, \
+                     endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
                      removeprefix, removesuffix, partition, rpartition, rsplit)"
                 ),
@@ -11211,6 +11220,67 @@ fn lower_str_method(
             args: call_args,
         },
     })
+}
+
+/// `s.find/index/rfind/rindex(sub[, start[, end]])` — CPython slice bounds.
+/// Missing `end` is `i64::MIN` (codegen/runtime treat it as `len(s)`).
+fn lower_str_find_family(
+    name: &str,
+    func: ir::StrFn,
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(err(
+            format!(
+                "{name}() takes from 1 to 3 positional arguments but {} were given",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+    let needle = lower_expr(&args[0], ctx)?;
+    if needle.ty != ir::Ty::Str {
+        return Err(err(
+            format!("{name}() argument 1 must be str, not {}", needle.ty),
+            args[0].span,
+        ));
+    }
+    let start = if args.len() >= 2 {
+        as_str_slice_bound(&args[1], ctx, 0)?
+    } else {
+        int_const(0)
+    };
+    let end = if args.len() >= 3 {
+        as_str_slice_bound(&args[2], ctx, i64::MIN)?
+    } else {
+        int_const(i64::MIN)
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::StrCall {
+            func,
+            args: vec![base_ir, needle, start, end],
+        },
+    })
+}
+
+fn as_str_slice_bound(arg: &ast::Expr, ctx: &mut FnCtx, none_as: i64) -> SResult<ir::Expr> {
+    let v = lower_expr(arg, ctx)?;
+    match v.ty {
+        ir::Ty::None => Ok(int_const(none_as)),
+        ir::Ty::Bool => Ok(ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::BoolToInt(Box::new(v)),
+        }),
+        ir::Ty::Int => Ok(v),
+        other => Err(err(
+            format!("'{other}' object cannot be interpreted as an integer"),
+            arg.span,
+        )),
+    }
 }
 
 fn lower_str_split_family(
@@ -23180,6 +23250,57 @@ print(f())
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn str_index_and_find_bounds_lower() {
+        let m = analyze_ok(
+            "a = \"banana\".index(\"an\")\n\
+             b = \"banana\".find(\"an\", 2)\n\
+             c = \"banana\".rindex(\"an\", 0, 5)\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::Index,
+                args,
+            } if args.len() == 4
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::Find,
+                args,
+            } if args.len() == 4
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::RIndex,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn str_find_rejects_non_int_start() {
+        let e = analyze_err("print(\"a\".find(\"a\", \"x\"))\n");
+        assert!(
+            e.message.contains("cannot be interpreted as an integer"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

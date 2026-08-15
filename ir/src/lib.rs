@@ -1339,11 +1339,13 @@ pub enum StrFn {
     /// `s.startswith(t)` / `s.endswith(t)` → bool
     StartsWith,
     EndsWith,
-    /// `s.find(t)` → int (-1 when absent)
+    /// `s.find(t[, start[, end]])` → int (-1 when absent)
     Find,
-    /// `s.rfind(t)` → int (-1 when absent; empty needle → `len(s)`)
+    /// `s.index(t[, start[, end]])` → int (ValueError when absent)
+    Index,
+    /// `s.rfind(t[, start[, end]])` → int (-1 when absent; empty needle → `len(s)`)
     RFind,
-    /// `s.rindex(t)` → int (traps with ValueError when absent)
+    /// `s.rindex(t[, start[, end]])` → int (traps with ValueError when absent)
     RIndex,
     /// `s.count(t)` → int (non-overlapping)
     Count,

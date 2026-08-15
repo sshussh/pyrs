@@ -2625,42 +2625,96 @@ PyrsStr *pyrs_str_removesuffix(const PyrsStr *s, const PyrsStr *suf) {
     return (PyrsStr *)s;
 }
 
-/* first index of t in s, or -1; the empty needle is found at 0 */
-long long pyrs_str_find(const PyrsStr *s, const PyrsStr *t) {
+/* Slice-adjust start/end like CPython. `end == LLONG_MIN` means missing → len. */
+static void str_adjust_bounds(long long len, long long *start, long long *end) {
+    long long s = *start;
+    long long e = *end;
+    if (s < 0) {
+        s += len;
+        if (s < 0) {
+            s = 0;
+        }
+    }
+    /* Do not clamp start > len — CPython then has start > end and returns -1
+     * (so "abc".find("", 4) is -1, not 3). */
+    if (e == LLONG_MIN) {
+        e = len;
+    } else if (e < 0) {
+        e += len;
+        if (e < 0) {
+            e = 0;
+        }
+    } else if (e > len) {
+        e = len;
+    }
+    *start = s;
+    *end = e;
+}
+
+static long long str_find_bounds(const PyrsStr *s, const PyrsStr *t, long long start,
+                                 long long end, int from_right) {
     check_ref(s);
     check_ref(t);
-    if (t->len > s->len) {
+    str_adjust_bounds(s->len, &start, &end);
+    if (start > end) {
         return -1;
     }
-    for (long long i = 0; i + t->len <= s->len; i++) {
+    if (t->len == 0) {
+        return from_right ? end : start;
+    }
+    if (t->len > end - start) {
+        return -1;
+    }
+    if (from_right) {
+        for (long long i = end - t->len; i >= start; i--) {
+            if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    for (long long i = start; i + t->len <= end; i++) {
         if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
             return i;
         }
     }
     return -1;
+}
+
+/* first index of t in s, or -1; the empty needle is found at 0 */
+long long pyrs_str_find(const PyrsStr *s, const PyrsStr *t) {
+    return str_find_bounds(s, t, 0, LLONG_MIN, 0);
 }
 
 /* last index of t in s, or -1; the empty needle is found at len(s) */
 long long pyrs_str_rfind(const PyrsStr *s, const PyrsStr *t) {
-    check_ref(s);
-    check_ref(t);
-    if (t->len > s->len) {
-        return -1;
-    }
-    if (t->len == 0) {
-        return s->len;
-    }
-    for (long long i = s->len - t->len; i >= 0; i--) {
-        if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
-            return i;
-        }
-    }
-    return -1;
+    return str_find_bounds(s, t, 0, LLONG_MIN, 1);
 }
 
-/* like rfind, but trap when absent (CPython: ValueError: substring not found) */
-long long pyrs_str_rindex(const PyrsStr *s, const PyrsStr *t) {
-    long long i = pyrs_str_rfind(s, t);
+long long pyrs_str_find_slice(const PyrsStr *s, const PyrsStr *t, long long start,
+                              long long end) {
+    return str_find_bounds(s, t, start, end, 0);
+}
+
+long long pyrs_str_rfind_slice(const PyrsStr *s, const PyrsStr *t, long long start,
+                               long long end) {
+    return str_find_bounds(s, t, start, end, 1);
+}
+
+/* like find, but trap when absent (CPython: ValueError: substring not found) */
+long long pyrs_str_index_of(const PyrsStr *s, const PyrsStr *t, long long start,
+                            long long end) {
+    long long i = str_find_bounds(s, t, start, end, 0);
+    if (i < 0) {
+        pyrs_die("ValueError: substring not found");
+    }
+    return i;
+}
+
+/* like rfind, but trap when absent */
+long long pyrs_str_rindex(const PyrsStr *s, const PyrsStr *t, long long start,
+                          long long end) {
+    long long i = str_find_bounds(s, t, start, end, 1);
     if (i < 0) {
         pyrs_die("ValueError: substring not found");
     }

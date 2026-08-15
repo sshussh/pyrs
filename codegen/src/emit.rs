@@ -964,7 +964,10 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_str_endswith(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_str_find(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_str_rfind(ptr, ptr)\n");
-        out.push_str("declare i64 @pyrs_str_rindex(ptr, ptr)\n");
+        out.push_str("declare i64 @pyrs_str_find_slice(ptr, ptr, i64, i64)\n");
+        out.push_str("declare i64 @pyrs_str_rfind_slice(ptr, ptr, i64, i64)\n");
+        out.push_str("declare i64 @pyrs_str_index_of(ptr, ptr, i64, i64)\n");
+        out.push_str("declare i64 @pyrs_str_rindex(ptr, ptr, i64, i64)\n");
         out.push_str("declare i64 @pyrs_str_count(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_replace(ptr, ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_split_ws(ptr, i64)\n");
@@ -3692,6 +3695,27 @@ impl Emitter {
             ExprKind::StrCall { func, args } => {
                 if matches!(
                     func,
+                    StrFn::Find | StrFn::Index | StrFn::RFind | StrFn::RIndex
+                ) {
+                    let s = self.emit_expr(&args[0]);
+                    let t = self.emit_expr(&args[1]);
+                    let start = self.emit_slice_bound(&args[2]);
+                    let end = self.emit_slice_bound(&args[3]);
+                    let callee = match func {
+                        StrFn::Find => "pyrs_str_find_slice",
+                        StrFn::Index => "pyrs_str_index_of",
+                        StrFn::RFind => "pyrs_str_rfind_slice",
+                        StrFn::RIndex => "pyrs_str_rindex",
+                        _ => unreachable!(),
+                    };
+                    let raw = self.tmp();
+                    self.line(format!(
+                        "{raw} = call i64 @{callee}(ptr {s}, ptr {t}, i64 {start}, i64 {end})"
+                    ));
+                    return self.emit_box_i64(&raw);
+                }
+                if matches!(
+                    func,
                     StrFn::Split | StrFn::SplitWs | StrFn::RSplit | StrFn::RSplitWs
                 ) {
                     let s = self.emit_expr(&args[0]);
@@ -3730,9 +3754,9 @@ impl Emitter {
                     StrFn::Rstrip => ("pyrs_str_rstrip", false, false),
                     StrFn::StartsWith => ("pyrs_str_startswith", true, false),
                     StrFn::EndsWith => ("pyrs_str_endswith", true, false),
-                    StrFn::Find => ("pyrs_str_find", false, true),
-                    StrFn::RFind => ("pyrs_str_rfind", false, true),
-                    StrFn::RIndex => ("pyrs_str_rindex", false, true),
+                    StrFn::Find | StrFn::Index | StrFn::RFind | StrFn::RIndex => {
+                        unreachable!("find family handled above")
+                    }
                     StrFn::Count => ("pyrs_str_count", false, true),
                     StrFn::Replace => ("pyrs_str_replace", false, false),
                     StrFn::SplitWs | StrFn::Split | StrFn::RSplitWs | StrFn::RSplit => {

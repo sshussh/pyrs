@@ -3253,6 +3253,51 @@ print(\"banana\".rindex(\"an\"))
 }
 
 #[test]
+fn str_index_and_find_bounds_match_python() {
+    let src = "\
+print(\"banana\".find(\"an\"), \"banana\".index(\"an\"), \"banana\".rfind(\"an\"), \"banana\".rindex(\"an\"))
+print(\"banana\".find(\"an\", 2), \"banana\".index(\"an\", 2), \"banana\".rfind(\"an\", 0, 4))
+print(\"banana\".find(\"an\", 2, 4), \"banana\".find(\"x\"), \"abc\".find(\"\"), \"abc\".rfind(\"\"))
+print(\"abc\".find(\"\", 1), \"abc\".find(\"\", 3), \"abc\".find(\"\", 4), \"abc\".rfind(\"\", 1, 2))
+print(\"abc\".find(\"\", 2, 1), \"banana\".find(\"an\", -5), \"banana\".find(\"an\", -2), \"banana\".find(\"an\", 100))
+print(\"banana\".find(\"an\", None), \"banana\".find(\"an\", None, None), \"banana\".find(\"an\", 0, None))
+print(\"\".find(\"\"), \"\".rfind(\"\"), \"\".find(\"a\"))
+print(\"aaa\".find(\"aa\"), \"aaa\".rfind(\"aa\"), \"aaa\".index(\"aa\", 1))
+s = \"hello world\"
+print(s.find(\"o\", 5), s.rindex(\"o\"), s.index(\"world\"))
+print(\"banana\".rindex(\"an\", 0, 5), \"banana\".index(\"a\", True))
+";
+    let out = run_program("strindex", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+
+    let (code, stderr) = run_program_expect_fail("index_miss", "print(\"banana\".index(\"x\"))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: substring not found"),
+        "stderr: {stderr}"
+    );
+    let (code, stderr) = run_program_expect_fail(
+        "index_bounds_miss",
+        "print(\"banana\".index(\"an\", 2, 4))\n",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: substring not found"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn str_isalpha_isspace_case_match_python_ascii() {
     // ASCII-only rules (documented); cases chosen to match CPython on ASCII.
     let out = run_program(
