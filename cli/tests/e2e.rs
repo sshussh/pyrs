@@ -1379,6 +1379,56 @@ fn ord_chr_wrong_type_is_compile_error() {
     );
 }
 
+#[test]
+fn hex_bin_oct_literals_match_python() {
+    let src = "\
+print(0x10, 0XFF, 0x_ff, 0b1010, 0B_101, 0o17, 0O_7)
+print(0x10FFFF, chr(0xE9), 0xFF & 0b1111)
+print(0x7FFFFFFFFFFFFFFF)
+print(0x8000000000000000)
+x = 0x10
+print(x + 0b10)
+match 16:
+    case 0x10:
+        print(\"hex\")
+";
+    let out = run_program("hexlit", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn invalid_prefixed_int_is_compile_error() {
+    for (tag, src, needle) in [
+        ("hex_empty", "print(0x)\n", "invalid hexadecimal literal"),
+        ("hex_bad", "print(0xg)\n", "invalid hexadecimal literal"),
+        ("bin_digit", "print(0b2)\n", "invalid binary literal"),
+        ("oct_digit", "print(0o8)\n", "invalid octal literal"),
+        ("hex_trail", "print(0xFF_)\n", "invalid hexadecimal literal"),
+    ] {
+        let dir = TempDir::new(tag);
+        let path = dir.0.join("prog.py");
+        fs::write(&path, src).unwrap();
+        let out = Command::new(PYRS)
+            .args(["compile", "-i"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{tag} compiled");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(needle), "{tag} stderr: {stderr}");
+    }
+}
+
 // ---- v0.3: slicing, in/not in, pop, f-strings ----
 
 #[test]

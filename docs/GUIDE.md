@@ -850,8 +850,9 @@ value = 1 + \
 
 Indentation defines blocks; spaces and tabs both work (a tab counts as 8
 columns) but inconsistent dedents are an error. Number literals accept
-underscores (`1_000_000`), floats accept `1.5`, `.5`, `2.`, `1e3`,
-`2.5e-2`.
+underscores (`1_000_000`), hex/bin/oct prefixes (`0x10FFFF`, `0b1010`,
+`0o17`, any case; `0x_ff` is fine, `0xFF_` is not), and floats
+`1.5`, `.5`, `2.`, `1e3`, `2.5e-2`.
 
 ### Files
 

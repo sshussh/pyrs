@@ -113,6 +113,74 @@ fn lex_triple(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
     None
 }
 
+/// Decode a `0x` / `0b` / `0o` literal to a decimal digit string (underscores
+/// stripped). `None` → invalid literal (CPython SyntaxError).
+fn lex_prefixed_int(lex: &mut logos::Lexer<Token>, radix: u32) -> Option<String> {
+    let rest = &lex.slice()[2..];
+    if rest.is_empty() || rest.ends_with('_') || rest.contains("__") {
+        return None;
+    }
+    let mut digits = String::with_capacity(rest.len());
+    for c in rest.chars() {
+        if c == '_' {
+            continue;
+        }
+        c.to_digit(radix)?;
+        digits.push(c);
+    }
+    if digits.is_empty() {
+        return None;
+    }
+    Some(digits_to_decimal(&digits, radix))
+}
+
+fn lex_hex(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    lex_prefixed_int(lex, 16)
+}
+
+fn invalid_int_prefix(slice: &str) -> Option<&'static str> {
+    let b = slice.as_bytes();
+    if b.len() < 2 || b[0] != b'0' {
+        return None;
+    }
+    match b[1] {
+        b'x' | b'X' => Some("hexadecimal"),
+        b'b' | b'B' => Some("binary"),
+        b'o' | b'O' => Some("octal"),
+        _ => None,
+    }
+}
+
+fn lex_bin(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    lex_prefixed_int(lex, 2)
+}
+
+fn lex_oct(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    lex_prefixed_int(lex, 8)
+}
+
+/// Schoolbook `acc = acc * radix + digit` over little-endian decimal digits.
+fn digits_to_decimal(digits: &str, radix: u32) -> String {
+    let mut acc: Vec<u8> = vec![0];
+    for c in digits.chars() {
+        let d = c.to_digit(radix).unwrap_or(0);
+        let mut carry = d;
+        for cell in &mut acc {
+            let v = u32::from(*cell) * radix + carry;
+            *cell = (v % 10) as u8;
+            carry = v / 10;
+        }
+        while carry > 0 {
+            acc.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    while acc.len() > 1 && acc.last() == Some(&0) {
+        acc.pop();
+    }
+    acc.iter().rev().map(|&d| char::from(b'0' + d)).collect()
+}
+
 /// After matching the opening `f"""` / `f'''`, scan for the matching
 /// closing triple quotes (same rules as plain triples), unescape the
 /// interior, and return content only (no leading `f`, no surrounding
@@ -231,7 +299,11 @@ pub enum Token {
     // Literals
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),
-    /// Decimal digits only (underscores stripped). May exceed i64.
+    /// Decimal digits only (underscores stripped; hex/bin/oct converted).
+    /// May exceed i64.
+    #[regex(r"0[xX][0-9a-zA-Z_]*", lex_hex)]
+    #[regex(r"0[bB][0-9a-zA-Z_]*", lex_bin)]
+    #[regex(r"0[oO][0-9a-zA-Z_]*", lex_oct)]
     #[regex(r"[0-9][0-9_]*", |lex| Some(lex.slice().replace('_', "")))]
     Intlit(String),
     #[regex(r"([0-9][0-9_]*\.[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?", |lex| lex.slice().replace('_', "").parse::<f64>().ok())]
@@ -624,6 +696,8 @@ impl<'a> Iterator for Lexer<'a> {
                         "unterminated triple-quoted f-string literal".to_string()
                     } else if slice.starts_with("\"\"\"") || slice.starts_with("'''") {
                         "unterminated triple-quoted string literal".to_string()
+                    } else if let Some(kind) = invalid_int_prefix(slice) {
+                        format!("invalid {kind} literal")
                     } else {
                         format!("unexpected character {:?}", slice)
                     };
@@ -776,6 +850,45 @@ mod test {
                 Token::EOF,
             ]
         );
+    }
+
+    #[test]
+    fn test_hex_bin_oct_literals() {
+        assert_eq!(
+            kinds("0x10 0XFF 0x_ff 0b1010 0B_101 0o17 0O_7"),
+            vec![
+                Token::Intlit("16".into()),
+                Token::Intlit("255".into()),
+                Token::Intlit("255".into()),
+                Token::Intlit("10".into()),
+                Token::Intlit("5".into()),
+                Token::Intlit("15".into()),
+                Token::Intlit("7".into()),
+                Token::EOF,
+            ]
+        );
+        assert_eq!(
+            kinds("0x10FFFF 0x8000000000000000"),
+            vec![
+                Token::Intlit("1114111".into()),
+                Token::Intlit("9223372036854775808".into()),
+                Token::EOF,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_invalid_prefixed_int_is_error() {
+        for src in [
+            "0x", "0xg", "0x10g", "0xFF_", "0x__FF", "0b", "0b2", "0o", "0o8", "0b101_",
+        ] {
+            let err = lex(src).expect_err(src);
+            assert!(
+                err.message.contains("invalid") && err.message.contains("literal"),
+                "{src}: {}",
+                err.message
+            );
+        }
     }
 
     #[test]

@@ -3270,6 +3270,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_hex_bin_oct_int_literals() {
+        let m = parse_ok("x = 0x10 + 0b1010 + 0o17\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        let ExprKind::Binary {
+            op: BinOp::Add,
+            right,
+            ..
+        } = &value.kind
+        else {
+            panic!("expected Add, got {:?}", value.kind);
+        };
+        assert!(matches!(right.kind, ExprKind::Int(15)));
+        let m = parse_ok("x = 0x8000000000000000\n");
+        let StmtKind::Assign { value, .. } = &m.body[0].kind else {
+            panic!("expected Assign");
+        };
+        assert!(matches!(&value.kind, ExprKind::IntDigits(s) if s == "9223372036854775808"));
+    }
+
+    #[test]
     fn parses_triple_quoted_string_literal() {
         let m = parse_ok("s = \"\"\"a\nb\"\"\"\n");
         let StmtKind::Assign { value, .. } = &m.body[0].kind else {
