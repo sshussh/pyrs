@@ -338,6 +338,17 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         Stmt::IndexDelete { base, index } => {
             max_try_depth_in_expr(base).max(max_try_depth_in_expr(index))
         }
+        Stmt::ListSliceAssign {
+            list,
+            lo,
+            hi,
+            step,
+            value,
+        } => max_try_depth_in_expr(list)
+            .max(max_try_depth_in_expr(lo))
+            .max(max_try_depth_in_expr(hi))
+            .max(max_try_depth_in_expr(step))
+            .max(max_try_depth_in_expr(value)),
         Stmt::ListAppend { list, value }
         | Stmt::ListAppendUnchecked { list, value }
         | Stmt::ListRemove { list, value }
@@ -591,6 +602,19 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
         }
         Stmt::ListExtend { list, other } => {
             count_yields_in_expr(list) + count_yields_in_expr(other)
+        }
+        Stmt::ListSliceAssign {
+            list,
+            lo,
+            hi,
+            step,
+            value,
+        } => {
+            count_yields_in_expr(list)
+                + count_yields_in_expr(lo)
+                + count_yields_in_expr(hi)
+                + count_yields_in_expr(step)
+                + count_yields_in_expr(value)
         }
         _ => 0,
     }
@@ -900,6 +924,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_list_copy(ptr)\n");
         out.push_str("declare ptr @pyrs_list_from_str(ptr)\n");
         out.push_str("declare ptr @pyrs_list_slice(ptr, i64, i64, i64)\n");
+        out.push_str("declare void @pyrs_list_set_slice(ptr, i64, i64, i64, ptr)\n");
         out.push_str("declare i32 @pyrs_list_contains(ptr, i64, i32)\n");
         out.push_str("declare i32 @pyrs_list_eq(ptr, ptr, i32)\n");
         out.push_str("declare i32 @pyrs_list_cmp(ptr, ptr, i32)\n");
@@ -2771,6 +2796,23 @@ impl Emitter {
                     }
                     other => unreachable!("IndexAssign on {other:?}"),
                 }
+            }
+            Stmt::ListSliceAssign {
+                list,
+                lo,
+                hi,
+                step,
+                value,
+            } => {
+                let l = self.emit_expr(list);
+                let lo_v = self.emit_slice_bound(lo);
+                let hi_v = self.emit_slice_bound(hi);
+                let step_t = self.emit_expr(step);
+                let step_v = self.emit_unbox_i64(&step_t);
+                let src = self.emit_expr(value);
+                self.line(format!(
+                    "call void @pyrs_list_set_slice(ptr {l}, i64 {lo_v}, i64 {hi_v}, i64 {step_v}, ptr {src})"
+                ));
             }
             Stmt::IndexDelete { base, index } => {
                 let b = self.emit_expr(base);

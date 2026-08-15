@@ -117,6 +117,7 @@ typedef struct {
 /* used by the str splitters before the list section defines them */
 PyrsList *pyrs_list_new(long long cap);
 void pyrs_list_push(PyrsList *l, long long slot);
+PyrsList *pyrs_list_copy(const PyrsList *src);
 
 /* ---- exceptions (setjmp/longjmp try frames) ----
  * Single-threaded process-global state (PyRs programs are not multi-threaded). */
@@ -3304,6 +3305,69 @@ PyrsList *pyrs_list_slice(const PyrsList *l, long long lo, long long hi, long lo
         r->len = n;
     }
     return r;
+}
+
+static void list_ensure_cap(PyrsList *l, long long need) {
+    if (need <= l->cap) {
+        return;
+    }
+    long long cap = l->cap < 4 ? 4 : l->cap;
+    while (cap < need) {
+        cap *= 2;
+    }
+    long long *data = xmalloc((size_t)cap * sizeof(long long));
+    pyrs_gc_external_allocated(l, (size_t)cap * sizeof(long long));
+    if (l->len > 0) {
+        memcpy(data, l->data, (size_t)l->len * sizeof(long long));
+    }
+    pyrs_gc_external_freed(l, (size_t)l->cap * sizeof(long long));
+    free(l->data);
+    l->data = data;
+    l->cap = cap;
+}
+
+/* CPython list slice assignment. `src` is the replacement sequence. */
+void pyrs_list_set_slice(PyrsList *dst, long long lo, long long hi, long long step,
+                         const PyrsList *src) {
+    check_ref(dst);
+    check_ref(src);
+    if (step == 0) {
+        pyrs_die("ValueError: slice step cannot be zero");
+    }
+    PyrsList *owned = NULL;
+    if (dst == src) {
+        owned = pyrs_list_copy(src);
+        src = owned;
+    }
+    long long start = resolve_slice_bound(lo, 1, dst->len, step);
+    long long stop = resolve_slice_bound(hi, 0, dst->len, step);
+    long long nrepl = slice_count(start, stop, step);
+    long long nsrc = src->len;
+    if (step != 1) {
+        if (nsrc != nrepl) {
+            char buf[128];
+            snprintf(buf, sizeof buf,
+                     "ValueError: attempt to assign sequence of size %lld to "
+                     "extended slice of size %lld",
+                     nsrc, nrepl);
+            pyrs_die(buf);
+        }
+        for (long long i = 0; i < nsrc; i++) {
+            dst->data[start + i * step] = src->data[i];
+        }
+        return;
+    }
+    long long tail = start + nrepl;
+    long long new_len = dst->len - nrepl + nsrc;
+    list_ensure_cap(dst, new_len);
+    if (nsrc != nrepl && tail < dst->len) {
+        memmove(&dst->data[start + nsrc], &dst->data[tail],
+                (size_t)(dst->len - tail) * sizeof(long long));
+    }
+    if (nsrc > 0) {
+        memcpy(&dst->data[start], src->data, (size_t)nsrc * sizeof(long long));
+    }
+    dst->len = new_len;
 }
 
 /* element tags match codegen: 0=int 1=float 2=bool 3=str;

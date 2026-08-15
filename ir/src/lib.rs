@@ -534,6 +534,15 @@ pub enum Stmt {
         base: Expr,
         index: Expr,
     },
+    /// `list[lo:hi:step] = other` — CPython slice assignment; `other` is a
+    /// same-element list. Missing bounds are `i64::MIN`; missing step is 1.
+    ListSliceAssign {
+        list: Expr,
+        lo: Box<Expr>,
+        hi: Box<Expr>,
+        step: Box<Expr>,
+        value: Box<Expr>,
+    },
     /// `list.append(value)`
     ListAppend {
         list: Expr,

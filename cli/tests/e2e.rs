@@ -1453,6 +1453,71 @@ print(ys)
 }
 
 #[test]
+fn list_slice_assign_matches_python() {
+    let src = "\
+xs = [1, 2, 3, 4]
+xs[1:3] = [9]
+print(xs)
+xs = [1, 2, 3, 4]
+xs[1:3] = [8, 7, 6]
+print(xs)
+xs = [1, 2, 3, 4]
+xs[1:1] = [9]
+print(xs)
+xs = [1, 2, 3, 4]
+empty: list[int] = []
+xs[1:3] = empty
+print(xs)
+xs = [1, 2, 3, 4]
+xs[:] = [9, 8]
+print(xs)
+xs = [1, 2, 3, 4]
+xs[::2] = [9, 8]
+print(xs)
+xs = [1, 2, 3, 4]
+xs[::-1] = [4, 3, 2, 1]
+print(xs)
+xs = [1, 2, 3]
+xs[:] = xs
+print(xs)
+xs = [1, 2, 3, 4]
+del xs[1:3]
+print(xs)
+xs = [1, 2, 3, 4]
+xs[-2:] = [9]
+print(xs)
+xs = [1, 2, 3, 4]
+xs[3:1] = [9]
+print(xs)
+";
+    let out = run_program("list_slice_asgn", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn list_slice_assign_extended_size_error() {
+    let (code, stderr) =
+        run_program_expect_fail("list_slice_ext", "xs = [1, 2, 3, 4]\nxs[::2] = [9]\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(
+            "ValueError: attempt to assign sequence of size 1 to extended slice of size 2"
+        ),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn list_del_oob_matches_python() {
     let (code, stderr) = run_program_expect_fail("list_del_oob", "xs = [1, 2]\ndel xs[5]\n");
     assert_eq!(code, 1);

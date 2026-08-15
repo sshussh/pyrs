@@ -995,7 +995,9 @@ fn collect_bound_names(target: &ast::AssignTarget, names: &mut HashSet<String>) 
         ast::AssignTarget::Name { name, .. } => {
             names.insert(name.clone());
         }
-        ast::AssignTarget::Index { .. } | ast::AssignTarget::Attr { .. } => {}
+        ast::AssignTarget::Index { .. }
+        | ast::AssignTarget::Slice { .. }
+        | ast::AssignTarget::Attr { .. } => {}
         ast::AssignTarget::Tuple(items) => {
             for t in items {
                 collect_bound_names(t, names);

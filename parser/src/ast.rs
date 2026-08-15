@@ -222,6 +222,13 @@ pub enum AssignTarget {
         base: Expr,
         index: Expr,
     },
+    /// `base[lo:hi:step] = ...` — any part of the slice may be omitted.
+    Slice {
+        base: Expr,
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+    },
     /// `a, b = ...` / nested unpacking targets.
     Tuple(Vec<AssignTarget>),
     /// `*rest` in unpacking (`a, *rest, b = xs`). At most one per tuple level.

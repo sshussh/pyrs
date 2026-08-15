@@ -4608,7 +4608,9 @@ fn collect_assign_names(target: &ast::AssignTarget, names: &mut std::collections
         ast::AssignTarget::Name { name, .. } => {
             names.insert(name.clone());
         }
-        ast::AssignTarget::Index { .. } | ast::AssignTarget::Attr { .. } => {}
+        ast::AssignTarget::Index { .. }
+        | ast::AssignTarget::Slice { .. }
+        | ast::AssignTarget::Attr { .. } => {}
         ast::AssignTarget::Tuple(items) => {
             for t in items {
                 collect_assign_names(t, names);
@@ -7314,6 +7316,20 @@ fn collect_cell_candidates_in_target(t: &ast::AssignTarget, out: &mut HashSet<St
             collect_cell_candidates_in_expr(base, out);
             collect_cell_candidates_in_expr(index, out);
         }
+        ast::AssignTarget::Slice {
+            base, lo, hi, step, ..
+        } => {
+            collect_cell_candidates_in_expr(base, out);
+            if let Some(e) = lo {
+                collect_cell_candidates_in_expr(e, out);
+            }
+            if let Some(e) = hi {
+                collect_cell_candidates_in_expr(e, out);
+            }
+            if let Some(e) = step {
+                collect_cell_candidates_in_expr(e, out);
+            }
+        }
         ast::AssignTarget::Attr { base, .. } => {
             collect_cell_candidates_in_expr(base, out);
         }
@@ -7623,7 +7639,9 @@ fn assigned_names_in_target(t: &ast::AssignTarget, out: &mut HashSet<String>) {
         ast::AssignTarget::Name { name, .. } => {
             out.insert(name.clone());
         }
-        ast::AssignTarget::Index { .. } | ast::AssignTarget::Attr { .. } => {}
+        ast::AssignTarget::Index { .. }
+        | ast::AssignTarget::Slice { .. }
+        | ast::AssignTarget::Attr { .. } => {}
         ast::AssignTarget::Tuple(ts) => {
             for t in ts {
                 assigned_names_in_target(t, out);
@@ -7931,6 +7949,20 @@ fn collect_used_names_in_target_read(t: &ast::AssignTarget, out: &mut HashSet<St
         ast::AssignTarget::Index { base, index } => {
             collect_used_names_in_expr(base, out);
             collect_used_names_in_expr(index, out);
+        }
+        ast::AssignTarget::Slice {
+            base, lo, hi, step, ..
+        } => {
+            collect_used_names_in_expr(base, out);
+            if let Some(e) = lo {
+                collect_used_names_in_expr(e, out);
+            }
+            if let Some(e) = hi {
+                collect_used_names_in_expr(e, out);
+            }
+            if let Some(e) = step {
+                collect_used_names_in_expr(e, out);
+            }
         }
         ast::AssignTarget::Attr { base, .. } => {
             collect_used_names_in_expr(base, out);
@@ -11174,6 +11206,53 @@ fn lower_assign_ir(
             });
             Ok(())
         }
+        ast::AssignTarget::Slice {
+            base, lo, hi, step, ..
+        } => {
+            if ann_ty.is_some() {
+                return Err(err(
+                    "type annotations are only allowed on plain variable names",
+                    value_span,
+                ));
+            }
+            let base_ir = lower_expr(base, ctx)?;
+            let ir::Ty::List(elem) = base_ir.ty else {
+                return Err(err(
+                    format!(
+                        "slice assignment is only supported on lists, found {}",
+                        base_ir.ty
+                    ),
+                    base.span,
+                ));
+            };
+            let (lo_ir, hi_ir, step_ir) =
+                lower_slice_bounds(lo.as_deref(), hi.as_deref(), step.as_deref(), ctx)?;
+            let value_ir = match value_ir.ty {
+                ir::Ty::List(other) if *other == *elem || *other == ir::Ty::Any => value_ir,
+                ir::Ty::List(other) => {
+                    return Err(err(
+                        format!(
+                            "slice assignment element type mismatch: expected list[{elem}], found list[{other}]"
+                        ),
+                        value_span,
+                    ));
+                }
+                other => {
+                    return Err(err(
+                        format!("slice assignment currently requires a list, found {other}"),
+                        value_span,
+                    ));
+                }
+            };
+            out.push(ir::Stmt::ListSliceAssign {
+                list: base_ir,
+                lo: Box::new(lo_ir),
+                hi: Box::new(hi_ir),
+                step: Box::new(step_ir),
+                value: Box::new(value_ir),
+            });
+            Ok(())
+        }
         ast::AssignTarget::Tuple(targets) => {
             if ann_ty.is_some() {
                 return Err(err(
@@ -11267,17 +11346,82 @@ fn lower_delete(
                 }
                 other => Err(err(
                     format!(
-                        "'del' on '{other}' is not supported yet (only list indices and dict keys)"
+                        "'del' on '{other}' is not supported yet (only list indices, slices, and dict keys)"
                     ),
                     span,
                 )),
             }
         }
+        ast::AssignTarget::Slice {
+            base, lo, hi, step, ..
+        } => {
+            let base_ir = lower_expr(base, ctx)?;
+            let ir::Ty::List(elem) = base_ir.ty else {
+                return Err(err(
+                    format!(
+                        "'del' slice is only supported on lists, found {}",
+                        base_ir.ty
+                    ),
+                    span,
+                ));
+            };
+            let (lo_ir, hi_ir, step_ir) =
+                lower_slice_bounds(lo.as_deref(), hi.as_deref(), step.as_deref(), ctx)?;
+            let empty = ir::Expr {
+                ty: ir::list_of(*elem),
+                kind: ir::ExprKind::ListNew {
+                    cap: Box::new(int_const(0)),
+                },
+            };
+            out.push(ir::Stmt::ListSliceAssign {
+                list: base_ir,
+                lo: Box::new(lo_ir),
+                hi: Box::new(hi_ir),
+                step: Box::new(step_ir),
+                value: Box::new(empty),
+            });
+            Ok(())
+        }
         _ => Err(err(
-            "'del' only supports list index and dict item deletion (del xs[i] / del d[key]) for now",
+            "'del' only supports list index/slice and dict item deletion \
+             (del xs[i] / del xs[i:j] / del d[key]) for now",
             span,
         )),
     }
+}
+
+fn lower_slice_bounds(
+    lo: Option<&ast::Expr>,
+    hi: Option<&ast::Expr>,
+    step: Option<&ast::Expr>,
+    ctx: &mut FnCtx,
+) -> SResult<(ir::Expr, ir::Expr, ir::Expr)> {
+    let lo_ir = match lo {
+        Some(e) => {
+            let v = lower_expr(e, ctx)?;
+            coerce(v, ir::Ty::Int, e.span, "slice bound")?
+        }
+        None => int_const(i64::MIN),
+    };
+    let hi_ir = match hi {
+        Some(e) => {
+            let v = lower_expr(e, ctx)?;
+            coerce(v, ir::Ty::Int, e.span, "slice bound")?
+        }
+        None => int_const(i64::MIN),
+    };
+    let step_ir = match step {
+        Some(e) => {
+            let v = lower_expr(e, ctx)?;
+            let v = coerce(v, ir::Ty::Int, e.span, "slice step")?;
+            if matches!(v.kind, ir::ExprKind::ConstInt(0)) {
+                return Err(err("slice step cannot be zero", e.span));
+            }
+            v
+        }
+        None => int_const(1),
+    };
+    Ok((lo_ir, hi_ir, step_ir))
 }
 
 /// Unpack `value` into `targets` (tuple/list RHS). Supports a single `*rest`.
@@ -11880,6 +12024,10 @@ fn lower_aug_assign(
             });
             Ok(())
         }
+        ast::AssignTarget::Slice { .. } => Err(err(
+            "augmented assignment to a slice is not supported yet",
+            span,
+        )),
         ast::AssignTarget::Tuple(_) | ast::AssignTarget::Starred { .. } => Err(err(
             "augmented assignment to a tuple is not supported",
             span,
@@ -11893,6 +12041,14 @@ fn assign_target_span(target: &ast::AssignTarget) -> Span {
     match target {
         ast::AssignTarget::Name { span, .. } => *span,
         ast::AssignTarget::Index { base, index } => base.span.to(index.span),
+        ast::AssignTarget::Slice { base, hi, step, .. } => {
+            let end = step
+                .as_ref()
+                .or(hi.as_ref())
+                .map(|e| e.span)
+                .unwrap_or(base.span);
+            base.span.to(end)
+        }
         ast::AssignTarget::Starred { span, .. } => *span,
         ast::AssignTarget::Attr {
             base, attr_span, ..
@@ -14580,33 +14736,8 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     return Err(err(format!("'{other}' object cannot be sliced"), base.span));
                 }
             };
-            // missing bounds are i64::MIN sentinels: their meaning depends
-            // on the step's sign, resolved by the runtime like CPython
-            let lo_ir = match lo {
-                Some(e) => {
-                    let v = lower_expr(e, ctx)?;
-                    coerce(v, ir::Ty::Int, e.span, "slice bound")?
-                }
-                Option::None => int_const(i64::MIN),
-            };
-            let hi_ir = match hi {
-                Some(e) => {
-                    let v = lower_expr(e, ctx)?;
-                    coerce(v, ir::Ty::Int, e.span, "slice bound")?
-                }
-                Option::None => int_const(i64::MIN),
-            };
-            let step_ir = match step {
-                Some(e) => {
-                    let v = lower_expr(e, ctx)?;
-                    let v = coerce(v, ir::Ty::Int, e.span, "slice step")?;
-                    if matches!(v.kind, ir::ExprKind::ConstInt(0)) {
-                        return Err(err("slice step cannot be zero", e.span));
-                    }
-                    v
-                }
-                Option::None => int_const(1),
-            };
+            let (lo_ir, hi_ir, step_ir) =
+                lower_slice_bounds(lo.as_deref(), hi.as_deref(), step.as_deref(), ctx)?;
             Ok(ir::Expr {
                 ty,
                 kind: ir::ExprKind::Slice {
@@ -22543,6 +22674,30 @@ print(f(B()))
         let m = analyze_ok("xs = [1, 2, 3]\ndel xs[1]\n");
         let entry = find_func(&m, ENTRY_NAME);
         assert!(matches!(entry.body[1], ir::Stmt::IndexDelete { .. }));
+    }
+
+    #[test]
+    fn list_slice_assign_lowers() {
+        let m = analyze_ok("xs = [1, 2, 3, 4]\nxs[1:3] = [9]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(matches!(entry.body[1], ir::Stmt::ListSliceAssign { .. }));
+    }
+
+    #[test]
+    fn list_slice_del_lowers() {
+        let m = analyze_ok("xs = [1, 2, 3]\ndel xs[1:2]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(matches!(entry.body[1], ir::Stmt::ListSliceAssign { .. }));
+    }
+
+    #[test]
+    fn list_slice_assign_rejects_str() {
+        let e = analyze_err("xs = [1, 2, 3]\nxs[1:2] = \"a\"\n");
+        assert!(
+            e.message.contains("slice assignment") && e.message.contains("str"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

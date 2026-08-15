@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.42.0)
+## The language (v0.43.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.43.0**, not 1.0) until it is ready for
+milestone after this one is **0.44.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -129,6 +129,8 @@ A statically-typed Python subset:
   `IndexError` as list assignment).
   **v0.42:** class `==` / `!=` — `__eq__` when defined (virtual), else
   pointer identity; ordering still residual.
+  **v0.43:** list slice assignment `xs[lo:hi:step] = ys` and `del xs[lo:hi]`
+  (same-elem list RHS; extended slices require matching length).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -154,7 +156,7 @@ A statically-typed Python subset:
   sets / generators (including unpack targets `for a, b in xs` and
   `for a, *rest in xs`), `break`/`continue`, assignments (plain, annotated,
   multi-target, unpacking `a, b = t`, augmented — including
-  `xs[i] += v` and `s |= t` for sets), `del xs[i]` / `del d[k]`, `return`, `pass`,
+  `xs[i] += v` and `s |= t` for sets), `del xs[i]` / `del xs[i:j]` / `del d[k]`, `return`, `pass`,
   `raise ExcType("msg")`, `assert test` / `assert test, msg`
   (`AssertionError`), `try`/`except`/`except (A, B)`/`else`/`finally`
   (including inside generators),
@@ -203,7 +205,8 @@ A statically-typed Python subset:
   targets `[a+b for a, b in pairs]`; simple names use Python 3 scoping
   and do not leak — and faster than the equivalent loop when length is
   knowable: results are pre-sized and appends inlined),
-  indexing (read/write), `del xs[i]`, slicing (copies, like Python),
+  indexing (read/write), `del xs[i]` / `del xs[i:j]`, slicing (copies, like Python),
+  slice assignment `xs[i:j] = ys` / `xs[::2] = ys` (same-elem list),
   `append`/`pop`/`insert`/`remove`/`index`/`count`/`clear`/`reverse`/`sort`/`extend`/`copy` (homogeneous
   list arg), `list(iterable)`, `sorted(xs)` / `sorted(xs, key=f)` /
   `sorted(xs, reverse=…)` / `sorted(xs, key=f, reverse=…)`,
@@ -293,7 +296,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.42.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.43.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -453,4 +456,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.42.0 && git push origin v0.42.0`.
+Release tags: `git tag v0.43.0 && git push origin v0.43.0`.

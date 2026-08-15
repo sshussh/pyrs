@@ -477,6 +477,7 @@ Operations:
 xs[0] = 10                  # element write
 print(xs[-1])               # negative indexing
 del xs[1]                   # delete by index (negative OK)
+xs[1:3] = [9]               # slice assignment (length may change)
 xs.append(4)                # grow
 last = xs.pop()             # remove & return last
 first = xs.pop(0)           # or by index (negative OK)
@@ -556,7 +557,11 @@ comparisons (`<` / `<=` / `>` / `>=`), `min` / `max`, and
 `sorted` / `list.sort` work on lists of orderable elements, including
 nested orderable lists.
 
-Not supported yet: slice assignment.
+Slice assignment `xs[lo:hi] = ys` (and `del xs[lo:hi]`) replaces a
+contiguous range; length may change. Extended slices (`xs[::2] = ys`)
+require `len(ys)` to match the slice, like CPython. RHS must be a list
+of the same element type (empty `[]` is allowed). Augmented assignment
+to a slice is not supported yet.
 
 ### Control flow
 

@@ -533,6 +533,12 @@ impl Parser {
                 base: *base,
                 index: *index,
             }),
+            ExprKind::Slice { base, lo, hi, step } => Ok(AssignTarget::Slice {
+                base: *base,
+                lo,
+                hi,
+                step,
+            }),
             ExprKind::TupleLit(items) => {
                 if items.is_empty() {
                     return Err(Diagnostic::new(
@@ -2686,6 +2692,14 @@ fn target_span(target: &AssignTarget) -> Span {
     match target {
         AssignTarget::Name { span, .. } => *span,
         AssignTarget::Index { base, index } => base.span.to(index.span),
+        AssignTarget::Slice { base, hi, step, .. } => {
+            let end = step
+                .as_ref()
+                .or(hi.as_ref())
+                .map(|e| e.span)
+                .unwrap_or(base.span);
+            base.span.to(end)
+        }
         AssignTarget::Starred { span, .. } => *span,
         AssignTarget::Attr {
             base, attr_span, ..
@@ -2707,6 +2721,20 @@ fn rebase_target_spans(target: &mut AssignTarget, span: Span) {
         AssignTarget::Index { base, index } => {
             rebase_spans(base, span);
             rebase_spans(index, span);
+        }
+        AssignTarget::Slice {
+            base, lo, hi, step, ..
+        } => {
+            rebase_spans(base, span);
+            if let Some(e) = lo {
+                rebase_spans(e, span);
+            }
+            if let Some(e) = hi {
+                rebase_spans(e, span);
+            }
+            if let Some(e) = step {
+                rebase_spans(e, span);
+            }
         }
         AssignTarget::Starred { target, span: s } => {
             *s = span;
@@ -3713,6 +3741,21 @@ else:
             panic!("expected Assign");
         };
         assert!(matches!(targets.as_slice(), [AssignTarget::Index { .. }]));
+    }
+
+    #[test]
+    fn parses_slice_assignment() {
+        let m = parse_ok("xs[1:3] = ys\nxs[:] = []\nxs[::2] = zs\n");
+        for stmt in &m.body {
+            let StmtKind::Assign { targets, .. } = &stmt.kind else {
+                panic!("expected Assign");
+            };
+            assert!(
+                matches!(targets.as_slice(), [AssignTarget::Slice { .. }]),
+                "{:?}",
+                targets
+            );
+        }
     }
 
     #[test]
