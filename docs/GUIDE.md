@@ -798,9 +798,14 @@ print(isinstance(d, Animal))  # True
 - **`__contains__`** for user-class `in` / `not in`
 - **`==` / `!=`:** if the left class (or a parent) defines `__eq__`, that
   method is called (virtual); otherwise comparison is pointer identity
-  (CPython default). Ordering (`<` / `<=` / `>` / `>=`) is still
-  unsupported. `list[C] == list[C]` still uses identity of elements even
-  when `C` defines `__eq__`
+  (CPython default). `list[C] == list[C]` still uses identity of elements
+  even when `C` defines `__eq__`
+- **Ordering (`<` / `<=` / `>` / `>=`):** if the left class (or a parent)
+  defines the matching dunder (`__lt__` / `__le__` / `__gt__` / `__ge__`),
+  that method is called (virtual). There is no identity fallback and no
+  reflected swap (`b.__gt__(a)` when `a.__lt__` is missing). Non-bool
+  returns are coerced with the same truthiness as `__eq__`. `sorted` /
+  `min` / `max` of class instances remain residual
 - **Class `with`**: `__enter__` / `__exit__` — success path
   `__exit__(None, None, None)`; exception path `__exit__(None, exc, None)`
   (type and traceback args stay `None`); truthy `__exit__` return **suppresses**

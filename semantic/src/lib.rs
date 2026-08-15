@@ -23018,7 +23018,7 @@ fn lower_binary(
     if matches!(l.ty, ir::Ty::Tuple(_)) || matches!(r.ty, ir::Ty::Tuple(_)) {
         return lower_tuple_binary(op, l, r, span);
     }
-    // ---- class == / != (identity, or __eq__ when defined) ----
+    // ---- class == / != / ordering (identity or matching dunder) ----
     if matches!(l.ty, ir::Ty::Class(_)) || matches!(r.ty, ir::Ty::Class(_)) {
         match op {
             ast::BinOp::Eq
@@ -23236,9 +23236,14 @@ fn lower_bitwise(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
     }
 }
 
-/// Class instance `==` / `!=`. If the left class (or a parent) defines
-/// `__eq__`, call it (virtual). Otherwise both sides must be class
-/// instances and comparison is pointer identity (CPython default).
+/// Class instance `==` / `!=` / `<` / `<=` / `>` / `>=`.
+///
+/// If the left class (or a parent) defines the matching dunder
+/// (`__eq__` / `__lt__` / `__le__` / `__gt__` / `__ge__`), call it
+/// (virtual). `==` / `!=` without `__eq__` fall back to pointer identity
+/// when both sides are class instances (CPython default). Ordering has
+/// no identity fallback — missing dunders are compile errors. Reflected
+/// operators (`b.__gt__(a)` when `a.__lt__` is missing) are residual.
 fn lower_class_compare(
     op: ast::BinOp,
     l: ir::Expr,
@@ -23246,47 +23251,61 @@ fn lower_class_compare(
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    if !matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) {
+    let method = match op {
+        ast::BinOp::Eq | ast::BinOp::NotEq => "__eq__",
+        ast::BinOp::Lt => "__lt__",
+        ast::BinOp::LtEq => "__le__",
+        ast::BinOp::Gt => "__gt__",
+        ast::BinOp::GtEq => "__ge__",
+        _ => {
+            return Err(err(
+                format!("operator '{op}' is not supported for class instances"),
+                span,
+            ));
+        }
+    };
+    let invert = matches!(op, ast::BinOp::NotEq);
+    if let ir::Ty::Class(id) = l.ty
+        && resolve_method(id, method).is_some()
+    {
+        return lower_class_cmp_call(l, id, r, method, invert, span, ctx);
+    }
+    if matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) {
+        if matches!((l.ty, r.ty), (ir::Ty::Class(_), ir::Ty::Class(_))) {
+            return Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::IsIdentity {
+                    left: Box::new(l),
+                    right: Box::new(r),
+                    not: invert,
+                },
+            });
+        }
         return Err(err(
-            format!("operator '{op}' is not supported for class instances"),
+            format!(
+                "cannot compare {} and {} with '{op}' (define __eq__ or use 'is')",
+                l.ty, r.ty
+            ),
             span,
         ));
     }
-    let not = matches!(op, ast::BinOp::NotEq);
-    if let ir::Ty::Class(id) = l.ty
-        && resolve_method(id, "__eq__").is_some()
-    {
-        return lower_class_eq_call(l, id, r, not, span, ctx);
-    }
-    if matches!((l.ty, r.ty), (ir::Ty::Class(_), ir::Ty::Class(_))) {
-        return Ok(ir::Expr {
-            ty: ir::Ty::Bool,
-            kind: ir::ExprKind::IsIdentity {
-                left: Box::new(l),
-                right: Box::new(r),
-                not,
-            },
-        });
-    }
     Err(err(
-        format!(
-            "cannot compare {} and {} with '{op}' (define __eq__ or use 'is')",
-            l.ty, r.ty
-        ),
+        format!("operator '{op}' is not supported for class instances (define {method})"),
         span,
     ))
 }
 
-fn lower_class_eq_call(
+fn lower_class_cmp_call(
     left: ir::Expr,
     class_id: ir::ClassId,
     right: ir::Expr,
-    not: bool,
+    method: &str,
+    invert: bool,
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    let left_t = ctx.fresh_temp("eq.l", left.ty);
-    let right_t = ctx.fresh_temp("eq.r", right.ty);
+    let left_t = ctx.fresh_temp("cmp.l", left.ty);
+    let right_t = ctx.fresh_temp("cmp.r", right.ty);
     let left_ir = ir::Expr {
         ty: left.ty,
         kind: ir::ExprKind::Local(left_t.clone()),
@@ -23295,13 +23314,13 @@ fn lower_class_eq_call(
         kind: ast::ExprKind::Name(right_t.clone()),
         span,
     };
-    let call = lower_instance_method_call(left_ir, class_id, "__eq__", span, &[right_name], ctx)?;
+    let call = lower_instance_method_call(left_ir, class_id, method, span, &[right_name], ctx)?;
     let call = if call.ty == ir::Ty::Bool {
         call
     } else {
         to_bool(call, span, ctx)?
     };
-    let result = if not {
+    let result = if invert {
         ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::Unary {
@@ -26877,6 +26896,82 @@ print(A() < A())
         );
         assert!(
             e.message.contains("operator '<'") && e.message.contains("class"),
+            "{}",
+            e.message
+        );
+        assert!(e.message.contains("__lt__"), "{}", e.message);
+    }
+
+    #[test]
+    fn class_lt_dunder_lowers() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+    def __le__(self, other: P) -> bool:
+        return self.x <= other.x
+    def __gt__(self, other: P) -> bool:
+        return self.x > other.x
+    def __ge__(self, other: P) -> bool:
+        return self.x >= other.x
+a = P(1) < P(2)
+b = P(1) <= P(1)
+c = P(2) > P(1)
+d = P(2) >= P(2)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        for i in 0..4 {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!("expected GlobalAssign at {i}");
+            };
+            assert_eq!(value.ty, ir::Ty::Bool);
+            assert!(
+                matches!(value.kind, ir::ExprKind::Block { .. }),
+                "cmp {i} should lower to a method-call block"
+            );
+        }
+    }
+
+    #[test]
+    fn class_lt_inherited_lowers() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+class Q(P):
+    pass
+b = Q(1) < Q(2)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn class_gt_without_dunder_rejected() {
+        let e = analyze_err(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+print(P(1) > P(2))
+",
+        );
+        assert!(
+            e.message.contains("operator '>'") && e.message.contains("__gt__"),
             "{}",
             e.message
         );

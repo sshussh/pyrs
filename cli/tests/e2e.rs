@@ -13584,6 +13584,77 @@ print(A() < A())
 }
 
 #[test]
+fn class_order_dunder_matches_python() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+    def __le__(self, other: P) -> bool:
+        return self.x <= other.x
+    def __gt__(self, other: P) -> bool:
+        return self.x > other.x
+    def __ge__(self, other: P) -> bool:
+        return self.x >= other.x
+print(P(1) < P(2))
+print(P(2) < P(1))
+print(P(1) <= P(1))
+print(P(1) <= P(0))
+print(P(2) > P(1))
+print(P(1) > P(2))
+print(P(2) >= P(2))
+print(P(1) >= P(2))
+class Q(P):
+    def __lt__(self, other: P) -> bool:
+        return False
+def cmp(a: P, b: P) -> bool:
+    return a < b
+print(cmp(Q(1), P(2)))
+print(cmp(P(1), P(2)))
+";
+    let out = run_program("class_order_dunder", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn class_order_inherited_matches_python() {
+    let src = "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __lt__(self, other: P) -> bool:
+        return self.x < other.x
+class Q(P):
+    pass
+print(Q(1) < Q(2))
+print(Q(2) < Q(1))
+";
+    let out = run_program("class_order_inherited", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn v025_next_builtin() {
     let src = "\
 class Counter:
