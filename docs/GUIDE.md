@@ -319,12 +319,14 @@ Same-type and both-numeric operands keep the previous rules
 (`bool`→`int`→`float` unify); otherwise the result is a union of the
 operands' members.
 
-`in` / `not in` test substrings and list membership:
+`in` / `not in` test substrings and list membership, including nested
+lists (same recursive equality as `==`):
 
 ```python
 "ell" in "hello"        # True
 3 in [1, 2, 3]          # True
 "c" not in ["a", "b"]   # True
+[1, 2] in [[1, 2], [3]] # True
 ```
 
 ### Strings
@@ -544,10 +546,13 @@ lambda/function.
 List `+` concatenates (same element type); `*` repeats with an int count
 (`n <= 0` yields `[]`). Both produce a new list (shallow copy of slots).
 `==` / `!=` compare length and elements (same rules as `in`; nested lists
-compare recursively).
+compare recursively). `in` / `not in` accept a needle of the element
+type, including `list[list[…]]` (`[1, 2] in [[1, 2], [3]]`). Ordering
+comparisons (`<` / `<=` / `>` / `>=`), `min` / `max`, and
+`sorted` / `list.sort` work on lists of orderable elements, including
+nested orderable lists.
 
-Not supported yet: list ordering comparisons (`<` etc.), `in` on lists of
-lists (membership still limited), and slice assignment.
+Not supported yet: slice assignment.
 
 ### Control flow
 

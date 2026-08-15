@@ -21291,9 +21291,6 @@ fn lower_contains(
             }
             l
         }
-        ir::Ty::List(ir::Ty::List(_)) => {
-            return Err(err("'in' is not supported for lists of lists yet", span));
-        }
         ir::Ty::List(elem) => coerce(l, *elem, span, "'in' operand")?,
         ir::Ty::Dict { key, .. } => coerce(l, *key, span, "'in' dict key")?,
         ir::Ty::Set(elem) => coerce(l, *elem, span, "'in' set element")?,
@@ -23215,6 +23212,39 @@ print(count([]))
             panic!();
         };
         assert_eq!(needle.ty, ir::Ty::Float);
+    }
+
+    #[test]
+    fn contains_nested_list_lowers() {
+        let m = analyze_ok("b = [1, 2] in [[1, 2], [3]]\nc = [9] not in [[1], [2]]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        let ir::ExprKind::Contains { needle, haystack } = &value.kind else {
+            panic!("expected Contains, got {:?}", value.kind);
+        };
+        assert_eq!(needle.ty, ir::list_of(ir::Ty::Int));
+        assert_eq!(haystack.ty, ir::list_of(ir::list_of(ir::Ty::Int)));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::Unary { op: ir::UnOp::Not, operand }
+                if matches!(operand.kind, ir::ExprKind::Contains { .. })
+        ));
+    }
+
+    #[test]
+    fn contains_nested_list_rejects_scalar_needle() {
+        let e = analyze_err("b = 1 in [[1, 2]]\n");
+        assert!(
+            e.message.contains("'in' operand") || e.message.contains("list[int]"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

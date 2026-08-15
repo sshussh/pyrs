@@ -1282,6 +1282,52 @@ print(\"b\" in [\"a\", \"b\"], \"c\" not in [\"a\", \"b\"])
 }
 
 #[test]
+fn nested_list_membership_matches_python() {
+    let src = "\
+print([1, 2] in [[1, 2], [3]])
+print([1, 3] in [[1, 2], [3]])
+print([3] not in [[1, 2], [3]])
+empty: list[int] = []
+print(empty in [empty, [1]])
+print(empty not in [[1], [2]])
+print([[1]] in [[[1]], [[2]]])
+a = [1, 2]
+b = [1, 2]
+print(b in [a])
+print([1, 2] in [a, [9]])
+xs = [[1], [2], [1]]
+print(xs.index([1]))
+xs.remove([1])
+print(xs)
+print([[\"a\", \"b\"]] in [[[\"a\", \"b\"]], [[\"c\"]]])
+print([0.0] in [[-0.0], [1.0]])
+";
+    let out = run_program("nested_in", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn nested_list_index_miss_matches_python() {
+    let (code, stderr) =
+        run_program_expect_fail("nested_in_miss", "print([[1], [2]].index([9]))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: list.index(x): x not in list"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn list_pop_matches_python() {
     let out = run_program(
         "pop",

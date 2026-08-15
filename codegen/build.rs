@@ -1,9 +1,16 @@
 use std::process::Command;
 
 fn main() {
+    // Pin CMake's find_package(LLVM) to the same prefix as `llvm-config`.
+    // Otherwise CMAKE_PREFIX_PATH can pick a different install (headers vs
+    // the libs we link below) and the shim fails to link.
+    let llvm_prefix = run("llvm-config", &["--prefix"]);
+    let llvm_cmake = format!("{}/lib/cmake/llvm", llvm_prefix.trim());
+
     // build the C++ shim
     let dst = cmake::Config::new("shim")
         .define("CMAKE_BUILD_TYPE", "Release")
+        .define("LLVM_DIR", &llvm_cmake)
         .build();
 
     // link the shim static archive

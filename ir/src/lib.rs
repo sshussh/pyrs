@@ -783,7 +783,8 @@ pub enum ExprKind {
         args: Vec<Expr>,
     },
     /// `needle in haystack`: str-in-str, element-in-list/tuple/set, key-in-dict.
-    /// The needle is already coerced. Result is Bool.
+    /// Nested lists use recursive slot equality (same as `==`). The needle is
+    /// already coerced. Result is Bool.
     Contains {
         needle: Box<Expr>,
         haystack: Box<Expr>,
