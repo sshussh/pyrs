@@ -476,7 +476,8 @@ Changing a layout or tag encoding requires a coordinated edit of
 3. **Local CI gate:** `make ci` → rustfmt check, clippy (`-D warnings`),
    full workspace tests, example parity vs `python3`.
 4. **`make examples`:** globs `examples/*.py`, `examples/modules/*.py`,
-   and `examples/packages/main.py` (package tree entry point).
+   and `examples/packages/main.py` (package tree entry point), plus the
+   RiskSim showcase with `examples/risksim/data/balanced.scenario`.
 5. **GitHub Actions:** `.github/workflows/ci.yml` mirrors `make ci`;
    separate workflows exist for benches, docs, and releases.
 6. **Benchmarks:** `benchmarks/run.sh` verifies byte-identical output

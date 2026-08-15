@@ -101,6 +101,14 @@ examples: release ## Run every example and diff its output against python3
 	        fail=1; \
 	    fi; \
 	done; \
+	got=$$($(PYRS) run -i examples/risksim/main.py -- examples/risksim/data/balanced.scenario 2>&1); \
+	want=$$($(PYTHON) examples/risksim/main.py examples/risksim/data/balanced.scenario 2>&1); \
+	if [ "$$got" = "$$want" ]; then \
+	    printf '  \033[32mMATCH\033[0m  %s\n' "examples/risksim/main.py"; \
+	else \
+	    printf '  \033[31mDIFFER\033[0m %s\n' "examples/risksim/main.py"; \
+	    fail=1; \
+	fi; \
 	exit $$fail
 
 .PHONY: bench
@@ -148,4 +156,5 @@ help: ## Show this help
 	@printf '\nExamples:\n'
 	@printf '  make run FILE=examples/fib.py     compile and run an example\n'
 	@printf '  make time FILE=main.py O=3        race pyrs -O3 against python3\n'
+	@printf '  bash examples/risksim/bench.sh    Monte Carlo showcase vs python3\n'
 	@printf '  make bench RUNS=5                 slower but steadier benchmark\n\n'

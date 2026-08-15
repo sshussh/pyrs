@@ -1471,4 +1471,7 @@ runtime error traps; they are compiled and linked into every binary by `cc`.
 
 Details and build strategy: [SPECIFICATIONS.md](../SPECIFICATIONS.md).
 Worked examples live in [examples/](../examples), benchmarks in
-[benchmarks/](../benchmarks).
+[benchmarks/](../benchmarks). The larger [RiskSim](../examples/risksim)
+showcase is a packaged Monte Carlo portfolio CLI (`make examples` runs it
+on `data/balanced.scenario`; `bash examples/risksim/bench.sh` races the
+native binary against CPython).

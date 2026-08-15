@@ -76,7 +76,7 @@ Useful day-to-day targets:
 ```console
 $ make run FILE=examples/fib.py
 $ make emit-llvm FILE=prog.py     # writes prog.ll
-$ make examples                   # parity: examples/*.py, modules/, packages/main.py
+$ make examples                   # parity: examples/*.py, modules/, packages/, risksim
 $ make bench                      # benchmarks vs CPython
 ```
 
@@ -285,7 +285,8 @@ features.
    `run_project` / `compile_project_expect_fail`.
 5. **Gate:** `make ci` (fmt-check, clippy `-D warnings`, tests, example
    parity). `make examples` globs `examples/*.py`,
-   `examples/modules/*.py`, and `examples/packages/main.py`.
+   `examples/modules/*.py`, and `examples/packages/main.py`, plus
+   `examples/risksim/main.py` with the bundled balanced scenario.
 
 ---
 

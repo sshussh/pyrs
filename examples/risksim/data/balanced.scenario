@@ -1,0 +1,13 @@
+# Balanced book — interactive report (moderate work).
+# For speed demos use stress.scenario.
+
+portfolio Core 100000.0
+
+equity SPY  0.45 0.08 0.15 broad
+equity QQQ  0.15 0.10 0.22 tech
+bond   AGG  0.30 0.03 0.05 6.5
+bond   TLT  0.10 0.02 0.12 17.0
+
+# paths years steps_per_year seed
+# 2k × 10y × 12 ≈ 0.96M asset-steps (4 assets).
+sim 2000 10 12 42

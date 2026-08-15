@@ -1,0 +1,13 @@
+# Heavier Monte Carlo for wall-clock races (still memory-safe: streamed paths).
+# ~12k paths × 15y × 12 steps × 5 assets ≈ 10.8M asset-steps.
+
+portfolio StressBook 250000.0
+
+equity SPY  0.35 0.07 0.16 broad
+equity QQQ  0.15 0.11 0.24 tech
+equity EFA  0.10 0.06 0.18 intl
+bond   AGG  0.25 0.03 0.05 6.0
+bond   HYG  0.15 0.05 0.10 4.0
+
+# paths years steps_per_year seed
+sim 12000 15 12 7
