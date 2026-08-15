@@ -4925,6 +4925,34 @@ print(s2)
 }
 
 #[test]
+fn set_subset_matches_python() {
+    let src = "\
+a = {1, 2}
+b = {1, 2, 3}
+c = {1, 2}
+d = {4, 5}
+print(a.issubset(b), a.issubset(c), b.issubset(a))
+print(b.issuperset(a), a.issuperset(b), a.issuperset(c))
+print(a.isdisjoint(d), a.isdisjoint(b))
+print(a <= b, a < b, a <= c, a < c)
+print(b >= a, b > a, a >= c, a > c)
+print(a == c, a != c, a == b, a != d)
+";
+    let out = run_program("set_subset", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn try_except_raise() {
     let out = run_program(
         "try_exc",

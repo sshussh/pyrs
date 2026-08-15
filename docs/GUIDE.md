@@ -1298,8 +1298,9 @@ Container notes (v0.20.1):
   same-typed dicts; insertion-order iteration over keys; mapping match
   supports `**rest`.
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
-  `{}` is always an empty dict; `|` / `.union` / `|=` / `.update` for
-  same element type.
+  `{}` is always an empty dict; `|` / `.union` / `|=` / `.update` and
+  `&` / `-` / `^` for same element type; `==` / `!=`; subset operators
+  `<` / `<=` / `>` / `>=`; methods `issubset` / `issuperset` / `isdisjoint`.
 - **Any (limited):** annotation `Any` / `list[Any]` etc. Values are
   heap-boxed print-tag + payload (same as container union slots).
   Concrete → Any and Any → concrete coerce at the boundary (runtime

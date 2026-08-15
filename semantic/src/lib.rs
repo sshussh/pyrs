@@ -10450,6 +10450,20 @@ fn lower_set_method_stmt(
             };
             Ok(ir::Stmt::ExprStmt(u))
         }
+        "issubset" | "issuperset" | "isdisjoint" => {
+            if args.len() != 1 {
+                return Err(err(
+                    format!(
+                        "{method}() takes exactly one argument ({} given)",
+                        args.len()
+                    ),
+                    method_span,
+                ));
+            }
+            let other = lower_expr(&args[0], ctx)?;
+            let rel = lower_set_relation(base_ir, other, method_span, method)?;
+            Ok(ir::Stmt::ExprStmt(rel))
+        }
         "update" => {
             // In-place union (same as |=).
             if args.len() != 1 {
@@ -10477,9 +10491,66 @@ fn lower_set_method_stmt(
         _ => Err(err(
             format!(
                 "set method '{method}' is not supported yet (supported: add, remove, \
-                 discard, clear, union, intersection, difference, symmetric_difference, update)"
+                 discard, clear, union, intersection, difference, symmetric_difference, \
+                 issubset, issuperset, isdisjoint, update)"
             ),
             method_span,
+        )),
+    }
+}
+
+fn lower_set_relation(l: ir::Expr, r: ir::Expr, span: Span, name: &str) -> SResult<ir::Expr> {
+    match (l.ty, r.ty) {
+        (ir::Ty::Set(a), ir::Ty::Set(b)) if a == b => {
+            let kind = match name {
+                "issubset" => ir::ExprKind::SetIsSubset {
+                    left: Box::new(l),
+                    right: Box::new(r),
+                    proper: false,
+                },
+                "issuperset" => ir::ExprKind::SetIsSubset {
+                    left: Box::new(r),
+                    right: Box::new(l),
+                    proper: false,
+                },
+                "isdisjoint" => ir::ExprKind::SetIsDisjoint {
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+                "lt" => ir::ExprKind::SetIsSubset {
+                    left: Box::new(l),
+                    right: Box::new(r),
+                    proper: true,
+                },
+                "le" => ir::ExprKind::SetIsSubset {
+                    left: Box::new(l),
+                    right: Box::new(r),
+                    proper: false,
+                },
+                "gt" => ir::ExprKind::SetIsSubset {
+                    left: Box::new(r),
+                    right: Box::new(l),
+                    proper: true,
+                },
+                "ge" => ir::ExprKind::SetIsSubset {
+                    left: Box::new(r),
+                    right: Box::new(l),
+                    proper: false,
+                },
+                _ => unreachable!("unknown set relation {name}"),
+            };
+            Ok(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind,
+            })
+        }
+        (ir::Ty::Set(a), ir::Ty::Set(b)) => Err(err(
+            format!("set {name} requires the same element type (set[{a}] vs set[{b}])"),
+            span,
+        )),
+        _ => Err(err(
+            format!("set {name} requires two sets, found {} and {}", l.ty, r.ty),
+            span,
         )),
     }
 }
@@ -14642,7 +14713,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         ),
                         *method_span,
                     )),
-                    "union" | "intersection" | "difference" | "symmetric_difference" => {
+                    "union"
+                    | "intersection"
+                    | "difference"
+                    | "symmetric_difference"
+                    | "issubset"
+                    | "issuperset"
+                    | "isdisjoint" => {
                         if args.len() != 1 {
                             return Err(err(
                                 format!(
@@ -14665,18 +14742,19 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                                     ir::ExprKind::SetDiff { left: l, right: r }
                                 })
                             }
-                            _ => {
+                            "symmetric_difference" => {
                                 lower_set_binary_op(base_ir, other, *method_span, method, |l, r| {
                                     ir::ExprKind::SetSymDiff { left: l, right: r }
                                 })
                             }
+                            rel => lower_set_relation(base_ir, other, *method_span, rel),
                         }
                     }
                     _ => Err(err(
                         format!(
                             "set method '{method}' is not supported yet (supported: add, \
                              remove, discard, clear, union, intersection, difference, \
-                             symmetric_difference, update)"
+                             symmetric_difference, issubset, issuperset, isdisjoint, update)"
                         ),
                         *method_span,
                     )),
@@ -21224,6 +21302,26 @@ fn lower_binary(
                     ir::ExprKind::SetSymDiff { left, right }
                 });
             }
+            ast::BinOp::Eq | ast::BinOp::NotEq => {
+                let (ir::Ty::Set(a), ir::Ty::Set(b)) = (l.ty, r.ty) else {
+                    unreachable!("set compare");
+                };
+                if a != b {
+                    return Err(err(format!("cannot compare set[{a}] and set[{b}]"), span));
+                }
+                return Ok(ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::Binary {
+                        op: comparison_ir_op(op),
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    },
+                });
+            }
+            ast::BinOp::Lt => return lower_set_relation(l, r, span, "lt"),
+            ast::BinOp::LtEq => return lower_set_relation(l, r, span, "le"),
+            ast::BinOp::Gt => return lower_set_relation(l, r, span, "gt"),
+            ast::BinOp::GtEq => return lower_set_relation(l, r, span, "ge"),
             _ => {}
         }
     }
@@ -23929,6 +24027,50 @@ print(count([]))
             _ => false,
         });
         assert!(has_is, "expected IsNone in IR: {:?}", entry.body);
+    }
+
+    #[test]
+    fn set_subset_lowers() {
+        let m = analyze_ok(
+            "a = {1, 2}\nb = {1, 2, 3}\nx = a.issubset(b)\ny = a < b\nz = a.isdisjoint({4})\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::SetIsSubset { proper: false, .. }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[3] else {
+            panic!();
+        };
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::SetIsSubset { proper: true, .. }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[4] else {
+            panic!();
+        };
+        assert!(matches!(value.kind, ir::ExprKind::SetIsDisjoint { .. }));
+    }
+
+    #[test]
+    fn set_eq_lowers() {
+        let m = analyze_ok("b = {1, 2} == {1, 2}\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Binary {
+                op: ir::BinOp::Eq,
+                ..
+            }
+        ));
     }
 
     #[test]

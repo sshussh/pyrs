@@ -500,7 +500,9 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         SetUnion { left, right }
         | SetIntersect { left, right }
         | SetDiff { left, right }
-        | SetSymDiff { left, right } => {
+        | SetSymDiff { left, right }
+        | SetIsSubset { left, right, .. }
+        | SetIsDisjoint { left, right } => {
             max_try_depth_in_expr(left).max(max_try_depth_in_expr(right))
         }
         SetFromList { list, .. } => max_try_depth_in_expr(list),
@@ -725,7 +727,9 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         SetUnion { left, right }
         | SetIntersect { left, right }
         | SetDiff { left, right }
-        | SetSymDiff { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
+        | SetSymDiff { left, right }
+        | SetIsSubset { left, right, .. }
+        | SetIsDisjoint { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
         SetFromList { list, .. } => count_yields_in_expr(list),
         DictFromPairs { pairs, .. } => count_yields_in_expr(pairs),
         ListPop { list, index }
@@ -867,6 +871,9 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_set_symdiff(ptr, ptr)\n");
         out.push_str("declare void @pyrs_set_update(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_set_contains(ptr, i64, i32)\n");
+        out.push_str("declare i32 @pyrs_set_eq(ptr, ptr)\n");
+        out.push_str("declare i32 @pyrs_set_issubset(ptr, ptr, i32)\n");
+        out.push_str("declare i32 @pyrs_set_isdisjoint(ptr, ptr)\n");
         out.push_str("declare void @pyrs_set_clear(ptr)\n");
         out.push_str("declare ptr @pyrs_set_elements(ptr)\n");
         out.push_str("declare ptr @pyrs_set_from_list(ptr, i32)\n");
@@ -3873,6 +3880,33 @@ impl Emitter {
                 ));
                 t
             }
+            ExprKind::SetIsSubset {
+                left,
+                right,
+                proper,
+            } => {
+                let l = self.emit_expr(left);
+                let r = self.emit_expr(right);
+                let c = self.tmp();
+                let p = if *proper { 1 } else { 0 };
+                self.line(format!(
+                    "{c} = call i32 @pyrs_set_issubset(ptr {l}, ptr {r}, i32 {p})"
+                ));
+                let t = self.tmp();
+                self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                t
+            }
+            ExprKind::SetIsDisjoint { left, right } => {
+                let l = self.emit_expr(left);
+                let r = self.emit_expr(right);
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_set_isdisjoint(ptr {l}, ptr {r})"
+                ));
+                let t = self.tmp();
+                self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                t
+            }
             ExprKind::ListPop { list, index } => {
                 let l = self.emit_expr(list);
                 let i_t = self.emit_expr(index);
@@ -5400,6 +5434,9 @@ impl Emitter {
         if matches!(left.ty, Ty::Tuple(_)) {
             return self.emit_tuple_binary(op, left, right);
         }
+        if matches!(left.ty, Ty::Set(_)) {
+            return self.emit_set_binary(op, left, right);
+        }
 
         let l = self.emit_expr(left);
         let r = self.emit_expr(right);
@@ -5644,6 +5681,27 @@ impl Emitter {
                 t
             }
             other => unreachable!("bad list op {other:?}"),
+        }
+    }
+
+    fn emit_set_binary(&mut self, op: BinOp, left: &Expr, right: &Expr) -> String {
+        let l = self.emit_expr(left);
+        let r = self.emit_expr(right);
+        match op {
+            BinOp::Eq | BinOp::Ne => {
+                let c = self.tmp();
+                self.line(format!("{c} = call i32 @pyrs_set_eq(ptr {l}, ptr {r})"));
+                let eq = self.tmp();
+                self.line(format!("{eq} = icmp ne i32 {c}, 0"));
+                if matches!(op, BinOp::Eq) {
+                    eq
+                } else {
+                    let t = self.tmp();
+                    self.line(format!("{t} = xor i1 {eq}, true"));
+                    t
+                }
+            }
+            other => unreachable!("bad set op {other:?}"),
         }
     }
 

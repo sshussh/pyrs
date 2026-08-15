@@ -885,6 +885,17 @@ pub enum ExprKind {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// `a.issubset(b)` / `a <= b`. `proper` is `a < b`. Result is Bool.
+    SetIsSubset {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        proper: bool,
+    },
+    /// `a.isdisjoint(b)`. Result is Bool.
+    SetIsDisjoint {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// Shallow copy of a list (`list.copy()` / `list(xs)` when xs is a list).
     ListCopy(Box<Expr>),
     /// `list(s)` for a str → list of 1-char strings.

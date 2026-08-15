@@ -4757,6 +4757,48 @@ int pyrs_set_eq(const PyrsSet *a, const PyrsSet *b) {
     return 1;
 }
 
+int pyrs_set_issubset(const PyrsSet *a, const PyrsSet *b, int proper) {
+    check_ref(a);
+    check_ref(b);
+    if (a->len > b->len) {
+        return 0;
+    }
+    if (proper && a->len == b->len) {
+        return 0;
+    }
+    for (long long i = 0; i < a->order_len; i++) {
+        SetSlot *e = &a->table[a->order[i]];
+        if (e->state != 1) {
+            continue;
+        }
+        int found;
+        set_lookup(b, e->key, e->key_tag, &found);
+        if (!found) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int pyrs_set_isdisjoint(const PyrsSet *a, const PyrsSet *b) {
+    check_ref(a);
+    check_ref(b);
+    const PyrsSet *small = a->len <= b->len ? a : b;
+    const PyrsSet *big = small == a ? b : a;
+    for (long long i = 0; i < small->order_len; i++) {
+        SetSlot *e = &small->table[small->order[i]];
+        if (e->state != 1) {
+            continue;
+        }
+        int found;
+        set_lookup(big, e->key, e->key_tag, &found);
+        if (found) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 PyrsList *pyrs_set_elements(const PyrsSet *s) {
     check_ref(s);
     PyrsList *r = pyrs_list_new(s->len);
