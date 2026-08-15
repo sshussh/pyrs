@@ -10037,6 +10037,10 @@ fn lower_method_stmt(
         let call = lower_str_maketrans(args, method_span, ctx)?;
         return Ok(ir::Stmt::ExprStmt(call));
     }
+    if is_dict_type_name(base, ctx) && method == "fromkeys" {
+        let call = lower_dict_fromkeys(args, method_span, ctx)?;
+        return Ok(ir::Stmt::ExprStmt(call));
+    }
     let base_ir = lower_expr(base, ctx)?;
     if let ir::Ty::Class(id) = base_ir.ty {
         if resolve_property(id, method).is_some() {
@@ -10457,14 +10461,15 @@ fn lower_dict_method_stmt(
                 other,
             })
         }
-        "get" | "pop" | "keys" | "values" | "items" | "setdefault" | "popitem" => {
+        "get" | "pop" | "keys" | "values" | "items" | "setdefault" | "popitem" | "fromkeys"
+        | "copy" => {
             let call = lower_dict_method(base_ir, key_ty, val_ty, method, method_span, args, ctx)?;
             Ok(ir::Stmt::ExprStmt(call))
         }
         _ => Err(err(
             format!(
                 "dict method '{method}' is not supported yet (supported: get, pop, \
-                 keys, values, items, clear, update, setdefault, popitem)"
+                 keys, values, items, clear, update, setdefault, popitem, copy, fromkeys)"
             ),
             method_span,
         )),
@@ -11114,10 +11119,11 @@ fn lower_dict_method(
                 kind: ir::ExprKind::DictCopy(Box::new(base_ir)),
             })
         }
+        "fromkeys" => lower_dict_fromkeys(args, method_span, ctx),
         _ => Err(err(
             format!(
                 "dict method '{method}' is not supported yet (supported: get, pop, \
-                 keys, values, items, clear, copy, setdefault, popitem)"
+                 keys, values, items, clear, copy, setdefault, popitem, fromkeys)"
             ),
             method_span,
         )),
@@ -11184,14 +11190,94 @@ fn lower_file_method(
 
 /// `str` as a type name (not a shadowed local/global) for `str.maketrans`.
 fn is_str_type_name(base: &ast::Expr, ctx: &FnCtx) -> bool {
+    is_builtin_type_name(base, ctx, "str")
+}
+
+/// `dict` as a type name for `dict.fromkeys`.
+fn is_dict_type_name(base: &ast::Expr, ctx: &FnCtx) -> bool {
+    is_builtin_type_name(base, ctx, "dict")
+}
+
+fn is_builtin_type_name(base: &ast::Expr, ctx: &FnCtx, name: &str) -> bool {
     match &base.kind {
-        ast::ExprKind::Name(n) if n == "str" => {
+        ast::ExprKind::Name(n) if n == name => {
             !ctx.locals.contains_key(n)
                 && !ctx.globals.contains_key(n)
                 && !ctx.cell_locals.contains_key(n)
         }
         _ => false,
     }
+}
+
+/// `dict.fromkeys(iterable[, value])` — classmethod; `self` is ignored.
+fn lower_dict_fromkeys(
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.is_empty() {
+        return Err(err(
+            "fromkeys expected at least 1 argument, got 0",
+            method_span,
+        ));
+    }
+    if args.len() > 2 {
+        return Err(err(
+            format!("fromkeys expected at most 2 arguments, got {}", args.len()),
+            method_span,
+        ));
+    }
+    let keys_ir = lower_expr(&args[0], ctx)?;
+    let keys_list = match keys_ir.ty {
+        ir::Ty::List(elem) => {
+            check_hashable_key(*elem, args[0].span, "fromkeys")?;
+            keys_ir
+        }
+        ir::Ty::Set(elem) => {
+            check_hashable_key(*elem, args[0].span, "fromkeys")?;
+            ir::Expr {
+                ty: ir::list_of(*elem),
+                kind: ir::ExprKind::SetToList(Box::new(keys_ir)),
+            }
+        }
+        ir::Ty::Str => ir::Expr {
+            ty: ir::list_of(ir::Ty::Str),
+            kind: ir::ExprKind::ListFromStr(Box::new(keys_ir)),
+        },
+        other => {
+            return Err(err(
+                format!(
+                    "fromkeys() iterable must be list/set of int or str, or a str, found {other}"
+                ),
+                args[0].span,
+            ));
+        }
+    };
+    let ir::Ty::List(key) = keys_list.ty else {
+        unreachable!("fromkeys keys lowered to list");
+    };
+    let value = if args.len() == 2 {
+        let v = lower_expr(&args[1], ctx)?;
+        if v.ty == ir::Ty::File || v.ty == ir::Ty::Exception {
+            return Err(err(
+                format!("fromkeys() value type {} is not supported", v.ty),
+                args[1].span,
+            ));
+        }
+        v
+    } else {
+        const_none()
+    };
+    let value_ty = value.ty;
+    Ok(ir::Expr {
+        ty: ir::dict_of(*key, value_ty),
+        kind: ir::ExprKind::DictFromKeys {
+            keys: Box::new(keys_list),
+            value: Box::new(value),
+            key: Box::new(*key),
+            value_ty: Box::new(value_ty),
+        },
+    })
 }
 
 fn expect_str_arg(e: ir::Expr, span: Span, what: &str) -> SResult<ir::Expr> {
@@ -15719,6 +15805,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             }
             if is_str_type_name(base, ctx) && method == "maketrans" {
                 return lower_str_maketrans(&args, *method_span, ctx);
+            }
+            if is_dict_type_name(base, ctx) && method == "fromkeys" {
+                return lower_dict_fromkeys(&args, *method_span, ctx);
             }
             let base_ir = lower_expr(base, ctx)?;
             // User class instance method (not property: obj.prop() is TypeError).
@@ -26494,6 +26583,41 @@ print(count([]))
         };
         assert_eq!(value.ty, ir::tuple_of(&[ir::Ty::Str, ir::Ty::Int]));
         assert!(matches!(value.kind, ir::ExprKind::DictPopItem(_)));
+    }
+
+    #[test]
+    fn dict_fromkeys_lowers() {
+        let m = analyze_ok(
+            "a = dict.fromkeys([1, 2], 0)\n\
+             b = dict.fromkeys([\"x\"])\n\
+             c = dict.fromkeys({1, 2}, 1)\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(value.ty, ir::Ty::Dict { .. }));
+        assert!(matches!(value.kind, ir::ExprKind::DictFromKeys { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(
+            value.ty,
+            ir::Ty::Dict {
+                key: ir::Ty::Str,
+                value: ir::Ty::None
+            }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert!(matches!(value.kind, ir::ExprKind::DictFromKeys { .. }));
+    }
+
+    #[test]
+    fn dict_fromkeys_rejects_bad_keys() {
+        let e = analyze_err("print(dict.fromkeys(1, 0))\n");
+        assert!(e.message.contains("fromkeys"), "{}", e.message);
     }
 
     #[test]

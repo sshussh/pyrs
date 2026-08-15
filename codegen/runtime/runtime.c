@@ -6345,6 +6345,16 @@ PyrsDict *pyrs_dict_copy(const PyrsDict *d) {
     return r;
 }
 
+/* dict.fromkeys(list of keys, fill value). */
+PyrsDict *pyrs_dict_fromkeys(const PyrsList *keys, int key_tag, long long val, int val_tag) {
+    check_ref(keys);
+    PyrsDict *d = pyrs_dict_new();
+    for (long long i = 0; i < keys->len; i++) {
+        pyrs_dict_set(d, keys->data[i], key_tag, val, val_tag);
+    }
+    return d;
+}
+
 /* dict(list of 2-tuples) — each element is a PyrsTuple* of length 2. */
 PyrsDict *pyrs_dict_from_pairs(const PyrsList *pairs, int key_tag, int val_tag) {
     check_ref(pairs);

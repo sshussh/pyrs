@@ -125,7 +125,9 @@ fn elem_tag(ty: &Ty) -> u32 {
         // do not share one print_tag (switch cases must be unique).
         // Encoding 13 + 8*class_id avoids collision with list tags (4+8*k).
         Ty::Class(id) => 13 + 8 * id,
-        Ty::File | Ty::None | Ty::Cell(_) => {
+        // None as a dict/list slot uses the union-box tag; payload 0 prints None.
+        Ty::None => 8,
+        Ty::File | Ty::Cell(_) => {
             unreachable!("no print tag for {ty:?}")
         }
     }
@@ -535,6 +537,9 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         }
         SetFromList { list, .. } => max_try_depth_in_expr(list),
         DictFromPairs { pairs, .. } => max_try_depth_in_expr(pairs),
+        DictFromKeys { keys, value, .. } => {
+            max_try_depth_in_expr(keys).max(max_try_depth_in_expr(value))
+        }
         ListPop { list, index } | ListCount { list, value: index } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
         }
@@ -808,6 +813,9 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | SetIsDisjoint { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
         SetFromList { list, .. } => count_yields_in_expr(list),
         DictFromPairs { pairs, .. } => count_yields_in_expr(pairs),
+        DictFromKeys { keys, value, .. } => {
+            count_yields_in_expr(keys) + count_yields_in_expr(value)
+        }
         ListPop { list, index } | ListCount { list, value: index } => {
             count_yields_in_expr(list) + count_yields_in_expr(index)
         }
@@ -988,6 +996,7 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_set_pop(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_copy(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_from_pairs(ptr, i32, i32)\n");
+        out.push_str("declare ptr @pyrs_dict_fromkeys(ptr, i32, i64, i32)\n");
         out.push_str("declare ptr @pyrs_str_concat(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_repeat(ptr, i64)\n");
         out.push_str("declare i32 @pyrs_str_cmp(ptr, ptr)\n");
@@ -5415,6 +5424,23 @@ impl Emitter {
                     "{t} = call ptr @pyrs_dict_from_pairs(ptr {v}, i32 {}, i32 {})",
                     elem_tag(key),
                     elem_tag(value)
+                ));
+                t
+            }
+            ExprKind::DictFromKeys {
+                keys,
+                value,
+                key,
+                value_ty,
+            } => {
+                let k = self.emit_expr(keys);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call ptr @pyrs_dict_fromkeys(ptr {k}, i32 {}, i64 {slot}, i32 {})",
+                    elem_tag(key),
+                    elem_tag(value_ty)
                 ));
                 t
             }

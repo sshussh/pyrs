@@ -7041,6 +7041,35 @@ fn dict_setdefault_errors() {
 }
 
 #[test]
+fn dict_fromkeys_match_python() {
+    let src = "\
+print(dict.fromkeys([1, 2, 3], 0))
+print(dict.fromkeys([\"a\", \"b\"], \"x\"))
+print(dict.fromkeys(\"ab\", 1))
+d = dict.fromkeys({1, 2}, 0)
+print(sorted(list(d.keys())), d[1], d[2])
+print(dict.fromkeys([1, 1, 2], 9))
+empty: list[int] = []
+print(dict.fromkeys(empty, 0))
+print(dict.fromkeys([1, 2]))
+base: dict[str, int] = {}
+print(base.fromkeys([\"z\"], 3))
+";
+    let out = run_program("dictfromkeys", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn dict_popitem_match_python() {
     let src = "\
 d: dict[str, int] = {}

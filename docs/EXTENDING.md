@@ -523,6 +523,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `ListPop` / `ListIndexOf` / `ListCount` / `ListLit` / `ListNew` / `Len` | list ops |
 | `TupleIndexOf` / `TupleCount` | `tuple.index([start, end])` / `tuple.count` → `pyrs_tuple_index` / `pyrs_tuple_count` |
 | `DictGet` / `DictPop` / `DictSetDefault` / `DictPopItem` | dict get / pop / setdefault / popitem |
+| `DictFromKeys` | `dict.fromkeys(keys[, value])` → `pyrs_dict_fromkeys` |
 | `SetCopy` | `set.copy()` → `pyrs_set_copy` |
 | `SetPop` | `set.pop()` → `pyrs_set_pop` (last-inserted; empty KeyError) |
 | `SetUpdate { op }` | in-place `|&=-^` / `*_update` → `pyrs_set_*_update` |

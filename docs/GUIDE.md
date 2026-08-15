@@ -1339,7 +1339,9 @@ Container notes (v0.20.1):
   `setdefault(k)` requires `V` to include `None`;
   `popitem()` returns and removes the last-inserted `(k, v)` (empty → KeyError);
   `keys`/`values`/`items` return lists (not views); `update(other)` merges
-  same-typed dicts; insertion-order iteration over keys; mapping match
+  same-typed dicts; `fromkeys(iterable[, value])` builds a new dict (omitted
+  value is `None`; iterable is list/set of int or str, or a str);
+  insertion-order iteration over keys; mapping match
   supports `**rest`.
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
   `{}` is always an empty dict; `|` / `.union` / `|=` / `.update` and

@@ -954,6 +954,13 @@ pub enum ExprKind {
         key: Box<Ty>,
         value: Box<Ty>,
     },
+    /// `dict.fromkeys(keys[, value])` — keys is `list[K]`; omitted value is None.
+    DictFromKeys {
+        keys: Box<Expr>,
+        value: Box<Expr>,
+        key: Box<Ty>,
+        value_ty: Box<Ty>,
+    },
     /// `d.get(key, default)`. Result type is on `expr.ty` (may be
     /// `optional_of(val)` for bare get). On hit the value is converted to
     /// `expr.ty` when needed; on miss the default is used as-is.
