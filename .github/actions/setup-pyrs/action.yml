@@ -81,8 +81,7 @@ runs:
         python-version: ${{ inputs.python-version }}
 
     - name: Install Rust toolchain
-      # No `toolchain:` input — use the repo rust-toolchain.toml pin.
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@1.96.1
       with:
         components: ${{ inputs.rust-components }}
 
