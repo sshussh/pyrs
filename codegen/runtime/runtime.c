@@ -2615,6 +2615,70 @@ PyrsStr *pyrs_str_swapcase(const PyrsStr *s) {
     return r;
 }
 
+/* mode: 0=ljust (pad right), 1=rjust (pad left), 2=center */
+static PyrsStr *str_just(const PyrsStr *s, long long width, const PyrsStr *fill, int mode) {
+    check_ref(s);
+    check_ref(fill);
+    if (fill->len != 1) {
+        pyrs_die("TypeError: The fill character must be exactly one character long");
+    }
+    if (width <= s->len) {
+        return str_sub(s, 0, s->len);
+    }
+    long long pad = width - s->len;
+    long long left;
+    if (mode == 0) {
+        left = 0;
+    } else if (mode == 1) {
+        left = pad;
+    } else {
+        /* CPython 3.14: extra pad on the left when len is even. */
+        left = (pad + 1 - (s->len & 1)) / 2;
+    }
+    long long right = pad - left;
+    PyrsStr *r = str_alloc(width);
+    char fc = fill->data[0];
+    for (long long i = 0; i < left; i++) {
+        r->data[i] = fc;
+    }
+    memcpy(r->data + left, s->data, (size_t)s->len);
+    for (long long i = 0; i < right; i++) {
+        r->data[left + s->len + i] = fc;
+    }
+    return r;
+}
+
+PyrsStr *pyrs_str_ljust(const PyrsStr *s, long long width, const PyrsStr *fill) {
+    return str_just(s, width, fill, 0);
+}
+
+PyrsStr *pyrs_str_rjust(const PyrsStr *s, long long width, const PyrsStr *fill) {
+    return str_just(s, width, fill, 1);
+}
+
+PyrsStr *pyrs_str_center(const PyrsStr *s, long long width, const PyrsStr *fill) {
+    return str_just(s, width, fill, 2);
+}
+
+PyrsStr *pyrs_str_zfill(const PyrsStr *s, long long width) {
+    check_ref(s);
+    if (width <= s->len) {
+        return str_sub(s, 0, s->len);
+    }
+    long long nzero = width - s->len;
+    int sign = s->len > 0 && (s->data[0] == '+' || s->data[0] == '-');
+    PyrsStr *r = str_alloc(width);
+    long long o = 0;
+    if (sign) {
+        r->data[o++] = s->data[0];
+    }
+    for (long long i = 0; i < nzero; i++) {
+        r->data[o++] = '0';
+    }
+    memcpy(r->data + o, s->data + (sign ? 1 : 0), (size_t)(s->len - (sign ? 1 : 0)));
+    return r;
+}
+
 static int is_py_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }

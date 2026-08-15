@@ -11113,6 +11113,18 @@ fn lower_str_method(
         "capitalize" => (Capitalize, ir::Ty::Str, 0),
         "title" => (Title, ir::Ty::Str, 0),
         "swapcase" => (SwapCase, ir::Ty::Str, 0),
+        "zfill" => {
+            return lower_str_zfill(base_ir, args, method_span, ctx);
+        }
+        "center" => {
+            return lower_str_pad("center", ir::StrFn::Center, base_ir, args, method_span, ctx);
+        }
+        "ljust" => {
+            return lower_str_pad("ljust", ir::StrFn::LJust, base_ir, args, method_span, ctx);
+        }
+        "rjust" => {
+            return lower_str_pad("rjust", ir::StrFn::RJust, base_ir, args, method_span, ctx);
+        }
         "strip" => (Strip, ir::Ty::Str, 0),
         "lstrip" => (Lstrip, ir::Ty::Str, 0),
         "rstrip" => (Rstrip, ir::Ty::Str, 0),
@@ -11192,7 +11204,8 @@ fn lower_str_method(
             return Err(err(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
-                     upper, lower, capitalize, title, swapcase, strip, lstrip, rstrip, startswith, \
+                     upper, lower, capitalize, title, swapcase, zfill, center, ljust, rjust, \
+                     strip, lstrip, rstrip, startswith, \
                      endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
                      removeprefix, removesuffix, partition, rpartition, rsplit, \
@@ -11264,6 +11277,97 @@ fn lower_str_splitlines(
         kind: ir::ExprKind::StrCall {
             func: ir::StrFn::SplitLines,
             args: vec![base_ir, keepends],
+        },
+    })
+}
+
+fn as_str_width(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    let w = lower_expr(arg, ctx)?;
+    match w.ty {
+        ir::Ty::Bool => Ok(ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::BoolToInt(Box::new(w)),
+        }),
+        ir::Ty::Int => Ok(w),
+        other => Err(err(
+            format!("'{other}' object cannot be interpreted as an integer"),
+            arg.span,
+        )),
+    }
+}
+
+fn as_fillchar(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    let f = lower_expr(arg, ctx)?;
+    if f.ty != ir::Ty::Str {
+        return Err(err(
+            format!(
+                "The fill character must be a unicode character, not {}",
+                f.ty
+            ),
+            arg.span,
+        ));
+    }
+    if let ir::ExprKind::ConstStr(c) = &f.kind
+        && c.len() != 1
+    {
+        return Err(err(
+            "The fill character must be exactly one character long",
+            arg.span,
+        ));
+    }
+    Ok(f)
+}
+
+fn lower_str_zfill(
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!("zfill() takes exactly one argument ({} given)", args.len()),
+            method_span,
+        ));
+    }
+    let width = as_str_width(&args[0], ctx)?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::StrCall {
+            func: ir::StrFn::ZFill,
+            args: vec![base_ir, width],
+        },
+    })
+}
+
+fn lower_str_pad(
+    name: &str,
+    func: ir::StrFn,
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(err(
+            format!(
+                "{name}() takes from 1 to 2 positional arguments but {} were given",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+    let width = as_str_width(&args[0], ctx)?;
+    let fill = if args.len() == 2 {
+        as_fillchar(&args[1], ctx)?
+    } else {
+        const_str_expr(" ")
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::StrCall {
+            func,
+            args: vec![base_ir, width, fill],
         },
     })
 }
@@ -23448,6 +23552,56 @@ print(f())
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn str_pad_family_lowers() {
+        let m =
+            analyze_ok("a = \"42\".zfill(5)\nb = \"hi\".center(5, \"-\")\nc = \"hi\".ljust(4)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::ZFill,
+                args,
+            } if args.len() == 2
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::Center,
+                args,
+            } if args.len() == 3
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::LJust,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn str_pad_rejects_bad_fill() {
+        let e = analyze_err("print(\"hi\".center(5, \"--\"))\n");
+        assert!(e.message.contains("exactly one character"), "{}", e.message);
+        let e = analyze_err("print(\"hi\".zfill(\"5\"))\n");
+        assert!(
+            e.message.contains("cannot be interpreted as an integer"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

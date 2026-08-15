@@ -379,6 +379,8 @@ String methods (ASCII case/whitespace rules):
 ```python
 "  hi  ".strip()          # also lstrip / rstrip
 "abc".upper()             # "ABC"; .lower() / .capitalize() / .title() / .swapcase() too
+"42".zfill(5)             # "00042"; "-42".zfill(5) is "-0042"
+"hi".center(5, "-")       # "--hi-"; also ljust / rjust (1-byte fill)
 "hello".startswith("he")  # True; .endswith too; tuple of strs and start/end ok
 "banana".find("an")       # 1, or -1 when absent; optional start/end
 "banana".index("an")      # like find, but ValueError if missing
@@ -1202,6 +1204,7 @@ pop the catch frame before leaving (CPython-compatible).
 | `ValueError: slice step cannot be zero` | zero slice step at runtime |
 | `ValueError: empty separator` | `s.split("")` |
 | `ValueError: substring not found` | `s.index` / `s.rindex` when the needle is absent in the slice |
+| `TypeError: The fill character must be exactly one character long` | `center`/`ljust`/`rjust` fillchar whose byte length is not 1 |
 | `EOFError: EOF when reading a line` | `input()` at end of stdin |
 | `FileNotFoundError: [Errno 2] ...` / `PermissionError` / `IsADirectoryError` | `open()` failures |
 | `ValueError: I/O operation on closed file.` | using a closed file |

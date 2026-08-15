@@ -2461,6 +2461,40 @@ print(\", \".join(csv.split(\",\")))
 }
 
 #[test]
+fn str_zfill_center_ljust_rjust_match_python() {
+    let src = "\
+print(\"42\".zfill(5), \"-42\".zfill(5), \"+42\".zfill(5), \"42\".zfill(2), \"42\".zfill(0), \"42\".zfill(-1))
+print(\"hi\".center(6), \"hi\".center(5), \"hi\".center(5, \"-\"), \"hi\".center(1), \"hi\".center(0))
+print(\"hi\".ljust(5, \".\"), \"hi\".rjust(5, \".\"), \"hi\".ljust(2), \"hi\".rjust(2))
+print(\"\".zfill(3), \"\".center(3, \"*\"), \"abc\".center(3))
+print(\"x\".center(4, \"0\"), \"x\".ljust(4, \"0\"), \"x\".rjust(4, \"0\"))
+print(\"-\".zfill(1), \"+\".zfill(3), \"--\".zfill(5))
+print(\"ab\".center(5, \"*\"), \"ab\".center(6, \"*\"), \"abc\".center(6, \"-\"), \"abc\".center(7, \"-\"))
+print(\"hi\".center(True), \"42\".zfill(True))
+";
+    let out = run_program("strpad", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+
+    let (code, stderr) =
+        run_program_expect_fail("strpadfill", "f = \"-\"\nprint(\"hi\".center(5, f + f))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("The fill character must be exactly one character long"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn str_capitalize_title_swapcase_match_python() {
     let src = "\
 print(\"hello WORLD\".capitalize(), \"123abc\".capitalize(), \"\".capitalize(), \"A\".capitalize())

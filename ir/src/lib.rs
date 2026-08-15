@@ -1336,6 +1336,12 @@ pub enum StrFn {
     Capitalize,
     Title,
     SwapCase,
+    /// `s.zfill(width)` → str; last arg is width
+    ZFill,
+    /// `s.center/ljust/rjust(width[, fill])` — last two args are width and 1-char fill
+    Center,
+    LJust,
+    RJust,
     /// `s.strip()` / `s.lstrip()` / `s.rstrip()` → str
     Strip,
     Lstrip,

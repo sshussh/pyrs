@@ -960,6 +960,10 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_capitalize(ptr)\n");
         out.push_str("declare ptr @pyrs_str_title(ptr)\n");
         out.push_str("declare ptr @pyrs_str_swapcase(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_zfill(ptr, i64)\n");
+        out.push_str("declare ptr @pyrs_str_center(ptr, i64, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_ljust(ptr, i64, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_rjust(ptr, i64, ptr)\n");
         out.push_str("declare ptr @pyrs_str_strip(ptr)\n");
         out.push_str("declare ptr @pyrs_str_lstrip(ptr)\n");
         out.push_str("declare ptr @pyrs_str_rstrip(ptr)\n");
@@ -3750,6 +3754,31 @@ impl Emitter {
                     ));
                     return self.emit_box_i64(&raw);
                 }
+                if matches!(func, StrFn::ZFill) {
+                    let s = self.emit_expr(&args[0]);
+                    let w = self.emit_expr(&args[1]);
+                    let w = self.emit_unbox_i64(&w);
+                    let t = self.tmp();
+                    self.line(format!("{t} = call ptr @pyrs_str_zfill(ptr {s}, i64 {w})"));
+                    return t;
+                }
+                if matches!(func, StrFn::Center | StrFn::LJust | StrFn::RJust) {
+                    let s = self.emit_expr(&args[0]);
+                    let w = self.emit_expr(&args[1]);
+                    let w = self.emit_unbox_i64(&w);
+                    let fill = self.emit_expr(&args[2]);
+                    let callee = match func {
+                        StrFn::Center => "pyrs_str_center",
+                        StrFn::LJust => "pyrs_str_ljust",
+                        StrFn::RJust => "pyrs_str_rjust",
+                        _ => unreachable!(),
+                    };
+                    let t = self.tmp();
+                    self.line(format!(
+                        "{t} = call ptr @{callee}(ptr {s}, i64 {w}, ptr {fill})"
+                    ));
+                    return t;
+                }
                 if matches!(func, StrFn::Replace) {
                     let s = self.emit_expr(&args[0]);
                     let old = self.emit_expr(&args[1]);
@@ -3811,6 +3840,9 @@ impl Emitter {
                     StrFn::Capitalize => ("pyrs_str_capitalize", false, false),
                     StrFn::Title => ("pyrs_str_title", false, false),
                     StrFn::SwapCase => ("pyrs_str_swapcase", false, false),
+                    StrFn::ZFill | StrFn::Center | StrFn::LJust | StrFn::RJust => {
+                        unreachable!("pad family handled above")
+                    }
                     StrFn::Strip => ("pyrs_str_strip", false, false),
                     StrFn::Lstrip => ("pyrs_str_lstrip", false, false),
                     StrFn::Rstrip => ("pyrs_str_rstrip", false, false),
