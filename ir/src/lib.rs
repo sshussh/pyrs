@@ -1386,6 +1386,12 @@ pub enum StrFn {
     IsUpper,
     /// `s.islower()` -> bool (ASCII: >=1 letter, all letters lower)
     IsLower,
+    /// `s.isalnum()` -> bool (ASCII letters or digits; nonempty)
+    IsAlnum,
+    /// `s.istitle()` -> bool (ASCII title case; >=1 letter)
+    IsTitle,
+    /// `s.isascii()` -> bool (all bytes < 128; empty is True)
+    IsAscii,
     /// `s.removeprefix(pre)` / `s.removesuffix(suf)` → str
     RemovePrefix,
     RemoveSuffix,

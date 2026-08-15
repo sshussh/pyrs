@@ -3471,6 +3471,31 @@ print(\"\".count(\"\"), \"\".count(\"a\"), \"hello\".count(\"l\", True))
 }
 
 #[test]
+fn str_isalnum_istitle_isascii_match_python() {
+    let src = "\
+print(\"abc\".isalnum(), \"A1\".isalnum(), \"\".isalnum(), \"a b\".isalnum(), \"a-1\".isalnum())
+print(\"Hello World\".istitle(), \"Hello world\".istitle(), \"HELLO\".istitle(), \"\".istitle())
+print(\"123 Abc\".istitle(), \"They'Re Fine\".istitle(), \"A\".istitle(), \"a\".istitle())
+print(\"Abc\".istitle(), \"A1B\".istitle(), \"A1b\".istitle(), \"12\".istitle())
+print(\"abc\".isascii(), \"\".isascii(), \"A1 \".isascii())
+print(chr(233).isascii(), (\"a\" + chr(233)).isascii())
+print(\" \".istitle(), \"1A\".istitle(), \"A1\".istitle())
+";
+    let out = run_program("strisx", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_isalpha_isspace_case_match_python_ascii() {
     // ASCII-only rules (documented); cases chosen to match CPython on ASCII.
     let out = run_program(

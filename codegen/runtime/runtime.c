@@ -4072,6 +4072,57 @@ int pyrs_str_islower(const PyrsStr *s) {
     return saw_cased;
 }
 
+int pyrs_str_isalnum(const PyrsStr *s) {
+    check_ref(s);
+    if (s->len == 0) {
+        return 0;
+    }
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        int letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        int digit = c >= '0' && c <= '9';
+        if (!letter && !digit) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int pyrs_str_istitle(const PyrsStr *s) {
+    check_ref(s);
+    int saw_cased = 0;
+    int prev_cased = 0;
+    for (long long i = 0; i < s->len; i++) {
+        char c = s->data[i];
+        int upper = c >= 'A' && c <= 'Z';
+        int lower = c >= 'a' && c <= 'z';
+        if (upper || lower) {
+            if (prev_cased) {
+                if (upper) {
+                    return 0;
+                }
+            } else if (lower) {
+                return 0;
+            }
+            saw_cased = 1;
+            prev_cased = 1;
+        } else {
+            prev_cased = 0;
+        }
+    }
+    return saw_cased;
+}
+
+int pyrs_str_isascii(const PyrsStr *s) {
+    check_ref(s);
+    for (long long i = 0; i < s->len; i++) {
+        if ((unsigned char)s->data[i] >= 128) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* ---- lists ---- */
 
 PyrsList *pyrs_list_new(long long cap) {

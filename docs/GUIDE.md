@@ -400,6 +400,9 @@ String methods (ASCII case/whitespace rules):
 " \\t".isspace()          # True; same whitespace set as strip/split
 "ABC".isupper()           # True; "AbC" / digits-only are False
 "a1".islower()            # True if all letters are lower and >=1 letter
+"A1".isalnum()            # True; empty / punctuation is False
+"Hello World".istitle()   # True; "HELLO" / "Hello world" are False
+"".isascii()              # True; any byte >= 128 is False
 "hello".removeprefix("he")  # "llo"; missing prefix is a no-op
 "hello".removesuffix("lo")  # "hel"; empty affix is a no-op
 "a,b,c".partition(",")    # ('a', ',', 'b,c'); rpartition uses the last match

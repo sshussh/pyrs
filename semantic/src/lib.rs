@@ -11188,6 +11188,9 @@ fn lower_str_method(
         "isspace" => (IsSpace, ir::Ty::Bool, 0),
         "isupper" => (IsUpper, ir::Ty::Bool, 0),
         "islower" => (IsLower, ir::Ty::Bool, 0),
+        "isalnum" => (IsAlnum, ir::Ty::Bool, 0),
+        "istitle" => (IsTitle, ir::Ty::Bool, 0),
+        "isascii" => (IsAscii, ir::Ty::Bool, 0),
         "removeprefix" => (RemovePrefix, ir::Ty::Str, 1),
         "removesuffix" => (RemoveSuffix, ir::Ty::Str, 1),
         "partition" => (
@@ -11208,6 +11211,7 @@ fn lower_str_method(
                      strip, lstrip, rstrip, startswith, \
                      endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
+                     isalnum, istitle, isascii, \
                      removeprefix, removesuffix, partition, rpartition, rsplit, \
                      splitlines)"
                 ),
@@ -23777,6 +23781,22 @@ print(f())
     fn str_startswith_rejects_list() {
         let e = analyze_err("print(\"a\".startswith([\"a\"]))\n");
         assert!(e.message.contains("str or a tuple of str"), "{}", e.message);
+    }
+
+    #[test]
+    fn str_isalnum_istitle_isascii_are_bool() {
+        let m = analyze_ok("a = \"A1\".isalnum()\nb = \"Hi\".istitle()\nc = \"az\".isascii()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        for (i, want) in [ir::StrFn::IsAlnum, ir::StrFn::IsTitle, ir::StrFn::IsAscii]
+            .into_iter()
+            .enumerate()
+        {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!();
+            };
+            assert_eq!(value.ty, ir::Ty::Bool);
+            assert!(matches!(&value.kind, ir::ExprKind::StrCall { func, .. } if *func == want));
+        }
     }
 
     #[test]

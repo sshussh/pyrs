@@ -542,7 +542,8 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 `RemovePrefix`, `RemoveSuffix`, `Partition`, `RPartition`,
 `Find`, `Index`, `RFind`, `RIndex`, `Count`, `Replace`, `SplitWs`, `Split`,
 `RSplitWs`, `RSplit`, `SplitLines`, `Join`,
-`IsDigit`, `IsAlpha`, `IsSpace`, `IsUpper`, `IsLower`.
+`IsDigit`, `IsAlpha`, `IsSpace`, `IsUpper`, `IsLower`, `IsAlnum`, `IsTitle`,
+`IsAscii`.
 
 ### `FileFn` (current)
 
