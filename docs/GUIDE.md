@@ -476,6 +476,7 @@ Operations:
 ```python
 xs[0] = 10                  # element write
 print(xs[-1])               # negative indexing
+del xs[1]                   # delete by index (negative OK)
 xs.append(4)                # grow
 last = xs.pop()             # remove & return last
 first = xs.pop(0)           # or by index (negative OK)
@@ -1159,7 +1160,7 @@ pop the catch frame before leaving (CPython-compatible).
 | `ZeroDivisionError: division by zero` | `/`, `//`, `%` with a zero divisor; `0.0 ** negative` |
 | `IndexError: string index out of range` | out-of-bounds `s[i]` |
 | `IndexError: list index out of range` | out-of-bounds `xs[i]` read |
-| `IndexError: list assignment index out of range` | out-of-bounds `xs[i] = v` |
+| `IndexError: list assignment index out of range` | out-of-bounds `xs[i] = v` or `del xs[i]` |
 | `IndexError: tuple index out of range` | out-of-bounds `t[i]` |
 | `IndexError: pop from empty list` / `pop index out of range` | `xs.pop(...)` |
 | `KeyError: ...` | missing dict key / `set.remove` of absent element |

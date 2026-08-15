@@ -3552,6 +3552,19 @@ void pyrs_list_sort(PyrsList *l, int tag) {
     qsort(l->data, (size_t)l->len, sizeof(long long), cmp_slots_qsort);
 }
 
+void pyrs_list_del(PyrsList *l, long long i) {
+    check_ref(l);
+    if (i < 0) {
+        i += l->len;
+    }
+    if (i < 0 || i >= l->len) {
+        pyrs_die("IndexError: list assignment index out of range");
+    }
+    memmove(&l->data[i], &l->data[i + 1],
+            (size_t)(l->len - i - 1) * sizeof(long long));
+    l->len--;
+}
+
 long long pyrs_list_pop(PyrsList *l, long long i) {
     check_ref(l);
     if (l->len == 0) {

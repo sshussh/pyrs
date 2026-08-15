@@ -529,7 +529,7 @@ pub enum Stmt {
         index: Expr,
         value: Expr,
     },
-    /// `del base[index]` — dict only.
+    /// `del base[index]` — dict key or list index (negative OK).
     IndexDelete {
         base: Expr,
         index: Expr,

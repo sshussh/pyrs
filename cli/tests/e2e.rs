@@ -1419,6 +1419,57 @@ fn list_reverse_expression_is_compile_error() {
 }
 
 #[test]
+fn list_del_matches_python() {
+    let src = "\
+xs = [1, 2, 3, 4]
+del xs[1]
+print(xs)
+del xs[-1]
+print(xs)
+del xs[0]
+print(xs)
+nested = [[1], [2], [3]]
+del nested[1]
+print(nested)
+grid = [[1, 2], [3, 4]]
+del grid[0][1]
+print(grid)
+ys = [10, 20]
+del ys[True]
+print(ys)
+";
+    let out = run_program("list_del", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn list_del_oob_matches_python() {
+    let (code, stderr) = run_program_expect_fail("list_del_oob", "xs = [1, 2]\ndel xs[5]\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("IndexError: list assignment index out of range"),
+        "stderr: {stderr}"
+    );
+    let (code, stderr) =
+        run_program_expect_fail("list_del_empty", "xs: list[int] = []\ndel xs[0]\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("IndexError: list assignment index out of range"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn list_pop_matches_python() {
     let out = run_program(
         "pop",

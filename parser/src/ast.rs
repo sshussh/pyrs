@@ -275,7 +275,7 @@ pub enum StmtKind {
         op: BinOp,
         value: Expr,
     },
-    /// `del target` — currently `del d[k]` for dicts.
+    /// `del target` — `del xs[i]` for lists and `del d[k]` for dicts.
     Delete {
         target: AssignTarget,
     },

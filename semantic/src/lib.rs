@@ -11256,14 +11256,25 @@ fn lower_delete(
                     });
                     Ok(())
                 }
+                ir::Ty::List(_) => {
+                    let index_ir = lower_expr(index, ctx)?;
+                    let index_ir = coerce(index_ir, ir::Ty::Int, index.span, "list index")?;
+                    out.push(ir::Stmt::IndexDelete {
+                        base: base_ir,
+                        index: index_ir,
+                    });
+                    Ok(())
+                }
                 other => Err(err(
-                    format!("'del' on '{other}' is not supported yet (only dict keys)"),
+                    format!(
+                        "'del' on '{other}' is not supported yet (only list indices and dict keys)"
+                    ),
                     span,
                 )),
             }
         }
         _ => Err(err(
-            "'del' only supports dict item deletion (del d[key]) for now",
+            "'del' only supports list index and dict item deletion (del xs[i] / del d[key]) for now",
             span,
         )),
     }
@@ -22417,6 +22428,29 @@ print(f(B()))
         };
         assert_eq!(value.ty, ir::Ty::Int);
         assert!(matches!(entry.body[2], ir::Stmt::IndexAssign { .. }));
+    }
+
+    #[test]
+    fn list_del_lowers() {
+        let m = analyze_ok("xs = [1, 2, 3]\ndel xs[1]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        assert!(matches!(entry.body[1], ir::Stmt::IndexDelete { .. }));
+    }
+
+    #[test]
+    fn list_del_rejects_non_int_index() {
+        let e = analyze_err("xs = [1, 2]\ndel xs[\"a\"]\n");
+        assert!(
+            e.message.contains("list index") || e.message.contains("str"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn del_on_str_is_error() {
+        let e = analyze_err("s = \"ab\"\ndel s[0]\n");
+        assert!(e.message.contains("'del'"), "{}", e.message);
     }
 
     #[test]

@@ -904,6 +904,7 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_list_eq(ptr, ptr, i32)\n");
         out.push_str("declare i32 @pyrs_list_cmp(ptr, ptr, i32)\n");
         out.push_str("declare i64 @pyrs_list_pop(ptr, i64)\n");
+        out.push_str("declare void @pyrs_list_del(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_input(ptr)\n");
         out.push_str("declare ptr @pyrs_argv()\n");
         out.push_str("declare void @pyrs_set_args(i32, ptr)\n");
@@ -2774,14 +2775,20 @@ impl Emitter {
             Stmt::IndexDelete { base, index } => {
                 let b = self.emit_expr(base);
                 let i = self.emit_expr(index);
-                let Ty::Dict { key, .. } = base.ty else {
-                    unreachable!("IndexDelete on non-dict");
-                };
-                let kslot = self.slot_from_value(&i, *key);
-                self.line(format!(
-                    "call void @pyrs_dict_del(ptr {b}, i64 {kslot}, i32 {})",
-                    elem_tag(key)
-                ));
+                match base.ty {
+                    Ty::List(_) => {
+                        let idx = self.emit_unbox_i64(&i);
+                        self.line(format!("call void @pyrs_list_del(ptr {b}, i64 {idx})"));
+                    }
+                    Ty::Dict { key, .. } => {
+                        let kslot = self.slot_from_value(&i, *key);
+                        self.line(format!(
+                            "call void @pyrs_dict_del(ptr {b}, i64 {kslot}, i32 {})",
+                            elem_tag(key)
+                        ));
+                    }
+                    other => unreachable!("IndexDelete on {other:?}"),
+                }
             }
             Stmt::DictClear { dict } => {
                 let d = self.emit_expr(dict);
