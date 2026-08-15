@@ -538,7 +538,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 
 ### `StrFn` (current)
 
-`Upper`, `Lower`, `Capitalize`, `Title`, `SwapCase`, `ZFill`, `Center`, `LJust`, `RJust`, `Strip`, `Lstrip`, `Rstrip`, `StripChars`, `LstripChars`, `RstripChars`, `StartsWith`, `EndsWith`,
+`Upper`, `Lower`, `CaseFold`, `Capitalize`, `Title`, `SwapCase`, `ZFill`, `Center`, `LJust`, `RJust`, `Strip`, `Lstrip`, `Rstrip`, `StripChars`, `LstripChars`, `RstripChars`, `StartsWith`, `EndsWith`,
 `StartsWithTuple`, `EndsWithTuple`,
 `RemovePrefix`, `RemoveSuffix`, `Partition`, `RPartition`,
 `Find`, `Index`, `RFind`, `RIndex`, `Count`, `Replace`, `SplitWs`, `Split`,

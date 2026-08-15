@@ -378,7 +378,7 @@ String methods (ASCII case/whitespace rules):
 
 ```python
 "  hi  ".strip()          # also lstrip / rstrip; .strip("x") / None ok
-"abc".upper()             # "ABC"; .lower() / .capitalize() / .title() / .swapcase() too
+"abc".upper()             # "ABC"; .lower() / .casefold() / .capitalize() / .title() / .swapcase() too
 "42".zfill(5)             # "00042"; "-42".zfill(5) is "-0042"
 "hi".center(5, "-")       # "--hi-"; also ljust / rjust (1-byte fill)
 "hello".startswith("he")  # True; .endswith too; tuple of strs and start/end ok

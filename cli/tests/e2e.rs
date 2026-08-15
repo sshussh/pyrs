@@ -2556,6 +2556,27 @@ print(\"hi\".center(True), \"42\".zfill(True))
 }
 
 #[test]
+fn str_casefold_match_python() {
+    let src = "\
+print(\"Hello WORLD\".casefold(), \"ABC123\".casefold(), \"\".casefold())
+print(\"already\".casefold(), \"MiXeD_Case-OK\".casefold())
+print(\"HELLO\".casefold() == \"hello\".casefold(), \"A\".casefold() == \"a\".lower())
+";
+    let out = run_program("strcfold", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_capitalize_title_swapcase_match_python() {
     let src = "\
 print(\"hello WORLD\".capitalize(), \"123abc\".capitalize(), \"\".capitalize(), \"A\".capitalize())

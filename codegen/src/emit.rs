@@ -995,6 +995,7 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_str_contains(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_upper(ptr)\n");
         out.push_str("declare ptr @pyrs_str_lower(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_casefold(ptr)\n");
         out.push_str("declare ptr @pyrs_str_capitalize(ptr)\n");
         out.push_str("declare ptr @pyrs_str_title(ptr)\n");
         out.push_str("declare ptr @pyrs_str_swapcase(ptr)\n");
@@ -3896,6 +3897,7 @@ impl Emitter {
                 let (callee, is_bool, is_int) = match func {
                     StrFn::Upper => ("pyrs_str_upper", false, false),
                     StrFn::Lower => ("pyrs_str_lower", false, false),
+                    StrFn::CaseFold => ("pyrs_str_casefold", false, false),
                     StrFn::Capitalize => ("pyrs_str_capitalize", false, false),
                     StrFn::Title => ("pyrs_str_title", false, false),
                     StrFn::SwapCase => ("pyrs_str_swapcase", false, false),

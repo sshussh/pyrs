@@ -2557,6 +2557,11 @@ PyrsStr *pyrs_str_lower(const PyrsStr *s) {
     return r;
 }
 
+/* ASCII: same as lower. Unicode folds (ß → ss) are residual. */
+PyrsStr *pyrs_str_casefold(const PyrsStr *s) {
+    return pyrs_str_lower(s);
+}
+
 static char ascii_upper(char c) {
     return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
 }

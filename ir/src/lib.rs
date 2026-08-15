@@ -1346,8 +1346,9 @@ pub enum FileFn {
 pub enum StrFn {
     /// `s.upper()` → str
     Upper,
-    /// `s.lower()` → str
+    /// `s.lower()` / `s.casefold()` → str (ASCII: casefold is the same as lower)
     Lower,
+    CaseFold,
     /// `s.capitalize()` / `s.title()` / `s.swapcase()` → str (ASCII)
     Capitalize,
     Title,

@@ -11124,6 +11124,7 @@ fn lower_str_method(
     let (func, ret, str_args): (ir::StrFn, ir::Ty, usize) = match method {
         "upper" => (Upper, ir::Ty::Str, 0),
         "lower" => (Lower, ir::Ty::Str, 0),
+        "casefold" => (CaseFold, ir::Ty::Str, 0),
         "capitalize" => (Capitalize, ir::Ty::Str, 0),
         "title" => (Title, ir::Ty::Str, 0),
         "swapcase" => (SwapCase, ir::Ty::Str, 0),
@@ -11258,7 +11259,7 @@ fn lower_str_method(
             return Err(err(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
-                     upper, lower, capitalize, title, swapcase, zfill, center, ljust, rjust, \
+                     upper, lower, casefold, capitalize, title, swapcase, zfill, center, ljust, rjust, \
                      strip, lstrip, rstrip (optional chars/None), startswith, \
                      endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
@@ -23912,6 +23913,29 @@ print(f())
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn str_casefold_lowers() {
+        let m = analyze_ok("s = \"Hi\".casefold()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::CaseFold,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn str_casefold_rejects_extra_arg() {
+        let e = analyze_err("print(\"a\".casefold(\"x\"))\n");
+        assert!(e.message.contains("exactly 0 argument"), "{}", e.message);
     }
 
     #[test]
