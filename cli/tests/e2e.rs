@@ -12480,6 +12480,37 @@ print(d[\"a\"], d[\"b\"])
 }
 
 #[test]
+fn set_copy_match_python() {
+    let src = "\
+s = {1, 2}
+t = s.copy()
+t.add(3)
+print(sorted(list(s)), sorted(list(t)))
+empty: set[int] = set()
+e = empty.copy()
+e.add(9)
+print(sorted(list(empty)), sorted(list(e)))
+words = {\"a\", \"b\"}
+w2 = words.copy()
+w2.add(\"c\")
+print(sorted(list(words)), sorted(list(w2)))
+s.copy()
+";
+    let out = run_program("setcopy", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn v022_list_dict_copy() {
     let src = "\
 a = [1, 2]

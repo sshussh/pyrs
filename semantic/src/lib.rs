@@ -10611,11 +10611,23 @@ fn lower_set_method_stmt(
                 other,
             })
         }
+        "copy" => {
+            if !args.is_empty() {
+                return Err(err(
+                    format!("copy() takes no arguments ({} given)", args.len()),
+                    method_span,
+                ));
+            }
+            Ok(ir::Stmt::ExprStmt(ir::Expr {
+                ty: ir::set_of(elem_ty),
+                kind: ir::ExprKind::SetCopy(Box::new(base_ir)),
+            }))
+        }
         _ => Err(err(
             format!(
                 "set method '{method}' is not supported yet (supported: add, remove, \
                  discard, clear, union, intersection, difference, symmetric_difference, \
-                 issubset, issuperset, isdisjoint, update)"
+                 issubset, issuperset, isdisjoint, update, copy)"
             ),
             method_span,
         )),
@@ -15691,7 +15703,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 ir::Ty::Dict { key, value } => {
                     lower_dict_method(base_ir, *key, *value, method, *method_span, &args, ctx)
                 }
-                ir::Ty::Set(_) => match method.as_str() {
+                ir::Ty::Set(elem) => match method.as_str() {
                     "add" | "remove" | "discard" | "clear" | "update" => Err(err(
                         format!(
                             "set.{method}(...) returns None and cannot be used in an \
@@ -15736,11 +15748,23 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                             rel => lower_set_relation(base_ir, other, *method_span, rel),
                         }
                     }
+                    "copy" => {
+                        if !args.is_empty() {
+                            return Err(err(
+                                format!("copy() takes no arguments ({} given)", args.len()),
+                                *method_span,
+                            ));
+                        }
+                        Ok(ir::Expr {
+                            ty: ir::set_of(*elem),
+                            kind: ir::ExprKind::SetCopy(Box::new(base_ir)),
+                        })
+                    }
                     _ => Err(err(
                         format!(
                             "set method '{method}' is not supported yet (supported: add, \
                              remove, discard, clear, union, intersection, difference, \
-                             symmetric_difference, issubset, issuperset, isdisjoint, update)"
+                             symmetric_difference, issubset, issuperset, isdisjoint, update, copy)"
                         ),
                         *method_span,
                     )),
@@ -26442,6 +26466,24 @@ print(count([]))
             panic!();
         };
         assert!(matches!(value.kind, ir::ExprKind::SetIsDisjoint { .. }));
+    }
+
+    #[test]
+    fn set_copy_lowers() {
+        let m = analyze_ok("s = {1, 2}\nt = s.copy()\ns.copy()\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(value.ty, ir::Ty::Set(_)));
+        assert!(matches!(value.kind, ir::ExprKind::SetCopy(_)));
+        assert!(matches!(entry.body[2], ir::Stmt::ExprStmt(_)));
+    }
+
+    #[test]
+    fn set_copy_rejects_args() {
+        let e = analyze_err("s = {1}\nprint(s.copy(1))\n");
+        assert!(e.message.contains("no arguments"), "{}", e.message);
     }
 
     #[test]

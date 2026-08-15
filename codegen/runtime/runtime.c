@@ -6168,6 +6168,14 @@ void pyrs_set_update(PyrsSet *s, const PyrsSet *other) {
     }
 }
 
+/* Shallow set copy. */
+PyrsSet *pyrs_set_copy(const PyrsSet *s) {
+    check_ref(s);
+    PyrsSet *r = pyrs_set_new();
+    pyrs_set_update(r, s);
+    return r;
+}
+
 /* New set = s | other. */
 PyrsSet *pyrs_set_union(const PyrsSet *a, const PyrsSet *b) {
     check_ref(a);

@@ -523,6 +523,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `ListPop` / `ListIndexOf` / `ListCount` / `ListLit` / `ListNew` / `Len` | list ops |
 | `TupleIndexOf` / `TupleCount` | `tuple.index([start, end])` / `tuple.count` → `pyrs_tuple_index` / `pyrs_tuple_count` |
 | `DictGet` / `DictPop` / `DictSetDefault` / `DictPopItem` | dict get / pop / setdefault / popitem |
+| `SetCopy` | `set.copy()` → `pyrs_set_copy` |
 | `Block { stmts, result }` | statements inside expressions (comprehensions) |
 | `Abs` | `abs(x)` via LLVM abs/fabs |
 | `Ord` / `Chr` | `ord(s)` / `chr(n)` via `pyrs_str_ord` / `pyrs_chr` (Unicode code points) |

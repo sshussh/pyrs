@@ -925,6 +925,8 @@ pub enum ExprKind {
     ListFromStr(Box<Expr>),
     /// Shallow copy of a dict (`dict.copy()`).
     DictCopy(Box<Expr>),
+    /// Shallow copy of a set (`set.copy()`).
+    SetCopy(Box<Expr>),
     /// `set(xs)` from a homogeneous list of int/str.
     SetFromList {
         list: Box<Expr>,

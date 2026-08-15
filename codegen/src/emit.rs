@@ -435,6 +435,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | ListCopy(operand)
         | ListFromStr(operand)
         | DictCopy(operand)
+        | SetCopy(operand)
         | SetFromStr(operand)
         | MinList(operand)
         | MaxList(operand)
@@ -725,6 +726,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | ListCopy(operand)
         | ListFromStr(operand)
         | DictCopy(operand)
+        | SetCopy(operand)
         | SetFromStr(operand)
         | MinList(operand)
         | MaxList(operand)
@@ -975,6 +977,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_set_elements(ptr)\n");
         out.push_str("declare ptr @pyrs_set_from_list(ptr, i32)\n");
         out.push_str("declare ptr @pyrs_set_from_str(ptr)\n");
+        out.push_str("declare ptr @pyrs_set_copy(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_copy(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_from_pairs(ptr, i32, i32)\n");
         out.push_str("declare ptr @pyrs_str_concat(ptr, ptr)\n");
@@ -5362,6 +5365,12 @@ impl Emitter {
                 let v = self.emit_expr(d);
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_dict_copy(ptr {v})"));
+                t
+            }
+            ExprKind::SetCopy(s) => {
+                let v = self.emit_expr(s);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_set_copy(ptr {v})"));
                 t
             }
             ExprKind::SetFromList { list, elem } => {

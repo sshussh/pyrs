@@ -1344,7 +1344,7 @@ Container notes (v0.20.1):
 - **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
   `{}` is always an empty dict; `|` / `.union` / `|=` / `.update` and
   `&` / `-` / `^` for same element type; `==` / `!=`; subset operators
-  `<` / `<=` / `>` / `>=`; methods `issubset` / `issuperset` / `isdisjoint`.
+  `<` / `<=` / `>` / `>=`; methods `issubset` / `issuperset` / `isdisjoint` / `copy`.
 - **Any (limited):** annotation `Any` / `list[Any]` etc. Values are
   heap-boxed print-tag + payload (same as container union slots).
   Concrete → Any and Any → concrete coerce at the boundary (runtime
