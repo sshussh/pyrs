@@ -1536,6 +1536,50 @@ fn hex_bin_oct_wrong_type_is_compile_error() {
     );
 }
 
+#[test]
+fn divmod_match_python() {
+    let src = "\
+print(divmod(7, 3), divmod(-7, 3), divmod(7, -3), divmod(-7, -3))
+print(divmod(0, 5), divmod(True, 2), divmod(8, True))
+print(divmod(7.5, 2.0), divmod(-7.5, 2.0), divmod(7, 2.5))
+q, r = divmod(20, 6)
+print(q, r)
+def side(n: int) -> int:
+    print(n)
+    return n
+print(divmod(side(11), side(4)))
+";
+    let out = run_program("divmod", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn divmod_errors() {
+    let (_, stderr) = run_program_expect_fail("dm_str", "print(divmod(\"a\", 1))\n");
+    assert!(
+        stderr.contains("unsupported operand type(s) for divmod()"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("dm_arity", "print(divmod(1))\n");
+    assert!(
+        stderr.contains("divmod expected 2 arguments"),
+        "stderr={stderr}"
+    );
+    let (code, stderr) = run_program_expect_fail("dm_zero", "print(divmod(1, 0))\n");
+    assert_eq!(code, 1);
+    assert!(stderr.contains("ZeroDivisionError"), "stderr={stderr}");
+}
+
 // ---- v0.3: slicing, in/not in, pop, f-strings ----
 
 #[test]

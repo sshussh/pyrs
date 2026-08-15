@@ -814,6 +814,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `ord(s)` | one-character `str` (Unicode code point, not byte length) | `int`; empty / multi-char → `TypeError` |
 | `chr(n)` | int or bool (`True` → 1) in `0 ..= 0x10FFFF` | one-character `str`; out of range → `ValueError` |
 | `hex(n)` / `bin(n)` / `oct(n)` | int or bool (`True` → 1) | `str` with lowercase prefix (`'0xff'`, `'-0xa'`, `'0b1010'`, `'0o10'`); same as `format(n, '#x')` / `'#b'` / `'#o'` |
+| `divmod(a, b)` | int, float, bool (2 args; mixed numeric promotes) | `tuple[T, T]` of `(a // b, a % b)`; operands evaluated once; zero divisor → `ZeroDivisionError` |
 | `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, orderable tuple, or orderable list (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple/list: lexicographic; optional monomorphic `key=` over homogeneous positionals; no `default=` |
 | `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple\|orderable list]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs[, start])` | `list[int]` or `list[float]`; optional numeric `start` (positional or `start=`) | `elem ⊔ start` (`bool`→`int`→`float`); empty yields `start` (default `0` / `0.0`) |

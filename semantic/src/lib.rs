@@ -1572,7 +1572,7 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 24] = [
+const BUILTINS: [&str; 25] = [
     "print",
     "len",
     "range",
@@ -1597,6 +1597,7 @@ const BUILTINS: [&str; 24] = [
     "hex",
     "bin",
     "oct",
+    "divmod",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -3282,7 +3283,8 @@ fn collect_param_constraints_expr(
                 || func == "chr"
                 || func == "hex"
                 || func == "bin"
-                || func == "oct")
+                || func == "oct"
+                || func == "divmod")
                 && let Some(ast::PosArg::Pos(ae)) = args.first()
                 && matches!(&ae.kind, ast::ExprKind::Name(n) if n == name)
             {
@@ -3290,7 +3292,7 @@ fn collect_param_constraints_expr(
                     "len" => {
                         // Ambiguous container — do not constrain alone.
                     }
-                    "abs" | "sum" | "round" => out.push(ir::Ty::Int),
+                    "abs" | "sum" | "round" | "divmod" => out.push(ir::Ty::Int),
                     "ord" => out.push(ir::Ty::Str),
                     "chr" | "hex" | "bin" | "oct" => out.push(ir::Ty::Int),
                     "sorted" => out.push(ir::list_of(ir::Ty::Int)),
@@ -16500,6 +16502,69 @@ fn lower_int_prefix_expr(
     })
 }
 
+fn is_numeric_ty(ty: ir::Ty) -> bool {
+    matches!(ty, ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool)
+}
+
+/// `divmod(a, b)` → `(a // b, a % b)` with operands evaluated once.
+fn lower_divmod_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() != 2 {
+        return Err(err(
+            format!("divmod expected 2 arguments, got {}", args.len()),
+            span,
+        ));
+    }
+    let l = lower_expr(args[0], ctx)?;
+    let r = lower_expr(args[1], ctx)?;
+    if !is_numeric_ty(l.ty) || !is_numeric_ty(r.ty) {
+        return Err(err(
+            format!(
+                "unsupported operand type(s) for divmod(): '{}' and '{}'",
+                l.ty, r.ty
+            ),
+            span,
+        ));
+    }
+    let (l, r, ty) = unify_numeric(l, r, span, "divmod()")?;
+    let a = ctx.fresh_temp("dm", ty);
+    let b = ctx.fresh_temp("dm", ty);
+    let loc = |name: &str| ir::Expr {
+        ty,
+        kind: ir::ExprKind::Local(name.to_string()),
+    };
+    let bin = |op: ir::BinOp, left: ir::Expr, right: ir::Expr| ir::Expr {
+        ty,
+        kind: ir::ExprKind::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+    };
+    let pair = ir::Expr {
+        ty: ir::tuple_of(&[ty, ty]),
+        kind: ir::ExprKind::TupleLit(vec![
+            bin(ir::BinOp::FloorDiv, loc(&a), loc(&b)),
+            bin(ir::BinOp::Mod, loc(&a), loc(&b)),
+        ]),
+    };
+    let inner = ir::Expr {
+        ty: pair.ty,
+        kind: ir::ExprKind::Let {
+            name: b,
+            value: Box::new(r),
+            body: Box::new(pair),
+        },
+    };
+    Ok(ir::Expr {
+        ty: inner.ty,
+        kind: ir::ExprKind::Let {
+            name: a,
+            value: Box::new(l),
+            body: Box::new(inner),
+        },
+    })
+}
+
 /// `print` `sep=` / `end=`: CPython accepts `str` or `None` (None → default).
 fn coerce_print_sep_end(value: ir::Expr, which: &str, span: Span) -> SResult<ir::Expr> {
     match value.ty {
@@ -18213,6 +18278,7 @@ fn lower_call(
             "hex" => lower_int_prefix_expr("hex", "#x", &args, span, ctx),
             "bin" => lower_int_prefix_expr("bin", "#b", &args, span, ctx),
             "oct" => lower_int_prefix_expr("oct", "#o", &args, span, ctx),
+            "divmod" => lower_divmod_expr(&args, span, ctx),
             "abs" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -22945,6 +23011,42 @@ print(f())
         let e = analyze_err("x = bin(1, 2)\n");
         assert!(
             e.message.contains("bin() takes exactly one argument"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn divmod_lowers_to_tuple() {
+        let m = analyze_ok("a = divmod(7, 3)\nb = divmod(7, 2.0)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!("{:?}", entry.body[0]);
+        };
+        assert_eq!(value.ty, ir::tuple_of(&[ir::Ty::Int, ir::Ty::Int]));
+        assert!(matches!(value.kind, ir::ExprKind::Let { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!("{:?}", entry.body[1]);
+        };
+        assert_eq!(value.ty, ir::tuple_of(&[ir::Ty::Float, ir::Ty::Float]));
+    }
+
+    #[test]
+    fn divmod_rejects_str() {
+        let e = analyze_err("x = divmod(\"a\", 1)\n");
+        assert!(
+            e.message
+                .contains("unsupported operand type(s) for divmod()"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn divmod_rejects_wrong_arity() {
+        let e = analyze_err("x = divmod(1)\n");
+        assert!(
+            e.message.contains("divmod expected 2 arguments"),
             "{}",
             e.message
         );
