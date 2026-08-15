@@ -1398,6 +1398,13 @@ pub enum StrFn {
     IsTitle,
     /// `s.isascii()` -> bool (all bytes < 128; empty is True)
     IsAscii,
+    /// `s.isdecimal()` / `s.isnumeric()` → bool (ASCII: same as `isdigit`)
+    IsDecimal,
+    IsNumeric,
+    /// `s.isidentifier()` → bool (ASCII: `[A-Za-z_][A-Za-z0-9_]*`; empty False)
+    IsIdentifier,
+    /// `s.isprintable()` → bool (ASCII 0x20..=0x7E; empty is True)
+    IsPrintable,
     /// `s.removeprefix(pre)` / `s.removesuffix(suf)` → str
     RemovePrefix,
     RemoveSuffix,

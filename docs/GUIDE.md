@@ -404,6 +404,9 @@ String methods (ASCII case/whitespace rules):
 "A1".isalnum()            # True; empty / punctuation is False
 "Hello World".istitle()   # True; "HELLO" / "Hello world" are False
 "".isascii()              # True; any byte >= 128 is False
+"123".isdecimal()         # True; ASCII same as isdigit / isnumeric
+"_x1".isidentifier()      # True; "if" is True too; "1x" is False
+"hi".isprintable()        # True; empty True; newline / DEL are False
 "hello".removeprefix("he")  # "llo"; missing prefix is a no-op
 "hello".removesuffix("lo")  # "hel"; empty affix is a no-op
 "a,b,c".partition(",")    # ('a', ',', 'b,c'); rpartition uses the last match

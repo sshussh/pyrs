@@ -1000,6 +1000,10 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_str_isalnum(ptr)\n");
         out.push_str("declare i32 @pyrs_str_istitle(ptr)\n");
         out.push_str("declare i32 @pyrs_str_isascii(ptr)\n");
+        out.push_str("declare i32 @pyrs_str_isdecimal(ptr)\n");
+        out.push_str("declare i32 @pyrs_str_isnumeric(ptr)\n");
+        out.push_str("declare i32 @pyrs_str_isidentifier(ptr)\n");
+        out.push_str("declare i32 @pyrs_str_isprintable(ptr)\n");
         out.push_str("declare ptr @pyrs_str_removeprefix(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_removesuffix(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_partition(ptr, ptr)\n");
@@ -3890,6 +3894,10 @@ impl Emitter {
                     StrFn::IsAlnum => ("pyrs_str_isalnum", true, false),
                     StrFn::IsTitle => ("pyrs_str_istitle", true, false),
                     StrFn::IsAscii => ("pyrs_str_isascii", true, false),
+                    StrFn::IsDecimal => ("pyrs_str_isdecimal", true, false),
+                    StrFn::IsNumeric => ("pyrs_str_isnumeric", true, false),
+                    StrFn::IsIdentifier => ("pyrs_str_isidentifier", true, false),
+                    StrFn::IsPrintable => ("pyrs_str_isprintable", true, false),
                     StrFn::RemovePrefix => ("pyrs_str_removeprefix", false, false),
                     StrFn::RemoveSuffix => ("pyrs_str_removesuffix", false, false),
                     StrFn::Partition => ("pyrs_str_partition", false, false),

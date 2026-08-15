@@ -3532,6 +3532,34 @@ print(\"\".count(\"\"), \"\".count(\"a\"), \"hello\".count(\"l\", True))
 }
 
 #[test]
+fn str_isdecimal_isnumeric_isidentifier_isprintable_match_python() {
+    let src = "\
+print(\"123\".isdecimal(), \"\".isdecimal(), \"12a\".isdecimal(), \"-3\".isdecimal())
+print(\"123\".isnumeric(), \"\".isnumeric(), \"3.5\".isnumeric(), \" 7\".isnumeric())
+print(\"abc\".isidentifier(), \"A1\".isidentifier(), \"1a\".isidentifier(), \"_\".isidentifier())
+print(\"__foo__\".isidentifier(), \"if\".isidentifier(), \"None\".isidentifier())
+print(\"\".isidentifier(), \"a b\".isidentifier(), \"a-b\".isidentifier(), \"0x\".isidentifier())
+print(\"hello\".isprintable(), \"hello world\".isprintable(), \"\".isprintable())
+print(\"hello\\n\".isprintable(), \"hello\\t\".isprintable(), \" \".isprintable())
+print(chr(0).isprintable(), chr(127).isprintable(), \"~\".isprintable(), \"!\".isprintable())
+print(\"\\0\".isprintable(), \"\\r\".isprintable(), chr(31).isprintable(), chr(32).isprintable())
+print(\"A_1\".isidentifier(), \"x0\".isidentifier(), \"class\".isidentifier())
+";
+    let out = run_program("strisid", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
 fn str_isalnum_istitle_isascii_match_python() {
     let src = "\
 print(\"abc\".isalnum(), \"A1\".isalnum(), \"\".isalnum(), \"a b\".isalnum(), \"a-1\".isalnum())

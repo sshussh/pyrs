@@ -4108,7 +4108,8 @@ PyrsStr *pyrs_format_str(const PyrsStr *s, const PyrsStr *spec) {
     return format_pad("", "", body, body_len, &fs);
 }
 
-int pyrs_str_isdigit(const PyrsStr *s) {
+/* ASCII: `0`..=`9`; empty is False. Shared by isdigit / isdecimal / isnumeric. */
+static int pyrs_str_is_ascii_digits(const PyrsStr *s) {
     check_ref(s);
     if (s->len == 0) {
         return 0;
@@ -4118,8 +4119,11 @@ int pyrs_str_isdigit(const PyrsStr *s) {
             return 0;
         }
     }
-
     return 1;
+}
+
+int pyrs_str_isdigit(const PyrsStr *s) {
+    return pyrs_str_is_ascii_digits(s);
 }
 
 int pyrs_str_isalpha(const PyrsStr *s) {
@@ -4225,6 +4229,48 @@ int pyrs_str_isascii(const PyrsStr *s) {
     check_ref(s);
     for (long long i = 0; i < s->len; i++) {
         if ((unsigned char)s->data[i] >= 128) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int pyrs_str_isdecimal(const PyrsStr *s) {
+    return pyrs_str_is_ascii_digits(s);
+}
+
+int pyrs_str_isnumeric(const PyrsStr *s) {
+    return pyrs_str_is_ascii_digits(s);
+}
+
+/* ASCII identifier: `[A-Za-z_][A-Za-z0-9_]*`. Keywords are identifiers. */
+int pyrs_str_isidentifier(const PyrsStr *s) {
+    check_ref(s);
+    if (s->len == 0) {
+        return 0;
+    }
+    char first = s->data[0];
+    int start = (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_';
+    if (!start) {
+        return 0;
+    }
+    for (long long i = 1; i < s->len; i++) {
+        char c = s->data[i];
+        int cont = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+            || c == '_';
+        if (!cont) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* ASCII printable: empty is True; each byte in 0x20..=0x7E (space through `~`). */
+int pyrs_str_isprintable(const PyrsStr *s) {
+    check_ref(s);
+    for (long long i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c < 0x20 || c > 0x7E) {
             return 0;
         }
     }

@@ -543,7 +543,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 `Find`, `Index`, `RFind`, `RIndex`, `Count`, `Replace`, `SplitWs`, `Split`,
 `RSplitWs`, `RSplit`, `SplitLines`, `ExpandTabs`, `Join`,
 `IsDigit`, `IsAlpha`, `IsSpace`, `IsUpper`, `IsLower`, `IsAlnum`, `IsTitle`,
-`IsAscii`.
+`IsAscii`, `IsDecimal`, `IsNumeric`, `IsIdentifier`, `IsPrintable`.
 
 ### `FileFn` (current)
 

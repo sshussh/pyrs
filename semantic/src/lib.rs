@@ -11224,6 +11224,10 @@ fn lower_str_method(
         "isalnum" => (IsAlnum, ir::Ty::Bool, 0),
         "istitle" => (IsTitle, ir::Ty::Bool, 0),
         "isascii" => (IsAscii, ir::Ty::Bool, 0),
+        "isdecimal" => (IsDecimal, ir::Ty::Bool, 0),
+        "isnumeric" => (IsNumeric, ir::Ty::Bool, 0),
+        "isidentifier" => (IsIdentifier, ir::Ty::Bool, 0),
+        "isprintable" => (IsPrintable, ir::Ty::Bool, 0),
         "removeprefix" => (RemovePrefix, ir::Ty::Str, 1),
         "removesuffix" => (RemoveSuffix, ir::Ty::Str, 1),
         "partition" => (
@@ -11244,7 +11248,8 @@ fn lower_str_method(
                      strip, lstrip, rstrip (optional chars/None), startswith, \
                      endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
-                     isalnum, istitle, isascii, \
+                     isalnum, istitle, isascii, isdecimal, isnumeric, \
+                     isidentifier, isprintable, \
                      removeprefix, removesuffix, partition, rpartition, rsplit, \
                      splitlines, expandtabs)"
                 ),
@@ -23982,6 +23987,36 @@ print(f())
             assert_eq!(value.ty, ir::Ty::Bool);
             assert!(matches!(&value.kind, ir::ExprKind::StrCall { func, .. } if *func == want));
         }
+    }
+
+    #[test]
+    fn str_isdecimal_isnumeric_isidentifier_isprintable_are_bool() {
+        let m = analyze_ok(
+            "a = \"12\".isdecimal()\nb = \"12\".isnumeric()\n\
+             c = \"_x\".isidentifier()\nd = \"ok\".isprintable()\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        for (i, want) in [
+            ir::StrFn::IsDecimal,
+            ir::StrFn::IsNumeric,
+            ir::StrFn::IsIdentifier,
+            ir::StrFn::IsPrintable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!("body[{i}]");
+            };
+            assert_eq!(value.ty, ir::Ty::Bool);
+            assert!(matches!(&value.kind, ir::ExprKind::StrCall { func, .. } if *func == want));
+        }
+    }
+
+    #[test]
+    fn str_isidentifier_rejects_extra_arg() {
+        let e = analyze_err("print(\"a\".isidentifier(\"x\"))\n");
+        assert!(e.message.contains("exactly 0 argument"), "{}", e.message);
     }
 
     #[test]
