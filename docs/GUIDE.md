@@ -813,6 +813,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `round(x[, ndigits])` | int, float, bool; optional int `ndigits` (positional or `ndigits=`) | one-arg → `int` (ties to even); two-arg `int` stays `int`; two-arg `float` stays `float` |
 | `ord(s)` | one-character `str` (Unicode code point, not byte length) | `int`; empty / multi-char → `TypeError` |
 | `chr(n)` | int or bool (`True` → 1) in `0 ..= 0x10FFFF` | one-character `str`; out of range → `ValueError` |
+| `hex(n)` / `bin(n)` / `oct(n)` | int or bool (`True` → 1) | `str` with lowercase prefix (`'0xff'`, `'-0xa'`, `'0b1010'`, `'0o10'`); same as `format(n, '#x')` / `'#b'` / `'#o'` |
 | `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, orderable tuple, or orderable list (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple/list: lexicographic; optional monomorphic `key=` over homogeneous positionals; no `default=` |
 | `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple\|orderable list]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs[, start])` | `list[int]` or `list[float]`; optional numeric `start` (positional or `start=`) | `elem ⊔ start` (`bool`→`int`→`float`); empty yields `start` (default `0` / `0.0`) |
@@ -852,7 +853,8 @@ Indentation defines blocks; spaces and tabs both work (a tab counts as 8
 columns) but inconsistent dedents are an error. Number literals accept
 underscores (`1_000_000`), hex/bin/oct prefixes (`0x10FFFF`, `0b1010`,
 `0o17`, any case; `0x_ff` is fine, `0xFF_` is not), and floats
-`1.5`, `.5`, `2.`, `1e3`, `2.5e-2`.
+`1.5`, `.5`, `2.`, `1e3`, `2.5e-2`. The inverse builtins `hex` / `bin` /
+`oct` produce lowercase prefixed strings (`hex(255)` is `'0xff'`).
 
 ### Files
 

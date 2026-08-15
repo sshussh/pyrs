@@ -1492,6 +1492,50 @@ fn invalid_prefixed_int_is_compile_error() {
     }
 }
 
+#[test]
+fn hex_bin_oct_builtins_match_python() {
+    let src = "\
+print(hex(0), hex(10), hex(255), hex(-255), hex(True), hex(False))
+print(bin(0), bin(10), bin(-10), bin(True))
+print(oct(0), oct(8), oct(-8), oct(True))
+print(hex(0x10FFFF), hex(0x8000000000000000), hex(-0x10))
+n = 255
+print(hex(n), bin(n), oct(n))
+print(hex(255) + bin(2))
+";
+    let out = run_program("hexfn", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn hex_bin_oct_wrong_type_is_compile_error() {
+    let (_, stderr) = run_program_expect_fail("hex_str", "print(hex(\"ff\"))\n");
+    assert!(
+        stderr.contains("cannot be interpreted as an integer"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("bin_float", "print(bin(1.0))\n");
+    assert!(
+        stderr.contains("cannot be interpreted as an integer"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("oct_arity", "print(oct(1, 2))\n");
+    assert!(
+        stderr.contains("oct() takes exactly one argument"),
+        "stderr={stderr}"
+    );
+}
+
 // ---- v0.3: slicing, in/not in, pop, f-strings ----
 
 #[test]

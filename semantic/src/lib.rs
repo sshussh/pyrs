@@ -1572,7 +1572,7 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 21] = [
+const BUILTINS: [&str; 24] = [
     "print",
     "len",
     "range",
@@ -1594,6 +1594,9 @@ const BUILTINS: [&str; 21] = [
     "round",
     "ord",
     "chr",
+    "hex",
+    "bin",
+    "oct",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -3276,7 +3279,10 @@ fn collect_param_constraints_expr(
                 || func == "sorted"
                 || func == "round"
                 || func == "ord"
-                || func == "chr")
+                || func == "chr"
+                || func == "hex"
+                || func == "bin"
+                || func == "oct")
                 && let Some(ast::PosArg::Pos(ae)) = args.first()
                 && matches!(&ae.kind, ast::ExprKind::Name(n) if n == name)
             {
@@ -3286,7 +3292,7 @@ fn collect_param_constraints_expr(
                     }
                     "abs" | "sum" | "round" => out.push(ir::Ty::Int),
                     "ord" => out.push(ir::Ty::Str),
-                    "chr" => out.push(ir::Ty::Int),
+                    "chr" | "hex" | "bin" | "oct" => out.push(ir::Ty::Int),
                     "sorted" => out.push(ir::list_of(ir::Ty::Int)),
                     _ => {}
                 }
@@ -16413,6 +16419,43 @@ fn const_str_expr(s: &str) -> ir::Expr {
     }
 }
 
+/// `hex` / `bin` / `oct`: CPython `format(n, "#x")` / `"#b"` / `"#o"`.
+fn lower_int_prefix_expr(
+    name: &str,
+    spec: &str,
+    args: &[&ast::Expr],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!("{name}() takes exactly one argument ({} given)", args.len()),
+            span,
+        ));
+    }
+    let arg = lower_expr(args[0], ctx)?;
+    let arg = match arg.ty {
+        ir::Ty::Bool => ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::BoolToInt(Box::new(arg)),
+        },
+        ir::Ty::Int => arg,
+        other => {
+            return Err(err(
+                format!("'{other}' object cannot be interpreted as an integer"),
+                args[0].span,
+            ));
+        }
+    };
+    Ok(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::FormatValue {
+            value: Box::new(arg),
+            spec: Box::new(const_str_expr(spec)),
+        },
+    })
+}
+
 /// `print` `sep=` / `end=`: CPython accepts `str` or `None` (None → default).
 fn coerce_print_sep_end(value: ir::Expr, which: &str, span: Span) -> SResult<ir::Expr> {
     match value.ty {
@@ -18123,6 +18166,9 @@ fn lower_call(
                     kind: ir::ExprKind::Chr(Box::new(arg)),
                 })
             }
+            "hex" => lower_int_prefix_expr("hex", "#x", &args, span, ctx),
+            "bin" => lower_int_prefix_expr("bin", "#b", &args, span, ctx),
+            "oct" => lower_int_prefix_expr("oct", "#o", &args, span, ctx),
             "abs" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -22812,6 +22858,49 @@ print(f())
         let e = analyze_err("x = chr(1, 2)\n");
         assert!(
             e.message.contains("chr() takes exactly one argument"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn hex_bin_oct_lower_int_and_bool() {
+        let m = analyze_ok("a = hex(255)\nb = bin(True)\nc = oct(8)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        for i in 0..3 {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!("{:?}", entry.body[i]);
+            };
+            assert_eq!(value.ty, ir::Ty::Str);
+            assert!(
+                matches!(value.kind, ir::ExprKind::FormatValue { .. }),
+                "{:?}",
+                value.kind
+            );
+        }
+    }
+
+    #[test]
+    fn hex_rejects_str() {
+        let e = analyze_err("x = hex(\"ff\")\n");
+        assert!(
+            e.message.contains("cannot be interpreted as an integer"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn hex_rejects_wrong_arity() {
+        let e = analyze_err("x = hex()\n");
+        assert!(
+            e.message.contains("hex() takes exactly one argument"),
+            "{}",
+            e.message
+        );
+        let e = analyze_err("x = bin(1, 2)\n");
+        assert!(
+            e.message.contains("bin() takes exactly one argument"),
             "{}",
             e.message
         );
