@@ -1328,6 +1328,50 @@ fn nested_list_index_miss_matches_python() {
 }
 
 #[test]
+fn list_count_matches_python() {
+    let src = "\
+xs = [1, 2, 1, 3, 1]
+print(xs.count(1), xs.count(2), xs.count(9))
+empty: list[int] = []
+print(empty.count(0))
+print([1.0, 2.0, 1.0].count(1))
+print([[1], [2], [1]].count([1]))
+print([[1, 2], [3]].count([1, 2]))
+print([[1, 2], [3]].count([9]))
+empty_row: list[int] = []
+print([empty_row, [1], empty_row].count(empty_row))
+print([[\"a\", \"b\"], [\"a\", \"b\"], [\"c\"]].count([\"a\", \"b\"]))
+print([0.0, -0.0, 1.0].count(0.0))
+ys = [[1], [1], [1]]
+print(ys.count([1]))
+ys.count([2])
+print(\"ok\")
+";
+    let out = run_program("list_count", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn list_count_type_mismatch_is_compile_error() {
+    let (code, stderr) = run_program_expect_fail("list_count_ty", "print([1, 2].count(\"a\"))\n");
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("count() argument") && stderr.contains("str"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn list_pop_matches_python() {
     let out = run_program(
         "pop",

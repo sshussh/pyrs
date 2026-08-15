@@ -3469,6 +3469,17 @@ long long pyrs_list_index(const PyrsList *l, long long slot, int tag) {
     pyrs_die("ValueError: list.index(x): x not in list");
 }
 
+long long pyrs_list_count(const PyrsList *l, long long slot, int tag) {
+    check_ref(l);
+    long long n = 0;
+    for (long long i = 0; i < l->len; i++) {
+        if (slot_eq(l->data[i], slot, tag)) {
+            n++;
+        }
+    }
+    return n;
+}
+
 void pyrs_list_clear(PyrsList *l) {
     check_ref(l);
     l->len = 0;

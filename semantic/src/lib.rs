@@ -3325,7 +3325,8 @@ fn collect_param_constraints_expr(
         } => {
             if matches!(&base.kind, ast::ExprKind::Name(n) if n == name) {
                 match method.as_str() {
-                    "append" | "pop" | "insert" | "remove" | "clear" | "sort" | "index" => {
+                    "append" | "pop" | "insert" | "remove" | "clear" | "sort" | "index"
+                    | "count" => {
                         if let Some(ast::PosArg::Pos(a0)) = args.first() {
                             if let Some(t) = try_type_ast_expr(a0, params, &HashMap::new()) {
                                 out.push(ir::list_of(t));
@@ -10034,10 +10035,14 @@ fn lower_method_stmt(
                 let idx = lower_list_index_of(base_ir, *elem, args, method_span, ctx)?;
                 Ok(ir::Stmt::ExprStmt(idx))
             }
+            "count" => {
+                let n = lower_list_count(base_ir, *elem, args, method_span, ctx)?;
+                Ok(ir::Stmt::ExprStmt(n))
+            }
             _ => Err(err(
                 format!(
                     "list method '{method}' is not supported yet (supported: \
-                     append, pop, insert, remove, index, clear, sort, extend, copy)"
+                     append, pop, insert, remove, index, count, clear, sort, extend, copy)"
                 ),
                 method_span,
             )),
@@ -11012,6 +11017,30 @@ fn lower_list_index_of(
     Ok(ir::Expr {
         ty: ir::Ty::Int,
         kind: ir::ExprKind::ListIndexOf {
+            list: Box::new(list),
+            value: Box::new(value),
+        },
+    })
+}
+
+fn lower_list_count(
+    list: ir::Expr,
+    elem: ir::Ty,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!("count() takes exactly one argument ({} given)", args.len()),
+            method_span,
+        ));
+    }
+    let value = lower_expr(&args[0], ctx)?;
+    let value = coerce(value, elem, args[0].span, "count() argument")?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::ListCount {
             list: Box::new(list),
             value: Box::new(value),
         },
@@ -14388,6 +14417,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     // pop returns the removed element
                     "pop" => lower_list_pop(base_ir, *elem, &args, *method_span, ctx),
                     "index" => lower_list_index_of(base_ir, *elem, &args, *method_span, ctx),
+                    "count" => lower_list_count(base_ir, *elem, &args, *method_span, ctx),
                     "append" | "insert" | "remove" | "clear" | "sort" | "extend" => Err(err(
                         format!(
                             "list.{method}(...) returns None and cannot be used \
@@ -22296,6 +22326,49 @@ print(f(B()))
         assert_eq!(value.ty, ir::Ty::Int);
         assert!(matches!(value.kind, ir::ExprKind::ListIndexOf { .. }));
         assert!(matches!(entry.body[4], ir::Stmt::ListClear { .. }));
+    }
+
+    #[test]
+    fn list_count_lowers() {
+        let m = analyze_ok("xs = [1, 2, 1]\nn = xs.count(1)\nxs.count(9)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::ListCount { .. }));
+        assert!(matches!(entry.body[2], ir::Stmt::ExprStmt(_)));
+    }
+
+    #[test]
+    fn list_count_nested_lowers() {
+        let m = analyze_ok("n = [[1], [2], [1]].count([1])\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        let ir::ExprKind::ListCount { list, value } = &value.kind else {
+            panic!("expected ListCount, got {:?}", value.kind);
+        };
+        assert_eq!(list.ty, ir::list_of(ir::list_of(ir::Ty::Int)));
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
+    }
+
+    #[test]
+    fn list_count_rejects_wrong_arity() {
+        let e = analyze_err("n = [1, 2].count()\n");
+        assert!(e.message.contains("exactly one argument"), "{}", e.message);
+    }
+
+    #[test]
+    fn list_count_rejects_wrong_elem_type() {
+        let e = analyze_err("n = [1, 2].count(\"a\")\n");
+        assert!(
+            e.message.contains("count() argument") && e.message.contains("str"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

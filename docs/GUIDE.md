@@ -527,8 +527,9 @@ m.append(["a", "b"])
 ```
 
 List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
-`index(v)`, `clear()`, `sort()`. `insert` clamps the index like CPython;
-`remove` / `index` trap with `ValueError` when the value is missing.
+`index(v)`, `count(v)`, `clear()`, `sort()`. `insert` clamps the index like CPython;
+`remove` / `index` trap with `ValueError` when the value is missing;
+`count` returns the number of matches (0 if none).
 `sort()` is in-place (statement only); `sorted(xs)` returns a new sorted
 copy. Without `key=`, element types are `int`, `float`, `bool`, `str`;
 float NaN sorts last on that path (stable total order via runtime
@@ -546,8 +547,9 @@ lambda/function.
 List `+` concatenates (same element type); `*` repeats with an int count
 (`n <= 0` yields `[]`). Both produce a new list (shallow copy of slots).
 `==` / `!=` compare length and elements (same rules as `in`; nested lists
-compare recursively). `in` / `not in` accept a needle of the element
-type, including `list[list[…]]` (`[1, 2] in [[1, 2], [3]]`). Ordering
+compare recursively). `in` / `not in` / `index` / `remove` / `count` accept
+a needle of the element type, including `list[list[…]]`
+(`[1, 2] in [[1, 2], [3]]`; `[[1], [1]].count([1])` is `2`). Ordering
 comparisons (`<` / `<=` / `>` / `>=`), `min` / `max`, and
 `sorted` / `list.sort` work on lists of orderable elements, including
 nested orderable lists.

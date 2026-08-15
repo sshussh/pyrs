@@ -520,7 +520,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `FileCall { func: FileFn, args }` | file methods → `pyrs_file_*` |
 | `Open` / `Input` / `Argv` | I/O and CLI |
 | `Contains` | `in` / `not in` |
-| `ListPop` / `ListIndexOf` / `ListLit` / `ListNew` / `Len` | list ops |
+| `ListPop` / `ListIndexOf` / `ListCount` / `ListLit` / `ListNew` / `Len` | list ops |
 | `Block { stmts, result }` | statements inside expressions (comprehensions) |
 | `Abs` | `abs(x)` via LLVM abs/fabs |
 | `Min` / `Max` | 2-arg `min`/`max` (numeric; select on compare) |

@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.37.0)
+## The language (v0.38.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.38.0**, not 1.0) until it is ready for
+milestone after this one is **0.39.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -119,6 +119,8 @@ A statically-typed Python subset:
   (`sorted` / `list.sort` / `min` / `max`).
   **v0.37:** `in` / `not in` for nested lists (`[1, 2] in [[1, 2], [3]]`),
   using the same recursive equality as `==` / `list.index` / `list.remove`.
+  **v0.38:** `list.count(x)` with the same recursive equality (including
+  nested lists).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -193,7 +195,7 @@ A statically-typed Python subset:
   and do not leak — and faster than the equivalent loop when length is
   knowable: results are pre-sized and appends inlined),
   indexing (read/write), slicing (copies, like Python),
-  `append`/`pop`/`insert`/`remove`/`index`/`clear`/`sort`/`extend`/`copy` (homogeneous
+  `append`/`pop`/`insert`/`remove`/`index`/`count`/`clear`/`sort`/`extend`/`copy` (homogeneous
   list arg), `list(iterable)`, `sorted(xs)` / `sorted(xs, key=f)` /
   `sorted(xs, reverse=…)` / `sorted(xs, key=f, reverse=…)`,
   `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` (and both kwargs),
@@ -282,7 +284,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.37.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.38.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -442,4 +444,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.37.0 && git push origin v0.37.0`.
+Release tags: `git tag v0.38.0 && git push origin v0.38.0`.

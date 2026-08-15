@@ -830,6 +830,12 @@ pub enum ExprKind {
         list: Box<Expr>,
         value: Box<Expr>,
     },
+    /// `list.count(value)` — number of matches using the same recursive
+    /// slot equality as `==` / `in` / `index` / `remove`. Result is `int`.
+    ListCount {
+        list: Box<Expr>,
+        value: Box<Expr>,
+    },
     /// A list literal; `ty` is `List(elem)` and items are already coerced.
     ListLit(Vec<Expr>),
     /// A fresh empty list with the given capacity (comprehension results).

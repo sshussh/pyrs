@@ -493,7 +493,9 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         }
         SetFromList { list, .. } => max_try_depth_in_expr(list),
         DictFromPairs { pairs, .. } => max_try_depth_in_expr(pairs),
-        ListPop { list, index } | ListIndexOf { list, value: index } => {
+        ListPop { list, index }
+        | ListIndexOf { list, value: index }
+        | ListCount { list, value: index } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
         }
         DictGet { dict, key, default } => max_try_depth_in_expr(dict)
@@ -701,7 +703,9 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | SetSymDiff { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
         SetFromList { list, .. } => count_yields_in_expr(list),
         DictFromPairs { pairs, .. } => count_yields_in_expr(pairs),
-        ListPop { list, index } | ListIndexOf { list, value: index } => {
+        ListPop { list, index }
+        | ListIndexOf { list, value: index }
+        | ListCount { list, value: index } => {
             count_yields_in_expr(list) + count_yields_in_expr(index)
         }
         DictGet { dict, key, default } => {
@@ -887,6 +891,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_list_insert(ptr, i64, i64)\n");
         out.push_str("declare void @pyrs_list_remove(ptr, i64, i32)\n");
         out.push_str("declare i64 @pyrs_list_index(ptr, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_list_count(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_list_clear(ptr)\n");
         out.push_str("declare void @pyrs_list_sort(ptr, i32)\n");
         out.push_str("declare void @pyrs_list_extend(ptr, ptr)\n");
@@ -3827,6 +3832,17 @@ impl Emitter {
                 let machine = self.tmp();
                 self.line(format!(
                     "{machine} = call i64 @pyrs_list_index(ptr {l}, i64 {slot}, i32 {})",
+                    elem_tag(&value.ty)
+                ));
+                self.emit_box_i64(&machine)
+            }
+            ExprKind::ListCount { list, value } => {
+                let l = self.emit_expr(list);
+                let v = self.emit_expr(value);
+                let slot = self.slot_from_value(&v, value.ty);
+                let machine = self.tmp();
+                self.line(format!(
+                    "{machine} = call i64 @pyrs_list_count(ptr {l}, i64 {slot}, i32 {})",
                     elem_tag(&value.ty)
                 ));
                 self.emit_box_i64(&machine)
