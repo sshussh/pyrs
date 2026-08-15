@@ -2556,6 +2556,47 @@ print(\"hi\".center(True), \"42\".zfill(True))
 }
 
 #[test]
+fn str_maketrans_translate_match_python() {
+    let src = "\
+print(\"hello\".translate(str.maketrans(\"he\", \"HE\")))
+print(\"hello\".translate(str.maketrans(\"he\", \"HE\", \"l\")))
+print(\"abc\".translate({ord(\"a\"): ord(\"x\")}))
+print(\"\".translate(str.maketrans(\"a\", \"b\")))
+print(\"aaa\".translate(str.maketrans(\"a\", \"A\")))
+print(\"abba\".translate(\"x\".maketrans(\"ab\", \"xy\")))
+print(str.maketrans(\"ab\", \"xy\"))
+print(str.maketrans(\"ab\", \"xy\", \"c\"))
+print(\"cab\".translate(str.maketrans(\"ab\", \"xy\", \"c\")))
+print(\"a\".translate({ord(\"a\"): 233}))
+";
+    let out = run_program("strxlat", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn str_maketrans_unequal_len_matches_python() {
+    let (code, stderr) = run_program_expect_fail(
+        "strxlatbad",
+        "x = \"ab\"\ny = \"c\"\nprint(str.maketrans(x, y))\n",
+    );
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: the first two maketrans arguments must have equal length"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn str_casefold_match_python() {
     let src = "\
 print(\"Hello WORLD\".casefold(), \"ABC123\".casefold(), \"\".casefold())

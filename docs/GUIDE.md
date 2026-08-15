@@ -407,6 +407,7 @@ String methods (ASCII case/whitespace rules):
 "123".isdecimal()         # True; ASCII same as isdigit / isnumeric
 "_x1".isidentifier()      # True; "if" is True too; "1x" is False
 "hi".isprintable()        # True; empty True; newline / DEL are False
+"hello".translate(str.maketrans("he", "HE"))  # "HEllo"; 3-arg deletes too
 "hello".removeprefix("he")  # "llo"; missing prefix is a no-op
 "hello".removesuffix("lo")  # "hel"; empty affix is a no-op
 "a,b,c".partition(",")    # ('a', ',', 'b,c'); rpartition uses the last match

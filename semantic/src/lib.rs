@@ -10033,6 +10033,10 @@ fn lower_method_stmt(
         let call = lower_super_method_call(method, method_span, args, ctx)?;
         return Ok(ir::Stmt::ExprStmt(call));
     }
+    if is_str_type_name(base, ctx) && method == "maketrans" {
+        let call = lower_str_maketrans(args, method_span, ctx)?;
+        return Ok(ir::Stmt::ExprStmt(call));
+    }
     let base_ir = lower_expr(base, ctx)?;
     if let ir::Ty::Class(id) = base_ir.ty {
         if resolve_property(id, method).is_some() {
@@ -11110,6 +11114,154 @@ fn lower_file_method(
     })
 }
 
+/// `str` as a type name (not a shadowed local/global) for `str.maketrans`.
+fn is_str_type_name(base: &ast::Expr, ctx: &FnCtx) -> bool {
+    match &base.kind {
+        ast::ExprKind::Name(n) if n == "str" => {
+            !ctx.locals.contains_key(n)
+                && !ctx.globals.contains_key(n)
+                && !ctx.cell_locals.contains_key(n)
+        }
+        _ => false,
+    }
+}
+
+fn expect_str_arg(e: ir::Expr, span: Span, what: &str) -> SResult<ir::Expr> {
+    if e.ty != ir::Ty::Str {
+        return Err(err(format!("{what} must be a str, found {}", e.ty), span));
+    }
+    Ok(e)
+}
+
+/// `str.maketrans(x, y[, z])` or `str.maketrans(dict)` pass-through.
+fn lower_str_maketrans(
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    match args.len() {
+        1 => {
+            let table = lower_expr(&args[0], ctx)?;
+            match table.ty {
+                ir::Ty::Dict { key, value }
+                    if *key == ir::Ty::Int
+                        && (*value == ir::Ty::Int || *value == ir::optional_of(ir::Ty::Int)) =>
+                {
+                    Ok(table)
+                }
+                other => Err(err(
+                    format!(
+                        "if you give only one argument to maketrans it must be a dict \
+                         [int, int] or dict[int, int | None], found {other}"
+                    ),
+                    args[0].span,
+                )),
+            }
+        }
+        2 => {
+            let x = expect_str_arg(
+                lower_expr(&args[0], ctx)?,
+                args[0].span,
+                "maketrans() arg 1",
+            )?;
+            let y = expect_str_arg(
+                lower_expr(&args[1], ctx)?,
+                args[1].span,
+                "maketrans() arg 2",
+            )?;
+            if let (ir::ExprKind::ConstStr(a), ir::ExprKind::ConstStr(b)) = (&x.kind, &y.kind)
+                && a.len() != b.len()
+            {
+                return Err(err(
+                    "the first two maketrans arguments must have equal length",
+                    args[1].span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::dict_of(ir::Ty::Int, ir::Ty::Int),
+                kind: ir::ExprKind::StrCall {
+                    func: ir::StrFn::MakeTrans,
+                    args: vec![x, y],
+                },
+            })
+        }
+        3 => {
+            let x = expect_str_arg(
+                lower_expr(&args[0], ctx)?,
+                args[0].span,
+                "maketrans() arg 1",
+            )?;
+            let y = expect_str_arg(
+                lower_expr(&args[1], ctx)?,
+                args[1].span,
+                "maketrans() arg 2",
+            )?;
+            let z = expect_str_arg(
+                lower_expr(&args[2], ctx)?,
+                args[2].span,
+                "maketrans() arg 3",
+            )?;
+            if let (ir::ExprKind::ConstStr(a), ir::ExprKind::ConstStr(b)) = (&x.kind, &y.kind)
+                && a.len() != b.len()
+            {
+                return Err(err(
+                    "the first two maketrans arguments must have equal length",
+                    args[1].span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::dict_of(ir::Ty::Int, ir::optional_of(ir::Ty::Int)),
+                kind: ir::ExprKind::StrCall {
+                    func: ir::StrFn::MakeTransDelete,
+                    args: vec![x, y, z],
+                },
+            })
+        }
+        n => Err(err(
+            format!("maketrans expected 1 to 3 arguments, got {n}"),
+            method_span,
+        )),
+    }
+}
+
+fn lower_str_translate(
+    base_ir: ir::Expr,
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!(
+                "translate() takes exactly one argument ({} given)",
+                args.len()
+            ),
+            method_span,
+        ));
+    }
+    let table = lower_expr(&args[0], ctx)?;
+    match table.ty {
+        ir::Ty::Dict { key, value }
+            if *key == ir::Ty::Int
+                && (*value == ir::Ty::Int || *value == ir::optional_of(ir::Ty::Int)) =>
+        {
+            Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::StrCall {
+                    func: ir::StrFn::Translate,
+                    args: vec![base_ir, table],
+                },
+            })
+        }
+        other => Err(err(
+            format!(
+                "translate() table must be dict[int, int] or dict[int, int | None], found {other}"
+            ),
+            args[0].span,
+        )),
+    }
+}
+
 /// The supported `str` methods (ASCII case/whitespace rules).
 fn lower_str_method(
     base_ir: ir::Expr,
@@ -11125,6 +11277,12 @@ fn lower_str_method(
         "upper" => (Upper, ir::Ty::Str, 0),
         "lower" => (Lower, ir::Ty::Str, 0),
         "casefold" => (CaseFold, ir::Ty::Str, 0),
+        "translate" => {
+            return lower_str_translate(base_ir, args, method_span, ctx);
+        }
+        "maketrans" => {
+            return lower_str_maketrans(args, method_span, ctx);
+        }
         "capitalize" => (Capitalize, ir::Ty::Str, 0),
         "title" => (Title, ir::Ty::Str, 0),
         "swapcase" => (SwapCase, ir::Ty::Str, 0),
@@ -11259,7 +11417,7 @@ fn lower_str_method(
             return Err(err(
                 format!(
                     "str method '{method}' is not supported yet (supported: \
-                     upper, lower, casefold, capitalize, title, swapcase, zfill, center, ljust, rjust, \
+                     upper, lower, casefold, translate, maketrans, capitalize, title, swapcase, zfill, center, ljust, rjust, \
                      strip, lstrip, rstrip (optional chars/None), startswith, \
                      endswith, find, index, rfind, rindex, count, replace, split, \
                      join, isdigit, isalpha, isspace, isupper, islower, \
@@ -15457,6 +15615,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 && let Some(class_id) = lookup_class(cls_name)
             {
                 return lower_class_name_method_call(class_id, method, *method_span, &args, ctx);
+            }
+            if is_str_type_name(base, ctx) && method == "maketrans" {
+                return lower_str_maketrans(&args, *method_span, ctx);
             }
             let base_ir = lower_expr(base, ctx)?;
             // User class instance method (not property: obj.prop() is TypeError).
@@ -23913,6 +24074,60 @@ print(f())
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn str_maketrans_and_translate_lower() {
+        let m = analyze_ok(
+            "t = str.maketrans(\"ab\", \"xy\")\n\
+             s = \"abba\".translate(t)\n\
+             u = str.maketrans(\"ab\", \"xy\", \"q\")\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(value.ty, ir::Ty::Dict { .. }));
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::MakeTrans,
+                ..
+            }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Str);
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::Translate,
+                ..
+            }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert!(matches!(
+            &value.kind,
+            ir::ExprKind::StrCall {
+                func: ir::StrFn::MakeTransDelete,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn str_maketrans_rejects_unequal_const() {
+        let e = analyze_err("print(str.maketrans(\"ab\", \"c\"))\n");
+        assert!(e.message.contains("equal length"), "{}", e.message);
+    }
+
+    #[test]
+    fn str_translate_rejects_str_table() {
+        let e = analyze_err("print(\"a\".translate(\"b\"))\n");
+        assert!(e.message.contains("dict[int, int]"), "{}", e.message);
     }
 
     #[test]

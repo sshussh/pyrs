@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.72.0)
+## The language (v0.73.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.73.0**, not 1.0) until it is ready for
+milestone after this one is **0.74.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -194,6 +194,9 @@ A statically-typed Python subset:
   (CPython slice bounds; `None` is a type error; miss is the same ValueError).
   **v0.72:** `str.casefold()` — ASCII case-fold (same as `lower`; Unicode
   folds like `ß` → `ss` remain residual).
+  **v0.73:** `str.maketrans` / `str.translate` — 2-arg maps equal-length
+  byte strings; 3-arg also deletes; `translate` accepts `dict[int, int]` or
+  `dict[int, int | None]` (byte keys; replacements via `chr`).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -267,7 +270,7 @@ A statically-typed Python subset:
   `rindex` `count` `replace` `split` `rsplit` `join` `isdigit` `isalpha`
   `isspace` `isupper` `islower` `isalnum` `istitle` `isascii` `isdecimal` `isnumeric`
   `isidentifier` `isprintable` `removeprefix` `removesuffix`
-  `partition` `rpartition` `splitlines` `expandtabs`
+  `partition` `rpartition` `splitlines` `expandtabs` `maketrans` `translate`
 - **Lists:** homogeneous, growable; literals, comprehensions
   (`[x * x for x in xs if x > 0]`, multi-`for` / multi-`if`, unpack
   targets `[a+b for a, b in pairs]`; simple names use Python 3 scoping
@@ -368,7 +371,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.72.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.73.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -530,4 +533,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.72.0 && git push origin v0.72.0`.
+Release tags: `git tag v0.73.0 && git push origin v0.73.0`.

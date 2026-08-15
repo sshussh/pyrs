@@ -996,6 +996,9 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_str_upper(ptr)\n");
         out.push_str("declare ptr @pyrs_str_lower(ptr)\n");
         out.push_str("declare ptr @pyrs_str_casefold(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_maketrans(ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_maketrans_delete(ptr, ptr, ptr)\n");
+        out.push_str("declare ptr @pyrs_str_translate(ptr, ptr, i32)\n");
         out.push_str("declare ptr @pyrs_str_capitalize(ptr)\n");
         out.push_str("declare ptr @pyrs_str_title(ptr)\n");
         out.push_str("declare ptr @pyrs_str_swapcase(ptr)\n");
@@ -3756,6 +3759,19 @@ impl Emitter {
                 t
             }
             ExprKind::StrCall { func, args } => {
+                if matches!(func, StrFn::Translate) {
+                    let s = self.emit_expr(&args[0]);
+                    let table = self.emit_expr(&args[1]);
+                    let val_tag = match args[1].ty {
+                        Ty::Dict { value, .. } => elem_tag(value),
+                        other => unreachable!("translate table {other:?}"),
+                    };
+                    let t = self.tmp();
+                    self.line(format!(
+                        "{t} = call ptr @pyrs_str_translate(ptr {s}, ptr {table}, i32 {val_tag})"
+                    ));
+                    return t;
+                }
                 if matches!(
                     func,
                     StrFn::StartsWith
@@ -3898,6 +3914,9 @@ impl Emitter {
                     StrFn::Upper => ("pyrs_str_upper", false, false),
                     StrFn::Lower => ("pyrs_str_lower", false, false),
                     StrFn::CaseFold => ("pyrs_str_casefold", false, false),
+                    StrFn::MakeTrans => ("pyrs_str_maketrans", false, false),
+                    StrFn::MakeTransDelete => ("pyrs_str_maketrans_delete", false, false),
+                    StrFn::Translate => unreachable!("translate handled above"),
                     StrFn::Capitalize => ("pyrs_str_capitalize", false, false),
                     StrFn::Title => ("pyrs_str_title", false, false),
                     StrFn::SwapCase => ("pyrs_str_swapcase", false, false),

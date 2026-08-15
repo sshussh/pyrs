@@ -5523,6 +5523,125 @@ long long pyrs_dict_setdefault(PyrsDict *d, long long key, int key_tag,
     return def;
 }
 
+int pyrs_dict_get_default(const PyrsDict *d, long long key, int key_tag, long long *out);
+
+PyrsDict *pyrs_str_maketrans(const PyrsStr *x, const PyrsStr *y) {
+    check_ref(x);
+    check_ref(y);
+    if (x->len != y->len) {
+        pyrs_die("ValueError: the first two maketrans arguments must have equal length");
+    }
+    PyrsDict *d = pyrs_dict_new();
+    for (long long i = 0; i < x->len; i++) {
+        long long k = pyrs_int_from_i64((unsigned char)x->data[i]);
+        long long v = pyrs_int_from_i64((unsigned char)y->data[i]);
+        pyrs_dict_set(d, k, TAG_INT, v, TAG_INT);
+    }
+    return d;
+}
+
+PyrsDict *pyrs_str_maketrans_delete(const PyrsStr *x, const PyrsStr *y, const PyrsStr *z) {
+    check_ref(x);
+    check_ref(y);
+    check_ref(z);
+    if (x->len != y->len) {
+        pyrs_die("ValueError: the first two maketrans arguments must have equal length");
+    }
+    PyrsDict *d = pyrs_dict_new();
+    for (long long i = 0; i < x->len; i++) {
+        long long k = pyrs_int_from_i64((unsigned char)x->data[i]);
+        long long v = pyrs_int_from_i64((unsigned char)y->data[i]);
+        PyrsUnionBox *box = pyrs_union_box_new(TAG_INT, v);
+        pyrs_dict_set(d, k, TAG_INT, (long long)(uintptr_t)box, TAG_UNION);
+    }
+    for (long long i = 0; i < z->len; i++) {
+        long long k = pyrs_int_from_i64((unsigned char)z->data[i]);
+        PyrsUnionBox *box = pyrs_union_box_new(-1, 0);
+        pyrs_dict_set(d, k, TAG_INT, (long long)(uintptr_t)box, TAG_UNION);
+    }
+    return d;
+}
+
+/* Encode one Unicode scalar as UTF-8 at *n. */
+static void translate_emit_cp(long long tagged, char *out, long long *n, long long cap) {
+    long long v = pyrs_int_as_i64(tagged);
+    if (v < 0 || v > 0x10ffff) {
+        pyrs_die("TypeError: character mapping must be in range(0x110000)");
+    }
+    unsigned int cp = (unsigned int)v;
+    char buf[4];
+    int nbytes;
+    if (cp < 0x80) {
+        buf[0] = (char)cp;
+        nbytes = 1;
+    } else if (cp < 0x800) {
+        buf[0] = (char)(0xc0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3f));
+        nbytes = 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (char)(0xe0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        buf[2] = (char)(0x80 | (cp & 0x3f));
+        nbytes = 3;
+    } else {
+        buf[0] = (char)(0xf0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        buf[3] = (char)(0x80 | (cp & 0x3f));
+        nbytes = 4;
+    }
+    if (*n + nbytes > cap) {
+        pyrs_die("ValueError: translate result too large");
+    }
+    memcpy(out + *n, buf, (size_t)nbytes);
+    *n += nbytes;
+}
+
+PyrsStr *pyrs_str_translate(const PyrsStr *s, const PyrsDict *table, int val_tag) {
+    check_ref(s);
+    check_ref(table);
+    long long cap = s->len * 4;
+    if (cap < 4) {
+        cap = 4;
+    }
+    char *buf = xmalloc((size_t)cap);
+    long long n = 0;
+    for (long long i = 0; i < s->len; i++) {
+        long long key = pyrs_int_from_i64((unsigned char)s->data[i]);
+        long long val;
+        if (!pyrs_dict_get_default(table, key, TAG_INT, &val)) {
+            if (n + 1 > cap) {
+                pyrs_die("ValueError: translate result too large");
+            }
+            buf[n++] = s->data[i];
+            continue;
+        }
+        if (val_tag == TAG_UNION) {
+            if (val == 0) {
+                continue;
+            }
+            const PyrsUnionBox *box = (const PyrsUnionBox *)(uintptr_t)val;
+            if (box->print_tag < 0) {
+                continue;
+            }
+            if (box->print_tag != TAG_INT) {
+                pyrs_die("TypeError: character mapping must return an integer, None or str");
+            }
+            translate_emit_cp(box->payload, buf, &n, cap);
+        } else if (val_tag == TAG_INT) {
+            translate_emit_cp(val, buf, &n, cap);
+        } else {
+            pyrs_die("TypeError: character mapping must return an integer, None or str");
+        }
+    }
+    PyrsStr *r = str_alloc(n);
+    if (n > 0) {
+        memcpy(r->data, buf, (size_t)n);
+    }
+    free(buf);
+    return r;
+}
+
 /* returns 1 and writes *out if found; else 0 */
 int pyrs_dict_get_default(const PyrsDict *d, long long key, int key_tag, long long *out) {
     check_ref(d);

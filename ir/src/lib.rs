@@ -1349,6 +1349,12 @@ pub enum StrFn {
     /// `s.lower()` / `s.casefold()` → str (ASCII: casefold is the same as lower)
     Lower,
     CaseFold,
+    /// `str.maketrans(x, y)` → `dict[int, int]` (byte ordinals)
+    MakeTrans,
+    /// `str.maketrans(x, y, z)` → `dict[int, int | None]` (z bytes delete)
+    MakeTransDelete,
+    /// `s.translate(table)` → str; table is `dict[int, int]` or `dict[int, int | None]`
+    Translate,
     /// `s.capitalize()` / `s.title()` / `s.swapcase()` → str (ASCII)
     Capitalize,
     Title,
