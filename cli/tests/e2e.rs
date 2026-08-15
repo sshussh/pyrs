@@ -1601,6 +1601,55 @@ fn divmod_errors() {
     assert!(stderr.contains("ZeroDivisionError"), "stderr={stderr}");
 }
 
+#[test]
+fn pow_match_python() {
+    let src = "\
+print(pow(2, 10), pow(2, 10, 3), pow(2, 3, 5))
+print(pow(-2, 3, 5), pow(2, 3, -5), pow(True, 3, 5))
+print(pow(2, -1), pow(2, 0, 7), pow(0, 0, 5), pow(5, 0, 1))
+print(pow(2, -1, 5), pow(3, -1, 5), pow(-3, -1, 5), pow(2, -1, -5))
+print(pow(2, 100, 97))
+";
+    let out = run_program("powfn", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn pow_errors() {
+    let (_, stderr) = run_program_expect_fail("pow_arity", "print(pow(1))\n");
+    assert!(
+        stderr.contains("pow expected at least 2 arguments"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail("pow_float_mod", "print(pow(2.0, 3, 5))\n");
+    assert!(
+        stderr.contains("3rd argument") && stderr.contains("integers"),
+        "stderr={stderr}"
+    );
+    let (code, stderr) = run_program_expect_fail("pow_mod0", "print(pow(2, 3, 0))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: pow() 3rd argument cannot be 0"),
+        "stderr={stderr}"
+    );
+    let (code, stderr) = run_program_expect_fail("pow_inv", "print(pow(2, -1, 4))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: base is not invertible for the given modulus"),
+        "stderr={stderr}"
+    );
+}
+
 // ---- v0.3: slicing, in/not in, pop, f-strings ----
 
 #[test]

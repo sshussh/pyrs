@@ -1572,7 +1572,7 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 25] = [
+const BUILTINS: [&str; 26] = [
     "print",
     "len",
     "range",
@@ -1598,6 +1598,7 @@ const BUILTINS: [&str; 25] = [
     "bin",
     "oct",
     "divmod",
+    "pow",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -3284,7 +3285,8 @@ fn collect_param_constraints_expr(
                 || func == "hex"
                 || func == "bin"
                 || func == "oct"
-                || func == "divmod")
+                || func == "divmod"
+                || func == "pow")
                 && let Some(ast::PosArg::Pos(ae)) = args.first()
                 && matches!(&ae.kind, ast::ExprKind::Name(n) if n == name)
             {
@@ -3292,7 +3294,7 @@ fn collect_param_constraints_expr(
                     "len" => {
                         // Ambiguous container — do not constrain alone.
                     }
-                    "abs" | "sum" | "round" | "divmod" => out.push(ir::Ty::Int),
+                    "abs" | "sum" | "round" | "divmod" | "pow" => out.push(ir::Ty::Int),
                     "ord" => out.push(ir::Ty::Str),
                     "chr" | "hex" | "bin" | "oct" => out.push(ir::Ty::Int),
                     "sorted" => out.push(ir::list_of(ir::Ty::Int)),
@@ -16620,6 +16622,87 @@ fn lower_divmod_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResul
     })
 }
 
+fn as_pow_int(value: ir::Expr, span: Span, which: &str) -> SResult<ir::Expr> {
+    match value.ty {
+        ir::Ty::Bool => Ok(ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::BoolToInt(Box::new(value)),
+        }),
+        ir::Ty::Int => Ok(value),
+        other => Err(err(
+            format!("pow() {which} must be an integer, not {other}"),
+            span,
+        )),
+    }
+}
+
+/// `pow(base, exp)` is `base ** exp`. `pow(base, exp, mod)` is modular.
+fn lower_pow_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(err(
+            if args.len() < 2 {
+                format!("pow expected at least 2 arguments, got {}", args.len())
+            } else {
+                format!("pow expected at most 3 arguments, got {}", args.len())
+            },
+            span,
+        ));
+    }
+    let base = lower_expr(args[0], ctx)?;
+    let exp = lower_expr(args[1], ctx)?;
+    if args.len() == 2 {
+        if !is_numeric_ty(base.ty) || !is_numeric_ty(exp.ty) {
+            return Err(err(
+                format!(
+                    "unsupported operand type(s) for ** or pow(): '{}' and '{}'",
+                    base.ty, exp.ty
+                ),
+                span,
+            ));
+        }
+        let (l, r, ty) = unify_numeric(base, exp, span, "pow()")?;
+        let (l, r, ty) =
+            if ty == ir::Ty::Int && matches!(r.kind, ir::ExprKind::ConstInt(k) if k < 0) {
+                let to_float = |e: ir::Expr| ir::Expr {
+                    ty: ir::Ty::Float,
+                    kind: ir::ExprKind::IntToFloat(Box::new(e)),
+                };
+                (to_float(l), to_float(r), ir::Ty::Float)
+            } else {
+                (l, r, ty)
+            };
+        return Ok(ir::Expr {
+            ty,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Pow,
+                left: Box::new(l),
+                right: Box::new(r),
+            },
+        });
+    }
+    let modulus = lower_expr(args[2], ctx)?;
+    if !matches!(base.ty, ir::Ty::Int | ir::Ty::Bool)
+        || !matches!(exp.ty, ir::Ty::Int | ir::Ty::Bool)
+        || !matches!(modulus.ty, ir::Ty::Int | ir::Ty::Bool)
+    {
+        return Err(err(
+            "pow() 3rd argument not allowed unless all arguments are integers",
+            span,
+        ));
+    }
+    let base = as_pow_int(base, args[0].span, "base")?;
+    let exp = as_pow_int(exp, args[1].span, "exp")?;
+    let modulus = as_pow_int(modulus, args[2].span, "modulus")?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::PowMod {
+            base: Box::new(base),
+            exp: Box::new(exp),
+            modulus: Box::new(modulus),
+        },
+    })
+}
+
 /// `print` `sep=` / `end=`: CPython accepts `str` or `None` (None → default).
 fn coerce_print_sep_end(value: ir::Expr, which: &str, span: Span) -> SResult<ir::Expr> {
     match value.ty {
@@ -18334,6 +18417,7 @@ fn lower_call(
             "bin" => lower_int_prefix_expr("bin", "#b", &args, span, ctx),
             "oct" => lower_int_prefix_expr("oct", "#o", &args, span, ctx),
             "divmod" => lower_divmod_expr(&args, span, ctx),
+            "pow" => lower_pow_expr(&args, span, ctx),
             "abs" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -23161,6 +23245,48 @@ print(f())
         let e = analyze_err("x = divmod(1)\n");
         assert!(
             e.message.contains("divmod expected 2 arguments"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn pow_two_arg_lowers_like_starstar() {
+        let m = analyze_ok("a = pow(2, 10)\nb = pow(2, -1)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!("{:?}", entry.body[0]);
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Binary {
+                op: ir::BinOp::Pow,
+                ..
+            }
+        ));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!("{:?}", entry.body[1]);
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+    }
+
+    #[test]
+    fn pow_three_arg_lowers() {
+        let m = analyze_ok("a = pow(2, 10, 3)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::PowMod { .. }));
+    }
+
+    #[test]
+    fn pow_three_arg_rejects_float() {
+        let e = analyze_err("x = pow(2.0, 3, 5)\n");
+        assert!(
+            e.message.contains("3rd argument") && e.message.contains("integers"),
             "{}",
             e.message
         );

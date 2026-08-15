@@ -1351,6 +1351,76 @@ long long pyrs_ipow(long long base, long long exp) {
     return pyrs_int_pow(base, exp);
 }
 
+/* Extended gcd: a*x + b*y = g. Uses Python floored div. */
+static long long int_egcd(long long a, long long b, long long *x_out, long long *y_out) {
+    long long old_r = a;
+    long long r = b;
+    long long old_s = pyrs_int_tag_small(1);
+    long long s = pyrs_int_tag_small(0);
+    long long old_t = pyrs_int_tag_small(0);
+    long long t = pyrs_int_tag_small(1);
+    while (pyrs_int_truth(r)) {
+        long long q = pyrs_int_floordiv(old_r, r);
+        long long nr = pyrs_int_sub(old_r, pyrs_int_mul(q, r));
+        long long ns = pyrs_int_sub(old_s, pyrs_int_mul(q, s));
+        long long nt = pyrs_int_sub(old_t, pyrs_int_mul(q, t));
+        old_r = r;
+        r = nr;
+        old_s = s;
+        s = ns;
+        old_t = t;
+        t = nt;
+    }
+    *x_out = old_s;
+    *y_out = old_t;
+    return old_r;
+}
+
+static long long int_modinv(long long a, long long m) {
+    long long x, y;
+    long long g = int_egcd(a, m, &x, &y);
+    (void)y;
+    if (!pyrs_int_eq(pyrs_int_abs(g), pyrs_int_tag_small(1))) {
+        pyrs_die("ValueError: base is not invertible for the given modulus");
+    }
+    if (pyrs_int_cmp(g, pyrs_int_tag_small(0)) < 0) {
+        x = pyrs_int_neg(x);
+    }
+    return pyrs_int_mod(x, m);
+}
+
+static long long int_pow_mod_nonneg(long long base, long long exp, long long mod) {
+    base = pyrs_int_mod(base, mod);
+    if (!pyrs_int_truth(exp)) {
+        return pyrs_int_mod(pyrs_int_tag_small(1), mod);
+    }
+    long long result = pyrs_int_tag_small(1);
+    long long two = pyrs_int_tag_small(2);
+    long long zero = pyrs_int_tag_small(0);
+    while (pyrs_int_cmp(exp, zero) > 0) {
+        if (pyrs_int_truth(pyrs_int_mod(exp, two))) {
+            result = pyrs_int_mod(pyrs_int_mul(result, base), mod);
+        }
+        base = pyrs_int_mod(pyrs_int_mul(base, base), mod);
+        exp = pyrs_int_floordiv(exp, two);
+    }
+    return result;
+}
+
+long long pyrs_int_pow_mod(long long base, long long exp, long long mod) {
+    if (!pyrs_int_truth(mod)) {
+        pyrs_die("ValueError: pow() 3rd argument cannot be 0");
+    }
+    if (pyrs_int_eq(pyrs_int_abs(mod), pyrs_int_tag_small(1))) {
+        return pyrs_int_tag_small(0);
+    }
+    if (pyrs_int_cmp(exp, pyrs_int_tag_small(0)) < 0) {
+        base = int_modinv(base, mod);
+        exp = pyrs_int_neg(exp);
+    }
+    return int_pow_mod_nonneg(base, exp, mod);
+}
+
 long long pyrs_float_round_to_int(double v) {
     if (isnan(v)) {
         pyrs_die("ValueError: cannot convert float NaN to integer");

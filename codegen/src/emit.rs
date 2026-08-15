@@ -540,6 +540,9 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
                 .max(max_try_depth_in_expr(key))
                 .max(max_try_depth_in_expr(default))
         }
+        PowMod { base, exp, modulus } => max_try_depth_in_expr(base)
+            .max(max_try_depth_in_expr(exp))
+            .max(max_try_depth_in_expr(modulus)),
         DictPop { dict, key, default } => max_try_depth_in_expr(dict)
             .max(max_try_depth_in_expr(key))
             .max(
@@ -786,6 +789,9 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         DictGet { dict, key, default } | DictSetDefault { dict, key, default } => {
             count_yields_in_expr(dict) + count_yields_in_expr(key) + count_yields_in_expr(default)
         }
+        PowMod { base, exp, modulus } => {
+            count_yields_in_expr(base) + count_yields_in_expr(exp) + count_yields_in_expr(modulus)
+        }
         DictPop { dict, key, default } => {
             count_yields_in_expr(dict)
                 + count_yields_in_expr(key)
@@ -1014,6 +1020,7 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_int_floordiv(i64, i64)\n");
         out.push_str("declare i64 @pyrs_int_mod(i64, i64)\n");
         out.push_str("declare i64 @pyrs_int_pow(i64, i64)\n");
+        out.push_str("declare i64 @pyrs_int_pow_mod(i64, i64, i64)\n");
         out.push_str("declare i64 @pyrs_int_and(i64, i64)\n");
         out.push_str("declare i64 @pyrs_int_or(i64, i64)\n");
         out.push_str("declare i64 @pyrs_int_xor(i64, i64)\n");
@@ -4104,6 +4111,16 @@ impl Emitter {
                 t
             }
             ExprKind::Round { value, ndigits } => self.emit_round(value, ndigits.as_deref()),
+            ExprKind::PowMod { base, exp, modulus } => {
+                let b = self.emit_expr(base);
+                let e = self.emit_expr(exp);
+                let m = self.emit_expr(modulus);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i64 @pyrs_int_pow_mod(i64 {b}, i64 {e}, i64 {m})"
+                ));
+                t
+            }
             // Python min/max: if right is strictly less/greater, take right;
             // otherwise left (ties and NaN comparisons keep the left operand).
             ExprKind::Min { left, right } => self.emit_min_max(false, left, right),

@@ -975,6 +975,12 @@ pub enum ExprKind {
         value: Box<Expr>,
         ndigits: Option<Box<Expr>>,
     },
+    /// `pow(base, exp, mod)` three-arg modular exponentiation. All `int`.
+    PowMod {
+        base: Box<Expr>,
+        exp: Box<Expr>,
+        modulus: Box<Expr>,
+    },
     /// `min(a, b)` - operands share a numeric type; on ties return the left.
     Min {
         left: Box<Expr>,
