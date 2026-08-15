@@ -521,7 +521,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `Open` / `Input` / `Argv` | I/O and CLI |
 | `Contains` | `in` / `not in` |
 | `ListPop` / `ListIndexOf` / `ListCount` / `ListLit` / `ListNew` / `Len` | list ops |
-| `TupleIndexOf` / `TupleCount` | `tuple.index` / `tuple.count` → `pyrs_tuple_index` / `pyrs_tuple_count` |
+| `TupleIndexOf` / `TupleCount` | `tuple.index([start, end])` / `tuple.count` → `pyrs_tuple_index` / `pyrs_tuple_count` |
 | `DictGet` / `DictPop` / `DictSetDefault` / `DictPopItem` | dict get / pop / setdefault / popitem |
 | `Block { stmts, result }` | statements inside expressions (comprehensions) |
 | `Abs` | `abs(x)` via LLVM abs/fabs |

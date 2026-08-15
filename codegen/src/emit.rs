@@ -532,14 +532,25 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         }
         SetFromList { list, .. } => max_try_depth_in_expr(list),
         DictFromPairs { pairs, .. } => max_try_depth_in_expr(pairs),
-        ListPop { list, index }
-        | ListIndexOf { list, value: index }
-        | ListCount { list, value: index }
+        ListPop { list, index } | ListCount { list, value: index } => {
+            max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
+        }
+        ListIndexOf {
+            list,
+            value,
+            start,
+            end,
+        }
         | TupleIndexOf {
             tuple: list,
-            value: index,
-        }
-        | TupleCount {
+            value,
+            start,
+            end,
+        } => max_try_depth_in_expr(list)
+            .max(max_try_depth_in_expr(value))
+            .max(max_try_depth_in_expr(start))
+            .max(max_try_depth_in_expr(end)),
+        TupleCount {
             tuple: list,
             value: index,
         } => max_try_depth_in_expr(list).max(max_try_depth_in_expr(index)),
@@ -791,14 +802,27 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | SetIsDisjoint { left, right } => count_yields_in_expr(left) + count_yields_in_expr(right),
         SetFromList { list, .. } => count_yields_in_expr(list),
         DictFromPairs { pairs, .. } => count_yields_in_expr(pairs),
-        ListPop { list, index }
-        | ListIndexOf { list, value: index }
-        | ListCount { list, value: index }
+        ListPop { list, index } | ListCount { list, value: index } => {
+            count_yields_in_expr(list) + count_yields_in_expr(index)
+        }
+        ListIndexOf {
+            list,
+            value,
+            start,
+            end,
+        }
         | TupleIndexOf {
             tuple: list,
-            value: index,
+            value,
+            start,
+            end,
+        } => {
+            count_yields_in_expr(list)
+                + count_yields_in_expr(value)
+                + count_yields_in_expr(start)
+                + count_yields_in_expr(end)
         }
-        | TupleCount {
+        TupleCount {
             tuple: list,
             value: index,
         } => count_yields_in_expr(list) + count_yields_in_expr(index),
@@ -881,7 +905,7 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_tuple_eq(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_tuple_cmp(ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_tuple_contains(ptr, i64, i32)\n");
-        out.push_str("declare i64 @pyrs_tuple_index(ptr, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_tuple_index(ptr, i64, i32, i64, i64)\n");
         out.push_str("declare i64 @pyrs_tuple_count(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_unpack_check(i64, i64)\n");
         out.push_str("declare void @pyrs_unpack_check_min(i64, i64)\n");
@@ -1028,7 +1052,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_list_repeat(ptr, i64)\n");
         out.push_str("declare void @pyrs_list_insert(ptr, i64, i64)\n");
         out.push_str("declare void @pyrs_list_remove(ptr, i64, i32)\n");
-        out.push_str("declare i64 @pyrs_list_index(ptr, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_list_index(ptr, i64, i32, i64, i64)\n");
         out.push_str("declare i64 @pyrs_list_count(ptr, i64, i32)\n");
         out.push_str("declare void @pyrs_list_clear(ptr)\n");
         out.push_str("declare void @pyrs_list_reverse(ptr)\n");
@@ -4242,13 +4266,22 @@ impl Emitter {
                 ));
                 self.value_from_slot(&slot, expr.ty)
             }
-            ExprKind::ListIndexOf { list, value } => {
+            ExprKind::ListIndexOf {
+                list,
+                value,
+                start,
+                end,
+            } => {
                 let l = self.emit_expr(list);
                 let v = self.emit_expr(value);
                 let slot = self.slot_from_value(&v, value.ty);
+                let s_t = self.emit_expr(start);
+                let s = self.emit_unbox_i64(&s_t);
+                let e_t = self.emit_expr(end);
+                let e = self.emit_unbox_i64(&e_t);
                 let machine = self.tmp();
                 self.line(format!(
-                    "{machine} = call i64 @pyrs_list_index(ptr {l}, i64 {slot}, i32 {})",
+                    "{machine} = call i64 @pyrs_list_index(ptr {l}, i64 {slot}, i32 {}, i64 {s}, i64 {e})",
                     elem_tag(&value.ty)
                 ));
                 self.emit_box_i64(&machine)
@@ -4264,13 +4297,22 @@ impl Emitter {
                 ));
                 self.emit_box_i64(&machine)
             }
-            ExprKind::TupleIndexOf { tuple, value } => {
+            ExprKind::TupleIndexOf {
+                tuple,
+                value,
+                start,
+                end,
+            } => {
                 let t = self.emit_expr(tuple);
                 let v = self.emit_expr(value);
                 let slot = self.slot_from_value(&v, value.ty);
+                let s_t = self.emit_expr(start);
+                let s = self.emit_unbox_i64(&s_t);
+                let e_t = self.emit_expr(end);
+                let e = self.emit_unbox_i64(&e_t);
                 let machine = self.tmp();
                 self.line(format!(
-                    "{machine} = call i64 @pyrs_tuple_index(ptr {t}, i64 {slot}, i32 {})",
+                    "{machine} = call i64 @pyrs_tuple_index(ptr {t}, i64 {slot}, i32 {}, i64 {s}, i64 {e})",
                     elem_tag(&value.ty)
                 ));
                 self.emit_box_i64(&machine)

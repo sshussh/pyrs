@@ -553,8 +553,9 @@ m.append(["a", "b"])
 ```
 
 List mutators: `append`, `pop([i])`, `insert(i, v)`, `remove(v)`,
-`index(v)`, `count(v)`, `clear()`, `reverse()`, `sort()`. `insert` clamps the index like CPython;
-`remove` / `index` trap with `ValueError` when the value is missing;
+`index(v[, start[, end]])`, `count(v)`, `clear()`, `reverse()`, `sort()`. `insert` clamps the index like CPython;
+`remove` / `index` trap with `ValueError` when the value is missing
+(`start`/`end` are CPython slice bounds; `None` is a type error);
 `count` returns the number of matches (0 if none).
 `reverse()` is in-place (statement only; `reversed(xs)` and `xs[::-1]`
 allocate a copy). `sort()` is in-place (statement only); `sorted(xs)` returns a new sorted
@@ -1326,8 +1327,8 @@ deliberate exceptions:
 Container notes (v0.20.1):
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
-  traps), `len`, unpack, `==`/`!=`, `count(x)` / `index(x)` (same
-  equality as `in`; missing `index` is `ValueError`), homogeneous `for`, membership `in`
+  traps), `len`, unpack, `==`/`!=`, `count(x)` / `index(x[, start[, end]])` (same
+  equality as `in`; missing `index` is `ValueError`; slice bounds like lists), homogeneous `for`, membership `in`
   (compatible element tags only for heterogeneous tuples). Homogeneous
   closures (same params/ret and capture env shape) and generators may be
   tuple/list elements; call via `t[i](args)`.

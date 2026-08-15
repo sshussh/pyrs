@@ -845,10 +845,13 @@ pub enum ExprKind {
         list: Box<Expr>,
         index: Box<Expr>,
     },
-    /// `list.index(value)` — first match; traps if missing. Result is `int`.
+    /// `list.index(value[, start[, end]])` — first match in `[start, end)`;
+    /// traps if missing. `end == i64::MIN` means `len`. Result is `int`.
     ListIndexOf {
         list: Box<Expr>,
         value: Box<Expr>,
+        start: Box<Expr>,
+        end: Box<Expr>,
     },
     /// `list.count(value)` — number of matches using the same recursive
     /// slot equality as `==` / `in` / `index` / `remove`. Result is `int`.
@@ -856,10 +859,13 @@ pub enum ExprKind {
         list: Box<Expr>,
         value: Box<Expr>,
     },
-    /// `tuple.index(value)` — first match (tag + slot_eq); traps if missing.
+    /// `tuple.index(value[, start[, end]])` — first match in `[start, end)`
+    /// (tag + slot_eq); traps if missing. `end == i64::MIN` means `len`.
     TupleIndexOf {
         tuple: Box<Expr>,
         value: Box<Expr>,
+        start: Box<Expr>,
+        end: Box<Expr>,
     },
     /// `tuple.count(value)` — number of matches (tag + slot_eq). Result is `int`.
     TupleCount {

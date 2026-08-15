@@ -2856,7 +2856,7 @@ PyrsStr *pyrs_str_removesuffix(const PyrsStr *s, const PyrsStr *suf) {
 }
 
 /* Slice-adjust start/end like CPython. `end == LLONG_MIN` means missing → len. */
-static void str_adjust_bounds(long long len, long long *start, long long *end) {
+static void adjust_slice_bounds(long long len, long long *start, long long *end) {
     long long s = *start;
     long long e = *end;
     if (s < 0) {
@@ -2885,7 +2885,7 @@ static int str_affix_in_slice(const PyrsStr *s, const PyrsStr *aff, long long st
                               long long end, int from_end) {
     check_ref(s);
     check_ref(aff);
-    str_adjust_bounds(s->len, &start, &end);
+    adjust_slice_bounds(s->len, &start, &end);
     if (start > end) {
         return 0;
     }
@@ -2915,7 +2915,7 @@ static long long str_find_bounds(const PyrsStr *s, const PyrsStr *t, long long s
                                  long long end, int from_right) {
     check_ref(s);
     check_ref(t);
-    str_adjust_bounds(s->len, &start, &end);
+    adjust_slice_bounds(s->len, &start, &end);
     if (start > end) {
         return -1;
     }
@@ -2986,7 +2986,7 @@ long long pyrs_str_count_slice(const PyrsStr *s, const PyrsStr *t, long long sta
                                long long end) {
     check_ref(s);
     check_ref(t);
-    str_adjust_bounds(s->len, &start, &end);
+    adjust_slice_bounds(s->len, &start, &end);
     if (start > end) {
         return 0;
     }
@@ -4610,9 +4610,11 @@ void pyrs_list_remove(PyrsList *l, long long slot, int tag) {
     pyrs_die("ValueError: list.remove(x): x not in list");
 }
 
-long long pyrs_list_index(const PyrsList *l, long long slot, int tag) {
+long long pyrs_list_index(const PyrsList *l, long long slot, int tag, long long start,
+                          long long end) {
     check_ref(l);
-    for (long long i = 0; i < l->len; i++) {
+    adjust_slice_bounds(l->len, &start, &end);
+    for (long long i = start; i < end; i++) {
         if (slot_eq(l->data[i], slot, tag)) {
             return i;
         }
@@ -5259,9 +5261,11 @@ int pyrs_tuple_contains(const PyrsTuple *t, long long slot, int tag) {
     return 0;
 }
 
-long long pyrs_tuple_index(const PyrsTuple *t, long long slot, int tag) {
+long long pyrs_tuple_index(const PyrsTuple *t, long long slot, int tag, long long start,
+                           long long end) {
     check_ref(t);
-    for (long long i = 0; i < t->len; i++) {
+    adjust_slice_bounds(t->len, &start, &end);
+    for (long long i = start; i < end; i++) {
         if (t->tags[i] == tag && slot_eq(t->data[i], slot, tag)) {
             return i;
         }

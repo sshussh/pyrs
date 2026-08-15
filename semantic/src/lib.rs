@@ -11800,6 +11800,51 @@ fn ensure_sortable_list_elem(elem: ir::Ty, span: Span) -> SResult<()> {
     }
 }
 
+fn as_seq_index_bound(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    let v = lower_expr(arg, ctx)?;
+    match v.ty {
+        ir::Ty::Bool => Ok(ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::BoolToInt(Box::new(v)),
+        }),
+        ir::Ty::Int => Ok(v),
+        _ => Err(err(
+            "slice indices must be integers or have an __index__ method",
+            arg.span,
+        )),
+    }
+}
+
+fn lower_seq_index_bounds(
+    args: &[ast::Expr],
+    method_span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<(ir::Expr, ir::Expr)> {
+    if args.is_empty() {
+        return Err(err(
+            "index expected at least 1 argument, got 0",
+            method_span,
+        ));
+    }
+    if args.len() > 3 {
+        return Err(err(
+            format!("index expected at most 3 arguments, got {}", args.len()),
+            method_span,
+        ));
+    }
+    let start = if args.len() >= 2 {
+        as_seq_index_bound(&args[1], ctx)?
+    } else {
+        int_const(0)
+    };
+    let end = if args.len() >= 3 {
+        as_seq_index_bound(&args[2], ctx)?
+    } else {
+        int_const(i64::MIN)
+    };
+    Ok((start, end))
+}
+
 fn lower_list_index_of(
     list: ir::Expr,
     elem: ir::Ty,
@@ -11807,12 +11852,7 @@ fn lower_list_index_of(
     method_span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    if args.len() != 1 {
-        return Err(err(
-            format!("index() takes exactly one argument ({} given)", args.len()),
-            method_span,
-        ));
-    }
+    let (start, end) = lower_seq_index_bounds(args, method_span, ctx)?;
     let value = lower_expr(&args[0], ctx)?;
     let value = coerce(value, elem, args[0].span, "index() argument")?;
     Ok(ir::Expr {
@@ -11820,6 +11860,8 @@ fn lower_list_index_of(
         kind: ir::ExprKind::ListIndexOf {
             list: Box::new(list),
             value: Box::new(value),
+            start: Box::new(start),
+            end: Box::new(end),
         },
     })
 }
@@ -11893,12 +11935,7 @@ fn lower_tuple_index_of(
     method_span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    if args.len() != 1 {
-        return Err(err(
-            format!("index() takes exactly one argument ({} given)", args.len()),
-            method_span,
-        ));
-    }
+    let (start, end) = lower_seq_index_bounds(args, method_span, ctx)?;
     let value = lower_expr(&args[0], ctx)?;
     let value = lower_tuple_search_needle(value, elems, args[0].span, "index() argument")?;
     Ok(ir::Expr {
@@ -11906,6 +11943,8 @@ fn lower_tuple_index_of(
         kind: ir::ExprKind::TupleIndexOf {
             tuple: Box::new(tuple),
             value: Box::new(value),
+            start: Box::new(start),
+            end: Box::new(end),
         },
     })
 }
@@ -26546,8 +26585,44 @@ print(f())
 
     #[test]
     fn tuple_index_rejects_extra_arg() {
-        let e = analyze_err("print((1, 2).index(1, 0))\n");
-        assert!(e.message.contains("exactly one argument"), "{}", e.message);
+        let e = analyze_err("print((1, 2).index(1, 0, 2, 3))\n");
+        assert!(e.message.contains("at most 3 arguments"), "{}", e.message);
+    }
+
+    #[test]
+    fn tuple_index_bounds_lower() {
+        let m = analyze_ok("i = (1, 2, 1).index(1, 1)\nj = (1, 2, 1).index(1, 0, 2)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        for i in 0..2 {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!("body[{i}]");
+            };
+            assert_eq!(value.ty, ir::Ty::Int);
+            assert!(matches!(value.kind, ir::ExprKind::TupleIndexOf { .. }));
+        }
+    }
+
+    #[test]
+    fn list_index_bounds_lower() {
+        let m = analyze_ok("i = [1, 2, 1].index(1, 1)\nj = [1, 2, 1].index(1, True, 3)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        for i in 0..2 {
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[i] else {
+                panic!("body[{i}]");
+            };
+            assert_eq!(value.ty, ir::Ty::Int);
+            assert!(matches!(value.kind, ir::ExprKind::ListIndexOf { .. }));
+        }
+    }
+
+    #[test]
+    fn list_index_rejects_none_bound() {
+        let e = analyze_err("print([1, 2].index(1, None))\n");
+        assert!(
+            e.message.contains("slice indices must be integers"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

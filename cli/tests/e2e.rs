@@ -5869,6 +5869,54 @@ fn tuple_index_miss_matches_python() {
 }
 
 #[test]
+fn list_and_tuple_index_bounds_match_python() {
+    let src = "\
+xs = [1, 2, 3, 2, 1]
+print(xs.index(2), xs.index(2, 2), xs.index(2, 2, 4), xs.index(2, -3))
+print(xs.index(1, True), xs.index(2, False), xs.index(1, -1), xs.index(2, -4, -1))
+print(xs.index(1, -100), xs.index(3, 0, 100))
+t = (1, 2, 3, 2, 1)
+print(t.index(2), t.index(2, 2), t.index(2, 2, 4), t.index(2, -3))
+print(t.index(1, True), t.index(1, -1), t.index(2, -4, -1))
+print([1, 2, 1].index(1, 1), (1, \"a\", 1).index(1, 1))
+";
+    let out = run_program("idxbnds", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn list_index_bounds_miss_matches_python() {
+    let (code, stderr) =
+        run_program_expect_fail("listidxmissb", "print([1, 2, 3, 2].index(2, 2, 3))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: list.index(x): x not in list"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn tuple_index_bounds_miss_matches_python() {
+    let (code, stderr) =
+        run_program_expect_fail("tupidxmissb", "print((1, 2, 3, 2).index(2, 2, 3))\n");
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("ValueError: tuple.index(x): x not in tuple"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn tuple_index_error() {
     // dynamic index so the trap is at runtime (constant OOB is a compile error)
     let (code, err) = run_program_expect_fail("tuple_idx", "t = (1, 2)\ni = 5\nprint(t[i])\n");
