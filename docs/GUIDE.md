@@ -1307,6 +1307,8 @@ Container notes (v0.20.1):
   tuple/list elements; call via `t[i](args)`.
 - **dict:** keys are `int` or `str` only; bare `get(k)` returns
   `Optional[V]` (`None` on miss); `get(k, default)` keeps value type;
+  `setdefault(k, default)` inserts on miss and returns `V`; bare
+  `setdefault(k)` requires `V` to include `None`;
   `keys`/`values`/`items` return lists (not views); `update(other)` merges
   same-typed dicts; insertion-order iteration over keys; mapping match
   supports `**rest`.

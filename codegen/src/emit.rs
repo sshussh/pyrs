@@ -528,9 +528,11 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | ListCount { list, value: index } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(index))
         }
-        DictGet { dict, key, default } => max_try_depth_in_expr(dict)
-            .max(max_try_depth_in_expr(key))
-            .max(max_try_depth_in_expr(default)),
+        DictGet { dict, key, default } | DictSetDefault { dict, key, default } => {
+            max_try_depth_in_expr(dict)
+                .max(max_try_depth_in_expr(key))
+                .max(max_try_depth_in_expr(default))
+        }
         DictPop { dict, key, default } => max_try_depth_in_expr(dict)
             .max(max_try_depth_in_expr(key))
             .max(
@@ -767,7 +769,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | ListCount { list, value: index } => {
             count_yields_in_expr(list) + count_yields_in_expr(index)
         }
-        DictGet { dict, key, default } => {
+        DictGet { dict, key, default } | DictSetDefault { dict, key, default } => {
             count_yields_in_expr(dict) + count_yields_in_expr(key) + count_yields_in_expr(default)
         }
         DictPop { dict, key, default } => {
@@ -888,6 +890,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_dict_clear(ptr)\n");
         out.push_str("declare void @pyrs_dict_update(ptr, ptr)\n");
         out.push_str("declare i64 @pyrs_dict_pop(ptr, i64, i32, i32, i64, ptr)\n");
+        out.push_str("declare i64 @pyrs_dict_setdefault(ptr, i64, i32, i64, i32)\n");
         out.push_str("declare ptr @pyrs_dict_keys(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_values(ptr)\n");
         out.push_str("declare ptr @pyrs_dict_items(ptr)\n");
@@ -4909,6 +4912,23 @@ impl Emitter {
                     lty(expr.ty)
                 ));
                 phi
+            }
+            ExprKind::DictSetDefault { dict, key, default } => {
+                let d = self.emit_expr(dict);
+                let k = self.emit_expr(key);
+                let def = self.emit_expr(default);
+                let Ty::Dict { key: kt, value: vt } = dict.ty else {
+                    unreachable!();
+                };
+                let kslot = self.slot_from_value(&k, *kt);
+                let vslot = self.slot_from_value(&def, default.ty);
+                let slot = self.tmp();
+                self.line(format!(
+                    "{slot} = call i64 @pyrs_dict_setdefault(ptr {d}, i64 {kslot}, i32 {}, i64 {vslot}, i32 {})",
+                    elem_tag(kt),
+                    elem_tag(vt)
+                ));
+                self.value_from_slot(&slot, *vt)
             }
             ExprKind::DictPop { dict, key, default } => {
                 let d = self.emit_expr(dict);

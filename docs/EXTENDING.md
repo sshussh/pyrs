@@ -521,6 +521,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `Open` / `Input` / `Argv` | I/O and CLI |
 | `Contains` | `in` / `not in` |
 | `ListPop` / `ListIndexOf` / `ListCount` / `ListLit` / `ListNew` / `Len` | list ops |
+| `DictGet` / `DictPop` / `DictSetDefault` | dict get / pop / setdefault |
 | `Block { stmts, result }` | statements inside expressions (comprehensions) |
 | `Abs` | `abs(x)` via LLVM abs/fabs |
 | `Ord` / `Chr` | `ord(s)` / `chr(n)` via `pyrs_str_ord` / `pyrs_chr` (Unicode code points) |

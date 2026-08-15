@@ -6145,6 +6145,57 @@ print(d.get(\"a\"))
 }
 
 #[test]
+fn dict_setdefault_match_python() {
+    let src = "\
+d: dict[str, int] = {\"a\": 1}
+print(d.setdefault(\"a\", 9))
+print(d.setdefault(\"b\", 2))
+print(d[\"a\"], d[\"b\"])
+e: dict[str, int | None] = {}
+print(e.setdefault(\"z\"))
+print(e[\"z\"])
+g: dict[str, list[int]] = {}
+g.setdefault(\"xs\", []).append(1)
+g.setdefault(\"xs\", []).append(2)
+print(g[\"xs\"])
+h: dict[int, str] = {}
+print(h.setdefault(1, \"one\"), h.setdefault(1, \"nope\"))
+";
+    let out = run_program("dictsd", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn dict_setdefault_errors() {
+    let (_, stderr) = run_program_expect_fail(
+        "sd_bare_int",
+        "d: dict[str, int] = {}\nprint(d.setdefault(\"a\"))\n",
+    );
+    assert!(
+        stderr.contains("setdefault") && stderr.contains("None"),
+        "stderr={stderr}"
+    );
+    let (_, stderr) = run_program_expect_fail(
+        "sd_ty",
+        "d: dict[str, int] = {}\nprint(d.setdefault(\"a\", \"x\"))\n",
+    );
+    assert!(
+        stderr.contains("setdefault") && stderr.contains("mismatch"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn stdlib_math_matches_python() {
     let out = run_program(
         "stdlib_math",

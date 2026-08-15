@@ -10417,14 +10417,14 @@ fn lower_dict_method_stmt(
                 other,
             })
         }
-        "get" | "pop" | "keys" | "values" | "items" => {
+        "get" | "pop" | "keys" | "values" | "items" | "setdefault" => {
             let call = lower_dict_method(base_ir, key_ty, val_ty, method, method_span, args, ctx)?;
             Ok(ir::Stmt::ExprStmt(call))
         }
         _ => Err(err(
             format!(
                 "dict method '{method}' is not supported yet (supported: get, pop, \
-                 keys, values, items, clear, update)"
+                 keys, values, items, clear, update, setdefault)"
             ),
             method_span,
         )),
@@ -10898,6 +10898,50 @@ fn lower_dict_method(
                 },
             })
         }
+        "setdefault" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(err(
+                    if args.is_empty() {
+                        "setdefault expected at least 1 argument, got 0".into()
+                    } else {
+                        format!(
+                            "setdefault expected at most 2 arguments, got {}",
+                            args.len()
+                        )
+                    },
+                    method_span,
+                ));
+            }
+            let key = lower_expr(&args[0], ctx)?;
+            let key = coerce(key, key_ty, args[0].span, "dict.setdefault() key")?;
+            let default = if args.len() == 2 {
+                lower_arg_expr(&args[1], val_ty, "dict.setdefault() default", ctx)?
+            } else {
+                if !ir::is_optional(val_ty) {
+                    return Err(err(
+                        format!(
+                            "dict.setdefault() without a default requires a value type \
+                             that includes None (found {val_ty})"
+                        ),
+                        method_span,
+                    ));
+                }
+                coerce(
+                    const_none(),
+                    val_ty,
+                    method_span,
+                    "dict.setdefault() default",
+                )?
+            };
+            Ok(ir::Expr {
+                ty: val_ty,
+                kind: ir::ExprKind::DictSetDefault {
+                    dict: Box::new(base_ir),
+                    key: Box::new(key),
+                    default: Box::new(default),
+                },
+            })
+        }
         "keys" => {
             if !args.is_empty() {
                 return Err(err(
@@ -10953,7 +10997,7 @@ fn lower_dict_method(
         _ => Err(err(
             format!(
                 "dict method '{method}' is not supported yet (supported: get, pop, \
-                 keys, values, items, clear, copy)"
+                 keys, values, items, clear, copy, setdefault)"
             ),
             method_span,
         )),
@@ -24509,6 +24553,34 @@ print(count([]))
         };
         assert_eq!(value.ty, ir::optional_of(ir::Ty::Int));
         assert!(matches!(value.kind, ir::ExprKind::DictGet { .. }));
+    }
+
+    #[test]
+    fn dict_setdefault_lowers() {
+        let m = analyze_ok(
+            "d: dict[str, int] = {\"a\": 1}\nx = d.setdefault(\"a\", 9)\ny = d.setdefault(\"b\", 2)\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let mut n = 0;
+        for s in &entry.body {
+            if let ir::Stmt::GlobalAssign { value, .. } = s
+                && matches!(value.kind, ir::ExprKind::DictSetDefault { .. })
+            {
+                assert_eq!(value.ty, ir::Ty::Int);
+                n += 1;
+            }
+        }
+        assert_eq!(n, 2, "expected two setdefault lowers: {:?}", entry.body);
+    }
+
+    #[test]
+    fn dict_setdefault_bare_requires_optional() {
+        let e = analyze_err("d: dict[str, int] = {}\nprint(d.setdefault(\"a\"))\n");
+        assert!(
+            e.message.contains("setdefault") && e.message.contains("None"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]

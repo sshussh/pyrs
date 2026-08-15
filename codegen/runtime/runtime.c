@@ -4438,6 +4438,19 @@ long long pyrs_dict_get(const PyrsDict *d, long long key, int key_tag) {
     return d->table[idx].val;
 }
 
+/* Insert `def` if missing; return the stored value (existing or `def`). */
+long long pyrs_dict_setdefault(PyrsDict *d, long long key, int key_tag,
+                               long long def, int val_tag) {
+    check_ref(d);
+    int found;
+    long long idx = dict_lookup(d, key, key_tag, &found);
+    if (found) {
+        return d->table[idx].val;
+    }
+    pyrs_dict_set(d, key, key_tag, def, val_tag);
+    return def;
+}
+
 /* returns 1 and writes *out if found; else 0 */
 int pyrs_dict_get_default(const PyrsDict *d, long long key, int key_tag, long long *out) {
     check_ref(d);

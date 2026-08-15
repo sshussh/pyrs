@@ -935,6 +935,13 @@ pub enum ExprKind {
         key: Box<Expr>,
         default: Option<Box<Expr>>,
     },
+    /// `d.setdefault(key, default)` — insert `default` on miss; always return
+    /// the stored value (`V`).
+    DictSetDefault {
+        dict: Box<Expr>,
+        key: Box<Expr>,
+        default: Box<Expr>,
+    },
     /// `d.keys()` → list of keys.
     DictKeys(Box<Expr>),
     /// `d.values()` → list of values.

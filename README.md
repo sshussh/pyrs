@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.49.0)
+## The language (v0.50.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.50.0**, not 1.0) until it is ready for
+milestone after this one is **0.51.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -146,6 +146,8 @@ A statically-typed Python subset:
   remain residual.
   **v0.49:** `hex(n)` / `bin(n)` / `oct(n)` — lowercase `0x` / `0b` / `0o`
   strings (`hex(-10)` is `'-0xa'`); `bool` → `int` like `chr`.
+  **v0.50:** `dict.setdefault(k[, default])` — insert on miss and return the
+  stored value; bare form requires a value type that includes `None`.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -235,7 +237,8 @@ A statically-typed Python subset:
   `{}` (needs annotation); get/set, `del d[k]`, `in` on keys, `len`,
   insertion-order key iteration; methods `get` (with default, or bare
   `get(k)` → `Optional[V]` / `None` on miss),
-  `pop`, `keys`/`values`/`items` (return lists), `clear`, `update`, `copy`, `dict(pairs)`, dict comps
+  `pop`, `setdefault` (insert on miss; bare form needs `None` in `V`),
+  `keys`/`values`/`items` (return lists), `clear`, `update`, `copy`, `dict(pairs)`, dict comps
 - **Sets:** `set[T]` with `T` in `{int, str}`; nonempty `{a, b}`, empty
   `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`/`union`/`intersection`/`difference`/`symmetric_difference`/`update` /
   `issubset`/`issuperset`/`isdisjoint`,
@@ -312,7 +315,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.49.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.50.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -474,4 +477,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.49.0 && git push origin v0.49.0`.
+Release tags: `git tag v0.50.0 && git push origin v0.50.0`.
