@@ -405,7 +405,6 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | ListFromStr(operand)
         | DictCopy(operand)
         | SetFromStr(operand)
-        | Sum(operand)
         | MinList(operand)
         | MaxList(operand)
         | JsonDumps(operand)
@@ -417,6 +416,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         FormatValue { value, spec } => {
             max_try_depth_in_expr(value).max(max_try_depth_in_expr(spec))
         }
+        Sum { list, start } => max_try_depth_in_expr(list).max(max_try_depth_in_expr(start)),
         GeneratorNext { generator, send } => {
             max_try_depth_in_expr(generator).max(max_try_depth_in_expr(send))
         }
@@ -635,12 +635,12 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | ListFromStr(operand)
         | DictCopy(operand)
         | SetFromStr(operand)
-        | Sum(operand)
         | MinList(operand)
         | MaxList(operand)
         | JsonDumps(operand)
         | JsonLoads { arg: operand, .. }
         | MathCall { arg: operand, .. } => count_yields_in_expr(operand),
+        Sum { list, start } => count_yields_in_expr(list) + count_yields_in_expr(start),
         FormatValue { value, spec } => count_yields_in_expr(value) + count_yields_in_expr(spec),
         GeneratorNext { generator, send } => {
             count_yields_in_expr(generator) + count_yields_in_expr(send)
@@ -1211,12 +1211,15 @@ impl Emitter {
         t
     }
 
-    /// `sum(xs)` for homogeneous numeric lists: open-coded loop over slots.
-    fn emit_sum(&mut self, list: &Expr) -> String {
+    /// `sum(xs, start)` for homogeneous numeric lists: open-coded loop.
+    /// Acc starts at `start` (already coerced to the result type).
+    fn emit_sum(&mut self, list: &Expr, start: &Expr) -> String {
         let Ty::List(elem) = list.ty else {
             unreachable!("sum of non-list");
         };
+        let acc_ty = start.ty;
         let hdr = self.emit_expr(list);
+        let start_v = self.emit_expr(start);
         let len = self.emit_len(&hdr);
         let data_pp = self.tmp();
         self.line(format!(
@@ -1235,12 +1238,7 @@ impl Emitter {
         self.tmp += 1;
         let acc_next = format!("%t{}", self.tmp);
 
-        let zero = match *elem {
-            Ty::Int => "1".to_string(), // tagged 0
-            Ty::Float => fconst(0.0),
-            other => unreachable!("sum element {other:?}"),
-        };
-        let elty = lty(*elem);
+        let elty = lty(acc_ty);
 
         let pred = self.cur_block.clone();
         let loop_l = self.fresh_block("sum.loop");
@@ -1253,7 +1251,7 @@ impl Emitter {
             "{i} = phi i64 [ 0, %{pred} ], [ {i_next}, %{body_l} ]"
         ));
         self.line(format!(
-            "{acc} = phi {elty} [ {zero}, %{pred} ], [ {acc_next}, %{body_l} ]"
+            "{acc} = phi {elty} [ {start_v}, %{pred} ], [ {acc_next}, %{body_l} ]"
         ));
         let done = self.tmp();
         self.line(format!("{done} = icmp sge i64 {i}, {len}"));
@@ -1266,18 +1264,23 @@ impl Emitter {
         ));
         let slot = self.tmp();
         self.line(format!("{slot} = load i64, ptr {addr}"));
-        match *elem {
-            Ty::Int => {
+        match (*elem, acc_ty) {
+            (Ty::Int, Ty::Int) => {
                 self.line(format!(
                     "{acc_next} = call i64 @pyrs_int_add(i64 {acc}, i64 {slot})"
                 ));
             }
-            Ty::Float => {
+            (Ty::Float, Ty::Float) => {
                 let v = self.tmp();
                 self.line(format!("{v} = bitcast i64 {slot} to double"));
                 self.line(format!("{acc_next} = fadd double {acc}, {v}"));
             }
-            other => unreachable!("sum element {other:?}"),
+            (Ty::Int, Ty::Float) => {
+                let v = self.tmp();
+                self.line(format!("{v} = call double @pyrs_int_to_float(i64 {slot})"));
+                self.line(format!("{acc_next} = fadd double {acc}, {v}"));
+            }
+            other => unreachable!("sum element/acc {other:?}"),
         }
         self.line(format!("{i_next} = add i64 {i}, 1"));
         self.line(format!("br label %{loop_l}"));
@@ -3900,7 +3903,7 @@ impl Emitter {
             ExprKind::Max { left, right } => self.emit_min_max(true, left, right),
             ExprKind::MinList(list) => self.emit_min_max_list(false, list),
             ExprKind::MaxList(list) => self.emit_min_max_list(true, list),
-            ExprKind::Sum(list) => self.emit_sum(list),
+            ExprKind::Sum { list, start } => self.emit_sum(list, start),
             ExprKind::MathCall { op, arg } => self.emit_math_call(*op, arg),
             ExprKind::OsGetcwd => {
                 let t = self.tmp();

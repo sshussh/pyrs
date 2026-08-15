@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.39.0)
+## The language (v0.40.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.40.0**, not 1.0) until it is ready for
+milestone after this one is **0.41.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
@@ -123,6 +123,8 @@ A statically-typed Python subset:
   nested lists).
   **v0.39:** `list.reverse()` in-place (statement only; `reversed(xs)` /
   `xs[::-1]` still allocate a copy).
+  **v0.40:** `sum(xs, start)` / `sum(xs, start=s)` — numeric start (default
+  0 / 0.0); result type is `elem ⊔ start`.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -169,7 +171,8 @@ A statically-typed Python subset:
   (two-or-more numeric args, or one list: without `key=` only
   `list[int|float|bool]`; with monomorphic `key=` any `list[T]` or
   multi-arg homogeneous candidates),
-  `sum()` on `list[int]`/`list[float]`, `isinstance(x, T)` /
+  `sum()` on `list[int]`/`list[float]` (optional numeric `start=` /
+  positional start), `isinstance(x, T)` /
   `isinstance(x, (T1,T2))` with flow-sensitive narrowing, `any`/`all`,
   `enumerate`/`zip`/`reversed` (materialize to lists when used as values),
   indexing with negative indices, full slicing `s[a:b:c]` including
@@ -286,7 +289,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.39.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.40.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -446,4 +449,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.39.0 && git push origin v0.39.0`.
+Release tags: `git tag v0.40.0 && git push origin v0.40.0`.

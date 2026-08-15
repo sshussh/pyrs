@@ -943,8 +943,13 @@ pub enum ExprKind {
     MinList(Box<Expr>),
     /// `max(xs)` for `list[int|float|bool]`; empty list traps ValueError.
     MaxList(Box<Expr>),
-    /// `sum(xs)` for `list[int]` or `list[float]`; empty lists yield 0 / 0.0.
-    Sum(Box<Expr>),
+    /// `sum(xs)` / `sum(xs, start)` / `sum(xs, start=s)` for `list[int]` or
+    /// `list[float]`. `start` is already coerced to the result type; empty
+    /// lists yield `start` (default 0 / 0.0).
+    Sum {
+        list: Box<Expr>,
+        start: Box<Expr>,
+    },
     /// `math.<op>(x)` — float unary from the `math` stdlib module.
     MathCall {
         op: MathOp,

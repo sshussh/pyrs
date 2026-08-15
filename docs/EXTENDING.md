@@ -525,7 +525,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `Abs` | `abs(x)` via LLVM abs/fabs |
 | `Min` / `Max` | 2-arg `min`/`max` (numeric; select on compare) |
 | `MinList` / `MaxList` | 1-arg `min`/`max` over list (empty → ValueError) |
-| `Sum` | `sum(list[int\|float])` open-coded loop |
+| `Sum { list, start }` | `sum(list[int\|float][, start])` open-coded loop |
 | `MathCall { op, arg }` | `math.*` unary intrinsics (float; floor/ceil → int) |
 | Numeric / string casts / `ToBool` | `int`/`float`/`bool`/`str` and truthiness |
 

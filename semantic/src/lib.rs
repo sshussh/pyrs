@@ -17642,8 +17642,8 @@ fn lower_call(
     if kwargs.is_some() {
         return Err(err(format!("'{func}()' does not take **kwargs"), span));
     }
-    // Builtin keywords we accept: enumerate(start=), sorted/min/max(key=).
-    if !matches!(func, "enumerate" | "sorted" | "min" | "max")
+    // Builtin keywords we accept: enumerate/sum(start=), sorted/min/max(key=).
+    if !matches!(func, "enumerate" | "sorted" | "min" | "max" | "sum")
         && let Some(kw) = keywords.first()
     {
         return Err(err(
@@ -17787,41 +17787,7 @@ fn lower_call(
             }
             "next" => lower_builtin_next(&args, span, ctx),
             "min" | "max" => lower_min_max_expr(func, &args, keywords, span, ctx),
-            "sum" => {
-                if args.len() != 1 {
-                    return Err(err(
-                        format!(
-                            "sum() takes exactly 1 argument ({} given); \
-                             start= is not supported yet",
-                            args.len()
-                        ),
-                        span,
-                    ));
-                }
-                let arg = lower_expr(args[0], ctx)?;
-                let elem = match arg.ty {
-                    ir::Ty::List(e) => *e,
-                    other => {
-                        return Err(err(
-                            format!("sum() expects a list of numbers, found {other}"),
-                            args[0].span,
-                        ));
-                    }
-                };
-                match elem {
-                    ir::Ty::Int | ir::Ty::Float => Ok(ir::Expr {
-                        ty: elem,
-                        kind: ir::ExprKind::Sum(Box::new(arg)),
-                    }),
-                    other => Err(err(
-                        format!(
-                            "sum() is only supported for list[int] and list[float], \
-                             found list[{other}]"
-                        ),
-                        args[0].span,
-                    )),
-                }
-            }
+            "sum" => lower_sum_expr(&args, keywords, span, ctx),
             "sorted" => lower_sorted_expr(&args, keywords, span, ctx),
             "range" => Err(err(
                 "range(...) is only supported as the iterable of a 'for' loop",
@@ -19831,6 +19797,107 @@ fn lower_min_max_list_key(
         kind: ir::ExprKind::Block {
             stmts,
             result: Box::new(local_expr(out_t, ret_ty)),
+        },
+    })
+}
+
+fn lower_sum_expr(
+    args: &[&ast::Expr],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if args.is_empty() {
+        return Err(err(
+            "sum() takes at least 1 positional argument (0 given)",
+            span,
+        ));
+    }
+    if args.len() > 2 {
+        return Err(err(
+            format!(
+                "sum() takes at most 2 positional arguments ({} given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let mut start_kw = None;
+    for kw in keywords {
+        if kw.name == "start" {
+            if start_kw.is_some() {
+                return Err(err(
+                    "sum() got multiple values for keyword argument 'start'",
+                    kw.name_span,
+                ));
+            }
+            start_kw = Some(kw);
+        } else {
+            return Err(err(
+                format!("sum() got an unexpected keyword argument '{}'", kw.name),
+                kw.name_span,
+            ));
+        }
+    }
+    if args.len() == 2
+        && let Some(kw) = start_kw
+    {
+        return Err(err(
+            "sum() got multiple values for argument 'start'",
+            kw.name_span,
+        ));
+    }
+    let list = lower_expr(args[0], ctx)?;
+    let elem = match list.ty {
+        ir::Ty::List(e) => *e,
+        other => {
+            return Err(err(
+                format!("sum() expects a list of numbers, found {other}"),
+                args[0].span,
+            ));
+        }
+    };
+    if !matches!(elem, ir::Ty::Int | ir::Ty::Float) {
+        return Err(err(
+            format!(
+                "sum() is only supported for list[int] and list[float], \
+                 found list[{elem}]"
+            ),
+            args[0].span,
+        ));
+    }
+    let start = if args.len() == 2 {
+        let s = lower_expr(args[1], ctx)?;
+        promote_numeric(s, args[1].span, "sum() start")?
+    } else if let Some(kw) = start_kw {
+        let s = lower_expr(&kw.value, ctx)?;
+        promote_numeric(s, kw.value.span, "sum() start")?
+    } else if elem == ir::Ty::Float {
+        ir::Expr {
+            ty: ir::Ty::Float,
+            kind: ir::ExprKind::ConstFloat(0.0),
+        }
+    } else {
+        int_const(0)
+    };
+    // Result type is elem ⊔ start (bool already promoted). Empty → start.
+    let (start, ret_ty) = match (elem, start.ty) {
+        (ir::Ty::Int, ir::Ty::Int) | (ir::Ty::Float, ir::Ty::Float) => (start, elem),
+        (ir::Ty::Float, ir::Ty::Int) => (
+            ir::Expr {
+                ty: ir::Ty::Float,
+                kind: ir::ExprKind::IntToFloat(Box::new(start)),
+            },
+            ir::Ty::Float,
+        ),
+        (ir::Ty::Int, ir::Ty::Float) => (start, ir::Ty::Float),
+        _ => unreachable!("sum start is int or float after promote_numeric"),
+    };
+    Ok(ir::Expr {
+        ty: ret_ty,
+        kind: ir::ExprKind::Sum {
+            list: Box::new(list),
+            start: Box::new(start),
         },
     })
 }
@@ -22168,12 +22235,49 @@ v = min(3, 1, 4, key=k)
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Int);
-        assert!(matches!(value.kind, ir::ExprKind::Sum(_)));
+        assert!(matches!(value.kind, ir::ExprKind::Sum { .. }));
         let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
             panic!();
         };
         assert_eq!(value.ty, ir::Ty::Float);
-        assert!(matches!(value.kind, ir::ExprKind::Sum(_)));
+        assert!(matches!(value.kind, ir::ExprKind::Sum { .. }));
+    }
+
+    #[test]
+    fn sum_with_start_lowers() {
+        let m = analyze_ok(
+            "a = sum([1, 2, 3], 10)\nb = sum([1, 2], start=0.5)\nc = sum([1.5], start=1)\n",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Int);
+        assert!(matches!(value.kind, ir::ExprKind::Sum { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[2] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Float);
+    }
+
+    #[test]
+    fn sum_start_rejects_str() {
+        let e = analyze_err("x = sum([1, 2], start=\"a\")\n");
+        assert!(
+            e.message.contains("sum() start") || e.message.contains("str"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn sum_rejects_duplicate_start() {
+        let e = analyze_err("x = sum([1], 2, start=3)\n");
+        assert!(e.message.contains("multiple values"), "{}", e.message);
     }
 
     #[test]

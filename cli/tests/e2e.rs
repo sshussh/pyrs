@@ -2612,6 +2612,45 @@ print(sum([-1, 4, 10]))
 }
 
 #[test]
+fn sum_start_matches_python() {
+    let src = "\
+print(sum([1, 2, 3], 10))
+print(sum([1, 2, 3], start=10))
+print(sum([1, 2], start=0.5))
+print(sum([1.5, 2.5], start=1))
+print(sum([1, 2], True))
+empty_i: list[int] = []
+print(sum(empty_i, 5))
+empty_f: list[float] = []
+print(sum(empty_f, start=1.5))
+print(sum([-1, 4], start=-3))
+";
+    let out = run_program("sum_start", src);
+    let py = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
+}
+
+#[test]
+fn sum_start_type_error_is_compile_error() {
+    let (code, stderr) =
+        run_program_expect_fail("sum_start_ty", "print(sum([1, 2], start=\"a\"))\n");
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("sum() start") || stderr.contains("str"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn sum_wrong_type_is_compile_error() {
     let dir = TempDir::new("sum_bad");
     let src = dir.0.join("prog.py");

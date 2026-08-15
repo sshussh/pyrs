@@ -1,4 +1,4 @@
 [package]
 name="ir"
-version = "0.39.0"
+version = "0.40.0"
 edition="2024"
