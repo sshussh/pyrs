@@ -12139,15 +12139,43 @@ fn class_has_method(ty: ir::Ty, method: &str) -> bool {
     }
 }
 
-/// Reflected rich-compare slot (`a < b` → `b.__gt__(a)`, `a == b` → `b.__eq__(a)`).
+/// Reflected rich-compare slot (`a < b` → `b.__gt__(a)`, `a != b` → `b.__ne__(a)`).
 fn class_reflected_method(op: ast::BinOp) -> Option<&'static str> {
     match op {
-        ast::BinOp::Eq | ast::BinOp::NotEq => Some("__eq__"),
+        ast::BinOp::Eq => Some("__eq__"),
+        ast::BinOp::NotEq => Some("__ne__"),
         ast::BinOp::Lt => Some("__gt__"),
         ast::BinOp::LtEq => Some("__ge__"),
         ast::BinOp::Gt => Some("__lt__"),
         ast::BinOp::GtEq => Some("__le__"),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ClassComparisonMethod {
+    name: &'static str,
+    invert: bool,
+}
+
+/// `object.__ne__` delegates to equality only when no explicit (possibly
+/// inherited) inequality method exists on this receiver.
+fn resolve_class_comparison(
+    class_id: ir::ClassId,
+    method: &'static str,
+) -> Option<ClassComparisonMethod> {
+    if resolve_method(class_id, method).is_some() {
+        Some(ClassComparisonMethod {
+            name: method,
+            invert: false,
+        })
+    } else if method == "__ne__" && resolve_method(class_id, "__eq__").is_some() {
+        Some(ClassComparisonMethod {
+            name: "__eq__",
+            invert: true,
+        })
+    } else {
+        None
     }
 }
 
@@ -12193,13 +12221,15 @@ fn ty_can_pass_as(src: ir::Ty, dst: ir::Ty) -> bool {
     }
 }
 
-/// Reflected `__eq__` is used only when the left type is assignable to
+/// Reflected equality/inequality is used only when the left type is assignable to
 /// `other` — otherwise identity (both classes) or a type error (mixed).
-fn class_eq_accepts(class_id: ir::ClassId, arg_ty: ir::Ty, ctx: &FnCtx) -> bool {
-    if resolve_method(class_id, "__eq__").is_none() {
-        return false;
-    }
-    match lookup_method_sig(class_id, "__eq__", ctx) {
+fn class_equality_accepts(
+    class_id: ir::ClassId,
+    method: &str,
+    arg_ty: ir::Ty,
+    ctx: &FnCtx,
+) -> bool {
+    match lookup_method_sig(class_id, method, ctx) {
         Some(sig) => match sig.params.get(1) {
             Some(p) => ty_can_pass_as(arg_ty, p.ty),
             None => sig.vararg.is_some(),
@@ -12217,11 +12247,11 @@ fn class_reflected_usable(
     let Some(refl) = class_reflected_method(op) else {
         return false;
     };
-    if resolve_method(class_id, refl).is_none() {
+    let Some(method) = resolve_class_comparison(class_id, refl) else {
         return false;
-    }
+    };
     if matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) {
-        class_eq_accepts(class_id, arg_ty, ctx)
+        class_equality_accepts(class_id, method.name, arg_ty, ctx)
     } else {
         true
     }
@@ -16991,6 +17021,9 @@ fn lower_compare_chain(
         return lower_binary(*op, prev, cur, span, ctx);
     }
 
+    // Bind a() before b() so a() < b() < c() evaluates operands in source order.
+    let prev_temp = ctx.fresh_temp("cmp.prev", prev.ty);
+    let prev_local = local_expr(prev_temp.clone(), prev.ty);
     let cur_ty = cur.ty;
     let temp = ctx.fresh_temp("cmp", cur_ty);
     let temp_local = ir::Expr {
@@ -16998,15 +17031,22 @@ fn lower_compare_chain(
         kind: ir::ExprKind::Local(temp.clone()),
     };
 
-    let head = lower_binary(*op, prev, temp_local.clone(), span, ctx)?;
+    let head = lower_binary(*op, prev_local, temp_local.clone(), span, ctx)?;
     let tail = lower_compare_chain(temp_local, &rest[1..], span, ctx)?;
 
     Ok(ir::Expr {
         ty: ir::Ty::Bool,
         kind: ir::ExprKind::Let {
-            name: temp,
-            value: Box::new(cur),
-            body: Box::new(bool_and(head, tail)),
+            name: prev_temp,
+            value: Box::new(prev),
+            body: Box::new(ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Let {
+                    name: temp,
+                    value: Box::new(cur),
+                    body: Box::new(bool_and(head, tail)),
+                },
+            }),
         },
     })
 }
@@ -23878,16 +23918,20 @@ fn lower_bitwise(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
 /// Class instance `==` / `!=` / `<` / `<=` / `>` / `>=`.
 ///
 /// If the left class (or a parent) defines the matching dunder
-/// (`__eq__` / `__lt__` / `__le__` / `__gt__` / `__ge__`), call it
+/// (`__eq__` / `__ne__` / `__lt__` / `__le__` / `__gt__` / `__ge__`), call it
 /// (virtual). Otherwise the right operand's reflected slot is tried
 /// (`b.__eq__(a)` for `a == b`, `b.__gt__(a)` for `a < b`). Reflected
-/// `__eq__` is used only when the left type is assignable to `other`;
+/// equality/inequality is used only when the left type is assignable to `other`;
 /// otherwise `==` / `!=` fall back to pointer identity when both sides
-/// are class instances (CPython default when neither side defines `__eq__`).
+/// are class instances (CPython default when neither side has a usable
+/// `__eq__` / `__ne__` protocol).
 /// Ordering has no identity fallback. If the right type is a proper
 /// subclass of the left and defines the reflected method, it is tried
 /// first (CPython subclass-first). There is no `NotImplemented`
-/// fallthrough. `sorted` / `list.sort` / `min` / `max` desugar to `<`.
+/// fallthrough. Missing `__ne__` delegates to negated `__eq__` on that
+/// receiver. Operands are always evaluated once in source order, regardless
+/// of which receiver is selected. `sorted` / `list.sort` / `min` / `max`
+/// desugar to `<`.
 fn lower_class_compare(
     op: ast::BinOp,
     l: ir::Expr,
@@ -23896,7 +23940,8 @@ fn lower_class_compare(
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     let method = match op {
-        ast::BinOp::Eq | ast::BinOp::NotEq => "__eq__",
+        ast::BinOp::Eq => "__eq__",
+        ast::BinOp::NotEq => "__ne__",
         ast::BinOp::Lt => "__lt__",
         ast::BinOp::LtEq => "__le__",
         ast::BinOp::Gt => "__gt__",
@@ -23908,7 +23953,6 @@ fn lower_class_compare(
             ));
         }
     };
-    let invert = matches!(op, ast::BinOp::NotEq);
     let reflected = class_reflected_method(op);
 
     // CPython: if the right type is a proper subtype of the left and has the
@@ -23917,20 +23961,22 @@ fn lower_class_compare(
         && lid != rid
         && class_is_subclass(rid, lid)
         && class_reflected_usable(op, rid, l.ty, ctx)
+        && let Some(method) = resolve_class_comparison(rid, refl)
     {
-        return lower_class_cmp_call(r, rid, l, refl, invert, span, ctx);
+        return lower_class_cmp_call(l, r, method, true, span, ctx);
     }
 
     if let ir::Ty::Class(id) = l.ty
-        && resolve_method(id, method).is_some()
+        && let Some(method) = resolve_class_comparison(id, method)
     {
-        return lower_class_cmp_call(l, id, r, method, invert, span, ctx);
+        return lower_class_cmp_call(l, r, method, false, span, ctx);
     }
 
     if let (ir::Ty::Class(id), Some(refl)) = (r.ty, reflected)
         && class_reflected_usable(op, id, l.ty, ctx)
+        && let Some(method) = resolve_class_comparison(id, refl)
     {
-        return lower_class_cmp_call(r, id, l, refl, invert, span, ctx);
+        return lower_class_cmp_call(l, r, method, true, span, ctx);
     }
 
     if matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) {
@@ -23940,14 +23986,20 @@ fn lower_class_compare(
                 kind: ir::ExprKind::IsIdentity {
                     left: Box::new(l),
                     right: Box::new(r),
-                    not: invert,
+                    not: matches!(op, ast::BinOp::NotEq),
                 },
             });
         }
         return Err(err(
             format!(
-                "cannot compare {} and {} with '{op}' (define __eq__ or use 'is')",
-                l.ty, r.ty
+                "cannot compare {} and {} with '{op}' (define {method}{} or use 'is')",
+                l.ty,
+                r.ty,
+                if op == ast::BinOp::NotEq {
+                    " or __eq__"
+                } else {
+                    ""
+                }
             ),
             span,
         ));
@@ -23964,30 +24016,34 @@ fn lower_class_compare(
 
 fn lower_class_cmp_call(
     left: ir::Expr,
-    class_id: ir::ClassId,
     right: ir::Expr,
-    method: &str,
-    invert: bool,
+    method: ClassComparisonMethod,
+    reflected: bool,
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     let left_t = ctx.fresh_temp("cmp.l", left.ty);
     let right_t = ctx.fresh_temp("cmp.r", right.ty);
-    let left_ir = ir::Expr {
-        ty: left.ty,
-        kind: ir::ExprKind::Local(left_t.clone()),
+    let (receiver, argument) = if reflected {
+        (local_expr(right_t.clone(), right.ty), left_t.clone())
+    } else {
+        (local_expr(left_t.clone(), left.ty), right_t.clone())
     };
-    let right_name = ast::Expr {
-        kind: ast::ExprKind::Name(right_t.clone()),
+    let ir::Ty::Class(class_id) = receiver.ty else {
+        unreachable!("class comparison receiver must be a class instance");
+    };
+    let argument_name = ast::Expr {
+        kind: ast::ExprKind::Name(argument),
         span,
     };
-    let call = lower_instance_method_call(left_ir, class_id, method, span, &[right_name], ctx)?;
+    let call =
+        lower_instance_method_call(receiver, class_id, method.name, span, &[argument_name], ctx)?;
     let call = if call.ty == ir::Ty::Bool {
         call
     } else {
         to_bool(call, span, ctx)?
     };
-    let result = if invert {
+    let result = if method.invert {
         ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::Unary {
@@ -24001,6 +24057,7 @@ fn lower_class_cmp_call(
     Ok(ir::Expr {
         ty: ir::Ty::Bool,
         kind: ir::ExprKind::Block {
+            // Source order: evaluate left, then right, then dispatch.
             stmts: vec![
                 ir::Stmt::Assign {
                     name: left_t,
@@ -24050,7 +24107,8 @@ fn lower_contains(
                 span,
             ));
         }
-        // Stash needle/haystack in temps so we can pass needle as an AST Name.
+        // Stash needle/haystack in source order before dispatching on haystack,
+        // so effects and exceptions in the needle happen first.
         let hay_t = ctx.fresh_temp("in.hay", r.ty);
         let ndl_t = ctx.fresh_temp("in.ndl", l.ty);
         // Build call via IR temps: we cannot easily pass IR needle through the
@@ -24090,12 +24148,12 @@ fn lower_contains(
             kind: ir::ExprKind::Block {
                 stmts: vec![
                     ir::Stmt::Assign {
-                        name: hay_t,
-                        value: r,
-                    },
-                    ir::Stmt::Assign {
                         name: ndl_t,
                         value: l,
+                    },
+                    ir::Stmt::Assign {
+                        name: hay_t,
+                        value: r,
                     },
                 ],
                 result: Box::new(result),
@@ -24675,9 +24733,30 @@ print(f())
             panic!("expected Assign");
         };
         assert_eq!(value.ty, ir::Ty::Bool);
-        let ir::ExprKind::Let { body, .. } = &value.kind else {
+        let ir::ExprKind::Let {
+            value: first, body, ..
+        } = &value.kind
+        else {
             panic!("expected Let, got {:?}", value.kind);
         };
+        assert!(
+            matches!(first.kind, ir::ExprKind::ConstInt(0)),
+            "outer let should bind the first operand, got {:?}",
+            first.kind
+        );
+        let ir::ExprKind::Let {
+            value: middle,
+            body,
+            ..
+        } = &body.kind
+        else {
+            panic!("expected nested Let, got {:?}", body.kind);
+        };
+        assert!(
+            matches!(&middle.kind, ir::ExprKind::GlobalLoad(name) if name == "x"),
+            "inner let should bind the shared middle operand, got {:?}",
+            middle.kind
+        );
         assert!(matches!(
             body.kind,
             ir::ExprKind::Binary {

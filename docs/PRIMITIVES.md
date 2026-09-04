@@ -6,8 +6,8 @@ native kit — then stdlib modules mostly in PyRs on top of that kit.
 
 Companion docs: [SPECIFICATIONS.md](SPECIFICATIONS.md) (architecture),
 [EXTENDING.md](EXTENDING.md) (full contributor guide for adding features),
-[GUIDE.md](GUIDE.md) (language reference), [AGENTS.md](../AGENTS.md)
-(agent conventions).
+[GUIDE.md](GUIDE.md) (language reference), [ROADMAP.md](ROADMAP.md)
+(path to 1.0).
 
 ---
 

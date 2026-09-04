@@ -40,7 +40,7 @@ documented in the README and GUIDE.
 | [GUIDE.md](GUIDE.md) | Language reference (what exists today) |
 | [SPECIFICATIONS.md](SPECIFICATIONS.md) | Architecture, crates, build/link |
 | [PRIMITIVES.md](PRIMITIVES.md) | Builtin/method/stdlib policy; IR vs C |
-| [AGENTS.md](../AGENTS.md) | Short conventions for automated agents |
+| [ROADMAP.md](ROADMAP.md) | Path to 1.0 and remaining readiness work |
 | [README.md](../README.md) | Overview, feature list, benchmarks |
 
 ---
