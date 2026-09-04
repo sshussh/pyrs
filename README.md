@@ -38,12 +38,13 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.82.0)
+## The language (v0.83.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.83.0**, not 1.0) until it is ready for
+milestone after this one is **0.84.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
-`pyrs --version` match this label. PyRs now ships its first default heap
+`pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
+for remaining readiness work. PyRs now ships its first default heap
 collector: a **nonmoving mark–sweep** backend with conservative native-root
 discovery. This replaces the old never-free runtime; it is the safe first
 backend, not the eventual moving generational/Immix design. See
@@ -223,6 +224,10 @@ A statically-typed Python subset:
   **v0.82:** class `__getitem__` / `__setitem__` / `__delitem__` — `obj[k]`,
   `obj[k] = v`, `del obj[k]`, and `obj[k] += v` (virtual, including
   inherited). Slice syntax on a class is still residual.
+  **v0.83:** class `!=` uses `__ne__` when present (virtual, inherited,
+  reflected, subclass-first); otherwise it still inverts that receiver's
+  `__eq__`. Comparison and class-membership operands are evaluated once
+  in source order (needle before container).
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -378,7 +383,7 @@ A statically-typed Python subset:
   int/float/bool/str and homogeneous list/dict-of-str, plus typed
   `json.loads_*` helpers (no dynamic `json.loads`). `import sys` remains
   special-cased for `sys.argv`. **No new stdlib until the core language
-  is far enough for pure-PyRs libraries** (see roadmap / `AGENTS.md`);
+  is far enough for pure-PyRs libraries** (see the [roadmap](docs/ROADMAP.md));
   interim modules may be rewritten pure later
 - **Entry point:** top-level statements run like a script; if there are
   none, a zero-argument `main()` is called automatically
@@ -400,7 +405,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.82.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.83.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -493,7 +498,7 @@ error[semantic]: type mismatch in argument 1 of 'f': expected int, found float
 ## Architecture
 
 Cargo workspace with a strict, unidirectional data flow
-(see [SPECIFICATIONS.md](SPECIFICATIONS.md)):
+(see [SPECIFICATIONS.md](docs/SPECIFICATIONS.md)):
 
 ```
 source ─→ lexer ─→ parser ─→ semantic ─→ ir ─→ codegen ─→ executable
@@ -562,4 +567,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.82.0 && git push origin v0.82.0`.
+Release tags: `git tag v0.83.0 && git push origin v0.83.0`.

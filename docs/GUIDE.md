@@ -797,21 +797,25 @@ print(isinstance(d, Animal))  # True
 - **Bound methods as values** (`f = obj.m; f(...)`)
 - **`__iter__` / `__next__`** for user for-loops; **`__len__` / `__bool__`**;
   builtin **`next(it)`** / **`next(it, default)`** (user iterators and generators)
-- **`__contains__`** for user-class `in` / `not in`
+- **`__contains__`** for user-class `in` / `not in` (the needle is
+  evaluated before the container)
 - **`__getitem__` / `__setitem__` / `__delitem__`** for `obj[k]`, `obj[k] = v`,
   and `del obj[k]` (virtual, including inherited). `obj[k] += v` loads via
   `__getitem__` and stores via `__setitem__` (base and key evaluated once).
   Key/value types follow the method signatures. Slice syntax on a class
   (`obj[a:b]`) is still a compile error (no slice object)
-- **`==` / `!=`:** if the left class (or a parent) defines `__eq__`, that
-  method is called (virtual). If it does not, the right operand's `__eq__`
-  is tried when the left type is assignable to that method's `other`
-  parameter (`1 == P()` → `P.__eq__(1)`). A proper subclass on the right
-  that defines `__eq__` is tried first. Otherwise both-class `==` / `!=`
-  is pointer identity (CPython default when neither side has `__eq__`).
+- **`==` / `!=`:** if the left class (or a parent) defines the matching
+  dunder (`__eq__` / `__ne__`), that method is called (virtual). If it
+  does not, the right operand's matching dunder is tried when the left
+  type is assignable to that method's `other` parameter (`1 == P()` →
+  `P.__eq__(1)`, `1 != P()` → `P.__ne__(1)`). Missing `__ne__` on a
+  receiver falls back to that receiver's negated `__eq__`. A proper
+  subclass on the right that defines the reflected slot is tried first.
+  Otherwise both-class `==` / `!=` is pointer identity (CPython default
+  when neither side has a usable equality/inequality method). Operands
+  are evaluated once, left to right, before the selected method runs.
   `list[C] == list[C]` still uses identity of elements even when `C`
-  defines `__eq__`. There is no `NotImplemented` fallthrough and no
-  separate `__ne__` slot (`!=` inverts `__eq__`)
+  defines `__eq__`. There is no `NotImplemented` fallthrough
 - **Ordering (`<` / `<=` / `>` / `>=`):** if the left class (or a parent)
   defines the matching dunder (`__lt__` / `__le__` / `__gt__` / `__ge__`),
   that method is called (virtual). If it does not, the right operand's
@@ -1469,7 +1473,7 @@ collector (`codegen/runtime/runtime.c` and `codegen/runtime/gc.c`) supply
 Python-faithful printing (shortest round-trip floats), managed storage, and
 runtime error traps; they are compiled and linked into every binary by `cc`.
 
-Details and build strategy: [SPECIFICATIONS.md](../SPECIFICATIONS.md).
+Details and build strategy: [SPECIFICATIONS.md](SPECIFICATIONS.md).
 Worked examples live in [examples/](../examples), benchmarks in
 [benchmarks/](../benchmarks). The larger [RiskSim](../examples/risksim)
 showcase is a packaged Monte Carlo portfolio CLI (`make examples` runs it
