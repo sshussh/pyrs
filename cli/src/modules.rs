@@ -617,6 +617,9 @@ fn collect_deps_in_stmts(
             }
             ast::StmtKind::Import { names } => {
                 for (m, alias, span) in names {
+                    // Only `from __future__ import ...` is a directive; plain
+                    // `import __future__` is an ordinary module import and
+                    // should still report that the module is unavailable.
                     if m != "sys" && m != self_name && seen.insert(m.clone()) {
                         deps.push((m.clone(), *span));
                     }
@@ -635,7 +638,12 @@ fn collect_deps_in_stmts(
                 span,
                 ..
             } => {
-                if m != "sys" && !m.is_empty() && m != self_name && seen.insert(m.clone()) {
+                if m != "sys"
+                    && m != semantic::FUTURE_MODULE
+                    && !m.is_empty()
+                    && m != self_name
+                    && seen.insert(m.clone())
+                {
                     deps.push((m.clone(), *span));
                 }
                 // `import *` does not force-load submodules (only names already

@@ -366,6 +366,54 @@ type SResult<T> = Result<T, Diagnostic>;
 /// Name of the synthesized entry function holding top-level statements.
 pub const ENTRY_NAME: &str = "__main__";
 
+/// `__future__` is a compiler directive, not a loadable module.
+pub const FUTURE_MODULE: &str = "__future__";
+
+/// Feature names CPython's `__future__` accepts. Every one of these is either
+/// mandatory in Python 3 or, for `annotations`, already how PyRs behaves: names
+/// in annotations are resolved after the whole module is parsed, so the import
+/// is a no-op rather than a behaviour switch.
+const FUTURE_FEATURES: [&str; 10] = [
+    "nested_scopes",
+    "generators",
+    "division",
+    "absolute_import",
+    "with_statement",
+    "print_function",
+    "unicode_literals",
+    "barry_as_FLUFL",
+    "generator_stop",
+    "annotations",
+];
+
+/// Validate `from __future__ import ...` the way CPython does, then treat it as
+/// a no-op. Unknown features must be rejected rather than silently ignored,
+/// since a program relying on one would otherwise compile with wrong semantics.
+fn check_future_import(
+    names: &[(String, Option<String>, Span)],
+    star: bool,
+    span: Span,
+) -> SResult<()> {
+    if star {
+        return Err(err("'from __future__ import *' is not allowed", span));
+    }
+    for (name, _, name_span) in names {
+        if !FUTURE_FEATURES.contains(&name.as_str()) {
+            return Err(err(
+                format!("future feature {name} is not defined"),
+                *name_span,
+            ));
+        }
+        if name == "barry_as_FLUFL" {
+            return Err(err(
+                "future feature barry_as_FLUFL is not supported",
+                *name_span,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn err(message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic::new(Phase::Semantic, message, span)
 }
@@ -2073,7 +2121,7 @@ fn inject_class_import_aliases(modules: &[ModuleInput<'_>]) {
             else {
                 continue;
             };
-            if *star || *level != 0 || src.is_empty() || src == "sys" {
+            if *star || *level != 0 || src.is_empty() || src == "sys" || src == FUTURE_MODULE {
                 continue;
             }
             for (name, alias, _) in names {
@@ -4741,6 +4789,10 @@ fn collect_imports(
                 span,
                 ..
             } => {
+                if m == FUTURE_MODULE {
+                    check_future_import(names, *star, *span)?;
+                    continue;
+                }
                 if m == "sys" {
                     return Err(err(
                         if *star {
@@ -8232,6 +8284,12 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             span,
             ..
         } => {
+            if module == FUTURE_MODULE {
+                // Compiler directive, already validated during import
+                // collection. Emitting nothing keeps it out of the module
+                // init graph, which has no `__future__` to initialize.
+                return Ok(());
+            }
             if *star && !ctx.is_entry {
                 return Err(err("import * only allowed at module level", *span));
             }

@@ -642,6 +642,39 @@ impl Parser {
         }
     }
 
+    /// Parse the contents of a string annotation as a type.
+    ///
+    /// Diagnostics are re-anchored to the literal itself: offsets produced by
+    /// the inner lex/parse are relative to the string's contents and would
+    /// point at unrelated places in the file.
+    fn parse_type_from_str(text: &str, context: &str, span: Span) -> PResult<TypeName> {
+        let at = |message: String| Diagnostic::new(Phase::Parse, message, span);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err(at(format!(
+                "expected a type {context}, found an empty string"
+            )));
+        }
+        let tokens = lexer::lex(trimmed)
+            .map_err(|d| at(format!("{} in string annotation {}", d.message, context)))?;
+        let mut inner = Parser::new(tokens);
+        let ty = inner
+            .parse_type_name(context)
+            .map_err(|d| at(format!("{} (in string annotation)", d.message)))?;
+        inner.skip_newlines();
+        while inner.peek() == &Token::Dedent {
+            inner.advance();
+        }
+        if inner.peek() != &Token::EOF {
+            return Err(at(format!(
+                "unexpected {} after the type in string annotation {:?}",
+                inner.peek().describe(),
+                trimmed
+            )));
+        }
+        Ok(ty)
+    }
+
     /// Type annotation: atoms joined by `|` into unions (`int | None`).
     fn parse_type_name(&mut self, context: &str) -> PResult<TypeName> {
         let first = self.parse_type_atom(context)?;
@@ -790,6 +823,17 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
                 Ok(TypeName::Class(Box::leak(name.into_boxed_str())))
+            }
+            // PEP 484 forward reference: `other: "Base"`. Pervasive in real
+            // typed Python, and unavoidable before CPython 3.14 (PEP 649)
+            // whenever an annotation names the class currently being defined.
+            // PyRs resolves names after the whole module is parsed, so the
+            // quotes carry no extra meaning here beyond deferring the parse.
+            Token::Strlit(text) => {
+                let text = text.clone();
+                let span = self.peek_span();
+                self.advance();
+                Self::parse_type_from_str(&text, context, span)
             }
             other => Err(self.error(format!(
                 "expected a type ('int', 'float', 'bool', 'str', 'file', 'list[...]', \
@@ -1646,6 +1690,15 @@ impl Parser {
     fn parse_term(&mut self) -> PResult<Expr> {
         let mut left = self.parse_unary()?;
         loop {
+            // `@` binds at this precedence in Python. PyRs has no array type to
+            // multiply, so say that plainly instead of letting the enclosing
+            // construct report a misleading "expected ')'".
+            if self.peek() == &Token::At {
+                return Err(self.error(
+                    "the matrix multiplication operator '@' is not supported; \
+                     PyRs has no array type for it to operate on",
+                ));
+            }
             let op = match self.peek() {
                 Token::Star => BinOp::Mul,
                 Token::Slash => BinOp::Div,
@@ -1801,6 +1854,16 @@ impl Parser {
                         };
                     } else {
                         let index = lo.expect("index expression parsed above");
+                        // `a[i, j]` is `a[(i, j)]` in Python. PyRs restricts
+                        // dict keys to int and str, so no type can accept a
+                        // tuple subscript; report that rather than a bare
+                        // "expected ']'".
+                        if self.peek() == &Token::Comma {
+                            return Err(self.error(
+                                "tuple subscripts like 'a[i, j]' are not supported; \
+                                 dict keys are limited to int and str",
+                            ));
+                        }
                         let close = self.expect(Token::RBracket, "to close the subscript")?;
                         let span = expr.span.to(close);
                         expr = Expr {

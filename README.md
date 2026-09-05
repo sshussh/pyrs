@@ -76,10 +76,10 @@ Build your own module with `pyrs build-extension -i kernels.py --module kernels_
 --python .venv/bin/python`; import `kernels_native` from that same environment.
 Only the exported kernels run natively; Python and package code keep using CPython.
 
-## The language (v0.86.0)
+## The language (v0.87.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.87.0**, not 1.0) until it is ready for
+milestone after this one is **0.88.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -285,6 +285,17 @@ A statically-typed Python subset:
   **runtime type_id switch** — AttributeError when the live instance
   lacks the field; method calls on bare `Any` and open setattr remain
   unsupported)
+- **Annotation syntax (v0.87):** annotations may be written as string
+  literals (`def f(other: "Node")`, `xs: "list[int]"`, `-> "int"`), the
+  PEP 484 forward-reference form that real typed Python uses everywhere and
+  that was mandatory before CPython 3.14 for a class naming itself. Quotes
+  add no meaning in PyRs, which resolves names after parsing the whole
+  module; nesting (`"list[Item]"`) and unions (`"int | None"`) work.
+  `from __future__ import ...` is accepted as the no-op directive it is in
+  Python 3, and an unknown feature is rejected with CPython's wording.
+  Two syntaxes are rejected with an explicit reason instead of a confusing
+  parse error: tuple subscripts (`a[i, j]`, since dict keys are int/str
+  only) and the `@` matrix-multiply operator (no array type)
 - **Functions:** `def` with optional parameter/return annotations
   (defaults infer param types; bare params inferred from body when unique;
   return type inferred from `return` when omitted), defaults and keyword
@@ -453,7 +464,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.86.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.87.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -615,4 +626,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.86.0 && git push origin v0.86.0`.
+Release tags: `git tag v0.87.0 && git push origin v0.87.0`.
