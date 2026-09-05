@@ -1,10 +1,10 @@
 # PyRs roadmap to 1.0
 
 PyRs has a substantial native compiler and runtime, but it is still a
-statically typed Python subset. Version **0.83.0** ships class comparison
-and membership correctness: independent `__ne__` methods and source-order
-operand evaluation. The next milestone is **0.84.0**; reaching a particular
-minor version does not establish 1.0 readiness.
+statically typed Python subset. Version **0.84.0** ships iterator exception
+boundaries and a shared iterable contract for `for` and comprehensions.
+The next milestone is **0.85.0**; reaching a particular minor version does
+not establish 1.0 readiness.
 
 ## State reviewed on 2026-09-05
 
@@ -42,7 +42,19 @@ After the 0.83 changes, the same host reported:
 | `make examples` | All 13 example entry points matched CPython |
 | `pyrs --version` | `PyRs 0.83.0` |
 
-Details live in the [0.83 implementation checklist](superpowers/plans/2026-09-05-comparison-protocols-0.83.md).
+After 0.84 on the same host:
+
+| Check | Result after 0.84 |
+|-------|-------------------|
+| `make doctor` | All required tools available |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | Passed; 14 new iterator-exception/comprehension tests |
+| `make examples` | All 13 example entry points matched CPython |
+| `pyrs --version` | `PyRs 0.84.0` |
+
+Details live in the [0.83 implementation checklist](superpowers/plans/2026-09-05-comparison-protocols-0.83.md)
+and the [0.84 implementation checklist](superpowers/plans/2026-09-05-iterator-exceptions-0.84.md).
 
 ## 0.83.0: comparison and membership correctness
 
@@ -75,6 +87,31 @@ and O0/O2/O3, followed by the full local gate.
 operand types remain unsupported. Virtual overrides of an already selected
 method continue to work; that does not make slot selection fully dynamic.
 
+## 0.84.0: iterator exception boundaries and shared iterables
+
+User-iterator `for` loops used to catch `StopIteration` around `__next__`
+and the loop body, so a body `raise StopIteration(...)` looked like
+normal exhaustion and could run `else`. Comprehensions only accepted
+range/list/str, while `for` already accepted tuple, dict keys, set, file,
+generator, and class `__iter__`.
+
+The milestone contract is:
+
+- User-iterator `for` and comprehensions catch `StopIteration` only around
+  `__next__`. Body and target-binding exceptions propagate. Ordinary
+  `__next__` exhaustion still runs loop `else` and does not leak into an
+  enclosing `except StopIteration`.
+- List, set, and dict comprehensions accept the same iterables as `for`.
+- Generator `for` / comprehension exhaustion remains Optional None
+  (documented subset). `any` / `all` / `enumerate` / `zip` / `reversed`
+  are unchanged.
+
+This is semantic lowering over existing `Try` / `While` IR. Acceptance
+requires differential tests for body `StopIteration`, exhaustion/`else`,
+non-StopIteration from `__next__`, break/continue/return/finally, nested
+loops, virtual/`__iter__` iterator classes, and comprehension coverage of
+tuple/dict/set/file/generator/user-iter, plus the full local gate.
+
 ## Confirmed remaining gaps
 
 These findings remain open after the 0.83 scope. Passing the baseline did
@@ -82,8 +119,8 @@ not cover them.
 
 | Area | Current gap | Required follow-up |
 |------|-------------|--------------------|
-| User iterator exception handling | A `for` loop over a class catches `StopIteration` from the whole loop body, so a body exception can be mistaken for normal exhaustion and run `else` | Catch exhaustion only around `__next__`; propagate body and target-binding exceptions |
-| Iterable coverage | Comprehension lowering accepts range/list/str, while ordinary `for` supports additional tuple/dict/set/generator/user-iterator paths | Define a common supported iterable contract and add parity tests for each consumer |
+| User iterator exception handling | Closed in 0.84: `StopIteration` is caught only around `__next__` | Keep generator `for` on Optional None unless that subset is deliberately changed |
+| Iterable coverage | Closed in 0.84 for `for` and list/set/dict comprehensions | `any` / `all` / `enumerate` / `zip` / `reversed` still use a narrower set |
 | Rich comparisons | No `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; `list[C]` equality uses element identity even when `C` defines `__eq__` | Complete or explicitly bound the protocol contract before claiming general object compatibility |
 | Text | String length/index/slice use UTF-8 bytes, while `ord`/`chr` use Unicode code points; many methods use ASCII case and whitespace rules | Establish a consistent Unicode string contract and test multibyte, combining, whitespace, and case behavior |
 | Numeric and binding semantics | int/float comparison loses precision beyond 2^53; some possibly unbound scalar locals read default values; dynamic negative integer powers trap | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
@@ -94,23 +131,20 @@ not cover them.
 | Release delivery | The compiler links system LLVM dynamically; archives have no clean-environment dependency check; tag/crate/CLI agreement is unchecked; manually selected release tags do not control archive version naming | State supported hosts/dependencies, verify extracted archives on clean hosts, and enforce consistent version/tag metadata |
 | Documentation checks | Hygiene verifies required files and basic workflow shape, without checking links or version agreement | Automate these checks; 0.83 repairs the observed active-document links but adds no new hygiene gate |
 
-The iterator bug has a minimal behavioral distinction: in
-`try: for x in Counter(): raise StopIteration("body")`, an enclosing
-`except StopIteration` should receive `"body"`. With a loop `else`, the
-reviewed implementation instead prints the `else` branch as though
-`Counter.__next__` had exhausted normally. This is a correctness defect,
-not a deliberate subset rule.
+The 0.84 body-`StopIteration` distinction is: in
+`try: for x in Counter(1): raise StopIteration("body")`, an enclosing
+`except StopIteration` receives `"body"` and loop `else` does not run.
+Ordinary `__next__` exhaustion still runs `else`.
 
 ## Proposed milestones and release gates
 
-The 0.83 scope is implemented by its linked checklist.
+The 0.83 and 0.84 scopes are implemented by their linked checklists.
 The following phases are proposed follow-up work; later version numbers
 should be assigned when each scope is reviewed.
 
 | Phase | Focus | Exit evidence |
 |-------|-------|---------------|
-| **0.84.0, proposed next** | Iterator exception boundaries and a documented iterable support matrix | `StopIteration` from body/target binding propagates; ordinary exhaustion alone runs loop `else`; break/continue/return/finally and nested-loop differential tests pass |
-| **Core compatibility** | Unicode semantics, numeric/binding correctness, and consistent class/container protocols | A supported-feature matrix links behavior to differential tests; silent wrong behavior is removed from supported paths; residual limitations are explicit |
+| **0.85.0, proposed next** | Unicode semantics, numeric/binding correctness, and remaining class/container protocol bounds | A supported-feature matrix links behavior to differential tests; silent wrong behavior is removed from supported paths; residual limitations are explicit |
 | **Reliable validation and delivery** | Strict parity checks, useful failure artifacts, version/link checks, and release dependency handling | Deliberately broken programs fail the parity gate; failure artifacts are retained; an extracted archive builds and runs a sample on each declared clean host |
 | **Sustained workload validation** | GC, resource handling, compile cost, and library-shaped programs | Repeatable memory/stress results and benchmark baselines; long-running programs with containers, cycles, exceptions, closures, and generators stay correct; pure-PyRs library needs are documented |
 | **1.0 release candidate** | Stable supported contract and reproducible release | Full gates pass for the exact candidate; no known silent correctness defects in its supported contract; installation, diagnostics, compatibility limits, and upgrade expectations are documented |
