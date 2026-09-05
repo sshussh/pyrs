@@ -3,7 +3,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, v1.0-development]
+    branches: [main, master, feat/cpython-interop]
   pull_request:
     branches: [main, master]
   workflow_dispatch:

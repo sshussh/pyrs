@@ -42,7 +42,7 @@ compatibility execution.
 - Native extension boundary tests at O0/O2/O3 under GC stress, including lifetime,
   thread/reentrancy, symbol isolation, and scientific package checks. The
   `examples/interop` demo verifies results and measures full call overhead.
-- Development is isolated on `v1.0-development`. The bridge remains an explicit
+- Development is isolated on `feat/cpython-interop`. The bridge remains an explicit
   numerical API; automatic mixed execution, general objects/arrays and a stable
   standalone library ABI remain planned work. See the
   [interoperability contract](docs/INTEROPERABILITY.md) for current restrictions.
