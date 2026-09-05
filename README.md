@@ -18,7 +18,7 @@ mode for packages such as NumPy and pandas. See the [unreleased changes](CHANGEL
 and [compatibility probes](compatibility/README.md). This is ongoing work;
 0.82.0 is not a declaration of 1.0 readiness.
 
-Development continues on `feat/cpython-interop`. The experimental
+This work landed on `main` in 0.86.0. The experimental
 [CPython bridge](docs/INTEROPERABILITY.md) compiles numerical functions into
 importable native extensions and can read NumPy float64 buffers without copying.
 It is the first step toward mixed Python/native execution and reusable native

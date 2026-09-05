@@ -2,7 +2,7 @@
 
 Status: implementation in progress; **not a 1.0 release declaration**.
 Baseline: repository 0.82.0 (`5b009a5`), reviewed 2026-09-05.
-Development branch: `feat/cpython-interop`. User testing precedes any stable release.
+Landed on `main` in 0.86.0. User testing precedes any stable release.
 
 ## Product contract
 
@@ -205,10 +205,13 @@ them with broad output normalization.
 - Scientific/data priority (NumPy and pandas) confirmed by the owner. Independent
   workload selection remains open; no native coverage percentage or
   1.0 readiness is claimed.
-- All prior changes moved to `feat/cpython-interop` (renamed from the earlier
-  `v1.0-development`, which overstated release intent); initial
-  correctness/invocation work committed as `818a366`. No stable release or tag
-  has been created.
+- This line of work was developed on `feat/cpython-interop` (renamed from the
+  earlier `v1.0-development`, which overstated release intent) and merged into
+  `main` as 0.86.0. No stable release or tag has been created.
+- 0.86.0 also fixed a heap-corruption defect in the bridge: borrowed list
+  headers now carry a non-owned capacity marker so runtime growth raises
+  `BufferError` instead of calling the libc allocator on exporter- or
+  `PyMem`-owned memory. Direct element stores remain frontend-enforced.
 - Native corrections: exact int/float comparisons and rounding; binding checks
   for locals/generators; optimized exception-local preservation; evaluation of
   None-valued expressions. Module/global/deleted bindings and the full numeric

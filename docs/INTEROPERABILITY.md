@@ -1,6 +1,6 @@
 # Native libraries and CPython interoperability
 
-Status: experimental development on `feat/cpython-interop`. This is a design contract
+Status: experimental, landed on `main` in 0.86.0. This is a design contract
 and incremental implementation plan, not a stable ABI or a 1.0 release.
 
 ## Product direction
