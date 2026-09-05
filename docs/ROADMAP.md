@@ -138,7 +138,10 @@ The milestone contract is:
   CPython slice bounds. The `in` needle is still evaluated first.
 - Nested `list[list[C]]` uses the same recursive `==`. Tuple `==` / `!=`
   with a class (or nested) element is pairwise `==` with short-circuit.
-- Mixed-tuple `in` / `index` / `count` stay on slot identity.
+- Same-object container elements skip `__eq__` (`RichCompareBool`);
+  scalar `a == a` still calls it. Homogeneous `tuple[C, …]` `in` /
+  `index` / `count` use class `==`. Mixed-tuple membership stays slot
+  identity.
 
 This is semantic lowering over existing `Block` / `While` / `Index` IR.
 Acceptance requires differential tests for value equality, identity
@@ -155,7 +158,7 @@ not cover them.
 |------|-------------|--------------------|
 | User iterator exception handling | Closed in 0.84: `StopIteration` is caught only around `__next__` | Keep generator `for` on Optional None unless that subset is deliberately changed |
 | Iterable coverage | Closed in 0.84 for `for` and list/set/dict comprehensions | `any` / `all` / `enumerate` / `zip` / `reversed` still use a narrower set |
-| Rich comparisons | Closed in 0.85 for `list[C]` `==`/`!=`/`in`/`index`/`count`/`remove` and tuple `==`/`!=`. Still: no `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; mixed-tuple membership uses identity | Complete or explicitly bound the protocol contract before claiming general object compatibility |
+| Rich comparisons | Closed in 0.85 for `list[C]` `==`/`!=`/`in`/`index`/`count`/`remove`, tuple `==`/`!=`, and homogeneous `tuple[C, …]` `in`/`index`/`count`. Still: no `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; mixed-tuple membership uses identity | Complete or explicitly bound the protocol contract before claiming general object compatibility |
 | Text | String length/index/slice use UTF-8 bytes, while `ord`/`chr` use Unicode code points; many methods use ASCII case and whitespace rules | Establish a consistent Unicode string contract and test multibyte, combining, whitespace, and case behavior |
 | Numeric and binding semantics | int/float comparison loses precision beyond 2^53; some possibly unbound scalar locals read default values; dynamic negative integer powers trap | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
 | Generators and dynamism | `yield from` does not forward `send`/`throw`; generator exhaustion uses Optional None in several paths; `Any`, class attributes, inheritance, and class values remain restricted | Stabilize the intended subset and reject unsupported paths clearly; broader CPython dynamism is separate work |

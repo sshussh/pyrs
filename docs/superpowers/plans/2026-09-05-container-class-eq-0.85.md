@@ -24,10 +24,14 @@ and mixed-tuple membership remain later work.
       `!=` negates overall `==`, not element `__ne__`). Bind each list once.
 - [x] `in` / `index` / `count` / `remove` use `item == needle` (CPython
       listobject). Same slice bounds as today's `index`. Needle still
-      evaluates before the container.
+      evaluates before the container. `index` binds start/end before
+      reading `len`.
 - [x] Tuple `==` / `!=` with a class (or nested) element is pairwise
-      `==` with short-circuit. Mixed-tuple `in` / `index` / `count` stay
-      on slot identity.
+      `==` with short-circuit. Homogeneous `tuple[C, …]` `in` / `index` /
+      `count` use class `==`. Mixed-tuple membership stays slot identity.
+- [x] Container element `==` identity-fast-paths the same object
+      (`is or ==`) without calling `__eq__`. Scalar `a == a` still calls
+      `__eq__`.
 - [x] Differential tests: direct/inherited/virtual `__eq__`, identity
       fallback, nested lists, `!=` vs `__ne__`, membership, index bounds,
       remove, tuple equality, side effects, exceptions, O0/O2/O3.
