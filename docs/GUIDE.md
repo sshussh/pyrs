@@ -92,6 +92,7 @@ pyrs <command> [options]
 |-----------|--------------|
 | `compile` | compile a source file to a native executable |
 | `run`     | compile to a temporary location and execute immediately |
+| `check`   | load and analyze native source without linking or execution |
 | `lex`     | dump the token stream (debugging the compiler) |
 | `parse`   | dump the abstract syntax tree (debugging the compiler) |
 
@@ -122,6 +123,39 @@ compiled and linked into the one executable. `run` compiles to a
 temporary directory, executes, cleans up, and exits with the program's
 exit code (0 on success, 1 if the program traps with a
 runtime error).
+
+The short form is `pyrs prog.py arg1 arg2`. Options must precede the script;
+subsequent values are program arguments. On Unix, `sys.argv[0]` is the script
+path passed to PyRs. A separately compiled executable uses its own invocation
+name. `pyrs -c 'print(42)'` compiles inline source and `pyrs -` reads source from
+stdin; these resolve imports from the current working directory.
+
+### CPython compatibility mode
+
+```console
+$ pyrs --compat analysis.py arg1
+$ pyrs --compat --python .venv/bin/python analysis.py
+$ pyrs --compat --python .venv/bin/python -m package arg1
+$ pyrs --compat -c 'import numpy as np; print(np.arange(3))'
+```
+
+`--compat` selects whole-program CPython execution, with access to the chosen
+environment's NumPy, pandas and other installed packages. Interpreter selection
+is `--python`, then `PYRS_PYTHON`, then `python3` on PATH. PyRs does not install
+packages automatically. This mode preserves Python semantics and does not provide
+native compilation or acceleration of the script. It never retries code after
+native execution; the default mode always reports native compilation errors.
+
+On Unix, compatibility mode replaces the PyRs process, preserving streams,
+environment, exit status and signals. Native `run` uses a child process and maps
+signal termination to shell-style `128 + signal`; complete native cancellation
+and signal forwarding remain release work. Neither mode currently offers a PyRs
+interactive REPL. `-m` currently requires `--compat`. Compiled compatibility
+artifacts and native calls into scientific extensions are future work.
+
+`pyrs check -i prog.py` reports native lexer/parser/import/type diagnostics
+without invoking the linker or executing user code. A successful check means the
+frontend accepts the source, not that runtime parity has been proved.
 
 ### `pyrs lex` / `pyrs parse`
 
@@ -1019,7 +1053,8 @@ for arg in sys.argv[1:]:       # arguments after the program name
 `pyrs run` forwards trailing arguments: `pyrs run -i tool.py a b c`.
 For a compiled binary they're just process arguments: `./tool a b c`.
 `sys.argv[0]` is the binary path (Python shows the script path — the
-only structural difference).
+only structural difference for separately compiled executables; native `pyrs run`
+preserves the source script's argv[0] on Unix).
 
 ### Modules and packages
 
@@ -1337,15 +1372,16 @@ deliberate exceptions:
    where Python keeps the bool and prints `True` (they still compare equal).
 4. **`x ** e` with a dynamic negative int exponent traps** at runtime
    (constant exponents like `2 ** -1` correctly give a float).
-5. **int↔float comparisons convert the int to float**, losing exactness
-   above 2⁵³ (Python compares exactly).
+5. **int↔float comparisons are exact**, including large integers, fractional
+   floats, NaN and infinities. Integer-to-float conversion rounds ties to even
+   and raises OverflowError when the rounded value cannot be finite.
 6. **`nan in [nan]` is `False`** (IEEE equality; CPython membership
    checks identity first). `is` / `is not` for floats use bit-identity
    (so a NaN `is` itself).
-7. **Possibly-unbound locals** read as `0`/`0.0`/`False` for plain
-   scalar locals; str/list and **unbound free cells** trap
-   (`UnboundLocalError` / `NameError`). Straight-line use-before-assignment
-   is often caught at compile time.
+7. **Possibly-unbound locals** raise `UnboundLocalError` when their load executes,
+   including scalar, None and generator-frame locals. Unbound free cells raise
+   `NameError`. Straight-line use-before-assignment is often caught at compile
+   time; module/global binding and `del name` parity remain incomplete.
 8. **str methods use ASCII rules** for case (`upper`/`lower`) and
    whitespace (`strip`/`split`) — Python is Unicode-aware. `int(s)` /
    `float(s)` also strip **ASCII** whitespace only (same set as `strip`).

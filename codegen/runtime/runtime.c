@@ -1072,12 +1072,43 @@ double pyrs_int_to_float(long long t) {
     if (h->sign == 0 || h->nlimbs == 0) {
         return 0.0;
     }
-    /* Build from high limb for better rounding (CPython uses similar). */
-    double acc = 0.0;
-    for (long long i = h->nlimbs - 1; i >= 0; i--) {
-        acc = acc * 18446744073709551616.0 + (double)h->limbs[i];
+    if (h->nlimbs > 16) {
+        pyrs_die("OverflowError: int too large to convert to float");
     }
-    return h->sign < 0 ? -acc : acc;
+    unsigned long long high = h->limbs[h->nlimbs - 1];
+    int high_bits = 0;
+    for (unsigned long long word = high; word; word >>= 1) {
+        high_bits++;
+    }
+    int bits = (int)(h->nlimbs - 1) * 64 + high_bits;
+    if (bits <= 53) {
+        double value = (double)high;
+        return h->sign < 0 ? -value : value;
+    }
+    /* Retain 53 significant bits and round the discarded tail once, ties to
+     * even. Summing rounded limbs can double-round at limb boundaries. */
+    int shift = bits - 53;
+    int word = shift / 64;
+    int offset = shift % 64;
+    unsigned long long significant = h->limbs[word] >> offset;
+    if (offset && word + 1 < h->nlimbs) {
+        significant |= h->limbs[word + 1] << (64 - offset);
+    }
+    int round_word = (shift - 1) / 64;
+    int round_bit = (shift - 1) % 64;
+    int round_up = (h->limbs[round_word] >> round_bit) & 1;
+    int sticky = (h->limbs[round_word] & ((1ULL << round_bit) - 1)) != 0;
+    for (int i = 0; i < round_word && !sticky; i++) {
+        sticky = h->limbs[i] != 0;
+    }
+    if (round_up && (sticky || (significant & 1))) {
+        significant++;
+    }
+    double value = ldexp((double)significant, shift);
+    if (isinf(value)) {
+        pyrs_die("OverflowError: int too large to convert to float");
+    }
+    return h->sign < 0 ? -value : value;
 }
 
 long long pyrs_int_from_float(double v) {
@@ -1098,7 +1129,9 @@ long long pyrs_int_from_float(double v) {
     if (v == 0.0) {
         return pyrs_int_tag_small(0);
     }
-    if (!neg && v <= (double)PYRS_SMALL_MAX && v >= 0.0) {
+    /* PYRS_SMALL_MAX rounds UP to 2**62 as a double; that positive boundary
+     * must be heap represented, or tagging it changes the sign. */
+    if (!neg && v < 4611686018427387904.0 && v >= 0.0) {
         return pyrs_int_tag_small((long long)v);
     }
     if (neg && v <= (double)(-PYRS_SMALL_MIN)) {
@@ -1178,6 +1211,67 @@ int pyrs_int_eq(long long a, long long b) {
     }
     /* two heap pointers or mixed: content equality */
     return pyrs_int_cmp(a, b) == 0;
+}
+
+/* Exact integer/float comparison: -1, 0, 1, or 2 (unordered NaN).
+ * Decompose the finite double into an integer magnitude and a fractional
+ * remainder. Never round the integer to double, or allocate a managed bigint
+ * just to compare it. A finite binary64 needs at most 16 64-bit limbs. */
+int pyrs_int_float_cmp(long long integer, double value) {
+    if (isnan(value)) {
+        return 2;
+    }
+    if (isinf(value)) {
+        return value > 0 ? -1 : 1;
+    }
+    int sign, owned;
+    long long n;
+    unsigned long long *digits = int_read_mag(integer, &sign, &n, &owned);
+    int float_sign = (value > 0) - (value < 0);
+    int result;
+    if (sign != float_sign) {
+        result = (sign > float_sign) - (sign < float_sign);
+    } else if (sign == 0) {
+        result = 0;
+    } else {
+        int exponent;
+        double mantissa = frexp(fabs(value), &exponent);
+        unsigned long long significand = (unsigned long long)ldexp(mantissa, 53);
+        int shift = exponent - 53;
+        unsigned long long limbs[16] = {0};
+        long long count = 0;
+        int fractional = 0;
+        if (shift >= 0) {
+            int word = shift / 64;
+            int bits = shift % 64;
+            limbs[word] = significand << bits;
+            count = word + 1;
+            if (bits && word + 1 < 16) {
+                limbs[word + 1] = significand >> (64 - bits);
+                if (limbs[word + 1]) {
+                    count++;
+                }
+            }
+        } else if (shift <= -53) {
+            fractional = 1;
+        } else {
+            int bits = -shift;
+            limbs[0] = significand >> bits;
+            count = limbs[0] ? 1 : 0;
+            fractional = (significand & ((1ULL << bits) - 1)) != 0;
+        }
+        result = u_cmp(digits, n, limbs, count);
+        if (result == 0 && fractional) {
+            result = -1;
+        }
+        if (sign < 0) {
+            result = -result;
+        }
+    }
+    if (owned) {
+        free(digits);
+    }
+    return result;
 }
 
 int pyrs_int_truth(long long a) {
@@ -4509,6 +4603,16 @@ static int slot_eq(long long a, long long b, int tag) {
             long long bi = ub->payload ? 3 : 1;
             return pyrs_int_eq(ua->payload, bi);
         }
+        const PyrsUnionBox *f = ua->print_tag == TAG_FLOAT ? ua : ub;
+        const PyrsUnionBox *i = f == ua ? ub : ua;
+        if (f->print_tag == TAG_FLOAT &&
+            (i->print_tag == TAG_INT || i->print_tag == TAG_BOOL)) {
+            double value;
+            memcpy(&value, &f->payload, sizeof value);
+            long long integer = i->print_tag == TAG_BOOL
+                ? (i->payload ? 3 : 1) : i->payload;
+            return pyrs_int_float_cmp(integer, value) == 0;
+        }
         return 0;
     }
     if (tag >= 4 && ((tag - 4) % 8) == 0) {
@@ -7009,7 +7113,9 @@ typedef struct {
 } PyrsGen;
 
 PyrsGen *pyrs_gen_new(void *code, long long nlocals) {
-    size_t sz = sizeof(PyrsGen) + (size_t)nlocals * sizeof(long long);
+    /* One binding byte per slot follows the values. This preserves the
+     * existing frame/collector layout and survives yield/resume. */
+    size_t sz = sizeof(PyrsGen) + (size_t)nlocals * (sizeof(long long) + 1);
     PyrsGen *g = (PyrsGen *)pyrs_gc_alloc(sz, PYRS_GC_GENERATOR);
     g->code = code;
     g->state = 0;
@@ -7030,6 +7136,7 @@ PyrsGen *pyrs_gen_new(void *code, long long nlocals) {
     for (long long i = 0; i < nlocals; i++) {
         g->locals[i] = 0;
     }
+    memset(g->locals + nlocals, 0, (size_t)nlocals);
     return g;
 }
 
@@ -7209,12 +7316,21 @@ long long pyrs_gen_get_local(PyrsGen *g, long long i) {
     return g->locals[i];
 }
 
+int pyrs_gen_local_bound(PyrsGen *g, long long i) {
+    check_ref(g);
+    if (i < 0 || i >= g->nlocals) {
+        pyrs_die("RuntimeError: generator local index out of range");
+    }
+    return ((unsigned char *)(g->locals + g->nlocals))[i] != 0;
+}
+
 void pyrs_gen_set_local(PyrsGen *g, long long i, long long slot) {
     check_ref(g);
     if (i < 0 || i >= g->nlocals) {
         pyrs_die("RuntimeError: generator local index out of range");
     }
     g->locals[i] = slot;
+    ((unsigned char *)(g->locals + g->nlocals))[i] = 1;
 }
 
 long long pyrs_gen_state(PyrsGen *g) {

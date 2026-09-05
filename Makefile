@@ -86,15 +86,19 @@ fmt-check: ## Check formatting without changing anything
 	$(CARGO) fmt --all -- --check
 
 .PHONY: ci
-ci: fmt-check clippy test examples ## Full gate: format + lints + tests + example parity
+ci: fmt-check clippy test examples compatibility ## Full gate: format + lints + tests + parity probes
+
+.PHONY: compatibility
+compatibility: release ## Core compatibility probes (native + CPython, O0/O2/O3)
+	$(PYTHON) -m unittest discover -s compatibility -p test_runner.py
+	$(PYTHON) compatibility/run.py --pyrs $(PYRS) --group core --mode both --opt-levels 0 2 3 --gc-stress --output target/compatibility/core.json
 
 .PHONY: examples
 examples: release ## Run every example and diff its output against python3
 	@fail=0; \
 	for ex in examples/*.py examples/modules/*.py examples/packages/main.py; do \
-	    got=$$($(PYRS) run -i $$ex); \
-	    want=$$($(PYTHON) $$ex); \
-	    if [ "$$got" = "$$want" ]; then \
+	    got=""; want=""; \
+	    if got=$$($(PYRS) run -i $$ex) && want=$$($(PYTHON) $$ex) && [ "$$got" = "$$want" ]; then \
 	        printf '  \033[32mMATCH\033[0m  %s\n' "$$ex"; \
 	    else \
 	        printf '  \033[31mDIFFER\033[0m %s\n' "$$ex"; \
@@ -102,9 +106,9 @@ examples: release ## Run every example and diff its output against python3
 	        fail=1; \
 	    fi; \
 	done; \
-	got=$$($(PYRS) run -i examples/risksim/main.py -- examples/risksim/data/balanced.scenario); \
-	want=$$($(PYTHON) examples/risksim/main.py examples/risksim/data/balanced.scenario); \
-	if [ "$$got" = "$$want" ]; then \
+	got=""; want=""; \
+	if got=$$($(PYRS) run -i examples/risksim/main.py -- examples/risksim/data/balanced.scenario) && \
+	   want=$$($(PYTHON) examples/risksim/main.py examples/risksim/data/balanced.scenario) && [ "$$got" = "$$want" ]; then \
 	    printf '  \033[32mMATCH\033[0m  %s\n' "examples/risksim/main.py"; \
 	else \
 	    printf '  \033[31mDIFFER\033[0m %s\n' "examples/risksim/main.py"; \

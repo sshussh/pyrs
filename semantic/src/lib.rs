@@ -18512,7 +18512,13 @@ fn lower_pow_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<i
 fn coerce_print_sep_end(value: ir::Expr, which: &str, span: Span) -> SResult<ir::Expr> {
     match value.ty {
         ir::Ty::Str => Ok(value),
-        ir::Ty::None => Ok(const_str_expr(if which == "sep" { " " } else { "\n" })),
+        ir::Ty::None => Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::Block {
+                stmts: vec![ir::Stmt::ExprStmt(value)],
+                result: Box::new(const_str_expr(if which == "sep" { " " } else { "\n" })),
+            },
+        }),
         other => Err(err(
             format!("print() {which} must be None or a string, not {other}"),
             span,
@@ -23887,10 +23893,17 @@ fn lower_is_none(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
             },
         }),
         (true, true) => {
-            // `None is None` → True; `None is not None` → False
+            // A None-typed call/local still needs evaluation (side effects,
+            // exceptions and unbound reads), even when the result is known.
             Ok(ir::Expr {
                 ty: ir::Ty::Bool,
-                kind: ir::ExprKind::ConstBool(!not),
+                kind: ir::ExprKind::Block {
+                    stmts: vec![ir::Stmt::ExprStmt(l), ir::Stmt::ExprStmt(r)],
+                    result: Box::new(ir::Expr {
+                        ty: ir::Ty::Bool,
+                        kind: ir::ExprKind::ConstBool(!not),
+                    }),
+                },
             })
         }
         (false, false) => {
@@ -24108,7 +24121,12 @@ fn lower_binary(
         | ast::BinOp::LtEq
         | ast::BinOp::Gt
         | ast::BinOp::GtEq => {
-            let (l, r, _) = unify_numeric(l, r, span, &describe)?;
+            // Comparison must preserve an integer's exact value. Converting
+            // it to f64 can collapse distinct integers above 2**53, or turn
+            // a finite bigint into infinity. The IR permits mixed numeric
+            // comparison operands; only bool needs promotion here.
+            let l = promote_numeric(l, span, &describe)?;
+            let r = promote_numeric(r, span, &describe)?;
             Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::Binary {

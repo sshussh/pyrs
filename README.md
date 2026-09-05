@@ -12,6 +12,12 @@ no interpreter, no VM. Compute-bound code runs 45–60× faster than CPython
 the Makefile, the full language reference, every difference from CPython,
 runtime errors, and performance notes.
 
+**Toward 1.0:** the [delivery plan](docs/ROADMAP-1.0.md) targets scientific/data
+workloads with native execution by default and explicit CPython compatibility
+mode for packages such as NumPy and pandas. See the [unreleased changes](CHANGELOG.md)
+and [compatibility probes](compatibility/README.md). This is ongoing work;
+0.82.0 is not a declaration of 1.0 readiness.
+
 ```console
 $ cat examples/fib.py
 def fib(n: int) -> int:
@@ -33,10 +39,21 @@ pyrs compile -i prog.py -o prog     # build a native executable
 pyrs run     -i prog.py             # compile and run immediately
 pyrs lex     -i prog.py             # dump tokens
 pyrs parse   -i prog.py             # dump the AST
+pyrs check   -i prog.py             # native frontend check; no execution
+pyrs prog.py arg1                   # native compile and run
+pyrs -c 'print(6 * 7)'              # native inline source
+pyrs --compat analysis.py          # whole-program CPython execution
+pyrs --compat --python .venv/bin/python -m package
 ```
 
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
+
+`--compat` uses the selected CPython environment, including its installed
+NumPy/pandas packages. It does not compile those libraries or provide a speedup.
+Select the interpreter with `--python`, then `PYRS_PYTHON`, otherwise `python3`.
+Native compilation never falls back automatically; `-m` currently requires
+compatibility mode. `pyrs -` reads source from stdin.
 
 ## The language (v0.85.0)
 
@@ -453,7 +470,7 @@ runtime exclusive-field access (AttributeError when missing); limited
 with `None` and same-type identity (heap pointers, scalar slots, float
 bitcast — not CPython int interning); `x ** e` with a *dynamic* negative
 int exponent traps (a constant like `2 ** -1` works and gives float),
-int↔float comparisons convert the int to float (exactness loss past 2^53),
+mixed int↔float comparisons preserve the exact integer value,
 list literals coerce mixed numerics to one element type (mixed non-numeric
 literal elements still error unless annotated as a union), `nan in [nan]`
 is False (IEEE equality), str methods use ASCII case/whitespace rules,

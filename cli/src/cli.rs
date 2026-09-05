@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use std::path;
+use std::{ffi::OsString, path};
 
 #[derive(Debug, Parser)]
 #[command(name = "PyRs", version = env!("CARGO_PKG_VERSION"), about = "PyRs compiler")]
@@ -7,6 +7,62 @@ pub struct Cli {
     /// Command to execute
     #[clap(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// Retain compiler subcommands while accepting `pyrs script.py args` and
+    /// Python-style execution options. Everything after the script is a program
+    /// argument, even if it happens to look like a compiler option.
+    pub fn parse_env() -> Self {
+        Self::parse_from(Self::execution_args(std::env::args_os().collect()))
+    }
+
+    fn execution_args(mut args: Vec<OsString>) -> Vec<OsString> {
+        if let Some(first) = args.get(1)
+            && !matches!(
+                first.to_str(),
+                Some(
+                    "compile"
+                        | "run"
+                        | "check"
+                        | "lex"
+                        | "parse"
+                        | "help"
+                        | "-h"
+                        | "--help"
+                        | "-V"
+                        | "--version"
+                )
+            )
+        {
+            args.insert(1, OsString::from("run"));
+        }
+        if args.get(1).is_some_and(|arg| arg == "run") {
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].to_str() {
+                    Some("-c" | "-m") if i + 1 < args.len() => {
+                        // CPython stops parsing its own options at -c/-m.
+                        if args.get(i + 2).is_some() {
+                            args.insert(i + 2, OsString::from("--"));
+                        }
+                        break;
+                    }
+                    Some("--python" | "-O" | "--opt-level" | "-i" | "--input") => i += 2,
+                    Some("--") => break,
+                    Some(arg)
+                        if (arg.starts_with("-c") || arg.starts_with("-m")) && arg.len() > 2 =>
+                    {
+                        args.insert(i + 1, OsString::from("--"));
+                        break;
+                    }
+                    Some(arg) if arg.starts_with('-') && arg != "-" => i += 1,
+                    _ => break,
+                }
+            }
+        }
+        args
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -22,6 +78,9 @@ pub enum Command {
 
     /// Compile the input file and run it immediately
     Run(RunCommand),
+
+    /// Check native compatibility without generating or running a program
+    Check(CheckCommand),
 }
 
 #[derive(Debug, Args)]
@@ -57,7 +116,7 @@ pub struct CompileCommand {
     pub output: path::PathBuf,
 
     /// Optimization level (0-3)
-    #[arg(short = 'O', long = "opt-level", default_value_t = 2)]
+    #[arg(short = 'O', long = "opt-level", default_value_t = 2, value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt_level: u8,
 
     /// Also write the generated LLVM IR next to the output (<output>.ll)
@@ -68,14 +127,37 @@ pub struct CompileCommand {
 #[derive(Debug, Args)]
 pub struct RunCommand {
     /// Input file path
-    #[arg(short, long)]
-    pub input: path::PathBuf,
+    #[arg(short, long, group = "source")]
+    pub input: Option<path::PathBuf>,
+
+    /// Execute a string as Python source
+    #[arg(short = 'c', group = "source")]
+    pub code: Option<String>,
+
+    /// Run an installed module (requires --compat)
+    #[arg(short = 'm', group = "source", requires = "compat")]
+    pub module: Option<String>,
+
+    /// Execute the whole program with CPython, including installed packages
+    #[arg(long)]
+    pub compat: bool,
+
+    /// CPython executable for --compat (default: PYRS_PYTHON or python3)
+    #[arg(long, requires = "compat")]
+    pub python: Option<path::PathBuf>,
 
     /// Optimization level (0-3)
-    #[arg(short = 'O', long = "opt-level", default_value_t = 2)]
+    #[arg(short = 'O', long = "opt-level", default_value_t = 2, value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt_level: u8,
 
-    /// Arguments passed to the program (visible as sys.argv[1:])
+    /// Script and arguments, or just arguments with -i/-c/-m; '-' reads stdin
     #[arg(trailing_var_arg = true)]
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckCommand {
+    /// Input file path
+    #[arg(short, long)]
+    pub input: path::PathBuf,
 }

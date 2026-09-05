@@ -784,6 +784,8 @@ pub enum ExprKind {
         func: String,
         args: Vec<Expr>,
     },
+    /// Numeric arithmetic operands share a type. Comparisons may also have
+    /// Int/Float operands in either order, preserving exact integer values.
     Binary {
         op: BinOp,
         left: Box<Expr>,

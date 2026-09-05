@@ -11,6 +11,203 @@ use std::time::{Duration, Instant};
 
 const PYRS: &str = env!("CARGO_BIN_EXE_pyrs");
 
+#[test]
+fn integer_float_conversion_rounding_and_overflow_match_python() {
+    let source = r#"
+for n in [2**53 - 1, 2**53, 2**53 + 1, 2**62 - 1, 2**62, 2**62 + 1,
+          2**64 - 1, 2**64, 2**64 + 1, 2**100 + 2**47,
+          2**100 + 2**47 + 1, 2**100 + 3 * 2**47,
+          2**100 + 3 * 2**47 - 1, 2**1023,
+          2**1024 - 2**971, 2**1024 - 2**970 - 1,
+          2**1024 - 2**970, 2**1024, 2**2048]:
+    for sign in [1, -1]:
+        try:
+            f = float(sign * n)
+            print(f, int(f))
+        except OverflowError as e:
+            print(e)
+for f in [4611686018427387392.0, 4611686018427387904.0,
+          4611686018427388928.0, -4611686018427387904.0]:
+    print(int(f))
+"#;
+    let python = Command::new("python3")
+        .args(["-c", source])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    for opt in ["0", "2", "3"] {
+        let (stdout, _) = run_program_gc_opt(
+            &format!("integer_float_conversion_{opt}"),
+            source,
+            opt,
+            &[("PYRS_GC_STRESS", "1")],
+        );
+        assert_eq!(stdout.as_bytes(), python.stdout, "optimization level {opt}");
+    }
+}
+
+#[test]
+fn none_typed_expressions_preserve_evaluation() {
+    let source = r#"
+def none_value(label: str):
+    print(label)
+    return None
+
+print(none_value("left") is none_value("right"))
+print(none_value("left") is not none_value("right"))
+print(None is none_value("right"))
+print(none_value("left") is None)
+print("a", "b", sep=none_value("sep"), end=none_value("end"))
+
+def unbound(assign: bool):
+    if assign:
+        value = None
+    try:
+        print(value is None)
+    except UnboundLocalError as e:
+        print(e)
+unbound(False)
+unbound(True)
+"#;
+    let python = Command::new("python3")
+        .args(["-c", source])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    assert_eq!(
+        run_program("none_evaluation", source).as_bytes(),
+        python.stdout
+    );
+}
+
+#[test]
+fn unassigned_locals_match_python_across_types_and_generator_resume() {
+    let mut source = String::new();
+    for (i, value) in [
+        "0", "0.0", "False", "None", "''", "[]", "{'a': 0}", "(1, 'x')",
+    ]
+    .iter()
+    .enumerate()
+    {
+        source.push_str(&format!(
+            "def f{i}(assign: bool):\n    if assign:\n        value = {value}\n    try:\n        print(value)\n    except UnboundLocalError as e:\n        print(e)\nf{i}(False)\nf{i}(True)\n"
+        ));
+    }
+    source.push_str(
+        r#"
+def loop(n: int):
+    for i in range(n):
+        value = i
+    try:
+        print(value)
+    except UnboundLocalError as e:
+        print(e)
+loop(0)
+loop(2)
+
+def gen(assign: bool):
+    if assign:
+        value = 0
+    yield 1
+    try:
+        print(value)
+    except UnboundLocalError as e:
+        print(e)
+    value = 2
+    yield value
+    print(value)
+for flag in [False, True]:
+    for v in gen(flag):
+        print(v)
+
+def assigned_before_exception():
+    try:
+        value = 4
+        raise ValueError("fail")
+    except ValueError:
+        print(value)
+assigned_before_exception()
+"#,
+    );
+    let python = Command::new("python3")
+        .args(["-c", &source])
+        .output()
+        .unwrap();
+    assert!(
+        python.status.success(),
+        "{}",
+        String::from_utf8_lossy(&python.stderr)
+    );
+    for opt in ["0", "2", "3"] {
+        let (stdout, _) = run_program_gc_opt(
+            &format!("local_bindings_{opt}"),
+            &source,
+            opt,
+            &[("PYRS_GC_STRESS", "1")],
+        );
+        assert_eq!(stdout.as_bytes(), python.stdout, "optimization level {opt}");
+    }
+}
+
+#[test]
+fn exact_mixed_numeric_comparisons_match_python() {
+    let source = r#"
+def compare(n: int, f: float):
+    print(n == f, n != f, n < f, n <= f, n > f, n >= f)
+    print(f == n, f != n, f < n, f <= n, f > n, f >= n)
+
+ints = [0, 1, -1, 2**53 - 1, 2**53, 2**53 + 1, -(2**53 + 1),
+        2**62 - 1, 2**62, 2**62 + 1, -(2**62), 2**64 - 1,
+        2**64, 2**100 + 1, -(2**100 + 1), 2**1024, -(2**1024)]
+floats = [0.0, -0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5,
+          9007199254740992.0, -9007199254740992.0,
+          4611686018427387904.0, 18446744073709551616.0,
+          1.2676506002282294e30, -1.2676506002282294e30,
+          1.7976931348623157e308, -1.7976931348623157e308,
+          5e-324, -5e-324, float("inf"), float("-inf"), float("nan")]
+for n in ints:
+    for f in floats:
+        compare(n, f)
+print(True == 1.0, False == -0.0, True < 1.5, 1.5 > True)
+print(2**53 < 9007199254740992.0 < 2**53 + 1)
+print(2**53 <= 9007199254740992.0 < 2**53 + 1)
+"#;
+    let python = Command::new("python3")
+        .args(["-c", source])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    for opt in ["0", "2", "3"] {
+        let (stdout, _) = run_program_gc_opt(
+            &format!("exact_numeric_{opt}"),
+            source,
+            opt,
+            &[("PYRS_GC_STRESS", "1")],
+        );
+        assert_eq!(stdout.as_bytes(), python.stdout, "optimization level {opt}");
+    }
+}
+
+#[test]
+fn boxed_numeric_equality_match_python() {
+    let source = r#"
+a: list[Any] = [True, False, 1, 0, 2**53, 2**53 + 1, 2**1024]
+b: list[Any] = [1.0, -0.0, 1.0, 0.0, 9007199254740992.0,
+                9007199254740992.0, float("inf")]
+for i in range(len(a)):
+    print([a[i]] == [b[i]], [b[i]] == [a[i]])
+print(a.count(1.0), a.count(9007199254740992.0), a.count(float("nan")))
+print(1.0 in a, float("inf") in a)
+"#;
+    let python = Command::new("python3")
+        .args(["-c", source])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    let (stdout, _) = run_program_gc_stress("boxed_numeric", source);
+    assert_eq!(stdout.as_bytes(), python.stdout);
+}
+
 struct TempDir(PathBuf);
 
 impl TempDir {

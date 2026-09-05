@@ -1,11 +1,11 @@
 //! Driver: orchestrates the pipeline (lex → parse → semantic → codegen →
 //! link) and renders diagnostics against the original source.
 
-use clap::Parser;
 use common::{Diagnostic, Span};
 use std::{
+    ffi::OsString,
     fs, io,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process,
 };
@@ -14,7 +14,7 @@ mod cli;
 mod modules;
 
 fn main() {
-    let args = cli::Cli::parse();
+    let args = cli::Cli::parse_env();
     let code = run(args).unwrap_or_else(|err| {
         eprintln!("{err}");
         1
@@ -50,26 +50,123 @@ fn run(args: cli::Cli) -> Result<i32, String> {
             compile(&cmd.input, &cmd.output, cmd.opt_level, cmd.emit_llvm)?;
             Ok(0)
         }
-        cli::Command::Run(cmd) => {
-            let workdir = temp_workdir()?;
-            let exe = workdir.join("program");
-            let result = compile(&cmd.input, &exe, cmd.opt_level, false).and_then(|()| {
-                process::Command::new(&exe)
-                    .args(&cmd.args)
-                    .status()
-                    .map_err(|e| format!("failed to run compiled program: {e}"))
-            });
-            let _ = fs::remove_dir_all(&workdir);
-            let status = result?;
-            Ok(status.code().unwrap_or(1))
+        cli::Command::Run(cmd) => run_program(cmd),
+        cli::Command::Check(cmd) => {
+            analyze(modules::load_program(&cmd.input).map_err(|e| e.0)?)?;
+            Ok(0)
         }
     }
 }
 
+fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
+    let input = cmd.input.take().or_else(|| {
+        if cmd.code.is_none() && cmd.module.is_none() && !cmd.args.is_empty() {
+            Some(PathBuf::from(cmd.args.remove(0)))
+        } else {
+            None
+        }
+    });
+    if cmd.compat {
+        // Explicit whole-program execution. Never execute part of a program
+        // natively and then retry its side effects in another engine.
+        let python = cmd.python.unwrap_or_else(|| {
+            std::env::var_os("PYRS_PYTHON")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("python3"))
+        });
+        let mut process = process::Command::new(&python);
+        if let Some(code) = cmd.code {
+            process.args(["-c", &code]);
+        } else if let Some(module) = cmd.module {
+            process.args(["-m", &module]);
+        } else if let Some(path) = input {
+            process.arg("--").arg(path);
+        } else {
+            process.arg("-");
+        }
+        process.args(cmd.args);
+        return execute(&mut process).map_err(|e| {
+            format!(
+                "failed to run CPython compatibility mode using {}: {e}; select an installed interpreter with --python or PYRS_PYTHON",
+                python.display()
+            )
+        });
+    }
+
+    let (loaded, argv0) = if let Some(code) = cmd.code {
+        (
+            modules::load_inline(code, "<string>").map_err(|e| e.0)?,
+            OsString::from("-c"),
+        )
+    } else if let Some(path) = input.filter(|p| p != Path::new("-")) {
+        (
+            modules::load_program(&path).map_err(|e| e.0)?,
+            path.into_os_string(),
+        )
+    } else {
+        let mut source = String::new();
+        io::stdin()
+            .read_to_string(&mut source)
+            .map_err(|e| format!("failed to read stdin: {e}"))?;
+        (
+            modules::load_inline(source, "<stdin>").map_err(|e| e.0)?,
+            OsString::from("-"),
+        )
+    };
+    let module = analyze(loaded)?;
+    let workdir = temp_workdir()?;
+    let exe = workdir.join("program");
+    let result = compile_module(&module, &exe, cmd.opt_level, false).and_then(|()| {
+        let mut process = process::Command::new(&exe);
+        process.args(&cmd.args);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            process.arg0(&argv0);
+        }
+        #[cfg(not(unix))]
+        let _ = argv0;
+        // Keep the parent alive to clean up the native executable afterwards.
+        process
+            .status()
+            .map(exit_code)
+            .map_err(|e| format!("failed to run compiled program: {e}"))
+    });
+    drop(workdir);
+    result
+}
+
+fn exit_code(status: process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    }
+    #[cfg(not(unix))]
+    status.code().unwrap_or(1)
+}
+
+fn execute(command: &mut process::Command) -> Result<i32, io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // No temporary native artifact in compatibility mode: replacing the
+        // process preserves signal, stdin and exit behavior exactly.
+        Err(command.exec())
+    }
+    #[cfg(not(unix))]
+    command.status().map(exit_code)
+}
+
 /// The full pipeline: source file(s) in, linked native executable out.
 fn compile(input: &Path, output: &Path, opt_level: u8, emit_llvm: bool) -> Result<(), String> {
-    // resolve imports into a topologically-ordered set of modules
-    let loaded = modules::load_program(input).map_err(|e| e.0)?;
+    let module = analyze(modules::load_program(input).map_err(|e| e.0)?)?;
+    compile_module(&module, output, opt_level, emit_llvm)
+}
+
+fn analyze(loaded: Vec<modules::Loaded>) -> Result<ir::Module, String> {
     let inputs: Vec<semantic::ModuleInput> = loaded
         .iter()
         .map(|m| semantic::ModuleInput {
@@ -78,15 +175,23 @@ fn compile(input: &Path, output: &Path, opt_level: u8, emit_llvm: bool) -> Resul
         })
         .collect();
 
-    let ir_module = semantic::analyze_program(&inputs).map_err(|d| {
+    semantic::analyze_program(&inputs).map_err(|d| {
         let m = &loaded[d.file.min(loaded.len() - 1)];
         if d.span == Span::default() {
             format!("{d}")
         } else {
             d.render(&m.display, &m.source)
         }
-    })?;
-    let llvm_ir = codegen::emit_llvm_ir(&ir_module);
+    })
+}
+
+fn compile_module(
+    module: &ir::Module,
+    output: &Path,
+    opt_level: u8,
+    emit_llvm: bool,
+) -> Result<(), String> {
+    let llvm_ir = codegen::emit_llvm_ir(module);
 
     if emit_llvm {
         let ll_path = output.with_extension("ll");
@@ -133,7 +238,7 @@ fn compile(input: &Path, output: &Path, opt_level: u8, emit_llvm: bool) -> Resul
         }
         Ok(())
     })();
-    let _ = fs::remove_dir_all(&workdir);
+    drop(workdir);
     result
 }
 
@@ -162,19 +267,43 @@ fn write_output(text: &str, output: Option<&Path>) -> Result<(), String> {
     }
 }
 
-fn temp_workdir() -> Result<PathBuf, String> {
-    // nanos make concurrent invocations (e.g. parallel tests) collision-free
-    let unique = format!(
-        "pyrs-{}-{}",
-        process::id(),
-        std::time::SystemTime::now()
+struct TempWorkdir(PathBuf);
+
+impl std::ops::Deref for TempWorkdir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempWorkdir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_workdir() -> Result<TempWorkdir, String> {
+    // Atomic creation refuses an existing path/symlink; private permissions
+    // protect the source, runtime objects and executable while linking.
+    for attempt in 0..100 {
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    );
-    let dir = std::env::temp_dir().join(unique);
-    fs::create_dir_all(&dir).map_err(|e| format!("failed to create temp dir: {e}"))?;
-    Ok(dir)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("pyrs-{}-{nanos}-{attempt}", process::id()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => return Ok(TempWorkdir(dir)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("failed to create temp dir: {e}")),
+        }
+    }
+    Err("failed to create a unique temporary directory".to_string())
 }
 
 #[cfg(test)]

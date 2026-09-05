@@ -110,6 +110,20 @@ fn push_unique_root(roots: &mut Vec<PathBuf>, p: PathBuf) {
 /// First filesystem root that resolves a name wins; if none match, the
 /// embedded stdlib is tried.
 pub fn load_program_with_roots(root: &Path, roots: &[PathBuf]) -> Result<Vec<Loaded>, LoadError> {
+    let root_parsed = parse_file(root, ROOT_NAME, None, roots)?;
+    load_parsed(root_parsed, roots)
+}
+
+/// Inline and stdin source use the caller's working directory for imports.
+pub fn load_inline(source: String, display: &str) -> Result<Vec<Loaded>, LoadError> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| LoadError(format!("failed to read working directory: {e}")))?;
+    let roots = import_fs_roots(cwd);
+    let parsed = parse_source(display.to_string(), source, ROOT_NAME, None, false, &roots)?;
+    load_parsed(parsed, &roots)
+}
+
+fn load_parsed(root_parsed: Parsed, roots: &[PathBuf]) -> Result<Vec<Loaded>, LoadError> {
     let mut state = LoadState {
         roots: roots.to_vec(),
         modules: HashMap::new(),
@@ -117,7 +131,6 @@ pub fn load_program_with_roots(root: &Path, roots: &[PathBuf]) -> Result<Vec<Loa
         visiting: HashSet::new(),
     };
 
-    let root_parsed = parse_file(root, ROOT_NAME, None, &state.roots)?;
     state.modules.insert(ROOT_NAME.to_string(), root_parsed);
     state.require(ROOT_NAME, common::Span::default(), ROOT_NAME)?;
 

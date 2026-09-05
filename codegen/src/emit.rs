@@ -250,6 +250,10 @@ struct Emitter {
     /// peels may retype a `Local` to a semantic subtype/union without changing
     /// the alloca (e.g. `Class(A)` → `Class(B)|Class(C)` for isinstance).
     local_storage: HashMap<String, Ty>,
+    /// User locals that need a binding bit independent of their value/tag.
+    local_bindings: std::collections::HashSet<String>,
+    /// Locals written after setjmp must survive longjmp without SSA promotion.
+    volatile_locals: bool,
 }
 
 impl Default for Emitter {
@@ -277,6 +281,8 @@ impl Default for Emitter {
             gen_fin_stack: Vec::new(),
             classes: Vec::new(),
             local_storage: HashMap::new(),
+            local_bindings: std::collections::HashSet::new(),
+            volatile_locals: false,
         }
     }
 }
@@ -933,6 +939,7 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_closure_get(ptr, i64)\n");
         out.push_str("declare ptr @pyrs_gen_new(ptr, i64)\n");
         out.push_str("declare i64 @pyrs_gen_get_local(ptr, i64)\n");
+        out.push_str("declare i32 @pyrs_gen_local_bound(ptr, i64)\n");
         out.push_str("declare void @pyrs_gen_set_local(ptr, i64, i64)\n");
         out.push_str("declare i64 @pyrs_gen_state(ptr)\n");
         out.push_str("declare void @pyrs_gen_set_state(ptr, i64)\n");
@@ -1109,6 +1116,7 @@ impl Emitter {
         out.push_str("declare double @pyrs_int_to_float(i64)\n");
         out.push_str("declare i64 @pyrs_int_from_float(double)\n");
         out.push_str("declare i32 @pyrs_int_cmp(i64, i64)\n");
+        out.push_str("declare i32 @pyrs_int_float_cmp(i64, double)\n");
         out.push_str("declare i32 @pyrs_int_eq(i64, i64)\n");
         out.push_str("declare i32 @pyrs_int_truth(i64)\n");
         out.push_str("declare i64 @pyrs_int_add(i64, i64)\n");
@@ -1347,6 +1355,52 @@ impl Emitter {
         self.start_block(&trap_l);
         self.emit_die("UnboundLocalError: value used before assignment");
         self.start_block(&ok_l);
+    }
+
+    fn emit_binding_check(&mut self, name: &str) {
+        if !self.local_bindings.contains(name) {
+            return;
+        }
+        let bound = self.tmp();
+        if let Some(frame) = self.gen_frame.clone() {
+            let idx = self.gen_local_index[name];
+            let flag = self.tmp();
+            self.line(format!(
+                "{flag} = call i32 @pyrs_gen_local_bound(ptr {frame}, i64 {idx})"
+            ));
+            self.line(format!("{bound} = icmp ne i32 {flag}, 0"));
+        } else {
+            self.line(format!(
+                "{bound} = load {}i1, ptr %bound.{name}",
+                self.local_volatile()
+            ));
+        }
+        let ok = self.fresh_block("bound.ok");
+        let trap = self.fresh_block("bound.trap");
+        self.line(format!("br i1 {bound}, label %{ok}, label %{trap}"));
+        self.start_block(&trap);
+        self.emit_die(&format!(
+            "UnboundLocalError: cannot access local variable '{name}' where it is not associated with a value"
+        ));
+        self.start_block(&ok);
+    }
+
+    fn mark_local_bound(&mut self, name: &str) {
+        // Generator stores update the frame's binding bitmap in the runtime.
+        if self.gen_frame.is_none() && self.local_bindings.contains(name) {
+            self.line(format!(
+                "store {}i1 true, ptr %bound.{name}",
+                self.local_volatile()
+            ));
+        }
+    }
+
+    fn local_volatile(&self) -> &'static str {
+        if self.volatile_locals {
+            "volatile "
+        } else {
+            ""
+        }
     }
 
     /// str and list both lead with an i64 length; load it inline.
@@ -2733,6 +2787,12 @@ impl Emitter {
         self.try_ret_ptr = None;
         self.gen_frame = None;
         self.local_storage.clear();
+        self.local_bindings = func
+            .locals
+            .iter()
+            .filter(|(name, _)| !name.starts_with('.'))
+            .map(|(name, _)| name.clone())
+            .collect();
         for (name, ty) in &func.params {
             self.local_storage.insert(name.clone(), *ty);
         }
@@ -2745,6 +2805,7 @@ impl Emitter {
         // control triple per lexical nesting level here so `try` inside a loop
         // does not consume native stack on every iteration.
         let try_depth = max_try_depth_in_stmts(&func.body);
+        self.volatile_locals = try_depth > 0;
         self.try_pool.clear();
         self.try_pool_next = 0;
         for i in 0..try_depth {
@@ -2759,13 +2820,23 @@ impl Emitter {
         // spill params into allocas so assignment to params just works
         for (name, ty) in &func.params {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
-            self.line(format!("store {} %p.{name}, ptr %v.{name}", lty(*ty)));
+            self.line(format!(
+                "store {}{} %p.{name}, ptr %v.{name}",
+                self.local_volatile(),
+                lty(*ty)
+            ));
         }
-        // all locals up front, zero/null-initialized (a conditionally
-        // assigned variable reads as 0/0.0/False/null instead of being UB;
-        // the runtime traps on null str/list use)
+        // Initialize storage for safe conservative GC scans, while tracking
+        // binding separately: zero, False and None are all valid values.
         for (name, ty) in &func.locals {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
+            if self.local_bindings.contains(name) {
+                self.line(format!("%bound.{name} = alloca i1"));
+                self.line(format!(
+                    "store {}i1 false, ptr %bound.{name}",
+                    self.local_volatile()
+                ));
+            }
             let zero = match ty {
                 Ty::Float => fconst(0.0),
                 Ty::Int => "1".to_string(), // tagged small 0
@@ -2784,7 +2855,11 @@ impl Emitter {
                 Ty::Union(_) => "zeroinitializer".to_string(),
                 _ => "0".to_string(),
             };
-            self.line(format!("store {} {zero}, ptr %v.{name}", lty(*ty)));
+            self.line(format!(
+                "store {}{} {zero}, ptr %v.{name}",
+                self.local_volatile(),
+                lty(*ty)
+            ));
         }
         // pending return value for try/finally (only if the function returns)
         if func.ret != Ty::None {
@@ -2836,10 +2911,17 @@ impl Emitter {
         self.fn_ret = Ty::Int;
         self.try_ret_ptr = None;
         self.gen_frame = Some("%gen".to_string());
+        self.volatile_locals = false; // frame storage already survives resume
         self.gen_local_index.clear();
         self.gen_fin_stack.clear();
         self.gen_yield_ty = func.yield_ty.unwrap_or(Ty::Int);
         self.local_storage.clear();
+        self.local_bindings = func
+            .locals
+            .iter()
+            .filter(|(name, _)| !name.starts_with('.'))
+            .map(|(name, _)| name.clone())
+            .collect();
         for (name, ty) in &func.params {
             self.local_storage.insert(name.clone(), *ty);
         }
@@ -2961,8 +3043,13 @@ impl Emitter {
                         "call void @pyrs_gen_set_local(ptr {frame}, i64 {idx}, i64 {slot})"
                     ));
                 } else {
-                    self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
+                    self.line(format!(
+                        "store {}{} {v}, ptr %v.{name}",
+                        self.local_volatile(),
+                        lty(value.ty)
+                    ));
                 }
+                self.mark_local_bound(name);
             }
             Stmt::GlobalAssign { name, value } => {
                 let v = self.emit_expr(value);
@@ -3629,6 +3716,7 @@ impl Emitter {
             ExprKind::IsNone { value, not } => self.emit_is_none(value, *not),
             ExprKind::IsIdentity { left, right, not } => self.emit_is_identity(left, right, *not),
             ExprKind::Local(name) => {
+                self.emit_binding_check(name);
                 // Load the alloca/frame storage type. Semantic peels may retype
                 // `expr.ty` (e.g. Class multi-subclass peel) without a different
                 // LLVM ABI for class pointers.
@@ -3644,7 +3732,11 @@ impl Emitter {
                     self.value_from_slot(&slot, storage)
                 } else {
                     let t = self.tmp();
-                    self.line(format!("{t} = load {}, ptr %v.{name}", lty(storage)));
+                    self.line(format!(
+                        "{t} = load {}{}, ptr %v.{name}",
+                        self.local_volatile(),
+                        lty(storage)
+                    ));
                     t
                 }
             }
@@ -3705,7 +3797,12 @@ impl Emitter {
             }
             ExprKind::Let { name, value, body } => {
                 let v = self.emit_expr(value);
-                self.line(format!("store {} {v}, ptr %v.{name}", lty(value.ty)));
+                self.line(format!(
+                    "store {}{} {v}, ptr %v.{name}",
+                    self.local_volatile(),
+                    lty(value.ty)
+                ));
+                self.mark_local_bound(name);
                 self.emit_expr(body)
             }
             ExprKind::Call { func, args } => {
@@ -5889,8 +5986,12 @@ impl Emitter {
                         "call void @pyrs_gen_set_local(ptr {frame}, i64 {idx}, i64 {slot})"
                     ));
                 } else {
-                    self.line(format!("store ptr {obj}, ptr %v.{name}"));
+                    self.line(format!(
+                        "store {}ptr {obj}, ptr %v.{name}",
+                        self.local_volatile()
+                    ));
                 }
+                self.mark_local_bound(name);
             }
             self.line("call void @pyrs_exc_clear()");
             // Frame remains live so traps/raises in the handler longjmp here
@@ -5966,7 +6067,39 @@ impl Emitter {
 
         let l = self.emit_expr(left);
         let r = self.emit_expr(right);
-        let ty = left.ty; // semantic guarantees both sides match
+        if matches!(
+            (left.ty, right.ty),
+            (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int)
+        ) {
+            // Semantic preserves mixed numeric types for comparisons only.
+            // The runtime compares int against float, returning 2 for NaN.
+            let c = self.tmp();
+            let int_first = left.ty == Ty::Int;
+            let (integer, float) = if int_first { (&l, &r) } else { (&r, &l) };
+            self.line(format!(
+                "{c} = call i32 @pyrs_int_float_cmp(i64 {integer}, double {float})"
+            ));
+            let cc = match (op, int_first) {
+                (BinOp::Eq, _) => "eq",
+                (BinOp::Ne, _) => "ne",
+                (BinOp::Lt, true) | (BinOp::Gt, false) => "slt",
+                (BinOp::Le, true) | (BinOp::Ge, false) => "sle",
+                (BinOp::Gt, true) | (BinOp::Lt, false) => "sgt",
+                (BinOp::Ge, true) | (BinOp::Le, false) => "sge",
+                _ => unreachable!("mixed numeric types require a comparison"),
+            };
+            let cmp = self.tmp();
+            self.line(format!("{cmp} = icmp {cc} i32 {c}, 0"));
+            if matches!(op, BinOp::Eq | BinOp::Ne) {
+                return cmp;
+            }
+            let ordered = self.tmp();
+            self.line(format!("{ordered} = icmp ne i32 {c}, 2"));
+            let result = self.tmp();
+            self.line(format!("{result} = and i1 {ordered}, {cmp}"));
+            return result;
+        }
+        let ty = left.ty; // remaining numeric operands have the same type
 
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul => {
@@ -6341,6 +6474,7 @@ impl Emitter {
         match value.ty {
             Ty::None => {
                 // pure None: is None → true, is not None → false
+                let _ = self.emit_expr(value);
                 if not { "false" } else { "true" }.to_string()
             }
             Ty::Union(members) => {
