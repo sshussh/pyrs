@@ -27,9 +27,11 @@ Four concrete problems, all found by review rather than by the gates:
 
 ## Milestone contract
 
-- Example parity compares stdout bytes, stderr bytes and exit status. The
-  logic lives in `scripts/check_examples.py`, runnable directly, with
-  `--opt-levels` for O0/O2/O3.
+- Example parity compares stdout bytes, stderr bytes and exit status of the
+  compiled program. Compiling and running are separate steps, so C toolchain
+  output on `pyrs run`'s stderr is never compared against an interpreter's;
+  build output surfaces only when the build fails. The logic lives in
+  `scripts/check_examples.py`, runnable directly, with `--opt-levels`.
 - `make hygiene` checks version agreement across the seven crate
   manifests, `Cargo.lock`, three README sites, two SPECIFICATIONS sites
   and the compiled binary's `--version`, and resolves every relative
@@ -43,6 +45,27 @@ Four concrete problems, all found by review rather than by the gates:
 - Failing integration tests retain their inputs under
   `CARGO_TARGET_TMPDIR` (`target/tmp`).
 - One roadmap document, not two.
+
+## The gate's own first failure
+
+The first version compared the stderr of `pyrs run` directly against
+CPython's, and it turned all 13 examples red on CI while passing locally.
+The cause was not a parity defect: `pyrs run` compiles the C runtime as
+part of the run, and CI's clang emitted a warning that GCC 16 locally did
+not, so every example's "stderr" contained toolchain chatter.
+
+That is a design error in the gate, not a flaky environment. Comparing a
+compiler's stderr against an interpreter's conflates two unrelated
+channels. The gate now runs `pyrs compile` and then executes the produced
+binary, which isolates program output from toolchain output; build output
+is reported only when the build fails. Program stderr is still compared
+strictly, and two tests pin the distinction: one asserts build noise does
+not fail a matching example, another asserts program stderr still does.
+
+The warning itself was real and pre-existing:
+`(e->msg != NULL && e->msg->data != NULL)` tests a flexible array member,
+which can never be null, so clang reported a tautological comparison. The
+dead half of the condition is removed.
 
 ## Notes on the implementation
 
@@ -123,8 +146,8 @@ Toolchain: Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1.
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 | `cargo test --workspace` | 1066 passed, 0 failed, 0 ignored |
-| `make hygiene` | 14 gate tests passed; versions agree at 0.88.0 across 20 sites; 53 links resolve |
-| `make examples` | 13/13 byte-exact including stderr and exit status |
+| `make hygiene` | 16 gate tests passed; versions agree at 0.88.0 across 20 sites; 52 links resolve |
+| `make examples` | 13/13 byte-exact including program stderr and exit status |
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `make asan` | 9 passed, 1 skipped; no findings |
 | `make ubsan` | 9 passed, 1 skipped; no findings |

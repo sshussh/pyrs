@@ -496,8 +496,9 @@ _Noreturn void pyrs_raise_exc(PyrsExc *e) {
         pyrs_raise(PYRS_EXC_RUNTIME, "unknown error");
     }
     g_exc_type = e->type_tag;
-    const char *body =
-        (e->msg != NULL && e->msg->data != NULL) ? e->msg->data : "";
+    /* `data` is a flexible array member, so it can never be null; testing it
+     * was dead code and clang reports it as a tautological comparison. */
+    const char *body = (e->msg != NULL) ? e->msg->data : "";
     snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(e->type_tag), body);
     if (g_exc_frames != NULL) {
         pyrs_jump_current();

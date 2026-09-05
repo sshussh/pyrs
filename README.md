@@ -631,7 +631,7 @@ compatibility probes.
 
 | Target | What it checks |
 |--------|----------------|
-| `make examples` | Example parity against `python3` comparing **stdout bytes, stderr bytes and exit status** (`make examples-all-opts` for O0/O2/O3) |
+| `make examples` | Example parity against `python3` comparing **stdout bytes, stderr bytes and exit status** of the compiled program. Building and running are separate steps so C toolchain warnings on `pyrs run`'s stderr are never mistaken for program output; build output is shown only when the build fails. (`make examples-all-opts` for O0/O2/O3) |
 | `make hygiene` | Version agreement across the 7 crates, `Cargo.lock`, README, SPECIFICATIONS and `pyrs --version`; every relative documentation link resolves; and the gates' own failure paths |
 | `make asan` / `make ubsan` | The extension boundary suite with the C adapter, runtime and collector instrumented. The LLVM-generated kernel object is not instrumented, so this is adapter/runtime coverage |
 | `make compatibility` | Native and CPython probes at O0/O2/O3 under GC stress |

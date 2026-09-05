@@ -27,27 +27,47 @@ def write(path: Path, text: str) -> None:
     path.write_text(textwrap.dedent(text))
 
 
-def fake_compiler(path: Path, body: str) -> str:
-    """A stand-in for `pyrs run -O N -i FILE` that emits fixed results."""
-    write(
-        path,
-        f"""\
-        import sys
-        {body}
-        """,
-    )
-    return f"{sys.executable} {path}"
-
-
 class ExampleGateTests(unittest.TestCase):
-    def run_gate(self, root: Path, pyrs_cmd: str, example: str) -> subprocess.CompletedProcess:
-        parts = pyrs_cmd.split()
-        # check_examples invokes `<pyrs> run -O n -i <example>`; wrap the
-        # interpreter+script pair into a single executable shim.
-        shim = root / "pyrs-shim"
-        shim.write_text(f'#!/bin/sh\nexec {pyrs_cmd} "$@"\n')
+    """The gate compiles, then runs the produced binary.
+
+    The stand-in "compiler" therefore has to *emit an executable* at the `-o`
+    path rather than print anything itself. That mirrors the real contract and
+    keeps toolchain output separate from program output -- the distinction the
+    gate exists to preserve, after comparing `pyrs run` stderr against CPython
+    turned every example red on CI because the C compiler emitted a warning.
+    """
+
+    def fake_compiler(self, emit: str, *, build_fails: bool = False) -> Path:
+        """Write a shim accepting `compile -O n -i SRC -o OUT`.
+
+        `emit` is the shell body of the produced program.
+        """
+        shim = self.root / "pyrs-shim"
+        if build_fails:
+            shim.write_text(
+                "#!/bin/sh\n"
+                "echo 'runtime.c:500: warning: some toolchain noise' >&2\n"
+                "echo 'error: deliberate build failure' >&2\n"
+                "exit 1\n"
+            )
+        else:
+            shim.write_text(
+                "#!/bin/sh\n"
+                # Toolchain chatter on the *build* step must never be compared
+                # against CPython's stderr.
+                "echo 'runtime.c:500: warning: some toolchain noise' >&2\n"
+                'out=""\n'
+                "while [ $# -gt 0 ]; do\n"
+                '  case "$1" in -o) out="$2"; shift 2;; *) shift;; esac\n'
+                "done\n"
+                'printf "%s\\n" "#!/bin/sh" > "$out"\n'
+                f'cat >> "$out" <<\'PROG\'\n{emit}\nPROG\n'
+                'chmod +x "$out"\n'
+            )
         shim.chmod(0o755)
-        self.assertTrue(parts)
+        return shim
+
+    def run_gate(self, shim: Path, example: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             [
                 sys.executable,
@@ -55,7 +75,7 @@ class ExampleGateTests(unittest.TestCase):
                 "--pyrs",
                 str(shim),
                 "--root",
-                str(root),
+                str(self.root),
                 "--only",
                 example,
             ],
@@ -72,55 +92,65 @@ class ExampleGateTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_matching_output_passes(self) -> None:
-        cmd = fake_compiler(self.root / "fake.py", 'sys.stdout.write("hi\\n")')
-        done = self.run_gate(self.root, cmd, "examples/x.py")
+        done = self.run_gate(self.fake_compiler('printf "hi\\n"'), "examples/x.py")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("MATCH", done.stdout)
 
+    def test_build_stderr_is_not_compared_against_cpython(self) -> None:
+        # Regression for the CI failure this gate caused: the shim always
+        # writes toolchain noise to stderr during the build step, and that must
+        # not be mistaken for program output.
+        done = self.run_gate(self.fake_compiler('printf "hi\\n"'), "examples/x.py")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertNotIn("toolchain noise", done.stdout)
+
     def test_missing_trailing_newline_is_caught(self) -> None:
         # The exact case the old command-substitution recipe could not see.
-        cmd = fake_compiler(self.root / "fake.py", 'sys.stdout.write("hi")')
-        done = self.run_gate(self.root, cmd, "examples/x.py")
+        done = self.run_gate(self.fake_compiler('printf "hi"'), "examples/x.py")
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("DIFFER", done.stdout)
         self.assertIn("stdout", done.stdout)
 
     def test_extra_trailing_newline_is_caught(self) -> None:
-        cmd = fake_compiler(self.root / "fake.py", 'sys.stdout.write("hi\\n\\n")')
-        done = self.run_gate(self.root, cmd, "examples/x.py")
+        done = self.run_gate(self.fake_compiler('printf "hi\\n\\n"'), "examples/x.py")
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("DIFFER", done.stdout)
 
     def test_wrong_content_is_caught(self) -> None:
-        cmd = fake_compiler(self.root / "fake.py", 'sys.stdout.write("bye\\n")')
-        done = self.run_gate(self.root, cmd, "examples/x.py")
+        done = self.run_gate(self.fake_compiler('printf "bye\\n"'), "examples/x.py")
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("DIFFER", done.stdout)
 
     def test_nonzero_exit_with_right_stdout_is_caught(self) -> None:
         # Correct bytes but a failed process must not pass.
-        cmd = fake_compiler(
-            self.root / "fake.py", 'sys.stdout.write("hi\\n")\nsys.exit(3)'
+        done = self.run_gate(
+            self.fake_compiler('printf "hi\\n"\nexit 3'), "examples/x.py"
         )
-        done = self.run_gate(self.root, cmd, "examples/x.py")
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("exit status differs", done.stdout)
 
-    def test_unexpected_stderr_is_caught(self) -> None:
-        cmd = fake_compiler(
-            self.root / "fake.py",
-            'sys.stdout.write("hi\\n")\nsys.stderr.write("warning\\n")',
+    def test_program_stderr_is_still_compared(self) -> None:
+        # Build noise is ignored, but what the *program* writes is not.
+        done = self.run_gate(
+            self.fake_compiler('printf "hi\\n"\nprintf "boom\\n" >&2'),
+            "examples/x.py",
         )
-        done = self.run_gate(self.root, cmd, "examples/x.py")
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("stderr", done.stdout)
 
+    def test_build_failure_is_reported_with_its_output(self) -> None:
+        done = self.run_gate(
+            self.fake_compiler("", build_fails=True), "examples/x.py"
+        )
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("build failed", done.stdout)
+        self.assertIn("deliberate build failure", done.stdout)
+
     def test_failing_oracle_is_reported_not_skipped(self) -> None:
         write(self.root / "examples/x.py", "raise SystemExit(2)\n")
-        cmd = fake_compiler(self.root / "fake.py", "pass")
-        done = self.run_gate(self.root, cmd, "examples/x.py")
+        done = self.run_gate(self.fake_compiler('printf ""'), "examples/x.py")
         self.assertEqual(done.returncode, 1, done.stdout)
-        self.assertIn("ORACLE", done.stdout)
+        self.assertIn("no oracle", done.stdout)
 
 
 class HygieneGateTests(unittest.TestCase):
