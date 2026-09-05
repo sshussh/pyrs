@@ -1852,6 +1852,152 @@ fn collect_class_asts<'a>(modules: &'a [ModuleInput<'a>]) -> SResult<Vec<ClassAs
     Ok(out)
 }
 
+/// Give a class that defines `__eq__` but not `__ne__` a `__ne__` of its own,
+/// equivalent to `return not self.__eq__(other)`.
+///
+/// Without this, `!=` picked its slot from the operand's *static* type: a
+/// `Base`-typed variable holding a `Child` that defines `__ne__` compiled to
+/// the negation of `__eq__` and could never reach `Child.__ne__`, losing both
+/// the result and any side effects. Synthesizing the slot makes every class
+/// that participates in equality carry a real `__ne__`, so dispatch goes
+/// through the existing vtable and inheritance, overriding and reflection all
+/// work with no special cases.
+///
+/// The body calls `self.__eq__(...)` rather than the declaring class's `__eq__`
+/// directly, so a subclass overriding only `__eq__` still changes `!=`.
+///
+/// Returns whether a `__ne__` was added.
+fn synthesize_default_ne(methods: &mut Vec<ClassMethodAst<'_>>) -> bool {
+    if methods.iter().any(|m| m.def.name == "__ne__") {
+        return false;
+    }
+    let Some(eq) = methods
+        .iter()
+        .find(|m| m.def.name == "__eq__")
+        .map(|m| m.def)
+    else {
+        return false;
+    };
+    // `__eq__(self, other)` exactly; anything else is rejected elsewhere, and
+    // guessing at an unusual signature would be worse than leaving it alone.
+    if eq.params.len() != 2 || eq.vararg.is_some() || eq.kwarg.is_some() {
+        return false;
+    }
+    let span = eq.span;
+    let self_name = eq.params[0].name.clone();
+    let other_name = eq.params[1].name.clone();
+    let name_expr = |name: String| ast::Expr {
+        kind: ast::ExprKind::Name(name),
+        span,
+    };
+    let call = ast::Expr {
+        kind: ast::ExprKind::MethodCall {
+            base: Box::new(name_expr(self_name)),
+            method: "__eq__".to_string(),
+            method_span: span,
+            args: vec![ast::PosArg::Pos(name_expr(other_name))],
+            keywords: Vec::new(),
+            kwargs: None,
+        },
+        span,
+    };
+    let body = vec![ast::Stmt {
+        kind: ast::StmtKind::Return(Some(ast::Expr {
+            kind: ast::ExprKind::Unary {
+                op: ast::UnaryOp::Not,
+                operand: Box::new(call),
+            },
+            span,
+        })),
+        span,
+    }];
+    let synthetic = ast::FuncDef {
+        name: "__ne__".to_string(),
+        params: eq.params.clone(),
+        vararg: None,
+        kwarg: None,
+        ret: Some(ast::TypeName::Bool),
+        body,
+        span,
+        decorators: Vec::new(),
+    };
+    // The class table borrows method definitions from the module AST, which
+    // has no slot for a node the source never contained. Leaking matches how
+    // this file already handles synthesized type names, and the number of
+    // classes in a compilation is bounded by the program.
+    methods.push(ClassMethodAst {
+        def: Box::leak(Box::new(synthetic)),
+    });
+    true
+}
+
+/// Decide which classes get a default `__ne__`, respecting inheritance.
+///
+/// CPython places the default on `object`, so it sits above every user class.
+/// PyRs has no `object`, so the equivalent is: a class gets one only when no
+/// ancestor already supplies a `__ne__`. Getting this wrong in the obvious way
+/// -- synthesizing wherever a class declares `__eq__` -- shadows an explicit
+/// `Base.__ne__` for a `Child` that overrides only `__eq__`, which CPython
+/// resolves to the inherited `Base.__ne__`.
+///
+/// Classes are visited parents-first so `provided` is populated before any
+/// descendant consults it, and an inherited entry propagates down the chain.
+fn synthesize_default_ne_methods(classes: &mut [ClassAst<'_>]) {
+    let class_depth = |c: &ClassAst<'_>| {
+        let Some(id) = lookup_class_in_module(&c.module, &c.name) else {
+            return u32::MAX;
+        };
+        let mut depth = 0u32;
+        let mut cur = class_info(id).and_then(|i| i.parent);
+        while let Some(p) = cur {
+            depth += 1;
+            if depth > 64 {
+                break;
+            }
+            cur = class_info(p).and_then(|i| i.parent);
+        }
+        depth
+    };
+    let mut order: Vec<usize> = (0..classes.len()).collect();
+    order.sort_by_key(|&i| class_depth(&classes[i]));
+
+    let mut provided: HashSet<ir::ClassId> = HashSet::new();
+    for idx in order {
+        let Some(id) = lookup_class_in_module(&classes[idx].module, &classes[idx].name) else {
+            continue;
+        };
+        if classes[idx].methods.iter().any(|m| m.def.name == "__ne__") {
+            provided.insert(id);
+            continue;
+        }
+        let mut cur = class_info(id).and_then(|i| i.parent);
+        let mut inherits_ne = false;
+        let mut hops = 0u32;
+        while let Some(p) = cur {
+            if provided.contains(&p) {
+                inherits_ne = true;
+                break;
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            cur = class_info(p).and_then(|i| i.parent);
+        }
+        if inherits_ne {
+            // An inherited `__ne__` already dispatches `self.__eq__` virtually,
+            // so overriding only `__eq__` still changes `!=`. Adding one here
+            // would shadow it.
+            provided.insert(id);
+            continue;
+        }
+        set_class_current_module(&classes[idx].module);
+        if synthesize_default_ne(&mut classes[idx].methods) {
+            provided.insert(id);
+        }
+    }
+}
+
 /// Infer field types from `self.attr = expr` assignments. Declaration order
 /// is preserved (Vec, not HashMap). Multiple passes refine `self.x = self.y + 1`.
 fn collect_self_fields(
@@ -3037,7 +3183,9 @@ fn try_type_ast_expr(
                 let t = try_type_ast_expr(e, params, known_rets)?;
                 elem = Some(match elem {
                     None => t,
-                    Some(prev) => join_types(prev, t),
+                    // Element joining, not scalar storage joining: keep mixed
+                    // numerics as a union so the literal's values survive.
+                    Some(prev) => join_elem_types(prev, t)?,
                 });
             }
             Some(ir::list_of(elem?))
@@ -5069,10 +5217,14 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     let root_idx = modules.len() - 1;
 
     // pass 0: class ids → import aliases for bases/annotations → bases → layouts
-    let class_asts = collect_class_asts(modules)?;
+    let mut class_asts = collect_class_asts(modules)?;
     register_class_ids(&class_asts)?;
     inject_class_import_aliases(modules);
     resolve_class_bases(&class_asts)?;
+    // Needs resolved bases: whether a class should get a default `__ne__`
+    // depends on what its ancestors already provide.
+    synthesize_default_ne_methods(&mut class_asts);
+    let class_asts = class_asts;
     let free_func_rets = pre_infer_free_func_rets(modules);
     finalize_class_layouts(&class_asts, &free_func_rets)?;
 
@@ -18369,11 +18521,25 @@ fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
     match (a, b) {
         _ if a == b => Some(a),
         (ir::Ty::Any, _) | (_, ir::Ty::Any) => Some(ir::Ty::Any),
+        // Python keeps each element's own type: `[1, 2.5, 1]` is
+        // `[1, 2.5, 1]`, not `[1.0, 2.5, 1.0]`. Collapsing to one numeric type
+        // changed printed values and `is`/`==` results, so mixed numerics
+        // become a union and keep per-element identity. Homogeneous lists are
+        // unaffected and keep their optimized storage.
         (ir::Ty::Float, ir::Ty::Int)
         | (ir::Ty::Int, ir::Ty::Float)
         | (ir::Ty::Float, ir::Ty::Bool)
-        | (ir::Ty::Bool, ir::Ty::Float) => Some(ir::Ty::Float),
-        (ir::Ty::Int, ir::Ty::Bool) | (ir::Ty::Bool, ir::Ty::Int) => Some(ir::Ty::Int),
+        | (ir::Ty::Bool, ir::Ty::Float)
+        | (ir::Ty::Int, ir::Ty::Bool)
+        | (ir::Ty::Bool, ir::Ty::Int) => {
+            // Built here rather than through `join_types`, which collapses
+            // numerics to one type. That rule is right for a scalar variable's
+            // storage (the documented "join of all assignments") but wrong for
+            // container elements, which Python keeps individually typed.
+            let mut members = ir::flatten_union_members(a);
+            members.extend(ir::flatten_union_members(b));
+            Some(ir::union_of(&members))
+        }
         // Grow optionals/unions in homogeneous containers (list/dict values).
         _ if a == ir::Ty::None
             || b == ir::Ty::None
@@ -27112,13 +27278,36 @@ v = min(3, 1, 4, key=k)
     }
 
     #[test]
-    fn list_literal_infers_type_and_promotes() {
+    fn list_literal_keeps_each_element_type() {
+        // Python prints `[1, 2.5, True]`. Collapsing to `list[float]` used to
+        // print `[1.0, 2.5, 1.0]`, changing both the values and their types.
         let m = analyze_ok("xs = [1, 2.5, True]\n");
         let entry = find_func(&m, ENTRY_NAME);
         let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
             panic!();
         };
-        assert_eq!(value.ty, ir::list_of(ir::Ty::Float));
+        assert_eq!(
+            value.ty,
+            ir::list_of(ir::union_of(&[ir::Ty::Bool, ir::Ty::Int, ir::Ty::Float]))
+        );
+    }
+
+    #[test]
+    fn homogeneous_numeric_lists_keep_optimized_storage() {
+        // The union only appears for genuinely mixed literals; uniform lists
+        // must not pay for it.
+        for (src, want) in [
+            ("xs = [1, 2, 3]\n", ir::Ty::Int),
+            ("xs = [1.0, 2.0]\n", ir::Ty::Float),
+            ("xs = [True, False]\n", ir::Ty::Bool),
+        ] {
+            let m = analyze_ok(src);
+            let entry = find_func(&m, ENTRY_NAME);
+            let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+                panic!();
+            };
+            assert_eq!(value.ty, ir::list_of(want), "for {src:?}");
+        }
     }
 
     #[test]
