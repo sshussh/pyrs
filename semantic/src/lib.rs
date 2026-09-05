@@ -14011,8 +14011,8 @@ fn lower_builtin_next(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResu
 }
 
 /// `for x in obj:` when `obj` is a class with `__iter__` / `__next__`.
-/// Desugars to: `it = obj.__iter__(); while True: try: x = it.__next__(); body
-/// except StopIteration: break`.
+/// Desugars to: `it = obj.__iter__(); while more: try: x = it.__next__()
+/// except StopIteration: more = False else: bind; body`.
 #[allow(clippy::too_many_arguments)]
 fn lower_for_user_iter(
     target: &ast::AssignTarget,
@@ -14078,18 +14078,17 @@ fn lower_for_user_iter(
     ctx.loop_depth -= 1;
     restore_refinements_after_for(ctx, entry_ref, target, body, orelse);
 
-    // try: nxt = it.__next__(); bind; body
+    // try: nxt = it.__next__()
     // except StopIteration: more = False
+    // else: bind; body
+    // StopIteration from bind/body must propagate (CPython).
     let next_call = lower_instance_method_call(it_local, it_id, "__next__", span, &[], ctx)?;
-    let try_body = {
-        let mut b = vec![ir::Stmt::Assign {
-            name: nxt_t.clone(),
-            value: next_call,
-        }];
-        b.extend(bind);
-        b.extend(user_body);
-        b
-    };
+    let try_body = vec![ir::Stmt::Assign {
+        name: nxt_t.clone(),
+        value: next_call,
+    }];
+    let mut try_orelse = bind;
+    try_orelse.extend(user_body);
     let handler = (
         Some(vec![ir::ExcType::StopIteration]),
         None,
@@ -14104,7 +14103,7 @@ fn lower_for_user_iter(
     let loop_body = vec![ir::Stmt::Try {
         body: try_body,
         handlers: vec![handler],
-        orelse: vec![],
+        orelse: try_orelse,
         finally: vec![],
     }];
     let more_local = ir::Expr {
@@ -17051,6 +17050,31 @@ fn lower_compare_chain(
     })
 }
 
+/// How one comprehension generator advances each iteration.
+enum CompIterKind {
+    /// Index or range: bind runs directly in the while body.
+    Indexed,
+    /// User iterator: try `__next__`; StopIteration clears `more`.
+    StopTry {
+        next_assign: Box<ir::Stmt>,
+        more: String,
+    },
+    /// Generator / file: prelude, then if exhausted clear `more`, else bind.
+    ExhaustIf {
+        prelude: Vec<ir::Stmt>,
+        exhausted: ir::Expr,
+        more: String,
+    },
+}
+
+struct CompIterParts {
+    cond: ir::Expr,
+    step: Vec<ir::Stmt>,
+    element: ir::Expr,
+    cap: Option<ir::Expr>,
+    kind: CompIterKind,
+}
+
 /// One prepared `for` level inside a list comprehension.
 struct CompLevel {
     /// Stmts that run before this level's while (at the appropriate nesting).
@@ -17063,16 +17087,93 @@ struct CompLevel {
     ifs: Vec<ir::Expr>,
     /// Exact capacity when knowable (only used for a single unfiltered gen).
     cap: Option<ir::Expr>,
+    kind: CompIterKind,
 }
 
-/// Build range/list/str loop setup for one comprehension generator.
-/// Appends setup into `setup`; returns (cond, step, element, optional cap).
+fn assign_const_bool(name: String, value: bool) -> ir::Stmt {
+    ir::Stmt::Assign {
+        name,
+        value: ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(value),
+        },
+    }
+}
+
+fn push_comp_more(ctx: &mut FnCtx, setup: &mut Vec<ir::Stmt>) -> (String, ir::Expr) {
+    let more_t = ctx.fresh_temp("comp.more", ir::Ty::Bool);
+    setup.push(assign_const_bool(more_t.clone(), true));
+    (
+        more_t.clone(),
+        ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Local(more_t),
+        },
+    )
+}
+
+fn homogeneous_tuple_elem(elems: &[ir::Ty], span: Span) -> SResult<ir::Ty> {
+    if elems.is_empty() {
+        return Ok(ir::Ty::Int);
+    }
+    let t0 = elems[0];
+    if elems.iter().all(|e| *e == t0) {
+        Ok(t0)
+    } else {
+        Err(err(
+            "iterating a heterogeneous tuple is not supported yet; \
+             unpack or index with constants",
+            span,
+        ))
+    }
+}
+
+fn wrap_comp_level(level: CompLevel, inner: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
+    let mut payload = level.bind;
+    payload.extend(wrap_comp_ifs(&level.ifs, inner));
+    let while_body = match level.kind {
+        CompIterKind::Indexed => payload,
+        CompIterKind::StopTry { next_assign, more } => vec![ir::Stmt::Try {
+            body: vec![*next_assign],
+            handlers: vec![(
+                Some(vec![ir::ExcType::StopIteration]),
+                None,
+                vec![assign_const_bool(more, false)],
+            )],
+            orelse: payload,
+            finally: vec![],
+        }],
+        CompIterKind::ExhaustIf {
+            prelude,
+            exhausted,
+            more,
+        } => {
+            let mut b = prelude;
+            b.push(ir::Stmt::If {
+                branches: vec![(exhausted, vec![assign_const_bool(more, false)])],
+                orelse: payload,
+            });
+            b
+        }
+    };
+    let while_stmt = ir::Stmt::While {
+        cond: level.cond,
+        body: while_body,
+        step: level.step,
+    };
+    let mut wrapped = level.setup;
+    wrapped.push(while_stmt);
+    wrapped
+}
+
+/// Build loop setup for one comprehension generator.
+/// Appends setup into `setup`.
 fn lower_comp_iter(
     iter: &ast::Expr,
     want_cap: bool,
     ctx: &mut FnCtx,
     setup: &mut Vec<ir::Stmt>,
-) -> SResult<(ir::Expr, Vec<ir::Stmt>, ir::Expr, Option<ir::Expr>)> {
+) -> SResult<CompIterParts> {
     if let ast::ExprKind::Call { func, args, .. } = &iter.kind
         && func == "range"
         && !ctx.funcs().contains_key("range")
@@ -17214,16 +17315,56 @@ fn lower_comp_iter(
                 },
             },
         };
-        return Ok((loop_cond, vec![step_stmt], it_local, cap));
+        return Ok(CompIterParts {
+            cond: loop_cond,
+            step: vec![step_stmt],
+            element: it_local,
+            cap,
+            kind: CompIterKind::Indexed,
+        });
     }
 
-    // list or str: index loop; optional presize via len
     let seq = lower_expr(iter, ctx)?;
-    let src_elem_ty = match seq.ty {
-        ir::Ty::List(e) => *e,
+    match seq.ty {
+        ir::Ty::List(_) | ir::Ty::Str | ir::Ty::Tuple(_) | ir::Ty::Dict { .. } | ir::Ty::Set(_) => {
+            lower_comp_indexed(seq, want_cap, iter.span, ctx, setup)
+        }
+        ir::Ty::File => lower_comp_file(seq, iter.span, ctx, setup),
+        ir::Ty::Generator { yield_ty } => lower_comp_generator(seq, *yield_ty, ctx, setup),
+        ir::Ty::Class(id) if resolve_method(id, "__iter__").is_some() => {
+            lower_comp_user_iter(seq, id, iter.span, ctx, setup)
+        }
+        other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
+    }
+}
+
+fn lower_comp_indexed(
+    seq: ir::Expr,
+    want_cap: bool,
+    span: Span,
+    ctx: &mut FnCtx,
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<CompIterParts> {
+    let seq = match seq.ty {
+        ir::Ty::Dict { key, .. } => ir::Expr {
+            ty: ir::list_of(*key),
+            kind: ir::ExprKind::DictKeys(Box::new(seq)),
+        },
+        ir::Ty::Set(elem) => ir::Expr {
+            ty: ir::list_of(*elem),
+            kind: ir::ExprKind::SetToList(Box::new(seq)),
+        },
+        _ => seq,
+    };
+    let src_elem_ty = match &seq.ty {
+        ir::Ty::List(e) => **e,
         ir::Ty::Str => ir::Ty::Str,
+        ir::Ty::Tuple(elems) => homogeneous_tuple_elem(elems, span)?,
         other => {
-            return Err(err(format!("'{other}' object is not iterable"), iter.span));
+            return Err(err(
+                format!("internal error: lower_comp_indexed on {other}"),
+                span,
+            ));
         }
     };
     let seq_ty = seq.ty;
@@ -17237,14 +17378,8 @@ fn lower_comp_iter(
         name: idx_t.clone(),
         value: int_const(0),
     });
-    let seq_local = ir::Expr {
-        ty: seq_ty,
-        kind: ir::ExprKind::Local(seq_t),
-    };
-    let idx_local = ir::Expr {
-        ty: ir::Ty::Int,
-        kind: ir::ExprKind::Local(idx_t.clone()),
-    };
+    let seq_local = local_expr(seq_t, seq_ty);
+    let idx_local = local_expr(idx_t.clone(), ir::Ty::Int);
     let cond = int_cmp(
         ir::BinOp::Lt,
         idx_local.clone(),
@@ -17279,7 +17414,159 @@ fn lower_comp_iter(
     } else {
         None
     };
-    Ok((cond, vec![step_stmt], element, cap))
+    Ok(CompIterParts {
+        cond,
+        step: vec![step_stmt],
+        element,
+        cap,
+        kind: CompIterKind::Indexed,
+    })
+}
+
+fn lower_comp_file(
+    file: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<CompIterParts> {
+    let file_t = ctx.fresh_temp("comp.file", ir::Ty::File);
+    setup.push(ir::Stmt::Assign {
+        name: file_t.clone(),
+        value: file,
+    });
+    let (more, cond) = push_comp_more(ctx, setup);
+    let line_t = ctx.fresh_temp("comp.line", ir::Ty::Str);
+    let line_local = local_expr(line_t.clone(), ir::Ty::Str);
+    let prelude = vec![ir::Stmt::Assign {
+        name: line_t,
+        value: ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::FileCall {
+                func: ir::FileFn::ReadLine,
+                args: vec![local_expr(file_t, ir::Ty::File)],
+            },
+        },
+    }];
+    let truthy = to_bool(line_local.clone(), span, ctx)?;
+    let exhausted = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Unary {
+            op: ir::UnOp::Not,
+            operand: Box::new(truthy),
+        },
+    };
+    Ok(CompIterParts {
+        cond,
+        step: vec![],
+        element: line_local,
+        cap: None,
+        kind: CompIterKind::ExhaustIf {
+            prelude,
+            exhausted,
+            more,
+        },
+    })
+}
+
+fn lower_comp_generator(
+    gen_expr: ir::Expr,
+    yield_ty: ir::Ty,
+    ctx: &mut FnCtx,
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<CompIterParts> {
+    let gen_ty = gen_expr.ty;
+    let gen_t = ctx.fresh_temp("comp.gen", gen_ty);
+    setup.push(ir::Stmt::Assign {
+        name: gen_t.clone(),
+        value: gen_expr,
+    });
+    let (more, cond) = push_comp_more(ctx, setup);
+    let opt_ty = ir::optional_of(yield_ty);
+    let nxt_t = ctx.fresh_temp("comp.gnext", opt_ty);
+    let nxt_local = local_expr(nxt_t.clone(), opt_ty);
+    let prelude = vec![ir::Stmt::Assign {
+        name: nxt_t,
+        value: ir::Expr {
+            ty: opt_ty,
+            kind: ir::ExprKind::GeneratorNext {
+                generator: Box::new(local_expr(gen_t, gen_ty)),
+                send: Box::new(const_none()),
+            },
+        },
+    }];
+    let exhausted = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::IsNone {
+            value: Box::new(nxt_local.clone()),
+            not: false,
+        },
+    };
+    let element = ir::Expr {
+        ty: yield_ty,
+        kind: ir::ExprKind::FromUnion {
+            value: Box::new(nxt_local),
+        },
+    };
+    Ok(CompIterParts {
+        cond,
+        step: vec![],
+        element,
+        cap: None,
+        kind: CompIterKind::ExhaustIf {
+            prelude,
+            exhausted,
+            more,
+        },
+    })
+}
+
+fn lower_comp_user_iter(
+    obj: ir::Expr,
+    class_id: ir::ClassId,
+    span: Span,
+    ctx: &mut FnCtx,
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<CompIterParts> {
+    let it_call = lower_instance_method_call(obj, class_id, "__iter__", span, &[], ctx)?;
+    let it_ty = it_call.ty;
+    let ir::Ty::Class(it_id) = it_ty else {
+        return Err(err(
+            format!("__iter__ must return a class instance, found {it_ty}"),
+            span,
+        ));
+    };
+    let Some(next_func) = resolve_method(it_id, "__next__") else {
+        return Err(err("iterator from __iter__ must define __next__", span));
+    };
+    let next_sig = method_sig_lookup(&next_func)
+        .ok_or_else(|| err("internal error: missing signature for __next__", span))?;
+    let yield_ty = next_sig.ret;
+    if yield_ty == ir::Ty::None {
+        return Err(err("__next__ must return a non-None value type", span));
+    }
+    let it_t = ctx.fresh_temp("comp.it", it_ty);
+    setup.push(ir::Stmt::Assign {
+        name: it_t.clone(),
+        value: it_call,
+    });
+    let (more, cond) = push_comp_more(ctx, setup);
+    let nxt_t = ctx.fresh_temp("comp.inext", yield_ty);
+    let it_local = local_expr(it_t, it_ty);
+    let next_call = lower_instance_method_call(it_local, it_id, "__next__", span, &[], ctx)?;
+    let next_assign = ir::Stmt::Assign {
+        name: nxt_t.clone(),
+        value: next_call,
+    };
+    Ok(CompIterParts {
+        cond,
+        step: vec![],
+        element: local_expr(nxt_t, yield_ty),
+        cap: None,
+        kind: CompIterKind::StopTry {
+            next_assign: Box::new(next_assign),
+            more,
+        },
+    })
 }
 
 /// Bind a comprehension target: simple names use hidden storage (no leak);
@@ -17348,8 +17635,8 @@ fn lower_list_comp(
     for (i, clause) in generators.iter().enumerate() {
         let want_cap = can_presize && i == 0;
         let mut setup = Vec::new();
-        let (cond, step, element, cap) = lower_comp_iter(&clause.iter, want_cap, ctx, &mut setup)?;
-        let (bind, n_renames) = bind_comp_target(&clause.target, element, ctx)?;
+        let parts = lower_comp_iter(&clause.iter, want_cap, ctx, &mut setup)?;
+        let (bind, n_renames) = bind_comp_target(&clause.target, parts.element, ctx)?;
         renames_pushed += n_renames;
         let mut ifs = Vec::with_capacity(clause.ifs.len());
         for c in &clause.ifs {
@@ -17357,11 +17644,12 @@ fn lower_list_comp(
         }
         levels.push(CompLevel {
             setup,
-            cond,
-            step,
+            cond: parts.cond,
+            step: parts.step,
             bind,
             ifs,
-            cap,
+            cap: parts.cap,
+            kind: parts.kind,
         });
     }
 
@@ -17418,16 +17706,7 @@ fn lower_list_comp(
     // Outermost setup already emitted; its while is built here with empty setup.
     let mut inner_body = vec![append];
     for level in levels.into_iter().rev() {
-        let mut body = level.bind;
-        body.extend(wrap_comp_ifs(&level.ifs, inner_body));
-        let while_stmt = ir::Stmt::While {
-            cond: level.cond,
-            body,
-            step: level.step,
-        };
-        let mut wrapped = level.setup;
-        wrapped.push(while_stmt);
-        inner_body = wrapped;
+        inner_body = wrap_comp_level(level, inner_body);
     }
     stmts.extend(inner_body);
 
@@ -17457,8 +17736,8 @@ fn lower_comp_levels(
     let mut renames_pushed = 0usize;
     for clause in generators {
         let mut setup = Vec::new();
-        let (cond, step, element, cap) = lower_comp_iter(&clause.iter, false, ctx, &mut setup)?;
-        let (bind, n_renames) = bind_comp_target(&clause.target, element, ctx)?;
+        let parts = lower_comp_iter(&clause.iter, false, ctx, &mut setup)?;
+        let (bind, n_renames) = bind_comp_target(&clause.target, parts.element, ctx)?;
         renames_pushed += n_renames;
         let mut ifs = Vec::with_capacity(clause.ifs.len());
         for c in &clause.ifs {
@@ -17466,11 +17745,12 @@ fn lower_comp_levels(
         }
         levels.push(CompLevel {
             setup,
-            cond,
-            step,
+            cond: parts.cond,
+            step: parts.step,
             bind,
             ifs,
-            cap,
+            cap: parts.cap,
+            kind: parts.kind,
         });
     }
     Ok((levels, renames_pushed))
@@ -17479,16 +17759,7 @@ fn lower_comp_levels(
 fn nest_comp_body(levels: Vec<CompLevel>, inner_body: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
     let mut body = inner_body;
     for level in levels.into_iter().rev() {
-        let mut level_body = level.bind;
-        level_body.extend(wrap_comp_ifs(&level.ifs, body));
-        let while_stmt = ir::Stmt::While {
-            cond: level.cond,
-            body: level_body,
-            step: level.step,
-        };
-        let mut wrapped = level.setup;
-        wrapped.push(while_stmt);
-        body = wrapped;
+        body = wrap_comp_level(level, body);
     }
     body
 }

@@ -524,7 +524,9 @@ for x in xs:     # iteration re-reads the live length,
     xs.append(x) # so appending inside the loop extends it (careful!)
 ```
 
-List comprehensions support multiple `for` / `if` clauses and unpack
+List, set, and dict comprehensions use the same iterables as `for`
+(including tuples, dict keys, sets, files, generators, and classes with
+`__iter__`). They support multiple `for` / `if` clauses and unpack
 targets. Simple loop names follow Python 3 scoping (shadow inside; do
 not leak). Unpack targets bind real locals (like a nested `for`):
 
@@ -636,6 +638,24 @@ work in both loop kinds; `continue` in a `for` still advances the
 iteration. A `for`/`while` `else` clause runs when the loop finishes
 normally (including zero iterations) and is skipped if the loop exits
 via `break`.
+
+`for` and list/set/dict comprehensions accept the same iterables:
+
+| Iterable | Notes |
+|----------|--------|
+| `range(...)` | lazy; not a first-class value |
+| `list` / `str` | index loop; list length is re-read each iteration |
+| homogeneous `tuple` | mixed element types are a compile error |
+| `dict` | iterates keys (insertion order) |
+| `set` | converted to a list of elements |
+| file | `readline` until `""` |
+| generator | exhaustion is Optional None (subset), not a raised `StopIteration` |
+| class with `__iter__` | `__next__` `StopIteration` ends the loop; body/bind `StopIteration` propagates |
+
+A class without `__iter__` is `'{ty}' object is not iterable`. User-iterator
+loops catch `StopIteration` only around `__next__`, so
+`for x in Counter(): raise StopIteration("body")` reaches an enclosing
+`except StopIteration` instead of running `else`.
 
 ### Functions
 
@@ -795,7 +815,9 @@ print(isinstance(d, Animal))  # True
   (static call of the parent implementation with the same `self`)
 - **`@staticmethod` / `@classmethod` / read-only `@property`**
 - **Bound methods as values** (`f = obj.m; f(...)`)
-- **`__iter__` / `__next__`** for user for-loops; **`__len__` / `__bool__`**;
+- **`__iter__` / `__next__`** for user `for` loops and comprehensions
+  (`StopIteration` from `__next__` only terminates the loop);
+  **`__len__` / `__bool__`**;
   builtin **`next(it)`** / **`next(it, default)`** (user iterators and generators)
 - **`__contains__`** for user-class `in` / `not in` (the needle is
   evaluated before the container)
@@ -867,7 +889,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str\|orderable tuple\|orderable list\|class with __lt__ or __gt__]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len` (incl. class `__len__`)/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list; stable reverse-sort-reverse; class path is a `<` insertion sort; keyed path materializes a GC-managed keys list |
 | `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` | without `key=`: sortable elem (incl. orderable tuples/lists and classes with `__lt__` or `__gt__`); with monomorphic `key=`: any `list[T]`; same bare-builtin `key=` surface as `sorted`; `reverse=` is truthy | in-place (statement only); same key/reverse surface as `sorted` |
 | `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
-| `range(...)` | 1–3 ints | only as a `for` iterable |
+| `range(...)` | 1–3 ints | `for` and comprehensions; not a first-class value |
 | `set()` | empty only; needs annotation | `s: set[int] = set()` |
 | `global x` | (statement) | write access to a module global |
 | `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |
