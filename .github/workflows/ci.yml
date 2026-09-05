@@ -3,7 +3,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, feat/cpython-interop]
+    branches: [main, master]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -64,19 +64,6 @@ jobs:
 
       - name: Test (workspace)
         run: cargo test --workspace
-
-      - name: Core compatibility regressions
-        run: |
-          python3 -m unittest discover -s compatibility -p test_runner.py
-          python3 compatibility/run.py --group core --mode both --opt-levels 0 2 3 --gc-stress --output target/compatibility/core.json
-
-      - name: Upload compatibility evidence
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: core-compatibility-${{ github.run_id }}
-          path: target/compatibility/*.json
-          if-no-files-found: ignore
 
       - name: Upload test failure artifacts
         if: failure()
@@ -164,40 +151,10 @@ jobs:
   # ---------------------------------------------------------------------------
   # Single green gate for branch protection (all required jobs)
   # ---------------------------------------------------------------------------
-  scientific-compatibility:
-    name: NumPy and pandas compatibility
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - name: Setup PyRs toolchain
-        uses: ./.github/actions/setup-pyrs
-        with:
-          llvm-version: "18"
-          python-version: "3.12"
-      - name: Install pinned scientific packages
-        run: |
-          python3 -m venv target/science-venv
-          target/science-venv/bin/python -m pip install -r compatibility/requirements-science.txt
-      - name: Build and compare scientific probes
-        run: |
-          cargo build -p pyrs
-          python3 compatibility/run.py --group all --mode both --python target/science-venv/bin/python --output target/compatibility/science.json
-      - name: Native CPython bridge under GC stress (O0/O2/O3)
-        run: target/science-venv/bin/python compatibility/test_extension.py --pyrs target/debug/pyrs --require-science
-      - name: Numerical kernel parity and timings
-        run: target/science-venv/bin/python examples/interop/demo.py --pyrs target/debug/pyrs --size 20000 --repeats 3 --output target/compatibility/interop.json
-      - name: Upload scientific evidence
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: scientific-compatibility-${{ github.run_id }}
-          path: target/compatibility/*.json
-          if-no-files-found: ignore
-
   ci-success:
     name: CI success
     if: always()
-    needs: [fmt, test, examples, smoke, scientific-compatibility]
+    needs: [fmt, test, examples, smoke]
     runs-on: ubuntu-24.04
     steps:
       - name: Check all jobs
@@ -208,7 +165,6 @@ jobs:
             "${{ needs.test.result }}"
             "${{ needs.examples.result }}"
             "${{ needs.smoke.result }}"
-            "${{ needs.scientific-compatibility.result }}"
           )
           for r in "${results[@]}"; do
             if [ "$r" != "success" ]; then

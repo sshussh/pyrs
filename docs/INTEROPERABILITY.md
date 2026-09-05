@@ -55,6 +55,18 @@ Initial scope:
 - Buffer inputs are read-only to the kernel. Mutation, escaping views, methods,
   imports, callbacks, globals and external effects are rejected in kernel source.
   The caller retains its array; every buffer lease is released on success/error.
+- That read-only rule is enforced in two independent places, and it is worth
+  being precise about which covers what. Rejecting mutating *source* is a
+  frontend allowlist (`cli/src/extension.rs`). Independently, borrowed list
+  headers carry `PYRS_LIST_BORROWED_CAP` so every runtime growth site
+  (`pyrs_list_push`, `pyrs_list_insert`, `list_ensure_cap`, and `extend`
+  through push) raises `BufferError` instead of calling the libc allocator on
+  exporter- or `PyMem`-owned memory. Without that marker a resize would free a
+  foreign pointer and leave the lease we still must release dangling.
+  Direct element *stores* are not runtime-checked: generated code indexes
+  borrowed slots inline, so a frontend allowlist gap would write into caller
+  memory (or fault on a read-only mapping) rather than trap. Closing that
+  requires either a store-side check or a distinct immutable buffer type.
 - Unsupported argument types/layouts raise TypeError before native execution;
   errors raised by a buffer exporter propagate unchanged.
   Python scalar subclasses are rejected rather than bypassing their behavior.

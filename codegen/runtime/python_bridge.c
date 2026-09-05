@@ -103,7 +103,10 @@ static int bridge_sequence(BridgeArg *arg, const char *function, const char *nam
         }
         arg->owned = PyMem_Malloc(n ? (size_t)n * sizeof(long long) : 1);
         if (arg->owned == NULL) { PyErr_NoMemory(); return -1; }
-        arg->list.len = arg->list.cap = n;
+        arg->list.len = n;
+        /* PyMem memory: the runtime's libc allocator must never resize it, and
+         * `arg->owned` must stay the exact pointer PyMem_Free receives. */
+        arg->list.cap = PYRS_LIST_BORROWED_CAP;
         arg->list.data = arg->owned;
         for (Py_ssize_t i = 0; i < n; i++) {
             PyObject *value = PyList_GET_ITEM(arg->object, i);
@@ -134,7 +137,10 @@ static int bridge_sequence(BridgeArg *arg, const char *function, const char *nam
             "%s(): '%s' requires an aligned contiguous 1D native float64 buffer", function, name);
         return -1;
     }
-    arg->list.len = arg->list.cap = view->shape[0];
+    arg->list.len = view->shape[0];
+    /* Caller-owned exporter memory (NumPy/pandas). Resizing it would free a
+     * foreign pointer and invalidate the export we still have to release. */
+    arg->list.cap = PYRS_LIST_BORROWED_CAP;
     arg->list.data = view->buf;
     return 0;
 }

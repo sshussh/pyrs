@@ -1,8 +1,9 @@
 # PyRs roadmap to 1.0
 
 PyRs has a substantial native compiler and runtime, but it is still a
-statically typed Python subset. Version **0.85.0** ships container equality
-for class elements. The next milestone is **0.86.0**; reaching a particular
+statically typed Python subset. Version **0.86.0** lands CPython
+interoperability and the correctness fixes that were stranded on an
+unmerged branch. The next milestone is **0.87.0**; reaching a particular
 minor version does not establish 1.0 readiness.
 
 ## State reviewed on 2026-09-05
@@ -59,13 +60,30 @@ After 0.85 on the same host:
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1028 passed: 412 unit and 616 integration (4 new semantic + 12 new container-class-eq); none failed or ignored |
+| `cargo test --workspace` | 1034 passed: 412 unit and 622 integration; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `pyrs --version` | `PyRs 0.85.0` |
 
+The 0.85 row previously reported 1028 tests. A re-run on the merged tree
+counted 1034 (50 `#[test]` functions across the four new integration
+files, plus 4 new semantic unit tests). The corrected figure is above.
+
+After 0.86 on the same host:
+
+| Check | Result after 0.86 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1051 passed; none failed or ignored |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
+| `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
+| `pyrs --version` | `PyRs 0.86.0` |
+
 Details live in the [0.83 implementation checklist](superpowers/plans/2026-09-05-comparison-protocols-0.83.md),
 the [0.84 implementation checklist](superpowers/plans/2026-09-05-iterator-exceptions-0.84.md),
-and the [0.85 implementation checklist](superpowers/plans/2026-09-05-container-class-eq-0.85.md).
+the [0.85 implementation checklist](superpowers/plans/2026-09-05-container-class-eq-0.85.md),
+and the [0.86 implementation checklist](superpowers/plans/2026-09-05-cpython-interop-0.86.md).
 
 ## 0.83.0: comparison and membership correctness
 
@@ -160,10 +178,11 @@ not cover them.
 | Iterable coverage | Closed in 0.84 for `for` and list/set/dict comprehensions | `any` / `all` / `enumerate` / `zip` / `reversed` still use a narrower set |
 | Rich comparisons | Closed in 0.85 for `list[C]` `==`/`!=`/`in`/`index`/`count`/`remove`, tuple `==`/`!=`, and homogeneous `tuple[C, …]` `in`/`index`/`count`. Still: no `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; mixed-tuple membership uses identity | Complete or explicitly bound the protocol contract before claiming general object compatibility |
 | Text | String length/index/slice use UTF-8 bytes, while `ord`/`chr` use Unicode code points; many methods use ASCII case and whitespace rules | Establish a consistent Unicode string contract and test multibyte, combining, whitespace, and case behavior |
-| Numeric and binding semantics | int/float comparison loses precision beyond 2^53; some possibly unbound scalar locals read default values; dynamic negative integer powers trap | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
+| Numeric and binding semantics | Closed in 0.86 for mixed int/float comparison (exact, including bigints, NaN, infinities and signed zero) and for conditionally assigned locals including generator suspension. Still open: mixed numeric list literals promote ints to floats; dynamic negative integer powers trap; module globals, deletion and static use-before-assignment diagnostics | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
 | Generators and dynamism | `yield from` does not forward `send`/`throw`; generator exhaustion uses Optional None in several paths; `Any`, class attributes, inheritance, and class values remain restricted | Stabilize the intended subset and reject unsupported paths clearly; broader CPython dynamism is separate work |
 | Memory confidence | Conservative roots can retain garbage; abandoned generators do not run user finalizers; collection statistics exclude native/allocator overhead | Continue stress and exception-path tests and measure process memory on sustained workloads; see [GC.md](GC.md) |
-| Example parity gate | `make examples` compares shell command-substitution output without checking both exit statuses and strips trailing newlines | Compare actual bytes, check process success, and test the gate's failure paths |
+| Example parity gate | 0.86 makes the recipe fail when either process fails; it still uses command substitution, so trailing newlines are stripped and the comparison is not byte-exact | Compare actual bytes and test the gate's own failure paths |
+| Borrowed CPython buffers | Closed in 0.86 for reallocation: growth sites raise `BufferError` rather than freeing exporter- or `PyMem`-owned memory. Direct element stores are still only prevented by the extension frontend's allowlist | Add a store-side check or a distinct immutable buffer type before the bridge is non-experimental |
 | Failure artifacts | CI uploads `target/tmp`, but integration tests use system temporary directories and delete them on drop | Preserve failing inputs/artifacts at the location CI uploads |
 | Release delivery | The compiler links system LLVM dynamically; archives have no clean-environment dependency check; tag/crate/CLI agreement is unchecked; manually selected release tags do not control archive version naming | State supported hosts/dependencies, verify extracted archives on clean hosts, and enforce consistent version/tag metadata |
 | Documentation checks | Hygiene verifies required files and basic workflow shape, without checking links or version agreement | Automate these checks; 0.83 repairs the observed active-document links but adds no new hygiene gate |

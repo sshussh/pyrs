@@ -4378,6 +4378,22 @@ int pyrs_str_isprintable(const PyrsStr *s) {
 
 /* ---- lists ---- */
 
+/* A borrowed list header points at memory this runtime does not own (a CPython
+ * buffer export, or PyMem-allocated scratch). Growing it would call the libc
+ * allocator on a foreign pointer, corrupting the heap and leaving the owner's
+ * saved pointer stale. `cap` carries the marker so the layout stays
+ * `{ len, cap, data }` for generated code; every growth site checks it.
+ *
+ * This guards reallocation only. Direct element stores are prevented by the
+ * extension frontend's allowlist, not here -- see docs/INTEROPERABILITY.md. */
+#define PYRS_LIST_BORROWED_CAP (-1)
+
+static void list_require_owned(const PyrsList *l) {
+    if (l->cap < 0) {
+        pyrs_die("BufferError: cannot resize a borrowed buffer");
+    }
+}
+
 PyrsList *pyrs_list_new(long long cap) {
     if (cap < 4) {
         cap = 4;
@@ -4392,7 +4408,10 @@ PyrsList *pyrs_list_new(long long cap) {
 
 void pyrs_list_push(PyrsList *l, long long slot) {
     check_ref(l);
-    if (l->len == l->cap) {
+    /* `>=` rather than `==` so a borrowed marker enters the guarded branch
+     * instead of falling through into an out-of-bounds store. */
+    if (l->len >= l->cap) {
+        list_require_owned(l);
         long long cap = l->cap * 2;
         long long *data = xmalloc((size_t)cap * sizeof(long long));
         pyrs_gc_external_allocated(l, (size_t)cap * sizeof(long long));
@@ -4497,6 +4516,7 @@ static void list_ensure_cap(PyrsList *l, long long need) {
     if (need <= l->cap) {
         return;
     }
+    list_require_owned(l);
     long long cap = l->cap < 4 ? 4 : l->cap;
     while (cap < need) {
         cap *= 2;
@@ -4689,7 +4709,8 @@ void pyrs_list_insert(PyrsList *l, long long i, long long slot) {
     if (i > l->len) {
         i = l->len;
     }
-    if (l->len == l->cap) {
+    if (l->len >= l->cap) {
+        list_require_owned(l);
         long long cap = l->cap < 4 ? 4 : l->cap * 2;
         long long *data = xmalloc((size_t)cap * sizeof(long long));
         pyrs_gc_external_allocated(l, (size_t)cap * sizeof(long long));

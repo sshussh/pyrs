@@ -1,11 +1,18 @@
 # Changelog
 
-## Unreleased — toward 1.0
+## 0.86.0 — CPython interoperability and stranded correctness fixes
 
-The release remains 0.82.0 while the [1.0 readiness plan](docs/ROADMAP-1.0.md)
-is implemented. Native compilation is the default; the target workload family
-is scientific/data Python, including NumPy and pandas through optional CPython
-compatibility execution.
+Native compilation is the default; the target workload family is scientific/data
+Python, including NumPy and pandas through optional CPython compatibility
+execution. Reaching 0.86.0 does not establish 1.0 readiness; see the
+[1.0 readiness plan](docs/ROADMAP-1.0.md) for the remaining gates.
+
+- Borrowed list headers from the CPython bridge carry a non-owned capacity
+  marker, so every runtime growth site raises `BufferError` instead of calling
+  the libc allocator on exporter- or `PyMem`-owned memory. Previously a resize
+  would free a foreign pointer, corrupt the heap and invalidate a buffer lease
+  that still had to be released. Read-only enforcement no longer rests solely on
+  the extension frontend's allowlist.
 
 - Python-style script, `-c` and stdin invocation, with script arguments and
   native `sys.argv[0]` preserved on Unix. Existing compiler subcommands remain.
@@ -42,7 +49,13 @@ compatibility execution.
 - Native extension boundary tests at O0/O2/O3 under GC stress, including lifetime,
   thread/reentrancy, symbol isolation, and scientific package checks. The
   `examples/interop` demo verifies results and measures full call overhead.
-- Development is isolated on `feat/cpython-interop`. The bridge remains an explicit
-  numerical API; automatic mixed execution, general objects/arrays and a stable
-  standalone library ABI remain planned work. See the
-  [interoperability contract](docs/INTEROPERABILITY.md) for current restrictions.
+- The bridge remains an explicit numerical API; automatic mixed execution,
+  general objects/arrays and a stable standalone library ABI remain planned
+  work. See the [interoperability contract](docs/INTEROPERABILITY.md) for
+  current restrictions.
+- Known gaps recorded rather than claimed fixed: string length/indexing still
+  operate on UTF-8 bytes, and mixed numeric list literals still promote ints to
+  floats. Both are reported as `known_gap` by the compatibility probes.
+- CI wiring for the compatibility probes is deferred: the required
+  `scientific-compatibility` job would have made every run depend on installing
+  NumPy/pandas from PyPI. `make ci` runs the probes locally in the meantime.
