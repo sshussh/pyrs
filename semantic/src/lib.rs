@@ -1701,6 +1701,18 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
     }])
 }
 
+/// Analyze a library without requiring or automatically calling `main()`.
+/// Initialization IR is retained for an adapter to invoke explicitly.
+pub fn analyze_library(module: &ast::Module) -> SResult<ir::Module> {
+    analyze_target(
+        &[ModuleInput {
+            name: ENTRY_NAME.to_string(),
+            ast: module,
+        }],
+        false,
+    )
+}
+
 /// One method extracted from a class body.
 struct ClassMethodAst<'a> {
     def: &'a ast::FuncDef,
@@ -4995,6 +5007,10 @@ fn collect_imports_block(
 /// `modules` is in topological order (dependencies first, root last);
 /// diagnostics are tagged with the module index as their file id.
 pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
+    analyze_target(modules, true)
+}
+
+fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Module> {
     assert!(!modules.is_empty(), "a program needs at least one module");
     clear_closure_defaults();
     clear_class_env();
@@ -5328,7 +5344,7 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
                 }
             }
         }
-        let init = if is_root && script.is_empty() && !need_init_for_deco {
+        let init = if executable && is_root && script.is_empty() && !need_init_for_deco {
             // PyRs convenience: a root that is only definitions calls main()
             if let Some(sig) = funcs.get("main") {
                 if !sig.params.is_empty() || sig.vararg.is_some() || sig.kwarg.is_some() {
@@ -5501,7 +5517,7 @@ pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
 
         match init {
             Some(f) => out_funcs.push(f),
-            None if is_root => {
+            None if executable && is_root => {
                 return Err(err(
                     "program has no entry point: add top-level statements or define main()",
                     Span::default(),

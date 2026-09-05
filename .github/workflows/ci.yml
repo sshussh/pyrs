@@ -3,7 +3,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, v1.0-development]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -182,6 +182,10 @@ jobs:
         run: |
           cargo build -p pyrs
           python3 compatibility/run.py --group all --mode both --python target/science-venv/bin/python --output target/compatibility/science.json
+      - name: Native CPython bridge under GC stress (O0/O2/O3)
+        run: target/science-venv/bin/python compatibility/test_extension.py --pyrs target/debug/pyrs --require-science
+      - name: Numerical kernel parity and timings
+        run: target/science-venv/bin/python examples/interop/demo.py --pyrs target/debug/pyrs --size 20000 --repeats 3 --output target/compatibility/interop.json
       - name: Upload scientific evidence
         if: always()
         uses: actions/upload-artifact@v5

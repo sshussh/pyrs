@@ -14,7 +14,7 @@ pub mod emit;
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 
-pub use emit::emit_llvm_ir;
+pub use emit::{emit_library_ir, emit_llvm_ir};
 
 /// Source of the C runtime linked into every compiled program.
 pub const RUNTIME_C: &str = include_str!("../runtime/runtime.c");
@@ -85,6 +85,19 @@ mod tests {
         let module = parser::parse(src).expect("parse failed");
         let ir_module = semantic::analyze(&module).expect("semantic failed");
         emit_llvm_ir(&ir_module)
+    }
+
+    #[test]
+    fn library_has_no_c_entry_or_implicit_main_call() {
+        let ast = parser::parse("def main(value: int) -> int:\n    return value + 1\n").unwrap();
+        // Executable convenience entry points cannot have parameters. Library
+        // exports named main must behave like any other exported function.
+        assert!(semantic::analyze(&ast).is_err());
+        let module = semantic::analyze_library(&ast).unwrap();
+        let ll = emit_library_ir(&module);
+        assert!(ll.contains("define i64 @pyrs_main(i64 %p.value)"), "{ll}");
+        assert!(!ll.contains("define i32 @main("), "{ll}");
+        assert!(!ll.contains("call i64 @pyrs_main("), "{ll}");
     }
 
     #[test]

@@ -52,6 +52,26 @@ pandas grouping/joins, CSV round trips and time series. NumPy and pandas current
 execute entirely in CPython through `--compat`; there is no native array ABI or
 compiler speedup for that mode.
 
+The separate experimental native extension target has its own boundary tests:
+
+```sh
+python3 compatibility/test_extension.py --pyrs target/debug/pyrs
+target/science-venv/bin/python compatibility/test_extension.py \
+  --pyrs target/debug/pyrs --require-science
+target/science-venv/bin/python examples/interop/demo.py \
+  --pyrs target/debug/pyrs --output target/compatibility/interop.json
+```
+
+These compile and import real extensions at O0/O2/O3 with GC stress. The suite
+checks values, exceptions, keyword binding, exact type guards, buffer layouts,
+reference/export cleanup, runtime symbol isolation and thread/reentrancy guards.
+The standalone run skips the scientific case when packages are missing;
+`--require-science` makes missing packages a failure. The scientific CI job uses
+that flag. Native extensions require CPython 3.12+ development headers on Linux.
+`cargo test --workspace` also runs the boundary suite using `python3`, or
+`PYRS_TEST_PYTHON` when specified. This proves a bounded numerical interface; it
+does not count arbitrary NumPy/pandas code as native compatibility.
+
 The runner's result-classification tests are part of `make ci`:
 
 ```sh

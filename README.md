@@ -18,6 +18,12 @@ mode for packages such as NumPy and pandas. See the [unreleased changes](CHANGEL
 and [compatibility probes](compatibility/README.md). This is ongoing work;
 0.82.0 is not a declaration of 1.0 readiness.
 
+Development continues on `v1.0-development`. The experimental
+[CPython bridge](docs/INTEROPERABILITY.md) compiles numerical functions into
+importable native extensions and can read NumPy float64 buffers without copying.
+It is the first step toward mixed Python/native execution and reusable native
+libraries. Stable 1.0 requires the release gates and user testing in the plan.
+
 ```console
 $ cat examples/fib.py
 def fib(n: int) -> int:
@@ -54,6 +60,21 @@ NumPy/pandas packages. It does not compile those libraries or provide a speedup.
 Select the interpreter with `--python`, then `PYRS_PYTHON`, otherwise `python3`.
 Native compilation never falls back automatically; `-m` currently requires
 compatibility mode. `pyrs -` reads source from stdin.
+
+To try native functions inside a Python environment with NumPy and pandas
+(Linux, CPython 3.12+ with development headers):
+
+```sh
+cargo build --release -p pyrs
+python3 examples/interop/demo.py --pyrs target/release/pyrs
+```
+
+The demo compiles [numerical kernels](examples/interop/kernels.py), passes pandas
+columns through NumPy buffers, checks results against Python and reports complete
+call timings. It also measures NumPy vectorized implementations for comparison.
+Build your own module with `pyrs build-extension -i kernels.py --module kernels_native
+--python .venv/bin/python`; import `kernels_native` from that same environment.
+Only the exported kernels run natively; Python and package code keep using CPython.
 
 ## The language (v0.85.0)
 

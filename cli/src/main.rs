@@ -11,6 +11,7 @@ use std::{
 };
 
 mod cli;
+mod extension;
 mod modules;
 
 fn main() {
@@ -53,6 +54,10 @@ fn run(args: cli::Cli) -> Result<i32, String> {
         cli::Command::Run(cmd) => run_program(cmd),
         cli::Command::Check(cmd) => {
             analyze(modules::load_program(&cmd.input).map_err(|e| e.0)?)?;
+            Ok(0)
+        }
+        cli::Command::BuildExtension(cmd) => {
+            extension::build(cmd)?;
             Ok(0)
         }
     }
@@ -283,6 +288,10 @@ impl Drop for TempWorkdir {
 }
 
 fn temp_workdir() -> Result<TempWorkdir, String> {
+    temp_workdir_in(&std::env::temp_dir())
+}
+
+fn temp_workdir_in(parent: &Path) -> Result<TempWorkdir, String> {
     // Atomic creation refuses an existing path/symlink; private permissions
     // protect the source, runtime objects and executable while linking.
     for attempt in 0..100 {
@@ -290,7 +299,7 @@ fn temp_workdir() -> Result<TempWorkdir, String> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("pyrs-{}-{nanos}-{attempt}", process::id()));
+        let dir = parent.join(format!("pyrs-{}-{nanos}-{attempt}", process::id()));
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {

@@ -2,6 +2,7 @@
 
 Status: implementation in progress; **not a 1.0 release declaration**.
 Baseline: repository 0.82.0 (`5b009a5`), reviewed 2026-09-05.
+Development branch: `v1.0-development`. User testing precedes any stable release.
 
 ## Product contract
 
@@ -12,6 +13,12 @@ The owner selected **scientific/data workloads, including NumPy and pandas**.
 Initial implementation targets native numerical Python and explicit whole-program
 CPython execution for the scientific package ecosystem. This does not yet provide
 native calls into NumPy, pandas, or their compiled extensions.
+
+The next implemented layer is an explicit native extension target: CPython can
+call compiled numerical functions and pass NumPy/pandas buffers to them. See the
+[interoperability contract](INTEROPERABILITY.md) for ownership, GIL, exceptions,
+guard rules and the route toward reusable native libraries. Automatic mixed
+execution and general native-to-Python object calls remain future work.
 
 “A good percentage of Python use cases” is not yet a measurable claim. Before
 declaring 1.0, freeze a named workload corpus with project versions, commands,
@@ -37,13 +44,14 @@ and limited Any values, closures/cells, generator frames, exception handling,
 single-inheritance virtual methods, containers, package imports, and conservative
 mark–sweep collection. The existing end-to-end suite has 572 tests at baseline.
 
-The main blockers are semantic breadth, not missing spelling variants of methods:
+The baseline blockers were semantic breadth:
 numeric promotion changes values; string operations are largely byte/ASCII based;
 some unassigned locals read as zero; Any has limited operations; dictionary keys
 and container layouts are restricted; classes and imports are closed-world;
 generator exhaustion and exception objects differ from Python. Only a small
 stdlib is embedded. The driver recompiles the C runtime for each program and
-currently exposes only compiler-oriented subcommands.
+at baseline exposed only compiler-oriented subcommands. The implementation ledger
+below records resolved items; unresolved semantic differences remain release gates.
 
 ## Workstreams and dependency order
 
@@ -53,13 +61,13 @@ one small feature earns a release. Stay on 0.y.z until every release gate passes
 
 ### A. Evidence and compiler correctness (first)
 
-- [ ] Add a versioned compatibility probe manifest and runner that records
+- [x] Add a versioned compatibility probe manifest and runner that records
   CPython version, source, compiler version, optimization level, compile failures,
   timeouts, stdout, stderr, exit status, and file effects. Report native and
   compatibility results separately; fail on regressions and unexpected passes.
 - [ ] Freeze the independent workload corpus with the owner. Inventory actual
   dependency/import/syntax failures before prioritizing new stdlib modules.
-- [ ] Exact mixed integer/float comparisons, including bigints, NaN, infinities,
+- [x] Exact mixed integer/float comparisons, including bigints, NaN, infinities,
   signed zero, fractional values, and boxed/container equality.
 - [ ] Definite assignment/runtime binding checks for every local representation,
   including generator suspension; module/global and deleted bindings follow.
@@ -78,7 +86,7 @@ one small feature earns a release. Stay on 0.y.z until every release gate passes
 
 - [ ] Python-style `pyrs script.py args`, `-c`, `-m`, stdin, `--`, script argv[0],
   source metadata, working directory/import path, exit status and signals.
-- [ ] Explicit whole-program compatibility execution using the selected CPython
+- [x] Explicit whole-program compatibility execution using the selected CPython
   environment, including installed scientific packages. Native compilation remains
   the default. Never retry a program after native execution has begun. Preserve
   stdin/stdout/stderr/args, exit status, environment, imports and signals.
@@ -87,9 +95,13 @@ one small feature earns a release. Stay on 0.y.z until every release gate passes
 - [ ] Define compiled compatibility artifacts: dependency/version discovery,
   relocatability, deployment layout and diagnostics. A Python launcher is not a
   standalone native compilation and must never be labeled as one.
-- [ ] Decide whether workload evidence justifies finer-grained Python interop.
-  If so, specify object ownership, GIL, exception translation, GC boundaries,
-  callbacks and extension ABI before implementing an embedding bridge.
+- [x] Specify the initial numerical interop contract: object ownership, retained
+  GIL, exception translation, GC roots, guarded buffer layouts and blocked
+  callbacks/reentrancy. Implement and differentially test explicit extensions.
+- [ ] General mixed execution: guarded specialization, preserved Python fallback,
+  native-to-Python package calls, per-interpreter state, callbacks and deployment.
+- [ ] Native library initialization/export ABI, dependency manifests and archives
+  for compiling whole pure-Python libraries and linking them into executables.
 - [ ] Semantic-only `check`, clear unsupported-feature diagnostics, validated
   optimization options, secure temporary directories, interrupted-run cleanup.
 
@@ -193,3 +205,32 @@ them with broad output normalization.
 - Scientific/data priority (NumPy and pandas) confirmed by the owner. Independent
   workload selection remains open; no native coverage percentage or
   1.0 readiness is claimed.
+- All prior changes moved to `v1.0-development`; initial correctness/invocation
+  work committed as `818a366`. No stable release or tag has been created.
+- Native corrections: exact int/float comparisons and rounding; binding checks
+  for locals/generators; optimized exception-local preservation; evaluation of
+  None-valued expressions. Module/global/deleted bindings and the full numeric
+  type-preservation audit are still open.
+- Invocation/check/explicit CPython mode implemented. Initial core probes cover
+  six scenarios at O0/O2/O3 under GC stress; scientific probes add six scenarios.
+  Four of the twelve distinct probes pass natively, eight record native gaps;
+  all twelve pass through explicit CPython compatibility execution. These are
+  synthetic probes, not an independent-project coverage claim.
+- Native library analysis no longer requires or implicitly calls an executable
+  main. The CPython adapter exports typed numerical kernels, borrows supported
+  float64 buffers, converts arbitrary-size integers, and translates exceptions.
+  Boundary tests cover O0/O2/O3, GC stress, argument guards, ownership, exception
+  recovery, private runtime symbols and NumPy/pandas buffers. Full-call benchmarks
+  are generated by `examples/interop/demo.py` with environment/source hashes.
+- Validation on Linux x86-64: `make ci` passed (997 Rust tests, example parity,
+  core probes, formatting and Clippy); the nine extension boundary cases passed
+  with CPython 3.12.14 / NumPy 2.3.5 / pandas 2.2.3. CPython 3.14.7 passed the
+  core extension cases (scientific packages absent in that interpreter).
+  The C adapter/runtime also passed AddressSanitizer and UndefinedBehaviorSanitizer
+  checks for the core boundary cases; generated LLVM kernels were not instrumented.
+  Leak detection was disabled for the conservative runtime; buffer-export and
+  Python reference lifetimes are checked explicitly by the suite.
+- Before any 1.0 release: independent workloads and agreed native coverage;
+  recoverable runtime OOM; cancellation; thread/interpreter ownership beyond the
+  current restriction; general object/array semantics; native library ABI; user
+  testing and distribution gates. The current bridge remains experimental.

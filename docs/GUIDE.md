@@ -91,6 +91,7 @@ pyrs <command> [options]
 | command   | what it does |
 |-----------|--------------|
 | `compile` | compile a source file to a native executable |
+| `build-extension` | build an experimental CPython numerical extension |
 | `run`     | compile to a temporary location and execute immediately |
 | `check`   | load and analyze native source without linking or execution |
 | `lex`     | dump the token stream (debugging the compiler) |
@@ -156,6 +157,29 @@ artifacts and native calls into scientific extensions are future work.
 `pyrs check -i prog.py` reports native lexer/parser/import/type diagnostics
 without invoking the linker or executing user code. A successful check means the
 frontend accepts the source, not that runtime parity has been proved.
+
+### `pyrs build-extension` (experimental)
+
+```console
+$ pyrs build-extension -i examples/interop/kernels.py --module kernels_native --python python3 -O 2
+$ python3 -c 'import numpy as np, kernels_native; print(kernels_native.energy(np.arange(10, dtype="d")))'
+```
+
+The target CPython must be GIL-enabled, version 3.12 or later, on Linux with
+development headers installed. `-o` chooses an output path; otherwise the output
+is the module name with CPython's platform/version extension suffix. Use the same
+environment to import it. This produces native functions that Python can call;
+the surrounding program can run normally or through `pyrs --compat`.
+
+Source is currently limited to numerical function definitions: exact scalar
+arguments, scalar results, and read-only `list[float]` inputs. Such inputs accept
+copied Python float lists or borrowed aligned contiguous 1D float64 buffers from
+NumPy, `array.array`, or memoryviews. Unsupported boundaries raise before native
+execution. Imports, global state, mutations, callbacks and general Python objects
+are not supported in kernel bodies. Calls retain the GIL and require the importing
+thread. See the [architecture and limitations](INTEROPERABILITY.md),
+[runnable demo](../examples/interop/demo.py), and
+[boundary tests](../compatibility/README.md).
 
 ### `pyrs lex` / `pyrs parse`
 

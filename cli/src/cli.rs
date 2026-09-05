@@ -23,6 +23,7 @@ impl Cli {
                 first.to_str(),
                 Some(
                     "compile"
+                        | "build-extension"
                         | "run"
                         | "check"
                         | "lex"
@@ -81,6 +82,9 @@ pub enum Command {
 
     /// Check native compatibility without generating or running a program
     Check(CheckCommand),
+
+    /// Build an experimental CPython extension from native numerical functions
+    BuildExtension(ExtensionCommand),
 }
 
 #[derive(Debug, Args)]
@@ -160,4 +164,27 @@ pub struct CheckCommand {
     /// Input file path
     #[arg(short, long)]
     pub input: path::PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ExtensionCommand {
+    /// Source containing numerical function definitions
+    #[arg(short, long)]
+    pub input: path::PathBuf,
+
+    /// Import name of the resulting extension (an ASCII identifier)
+    #[arg(long)]
+    pub module: String,
+
+    /// CPython executable whose headers and ABI to target
+    #[arg(long, default_value = "python3")]
+    pub python: path::PathBuf,
+
+    /// Output extension path (defaults to MODULE plus Python's extension suffix)
+    #[arg(short, long)]
+    pub output: Option<path::PathBuf>,
+
+    /// Optimization level (0–3)
+    #[arg(short = 'O', long = "opt-level", default_value_t = 2, value_parser = clap::value_parser!(u8).range(0..=3))]
+    pub opt_level: u8,
 }

@@ -29,3 +29,17 @@ compatibility execution.
   `print(sep=.../end=...)` expressions with a None result.
 - Versioned compatibility probes and reports that distinguish native gaps from
   compatibility passes and compare streams, exit status and generated files.
+- Experimental `build-extension` target: compile numerical function modules into
+  CPython extensions on Linux. Native library analysis/emission is separate from
+  the Python adapter and does not require or automatically call `main()`.
+- Exact scalar boundary guards, arbitrary-size integer conversion, keyword
+  binding, native exception translation and read-only 1D float64 buffer borrowing.
+  Python lists of floats use temporary copies; NumPy/pandas buffers can pass
+  without copying. Buffer leases are released on ordinary success and failure.
+- Native extension boundary tests at O0/O2/O3 under GC stress, including lifetime,
+  thread/reentrancy, symbol isolation, and scientific package checks. The
+  `examples/interop` demo verifies results and measures full call overhead.
+- Development is isolated on `v1.0-development`. The bridge remains an explicit
+  numerical API; automatic mixed execution, general objects/arrays and a stable
+  standalone library ABI remain planned work. See the
+  [interoperability contract](docs/INTEROPERABILITY.md) for current restrictions.

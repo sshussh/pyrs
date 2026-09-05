@@ -28,7 +28,15 @@ use ir::{
 
 pub fn emit_llvm_ir(module: &Module) -> String {
     let mut e = Emitter::default();
-    e.emit_module(module);
+    e.emit_module(module, true);
+    e.finish()
+}
+
+/// Emit reusable native functions without a process entry point. Library
+/// initialization and foreign calling conventions belong to their adapter.
+pub fn emit_library_ir(module: &Module) -> String {
+    let mut e = Emitter::default();
+    e.emit_module(module, false);
     e.finish()
 }
 
@@ -1185,7 +1193,7 @@ impl Emitter {
         out
     }
 
-    fn emit_module(&mut self, module: &Module) {
+    fn emit_module(&mut self, module: &Module, executable: bool) {
         self.classes = module.classes.clone();
         // Class parent table + C-string name table for isinstance / print / str.
         if !module.classes.is_empty() {
@@ -1259,6 +1267,9 @@ impl Emitter {
         }
         for func in &module.funcs {
             self.emit_function(func);
+        }
+        if !executable {
+            return;
         }
         // the real C main: call the entry function and exit 0
         let entry = mangle(&module.entry);
