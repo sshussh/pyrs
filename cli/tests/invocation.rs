@@ -12,7 +12,7 @@ struct WorkDir(PathBuf);
 
 impl WorkDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "pyrs-invocation-{}-{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
@@ -24,6 +24,13 @@ impl WorkDir {
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
+        // Keep the inputs when a test fails. CI uploads `target/tmp`, so a
+        // directory deleted on the way out makes a CI-only failure
+        // impossible to reproduce from the artifact.
+        if std::thread::panicking() {
+            eprintln!("retaining failure artifacts in {}", self.0.display());
+            return;
+        }
         let _ = fs::remove_dir_all(&self.0);
     }
 }

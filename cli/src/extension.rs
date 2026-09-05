@@ -125,10 +125,21 @@ print('\0'.join([sysconfig.get_path('include'), sysconfig.get_path('platinclude'
     .map_err(|e| e.to_string())?;
     let library = dir.join("extension.so");
     let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    // Extra flags for the adapter/runtime translation unit. This exists so the
+    // bridge can be built under AddressSanitizer/UndefinedBehaviorSanitizer;
+    // without a hook there is no supported way to produce an instrumented
+    // build, and a "sanitizers pass" claim would not be reproducible.
+    // Does not affect the LLVM-generated kernel object, which is already built.
+    let extra: Vec<String> = std::env::var("PYRS_EXTENSION_CFLAGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
     let result = Command::new(cc)
         .arg("-shared")
         .arg("-fPIC")
         .arg("-O2")
+        .args(&extra)
         .arg("-fno-omit-frame-pointer")
         // Buffer exporters own double storage; the runtime's generic slots
         // access the same bytes through integer pointers.

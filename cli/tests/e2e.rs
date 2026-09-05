@@ -212,7 +212,8 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("pyrs-e2e-{tag}-{}", std::process::id()));
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("pyrs-e2e-{tag}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
     }
@@ -220,6 +221,13 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        // Keep the inputs when a test fails. CI uploads `target/tmp`, so a
+        // directory deleted on the way out makes a CI-only failure
+        // impossible to reproduce from the artifact.
+        if std::thread::panicking() {
+            eprintln!("retaining failure artifacts in {}", self.0.display());
+            return;
+        }
         let _ = fs::remove_dir_all(&self.0);
     }
 }

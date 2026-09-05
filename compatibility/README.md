@@ -3,7 +3,7 @@
 These are **synthetic regression probes**, not a representative sample of Python
 projects. Passing them does not establish 1.0 readiness or a percentage of Python
 workloads supported. The independent scientific corpus is still required by the
-[1.0 plan](../docs/ROADMAP-1.0.md).
+[roadmap](../docs/ROADMAP.md).
 
 Build the compiler, then compare native and explicit CPython execution:
 

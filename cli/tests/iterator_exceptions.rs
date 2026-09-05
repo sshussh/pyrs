@@ -10,7 +10,7 @@ struct Program(PathBuf);
 
 impl Program {
     fn new(tag: &str, source: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
             "pyrs-iterator-exceptions-{tag}-{}",
             std::process::id()
         ));
@@ -34,6 +34,13 @@ impl Program {
 
 impl Drop for Program {
     fn drop(&mut self) {
+        // Keep the inputs when a test fails. CI uploads `target/tmp`, so a
+        // directory deleted on the way out makes a CI-only failure
+        // impossible to reproduce from the artifact.
+        if std::thread::panicking() {
+            eprintln!("retaining failure artifacts in {}", self.0.display());
+            return;
+        }
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -339,7 +346,7 @@ except StopIteration as e:
 
 #[test]
 fn for_and_comp_over_file() {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "pyrs-iterator-file-{}-{}",
         std::process::id(),
         "txt"

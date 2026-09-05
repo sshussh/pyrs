@@ -5,7 +5,7 @@
 Native compilation is the default; the target workload family is scientific/data
 Python, including NumPy and pandas through optional CPython compatibility
 execution. Reaching 0.86.0 does not establish 1.0 readiness; see the
-[1.0 readiness plan](docs/ROADMAP-1.0.md) for the remaining gates.
+[roadmap](docs/ROADMAP.md) for the remaining gates.
 
 - Borrowed list headers from the CPython bridge carry a non-owned capacity
   marker, so every runtime growth site raises `BufferError` instead of calling

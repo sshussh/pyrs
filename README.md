@@ -12,7 +12,7 @@ no interpreter, no VM. Compute-bound code runs 45–60× faster than CPython
 the Makefile, the full language reference, every difference from CPython,
 runtime errors, and performance notes.
 
-**Toward 1.0:** the [delivery plan](docs/ROADMAP-1.0.md) targets scientific/data
+**Toward 1.0:** the [roadmap](docs/ROADMAP.md) targets scientific/data
 workloads with native execution by default and explicit CPython compatibility
 mode for packages such as NumPy and pandas. See the [unreleased changes](CHANGELOG.md)
 and [compatibility probes](compatibility/README.md). This is ongoing work;
@@ -76,10 +76,10 @@ Build your own module with `pyrs build-extension -i kernels.py --module kernels_
 --python .venv/bin/python`; import `kernels_native` from that same environment.
 Only the exported kernels run natively; Python and package code keep using CPython.
 
-## The language (v0.87.0)
+## The language (v0.88.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.88.0**, not 1.0) until it is ready for
+milestone after this one is **0.89.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -464,7 +464,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.87.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.88.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -625,5 +625,17 @@ GitHub Actions (see `.github/workflows/`):
 | **Release** | tags `v*.*.*` | Linux `x86_64` tarball + checksum + GitHub Release |
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
-Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.87.0 && git push origin v0.87.0`.
+Local gate (same spirit as CI): `make doctor && make ci`, which runs
+format, lints, tests, `make hygiene`, byte-exact example parity and the
+compatibility probes.
+
+| Target | What it checks |
+|--------|----------------|
+| `make examples` | Example parity against `python3` comparing **stdout bytes, stderr bytes and exit status** (`make examples-all-opts` for O0/O2/O3) |
+| `make hygiene` | Version agreement across the 7 crates, `Cargo.lock`, README, SPECIFICATIONS and `pyrs --version`; every relative documentation link resolves; and the gates' own failure paths |
+| `make asan` / `make ubsan` | The extension boundary suite with the C adapter, runtime and collector instrumented. The LLVM-generated kernel object is not instrumented, so this is adapter/runtime coverage |
+| `make compatibility` | Native and CPython probes at O0/O2/O3 under GC stress |
+
+Failing integration tests retain their inputs under `target/tmp`, which is
+what CI uploads, so a CI-only failure can be reproduced from the artifact.
+Release tags: `git tag v0.88.0 && git push origin v0.88.0`.

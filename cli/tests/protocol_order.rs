@@ -10,13 +10,21 @@ struct TempDir(PathBuf);
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        // Keep the inputs when a test fails. CI uploads `target/tmp`, so a
+        // directory deleted on the way out makes a CI-only failure
+        // impossible to reproduce from the artifact.
+        if std::thread::panicking() {
+            eprintln!("retaining failure artifacts in {}", self.0.display());
+            return;
+        }
         let _ = fs::remove_dir_all(&self.0);
     }
 }
 
 fn matches_python_at_all_opt_levels(tag: &str, source: &str) {
     let dir = TempDir(
-        std::env::temp_dir().join(format!("pyrs-protocol-order-{tag}-{}", std::process::id())),
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("pyrs-protocol-order-{tag}-{}", std::process::id())),
     );
     fs::create_dir_all(&dir.0).unwrap();
     let src = dir.0.join("prog.py");

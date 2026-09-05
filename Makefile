@@ -86,36 +86,66 @@ fmt-check: ## Check formatting without changing anything
 	$(CARGO) fmt --all -- --check
 
 .PHONY: ci
-ci: fmt-check clippy test examples compatibility ## Full gate: format + lints + tests + parity probes
+ci: fmt-check clippy test hygiene examples compatibility ## Full gate: format + lints + tests + hygiene + parity probes
 
 .PHONY: compatibility
 compatibility: release ## Core compatibility probes (native + CPython, O0/O2/O3)
 	$(PYTHON) -m unittest discover -s compatibility -p test_runner.py
 	$(PYTHON) compatibility/run.py --pyrs $(PYRS) --group core --mode both --opt-levels 0 2 3 --gc-stress --output target/compatibility/core.json
 
+.PHONY: hygiene
+hygiene: ## Version agreement + documentation link checks (and the gates' own tests)
+	$(PYTHON) -m unittest discover -s scripts -p 'test_*.py'
+	$(PYTHON) scripts/check_hygiene.py --binary $(PYRS)
+
 .PHONY: examples
-examples: release ## Run every example and diff its output against python3
-	@fail=0; \
-	for ex in examples/*.py examples/modules/*.py examples/packages/main.py; do \
-	    got=""; want=""; \
-	    if got=$$($(PYRS) run -i $$ex) && want=$$($(PYTHON) $$ex) && [ "$$got" = "$$want" ]; then \
-	        printf '  \033[32mMATCH\033[0m  %s\n' "$$ex"; \
-	    else \
-	        printf '  \033[31mDIFFER\033[0m %s\n' "$$ex"; \
-	        diff -u <(printf '%s\n' "$$want") <(printf '%s\n' "$$got") || true; \
-	        fail=1; \
-	    fi; \
-	done; \
-	got=""; want=""; \
-	if got=$$($(PYRS) run -i examples/risksim/main.py -- examples/risksim/data/balanced.scenario) && \
-	   want=$$($(PYTHON) examples/risksim/main.py examples/risksim/data/balanced.scenario) && [ "$$got" = "$$want" ]; then \
-	    printf '  \033[32mMATCH\033[0m  %s\n' "examples/risksim/main.py"; \
-	else \
-	    printf '  \033[31mDIFFER\033[0m %s\n' "examples/risksim/main.py"; \
-	    diff -u <(printf '%s\n' "$$want") <(printf '%s\n' "$$got") || true; \
-	    fail=1; \
-	fi; \
-	exit $$fail
+examples: release ## Byte-exact example parity vs python3 (stdout, stderr, exit status)
+	@$(PYTHON) scripts/check_examples.py --pyrs $(PYRS) --python $(PYTHON) --opt-levels $(O)
+
+.PHONY: examples-all-opts
+examples-all-opts: release ## Example parity at every optimization level
+	@$(PYTHON) scripts/check_examples.py --pyrs $(PYRS) --python $(PYTHON) --opt-levels 0 2 3
+
+# ---------------------------------------------------------------------------
+##@ Sanitizers
+# ---------------------------------------------------------------------------
+
+# The C adapter, runtime and collector, built instrumented. Only these are
+# instrumented; the LLVM-generated kernel object is compiled separately and is
+# not covered, so results should be described as adapter/runtime coverage.
+SAN_FLAGS := -fno-omit-frame-pointer -g
+# The conservative collector never frees at exit by design, so leak detection
+# would report its live heap. Buffer/reference lifetimes are asserted directly
+# by the extension suite instead.
+ASAN_OPTIONS ?= detect_leaks=0
+
+# The instrumented code is a shared library dlopen'd by an uninstrumented
+# python3, so the sanitizer runtime is not first in the link order and must be
+# preloaded. Resolve the absolute path from the compiler.
+SAN_CC    := $(if $(CC),$(CC),cc)
+ASAN_LIB  := $(shell $(SAN_CC) -print-file-name=libasan.so 2>/dev/null)
+UBSAN_LIB := $(shell $(SAN_CC) -print-file-name=libubsan.so 2>/dev/null)
+
+.PHONY: asan
+asan: release ## Extension boundary suite under AddressSanitizer
+	@case '$(ASAN_LIB)' in /*) ;; *) \
+	    echo 'cannot locate libasan.so via $(SAN_CC) -print-file-name; install the sanitizer runtime' >&2; \
+	    exit 1;; esac
+	LD_PRELOAD=$(ASAN_LIB) ASAN_OPTIONS=$(ASAN_OPTIONS) \
+	PYRS_EXTENSION_CFLAGS="-fsanitize=address $(SAN_FLAGS)" \
+	    $(PYTHON) compatibility/test_extension.py --pyrs $(PYRS)
+
+.PHONY: ubsan
+ubsan: release ## Extension boundary suite under UndefinedBehaviorSanitizer
+	@case '$(UBSAN_LIB)' in /*) ;; *) \
+	    echo 'cannot locate libubsan.so via $(SAN_CC) -print-file-name; install the sanitizer runtime' >&2; \
+	    exit 1;; esac
+	LD_PRELOAD=$(UBSAN_LIB) UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+	PYRS_EXTENSION_CFLAGS="-fsanitize=undefined $(SAN_FLAGS)" \
+	    $(PYTHON) compatibility/test_extension.py --pyrs $(PYRS)
+
+.PHONY: sanitizers
+sanitizers: asan ubsan ## Both sanitizer runs
 
 .PHONY: bench
 bench: release ## Benchmark suite vs CPython (best of N runs; set RUNS=N)
