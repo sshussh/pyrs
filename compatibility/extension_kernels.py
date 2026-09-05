@@ -21,6 +21,31 @@ def answer() -> int:
     return 42
 
 
+def ping() -> str:
+    return "pong"
+
+
+def unicode_text() -> str:
+    return "Hello, مرحبا 🌍\0done"
+
+
+def number_text(value: int) -> str:
+    return str(value)
+
+
+def joined_text(count: int) -> str:
+    text = ""
+    for i in range(count):
+        text = text + "ab"
+    return text
+
+
+def invalid_utf8(values: list[float]) -> str:
+    if len(values) > 0:
+        return "é"[0]
+    return ""
+
+
 def main(value: int) -> int:
     return value + 1
 

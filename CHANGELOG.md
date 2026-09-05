@@ -32,6 +32,9 @@ compatibility execution.
 - Experimental `build-extension` target: compile numerical function modules into
   CPython extensions on Linux. Native library analysis/emission is separate from
   the Python adapter and does not require or automatically call `main()`.
+- Extension functions can return strings: native UTF-8 is copied into a Python
+  string while the result remains rooted. Invalid UTF-8 raises UnicodeDecodeError
+  with input buffers released normally. String arguments remain unsupported.
 - Exact scalar boundary guards, arbitrary-size integer conversion, keyword
   binding, native exception translation and read-only 1D float64 buffer borrowing.
   Python lists of floats use temporary copies; NumPy/pandas buffers can pass

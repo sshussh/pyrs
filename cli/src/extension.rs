@@ -51,9 +51,12 @@ pub fn build(cmd: ExtensionCommand) -> Result<(), String> {
         if f.name == module.entry {
             continue;
         }
-        if f.is_generator || !scalar(f.ret) || f.params.iter().any(|(_, ty)| !argument(*ty)) {
+        if f.is_generator
+            || !(scalar(f.ret) || f.ret == Ty::Str)
+            || f.params.iter().any(|(_, ty)| !argument(*ty))
+        {
             return Err(format!(
-                "extension function '{}' requires int/float/bool or list[float] arguments and a scalar result",
+                "extension function '{}' requires int/float/bool or list[float] arguments and an int/float/bool/None/str result",
                 f.name
             ));
         }
@@ -188,6 +191,7 @@ fn code(ty: Ty) -> usize {
         Ty::Bool => 2,
         Ty::None => 3,
         Ty::List(_) => 4,
+        Ty::Str => 5,
         _ => unreachable!(),
     }
 }
@@ -199,6 +203,7 @@ fn ctype(ty: Ty, result: bool) -> &'static str {
         Ty::None if result => "void",
         Ty::None => "unsigned char",
         Ty::List(_) => "PyrsList *",
+        Ty::Str => "PyrsStr *",
         _ => unreachable!(),
     }
 }
@@ -239,6 +244,7 @@ fn wrapper(name: &str, exports: &[&ir::Function]) -> String {
             Ty::Int => format!("a[{}].integer = ", f.params.len()),
             Ty::Float => format!("a[{}].floating = ", f.params.len()),
             Ty::Bool => format!("a[{}].boolean = ", f.params.len()),
+            Ty::Str => format!("a[{}].string = ", f.params.len()),
             _ => String::new(),
         };
         out.push_str(&format!("    {result}pyrs_{}({args});\n}}\n", f.name));

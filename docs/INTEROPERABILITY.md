@@ -43,7 +43,11 @@ Initial scope:
 - Linux, GIL-enabled CPython 3.12 and later; target headers must be installed.
 - Module source contains function definitions and optional docstrings only.
 - Public function arguments: exact Python int, float, bool, or a
-  `list[float]` numerical sequence. Public results: int, float, bool, None.
+  `list[float]` numerical sequence. Public results: int, float, bool, None, str.
+- String results are copied from native UTF-8 storage into Python-owned strings.
+  String arguments are not supported yet. Invalid UTF-8 produced by the native
+  runtime's byte-based string operations raises UnicodeDecodeError; general
+  Python Unicode indexing/semantics remain separate compiler work.
 - A `list[float]` argument accepts an exact Python list of exact floats (copied
   into temporary native slots), or an aligned, contiguous, one-dimensional,
   native-endian float64 buffer (borrowed without copying). NumPy arrays,

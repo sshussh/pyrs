@@ -172,7 +172,9 @@ environment to import it. This produces native functions that Python can call;
 the surrounding program can run normally or through `pyrs --compat`.
 
 Source is currently limited to numerical function definitions: exact scalar
-arguments, scalar results, and read-only `list[float]` inputs. Such inputs accept
+arguments, scalar/string results, and read-only `list[float]` inputs. String
+results are decoded from UTF-8 into Python-owned strings; string inputs are not
+supported. Numerical sequence inputs accept
 copied Python float lists or borrowed aligned contiguous 1D float64 buffers from
 NumPy, `array.array`, or memoryviews. Unsupported boundaries raise before native
 execution. Imports, global state, mutations, callbacks and general Python objects

@@ -12,6 +12,7 @@ typedef struct {
     double floating;
     _Bool boolean;
     PyrsList list;
+    PyrsStr *string;               /* native result, rooted with this array */
 } BridgeArg;
 
 static uint64_t bridge_owner;
@@ -169,6 +170,19 @@ static PyObject *bridge_result(BridgeArg *arg, int kind) {
     }
     case 1: return PyFloat_FromDouble(arg->floating);
     case 2: return PyBool_FromLong(arg->boolean);
+    case 5:
+        if (arg->string == NULL) {
+            PyErr_SetString(PyExc_RuntimeError, "native string result is null");
+            return NULL;
+        }
+        if (arg->string->len < 0 || (unsigned long long)arg->string->len > PY_SSIZE_T_MAX) {
+            PyErr_SetString(PyExc_OverflowError, "native string result is too large");
+            return NULL;
+        }
+        /* Copy into a Python-owned string before the native root is released.
+         * The explicit length preserves embedded NULs. Byte-oriented native
+         * string operations can produce invalid UTF-8; report it strictly. */
+        return PyUnicode_DecodeUTF8(arg->string->data, (Py_ssize_t)arg->string->len, "strict");
     default: return Py_NewRef(Py_None);
     }
 }

@@ -79,6 +79,27 @@ class ExtensionTests(unittest.TestCase):
                 self.assertFalse(module.larger(1 << 1500, math.inf))
                 self.assertFalse(module.larger(2, math.nan))
 
+    def test_string_results_and_ownership(self):
+        for module in self.modules:
+            with self.subTest(module=module.__name__):
+                self.assertEqual(module.ping(), "pong")
+                self.assertEqual(module.unicode_text(), self.reference.unicode_text())
+                self.assertEqual(module.number_text(-(2**1000)), str(-(2**1000)))
+                self.assertEqual(module.joined_text(0), "")
+                retained = module.joined_text(300)
+                # Later native allocations/collections must not change the
+                # previously returned Python-owned string.
+                self.assertEqual(module.joined_text(200), self.reference.joined_text(200))
+                self.assertEqual(retained, "ab" * 300)
+                values = array.array("d", [1.0])
+                with self.assertRaises(UnicodeDecodeError):
+                    module.invalid_utf8(values)
+                # Byte-based native Unicode indexing is still a known gap;
+                # decoding failure must release input exports and native roots.
+                values.append(2.0)
+                self.assertEqual(module.invalid_utf8([]), "")
+                self.assertEqual(module.ping(), "pong")
+
     def test_binding_and_exact_type_guards(self):
         class IntSubclass(int):
             pass
@@ -258,6 +279,7 @@ else:
                   "def f(a: list[float]) -> float:\n    a.append(2.0)\n    return a[0]\n",
                   "def f(a: list[float]) -> list[float]:\n    return a\n",
                   "def f(a: int = 1) -> int:\n    return a\n",
+                  "def f(a: str) -> str:\n    return a\n",
                   "def f(a: list[float], b: list[float]) -> bool:\n    return a is b\n"]
         for i, body in enumerate(bodies):
             with self.subTest(source=body):
