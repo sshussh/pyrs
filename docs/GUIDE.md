@@ -836,8 +836,10 @@ print(isinstance(d, Animal))  # True
   Otherwise both-class `==` / `!=` is pointer identity (CPython default
   when neither side has a usable equality/inequality method). Operands
   are evaluated once, left to right, before the selected method runs.
-  `list[C] == list[C]` still uses identity of elements even when `C`
-  defines `__eq__`. There is no `NotImplemented` fallthrough
+  `list[C]` `==` / `!=` / `in` / `index` / `count` / `remove` and tuple
+  `==` / `!=` use that same element `==` (list `!=` negates overall
+  equality, not `__ne__`). Mixed-tuple membership still uses slot
+  identity. There is no `NotImplemented` fallthrough
 - **Ordering (`<` / `<=` / `>` / `>=`):** if the left class (or a parent)
   defines the matching dunder (`__lt__` / `__le__` / `__gt__` / `__ge__`),
   that method is called (virtual). If it does not, the right operand's
