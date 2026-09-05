@@ -235,7 +235,9 @@ A statically-typed Python subset:
   generator, class `__iter__`).
   **v0.85:** `list[C]` `==` / `!=` / `in` / `index` / `count` / `remove`
   and tuple `==` / `!=` use class `__eq__` (virtual, inherited, identity
-  fallback). List `!=` negates element `==`, not `__ne__`.
+  fallback). List `!=` negates element `==`, not `__ne__`. Homogeneous
+  `tuple[C, …]` `in` / `index` / `count` use the same protocol; mixed-tuple
+  membership stays slot identity.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;

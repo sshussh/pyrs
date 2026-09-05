@@ -838,8 +838,11 @@ print(isinstance(d, Animal))  # True
   are evaluated once, left to right, before the selected method runs.
   `list[C]` `==` / `!=` / `in` / `index` / `count` / `remove` and tuple
   `==` / `!=` use that same element `==` (list `!=` negates overall
-  equality, not `__ne__`). Mixed-tuple membership still uses slot
-  identity. There is no `NotImplemented` fallthrough
+  equality, not `__ne__`). Same-object elements skip `__eq__` (CPython
+  `RichCompareBool`); scalar `a == a` still calls it. Homogeneous
+  `tuple[C, …]` `in` / `index` / `count` use class `==`; mixed-tuple
+  membership still uses slot identity. There is no `NotImplemented`
+  fallthrough
 - **Ordering (`<` / `<=` / `>` / `>=`):** if the left class (or a parent)
   defines the matching dunder (`__lt__` / `__le__` / `__gt__` / `__ge__`),
   that method is called (virtual). If it does not, the right operand's
