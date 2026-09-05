@@ -10110,6 +10110,9 @@ fn lower_method_stmt(
                 }
                 let value = lower_expr(&args[0], ctx)?;
                 let value = coerce(value, *elem, args[0].span, "remove() argument")?;
+                if ty_uses_class_eq(*elem) {
+                    return lower_list_remove_protocol(base_ir, value, *elem, method_span, ctx);
+                }
                 Ok(ir::Stmt::ListRemove {
                     list: base_ir,
                     value,
@@ -12453,6 +12456,9 @@ fn lower_list_index_of(
     let (start, end) = lower_seq_index_bounds(args, method_span, ctx)?;
     let value = lower_expr(&args[0], ctx)?;
     let value = coerce(value, elem, args[0].span, "index() argument")?;
+    if ty_uses_class_eq(elem) {
+        return lower_list_index_protocol(list, value, elem, start, end, method_span, ctx);
+    }
     Ok(ir::Expr {
         ty: ir::Ty::Int,
         kind: ir::ExprKind::ListIndexOf {
@@ -12479,6 +12485,9 @@ fn lower_list_count(
     }
     let value = lower_expr(&args[0], ctx)?;
     let value = coerce(value, elem, args[0].span, "count() argument")?;
+    if ty_uses_class_eq(elem) {
+        return lower_list_count_protocol(list, value, elem, method_span, ctx);
+    }
     Ok(ir::Expr {
         ty: ir::Ty::Int,
         kind: ir::ExprKind::ListCount {
@@ -23962,11 +23971,11 @@ fn lower_binary(
     }
     // ---- list + / * ----
     if matches!(l.ty, ir::Ty::List(_)) || matches!(r.ty, ir::Ty::List(_)) {
-        return lower_list_binary(op, l, r, span);
+        return lower_list_binary(op, l, r, span, ctx);
     }
     // ---- tuple equality ----
     if matches!(l.ty, ir::Ty::Tuple(_)) || matches!(r.ty, ir::Ty::Tuple(_)) {
-        return lower_tuple_binary(op, l, r, span);
+        return lower_tuple_binary(op, l, r, span, ctx);
     }
     // ---- class == / != / ordering (identity or matching dunder) ----
     if matches!(l.ty, ir::Ty::Class(_)) || matches!(r.ty, ir::Ty::Class(_)) {
@@ -24356,6 +24365,598 @@ fn comparison_ir_op(op: ast::BinOp) -> ir::BinOp {
     }
 }
 
+/// Element types whose container `==` must go through class `__eq__`
+/// (including nested lists/tuples of those types).
+fn ty_uses_class_eq(ty: ir::Ty) -> bool {
+    match ty {
+        ir::Ty::Class(_) => true,
+        ir::Ty::List(inner) => ty_uses_class_eq(*inner),
+        ir::Ty::Tuple(elems) => elems.iter().copied().any(ty_uses_class_eq),
+        _ => false,
+    }
+}
+
+fn bool_not(operand: ir::Expr) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Unary {
+            op: ir::UnOp::Not,
+            operand: Box::new(operand),
+        },
+    }
+}
+
+fn assign_incr(name: String) -> ir::Stmt {
+    ir::Stmt::Assign {
+        name: name.clone(),
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(local_expr(name, ir::Ty::Int)),
+                right: Box::new(int_const(1)),
+            },
+        },
+    }
+}
+
+fn index_at(base: ir::Expr, index: ir::Expr, elem: ir::Ty) -> ir::Expr {
+    ir::Expr {
+        ty: elem,
+        kind: ir::ExprKind::Index {
+            base: Box::new(base),
+            index: Box::new(index),
+        },
+    }
+}
+
+fn len_of(value: ir::Expr) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Len(Box::new(value)),
+    }
+}
+
+/// `==` for values that may be class instances or containers of them.
+fn lower_eq(l: ir::Expr, r: ir::Expr, span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    match (l.ty, r.ty) {
+        (ir::Ty::Class(_), _) | (_, ir::Ty::Class(_)) => {
+            lower_class_compare(ast::BinOp::Eq, l, r, span, ctx)
+        }
+        (ir::Ty::List(_), ir::Ty::List(_)) => lower_list_binary(ast::BinOp::Eq, l, r, span, ctx),
+        (ir::Ty::Tuple(_), ir::Ty::Tuple(_)) => lower_tuple_binary(ast::BinOp::Eq, l, r, span, ctx),
+        _ => Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Eq,
+                left: Box::new(l),
+                right: Box::new(r),
+            },
+        }),
+    }
+}
+
+fn maybe_invert_eq(eq: ir::Expr, op: ast::BinOp) -> ir::Expr {
+    if op == ast::BinOp::NotEq {
+        bool_not(eq)
+    } else {
+        eq
+    }
+}
+
+/// CPython list/tuple equality: compare lengths, then `left[i] == right[i]`.
+/// `!=` is the negation of that result, not per-element `__ne__`.
+fn lower_list_eq_protocol(
+    left: ir::Expr,
+    right: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let ir::Ty::List(elem) = left.ty else {
+        unreachable!("list eq protocol");
+    };
+    let l_t = ctx.fresh_temp("leq.l", left.ty);
+    let r_t = ctx.fresh_temp("leq.r", right.ty);
+    let n_t = ctx.fresh_temp("leq.n", ir::Ty::Int);
+    let m_t = ctx.fresh_temp("leq.m", ir::Ty::Int);
+    let i_t = ctx.fresh_temp("leq.i", ir::Ty::Int);
+    let out_t = ctx.fresh_temp("leq.out", ir::Ty::Bool);
+    let l = local_expr(l_t.clone(), left.ty);
+    let r = local_expr(r_t.clone(), right.ty);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let m = local_expr(m_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    let item_eq = lower_eq(
+        index_at(l.clone(), i.clone(), *elem),
+        index_at(r.clone(), i.clone(), *elem),
+        span,
+        ctx,
+    )?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Block {
+            stmts: vec![
+                ir::Stmt::Assign {
+                    name: l_t,
+                    value: left,
+                },
+                ir::Stmt::Assign {
+                    name: r_t,
+                    value: right,
+                },
+                ir::Stmt::Assign {
+                    name: n_t,
+                    value: len_of(l),
+                },
+                ir::Stmt::Assign {
+                    name: m_t,
+                    value: len_of(r),
+                },
+                ir::Stmt::Assign {
+                    name: out_t.clone(),
+                    value: const_bool_expr(true),
+                },
+                ir::Stmt::If {
+                    branches: vec![(
+                        key_cmp(ir::BinOp::Ne, n.clone(), m),
+                        vec![ir::Stmt::Assign {
+                            name: out_t.clone(),
+                            value: const_bool_expr(false),
+                        }],
+                    )],
+                    orelse: vec![
+                        ir::Stmt::Assign {
+                            name: i_t.clone(),
+                            value: int_const(0),
+                        },
+                        ir::Stmt::While {
+                            cond: key_cmp(ir::BinOp::Lt, i, n),
+                            body: vec![
+                                ir::Stmt::If {
+                                    branches: vec![(
+                                        bool_not(item_eq),
+                                        vec![
+                                            ir::Stmt::Assign {
+                                                name: out_t.clone(),
+                                                value: const_bool_expr(false),
+                                            },
+                                            ir::Stmt::Break,
+                                        ],
+                                    )],
+                                    orelse: vec![],
+                                },
+                                assign_incr(i_t),
+                            ],
+                            step: vec![],
+                        },
+                    ],
+                },
+            ],
+            result: Box::new(local_expr(out_t, ir::Ty::Bool)),
+        },
+    })
+}
+
+/// CPython `list_contains`: `item == needle`. Bind needle first so
+/// `needle in haystack` still evaluates operands in source order.
+fn lower_list_contains_protocol(
+    needle: ir::Expr,
+    haystack: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let ir::Ty::List(elem) = haystack.ty else {
+        unreachable!("list contains protocol");
+    };
+    let ndl_t = ctx.fresh_temp("lin.ndl", needle.ty);
+    let hay_t = ctx.fresh_temp("lin.hay", haystack.ty);
+    let n_t = ctx.fresh_temp("lin.n", ir::Ty::Int);
+    let i_t = ctx.fresh_temp("lin.i", ir::Ty::Int);
+    let out_t = ctx.fresh_temp("lin.out", ir::Ty::Bool);
+    let ndl = local_expr(ndl_t.clone(), needle.ty);
+    let hay = local_expr(hay_t.clone(), haystack.ty);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    let item_eq = lower_eq(index_at(hay.clone(), i.clone(), *elem), ndl, span, ctx)?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Block {
+            stmts: vec![
+                ir::Stmt::Assign {
+                    name: ndl_t,
+                    value: needle,
+                },
+                ir::Stmt::Assign {
+                    name: hay_t,
+                    value: haystack,
+                },
+                ir::Stmt::Assign {
+                    name: n_t,
+                    value: len_of(hay),
+                },
+                ir::Stmt::Assign {
+                    name: out_t.clone(),
+                    value: const_bool_expr(false),
+                },
+                ir::Stmt::Assign {
+                    name: i_t.clone(),
+                    value: int_const(0),
+                },
+                ir::Stmt::While {
+                    cond: key_cmp(ir::BinOp::Lt, i, n),
+                    body: vec![
+                        ir::Stmt::If {
+                            branches: vec![(
+                                item_eq,
+                                vec![
+                                    ir::Stmt::Assign {
+                                        name: out_t.clone(),
+                                        value: const_bool_expr(true),
+                                    },
+                                    ir::Stmt::Break,
+                                ],
+                            )],
+                            orelse: vec![],
+                        },
+                        assign_incr(i_t),
+                    ],
+                    step: vec![],
+                },
+            ],
+            result: Box::new(local_expr(out_t, ir::Ty::Bool)),
+        },
+    })
+}
+
+/// CPython `listindex` / `list_count` / `list_remove`: `item == needle`.
+fn lower_list_find_eq(
+    list: ir::Expr,
+    needle: ir::Expr,
+    elem: ir::Ty,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<(Vec<ir::Stmt>, ir::Expr, ir::Expr, String)> {
+    let xs_t = ctx.fresh_temp("lfind.xs", list.ty);
+    let ndl_t = ctx.fresh_temp("lfind.ndl", needle.ty);
+    let xs = local_expr(xs_t.clone(), list.ty);
+    let ndl = local_expr(ndl_t.clone(), needle.ty);
+    let i_t = ctx.fresh_temp("lfind.i", ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    let item_eq = lower_eq(index_at(xs.clone(), i, elem), ndl, span, ctx)?;
+    let stmts = vec![
+        ir::Stmt::Assign {
+            name: xs_t,
+            value: list,
+        },
+        ir::Stmt::Assign {
+            name: ndl_t,
+            value: needle,
+        },
+    ];
+    Ok((stmts, xs, item_eq, i_t))
+}
+
+fn push_adjust_seq_bounds(
+    stmts: &mut Vec<ir::Stmt>,
+    n: &ir::Expr,
+    start: ir::Expr,
+    end: ir::Expr,
+    ctx: &mut FnCtx,
+) -> (ir::Expr, ir::Expr) {
+    let start_t = ctx.fresh_temp("ibnd.s", ir::Ty::Int);
+    let end_t = ctx.fresh_temp("ibnd.e", ir::Ty::Int);
+    stmts.push(ir::Stmt::Assign {
+        name: start_t.clone(),
+        value: start,
+    });
+    stmts.push(ir::Stmt::Assign {
+        name: end_t.clone(),
+        value: end,
+    });
+    let start_e = local_expr(start_t.clone(), ir::Ty::Int);
+    let end_e = local_expr(end_t.clone(), ir::Ty::Int);
+    let add_n = |value: ir::Expr| ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Binary {
+            op: ir::BinOp::Add,
+            left: Box::new(value),
+            right: Box::new(n.clone()),
+        },
+    };
+    stmts.push(ir::Stmt::If {
+        branches: vec![(
+            key_cmp(ir::BinOp::Lt, start_e.clone(), int_const(0)),
+            vec![
+                ir::Stmt::Assign {
+                    name: start_t.clone(),
+                    value: add_n(start_e.clone()),
+                },
+                ir::Stmt::If {
+                    branches: vec![(
+                        key_cmp(ir::BinOp::Lt, start_e.clone(), int_const(0)),
+                        vec![ir::Stmt::Assign {
+                            name: start_t.clone(),
+                            value: int_const(0),
+                        }],
+                    )],
+                    orelse: vec![],
+                },
+            ],
+        )],
+        orelse: vec![],
+    });
+    stmts.push(ir::Stmt::If {
+        branches: vec![
+            (
+                key_cmp(ir::BinOp::Eq, end_e.clone(), int_const(i64::MIN)),
+                vec![ir::Stmt::Assign {
+                    name: end_t.clone(),
+                    value: n.clone(),
+                }],
+            ),
+            (
+                key_cmp(ir::BinOp::Lt, end_e.clone(), int_const(0)),
+                vec![
+                    ir::Stmt::Assign {
+                        name: end_t.clone(),
+                        value: add_n(end_e.clone()),
+                    },
+                    ir::Stmt::If {
+                        branches: vec![(
+                            key_cmp(ir::BinOp::Lt, end_e.clone(), int_const(0)),
+                            vec![ir::Stmt::Assign {
+                                name: end_t.clone(),
+                                value: int_const(0),
+                            }],
+                        )],
+                        orelse: vec![],
+                    },
+                ],
+            ),
+            (
+                key_cmp(ir::BinOp::Gt, end_e.clone(), n.clone()),
+                vec![ir::Stmt::Assign {
+                    name: end_t,
+                    value: n.clone(),
+                }],
+            ),
+        ],
+        orelse: vec![],
+    });
+    (start_e, end_e)
+}
+
+fn lower_list_index_protocol(
+    list: ir::Expr,
+    needle: ir::Expr,
+    elem: ir::Ty,
+    start: ir::Expr,
+    end: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let (mut stmts, xs, item_eq, i_t) = lower_list_find_eq(list, needle, elem, span, ctx)?;
+    let n_t = ctx.fresh_temp("lidx.n", ir::Ty::Int);
+    let found_t = ctx.fresh_temp("lidx.found", ir::Ty::Bool);
+    let out_t = ctx.fresh_temp("lidx.out", ir::Ty::Int);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    stmts.push(ir::Stmt::Assign {
+        name: n_t,
+        value: len_of(xs),
+    });
+    let (start_e, end_e) = push_adjust_seq_bounds(&mut stmts, &n, start, end, ctx);
+    stmts.extend([
+        ir::Stmt::Assign {
+            name: found_t.clone(),
+            value: const_bool_expr(false),
+        },
+        ir::Stmt::Assign {
+            name: out_t.clone(),
+            value: int_const(0),
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: start_e,
+        },
+        ir::Stmt::While {
+            cond: key_cmp(ir::BinOp::Lt, i.clone(), end_e),
+            body: vec![
+                ir::Stmt::If {
+                    branches: vec![(
+                        item_eq,
+                        vec![
+                            ir::Stmt::Assign {
+                                name: found_t.clone(),
+                                value: const_bool_expr(true),
+                            },
+                            ir::Stmt::Assign {
+                                name: out_t.clone(),
+                                value: i,
+                            },
+                            ir::Stmt::Break,
+                        ],
+                    )],
+                    orelse: vec![],
+                },
+                assign_incr(i_t),
+            ],
+            step: vec![],
+        },
+        ir::Stmt::If {
+            branches: vec![(
+                bool_not(local_expr(found_t, ir::Ty::Bool)),
+                vec![ir::Stmt::Raise {
+                    exc: ir::ExcType::ValueError,
+                    message: const_str("list.index(x): x not in list"),
+                }],
+            )],
+            orelse: vec![],
+        },
+    ]);
+    Ok(ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(out_t, ir::Ty::Int)),
+        },
+    })
+}
+
+fn lower_list_count_protocol(
+    list: ir::Expr,
+    needle: ir::Expr,
+    elem: ir::Ty,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let (mut stmts, xs, item_eq, i_t) = lower_list_find_eq(list, needle, elem, span, ctx)?;
+    let n_t = ctx.fresh_temp("lcnt.n", ir::Ty::Int);
+    let out_t = ctx.fresh_temp("lcnt.out", ir::Ty::Int);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    stmts.extend([
+        ir::Stmt::Assign {
+            name: n_t,
+            value: len_of(xs),
+        },
+        ir::Stmt::Assign {
+            name: out_t.clone(),
+            value: int_const(0),
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(0),
+        },
+        ir::Stmt::While {
+            cond: key_cmp(ir::BinOp::Lt, i, n),
+            body: vec![
+                ir::Stmt::If {
+                    branches: vec![(item_eq, vec![assign_incr(out_t.clone())])],
+                    orelse: vec![],
+                },
+                assign_incr(i_t),
+            ],
+            step: vec![],
+        },
+    ]);
+    Ok(ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(out_t, ir::Ty::Int)),
+        },
+    })
+}
+
+fn lower_list_remove_protocol(
+    list: ir::Expr,
+    needle: ir::Expr,
+    elem: ir::Ty,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Stmt> {
+    let (mut stmts, xs, item_eq, i_t) = lower_list_find_eq(list, needle, elem, span, ctx)?;
+    let n_t = ctx.fresh_temp("lrm.n", ir::Ty::Int);
+    let found_t = ctx.fresh_temp("lrm.found", ir::Ty::Bool);
+    let n = local_expr(n_t.clone(), ir::Ty::Int);
+    let i = local_expr(i_t.clone(), ir::Ty::Int);
+    stmts.extend([
+        ir::Stmt::Assign {
+            name: n_t,
+            value: len_of(xs.clone()),
+        },
+        ir::Stmt::Assign {
+            name: found_t.clone(),
+            value: const_bool_expr(false),
+        },
+        ir::Stmt::Assign {
+            name: i_t.clone(),
+            value: int_const(0),
+        },
+        ir::Stmt::While {
+            cond: key_cmp(ir::BinOp::Lt, i.clone(), n),
+            body: vec![
+                ir::Stmt::If {
+                    branches: vec![(
+                        item_eq,
+                        vec![
+                            ir::Stmt::IndexDelete { base: xs, index: i },
+                            ir::Stmt::Assign {
+                                name: found_t.clone(),
+                                value: const_bool_expr(true),
+                            },
+                            ir::Stmt::Break,
+                        ],
+                    )],
+                    orelse: vec![],
+                },
+                assign_incr(i_t),
+            ],
+            step: vec![],
+        },
+        ir::Stmt::If {
+            branches: vec![(
+                bool_not(local_expr(found_t, ir::Ty::Bool)),
+                vec![ir::Stmt::Raise {
+                    exc: ir::ExcType::ValueError,
+                    message: const_str("list.remove(x): x not in list"),
+                }],
+            )],
+            orelse: vec![],
+        },
+    ]);
+    Ok(ir::Stmt::ExprStmt(ir::Expr {
+        ty: ir::Ty::None,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(const_none()),
+        },
+    }))
+}
+
+fn lower_tuple_eq_protocol(
+    left: ir::Expr,
+    right: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let ir::Ty::Tuple(elems) = left.ty else {
+        unreachable!("tuple eq protocol");
+    };
+    let l_t = ctx.fresh_temp("teq.l", left.ty);
+    let r_t = ctx.fresh_temp("teq.r", right.ty);
+    let l = local_expr(l_t.clone(), left.ty);
+    let r = local_expr(r_t.clone(), right.ty);
+    let stmts = vec![
+        ir::Stmt::Assign {
+            name: l_t,
+            value: left,
+        },
+        ir::Stmt::Assign {
+            name: r_t,
+            value: right,
+        },
+    ];
+    let mut eq = const_bool_expr(true);
+    for (i, elem) in elems.iter().enumerate() {
+        let pair = lower_eq(
+            index_at(l.clone(), int_const(i as i64), *elem),
+            index_at(r.clone(), int_const(i as i64), *elem),
+            span,
+            ctx,
+        )?;
+        eq = if i == 0 { pair } else { bool_and(eq, pair) };
+    }
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(eq),
+        },
+    })
+}
+
 /// `needle in haystack` / `not in`: substring, list/tuple/set membership, dict keys,
 /// or user-class `__contains__`.
 fn lower_contains(
@@ -24442,7 +25043,18 @@ fn lower_contains(
             }
             l
         }
-        ir::Ty::List(elem) => coerce(l, *elem, span, "'in' operand")?,
+        ir::Ty::List(elem) => {
+            let needle = coerce(l, *elem, span, "'in' operand")?;
+            if ty_uses_class_eq(*elem) {
+                let contains = lower_list_contains_protocol(needle, r, span, ctx)?;
+                return Ok(if op == ast::BinOp::NotIn {
+                    bool_not(contains)
+                } else {
+                    contains
+                });
+            }
+            needle
+        }
         ir::Ty::Dict { key, .. } => coerce(l, *key, span, "'in' dict key")?,
         ir::Ty::Set(elem) => coerce(l, *elem, span, "'in' set element")?,
         ir::Ty::Tuple(elems) => lower_tuple_search_needle(l, elems, span, "'in' tuple operand")?,
@@ -24469,7 +25081,13 @@ fn lower_contains(
     Ok(contains)
 }
 
-fn lower_tuple_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+fn lower_tuple_binary(
+    op: ast::BinOp,
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
     match op {
         ast::BinOp::Eq
         | ast::BinOp::NotEq
@@ -24489,6 +25107,10 @@ fn lower_tuple_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> S
                         ),
                         span,
                     ));
+                }
+                if matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) && ty_uses_class_eq(l.ty) {
+                    let eq = lower_tuple_eq_protocol(l, r, span, ctx)?;
+                    return Ok(maybe_invert_eq(eq, op));
                 }
                 Ok(ir::Expr {
                     ty: ir::Ty::Bool,
@@ -24524,7 +25146,13 @@ fn is_orderable_ty(ty: ir::Ty) -> bool {
     }
 }
 
-fn lower_list_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResult<ir::Expr> {
+fn lower_list_binary(
+    op: ast::BinOp,
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
     match op {
         // xs + ys — same element type required
         ast::BinOp::Add => match (l.ty, r.ty) {
@@ -24588,6 +25216,10 @@ fn lower_list_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SR
                         ),
                         span,
                     ));
+                }
+                if matches!(op, ast::BinOp::Eq | ast::BinOp::NotEq) && ty_uses_class_eq(*a) {
+                    let eq = lower_list_eq_protocol(l, r, span, ctx)?;
+                    return Ok(maybe_invert_eq(eq, op));
                 }
                 Ok(ir::Expr {
                     ty: ir::Ty::Bool,
@@ -27892,6 +28524,94 @@ class P:
     def __eq__(self, other: P) -> bool:
         return self.x == other.x
 b = P(1) == P(1)
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn list_class_eq_lowers_to_block() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __eq__(self, other: P) -> bool:
+        return self.x == other.x
+b = [P(1)] == [P(1)]
+c = [P(1)] != [P(2)]
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Unary {
+                op: ir::UnOp::Not,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn list_int_eq_stays_binary() {
+        let m = analyze_ok("b = [1, 2] == [1, 2]\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[0] else {
+            panic!();
+        };
+        assert!(matches!(
+            value.kind,
+            ir::ExprKind::Binary {
+                op: ir::BinOp::Eq,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn list_class_contains_lowers_to_block() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __eq__(self, other: P) -> bool:
+        return self.x == other.x
+xs = [P(1), P(2)]
+b = P(1) in xs
+",
+        );
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert_eq!(value.ty, ir::Ty::Bool);
+        assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn tuple_class_eq_lowers_to_block() {
+        let m = analyze_ok(
+            "\
+class P:
+    def __init__(self, x: int):
+        self.x = x
+    def __eq__(self, other: P) -> bool:
+        return self.x == other.x
+b = (P(1), 1) == (P(1), 1)
 ",
         );
         let entry = find_func(&m, ENTRY_NAME);

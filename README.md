@@ -38,10 +38,10 @@ pyrs parse   -i prog.py             # dump the AST
 `compile` options: `-O 0..3` (optimization level, default 2) and
 `--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
 
-## The language (v0.84.0)
+## The language (v0.85.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.85.0**, not 1.0) until it is ready for
+milestone after this one is **0.86.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -233,6 +233,9 @@ A statically-typed Python subset:
   exceptions propagate. List/set/dict comprehensions accept the same
   iterables as `for` (range, list, str, tuple, dict keys, set, file,
   generator, class `__iter__`).
+  **v0.85:** `list[C]` `==` / `!=` / `in` / `index` / `count` / `remove`
+  and tuple `==` / `!=` use class `__eq__` (virtual, inherited, identity
+  fallback). List `!=` negates element `==`, not `__ne__`.
   **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
   `__dict__`, nested classes, class decorators, stacked free-function
   decorators, two-arg `super()`, class-body attrs, first-class class values;
@@ -410,7 +413,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.84.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.85.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -572,4 +575,4 @@ GitHub Actions (see `.github/workflows/`):
 | **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
 
 Local gate (same spirit as CI): `make doctor && make ci`.
-Release tags: `git tag v0.84.0 && git push origin v0.84.0`.
+Release tags: `git tag v0.85.0 && git push origin v0.85.0`.

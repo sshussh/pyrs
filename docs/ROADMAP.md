@@ -1,10 +1,9 @@
 # PyRs roadmap to 1.0
 
 PyRs has a substantial native compiler and runtime, but it is still a
-statically typed Python subset. Version **0.84.0** ships iterator exception
-boundaries and a shared iterable contract for `for` and comprehensions.
-The next milestone is **0.85.0**; reaching a particular minor version does
-not establish 1.0 readiness.
+statically typed Python subset. Version **0.85.0** ships container equality
+for class elements. The next milestone is **0.86.0**; reaching a particular
+minor version does not establish 1.0 readiness.
 
 ## State reviewed on 2026-09-05
 
@@ -53,8 +52,20 @@ After 0.84 on the same host:
 | `make examples` | All 13 example entry points matched CPython |
 | `pyrs --version` | `PyRs 0.84.0` |
 
-Details live in the [0.83 implementation checklist](superpowers/plans/2026-09-05-comparison-protocols-0.83.md)
-and the [0.84 implementation checklist](superpowers/plans/2026-09-05-iterator-exceptions-0.84.md).
+After 0.85 on the same host:
+
+| Check | Result after 0.85 |
+|-------|-------------------|
+| `make doctor` | All required tools available |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1028 passed: 412 unit and 616 integration (4 new semantic + 12 new container-class-eq); none failed or ignored |
+| `make examples` | All 13 example entry points matched CPython |
+| `pyrs --version` | `PyRs 0.85.0` |
+
+Details live in the [0.83 implementation checklist](superpowers/plans/2026-09-05-comparison-protocols-0.83.md),
+the [0.84 implementation checklist](superpowers/plans/2026-09-05-iterator-exceptions-0.84.md),
+and the [0.85 implementation checklist](superpowers/plans/2026-09-05-container-class-eq-0.85.md).
 
 ## 0.83.0: comparison and membership correctness
 
@@ -112,6 +123,29 @@ non-StopIteration from `__next__`, break/continue/return/finally, nested
 loops, virtual/`__iter__` iterator classes, and comprehension coverage of
 tuple/dict/set/file/generator/user-iter, plus the full local gate.
 
+## 0.85.0: container class equality
+
+`list[C] == list[C]` compared elements by pointer identity even when `C`
+defined `__eq__`, so `[P(1)] == [P(1)]` was false. The same identity
+check fed `!=`, `in`, `index`, `count`, and `remove`, and tuple `==`.
+
+The milestone contract is:
+
+- List `==` compares lengths, then `left[i] == right[i]` through the
+  existing class protocol (virtual, inherited, reflected, subclass-first,
+  identity fallback). `!=` negates that result; it does not call `__ne__`.
+- `in` / `index` / `count` / `remove` use `item == needle`. `index` keeps
+  CPython slice bounds. The `in` needle is still evaluated first.
+- Nested `list[list[C]]` uses the same recursive `==`. Tuple `==` / `!=`
+  with a class (or nested) element is pairwise `==` with short-circuit.
+- Mixed-tuple `in` / `index` / `count` stay on slot identity.
+
+This is semantic lowering over existing `Block` / `While` / `Index` IR.
+Acceptance requires differential tests for value equality, identity
+fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
+index bounds, remove, nested lists, tuple pairs, side effects, and
+exceptions, plus O0/O2/O3 and the full local gate.
+
 ## Confirmed remaining gaps
 
 These findings remain open after the 0.83 scope. Passing the baseline did
@@ -121,7 +155,7 @@ not cover them.
 |------|-------------|--------------------|
 | User iterator exception handling | Closed in 0.84: `StopIteration` is caught only around `__next__` | Keep generator `for` on Optional None unless that subset is deliberately changed |
 | Iterable coverage | Closed in 0.84 for `for` and list/set/dict comprehensions | `any` / `all` / `enumerate` / `zip` / `reversed` still use a narrower set |
-| Rich comparisons | No `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; `list[C]` equality uses element identity even when `C` defines `__eq__` | Complete or explicitly bound the protocol contract before claiming general object compatibility |
+| Rich comparisons | Closed in 0.85 for `list[C]` `==`/`!=`/`in`/`index`/`count`/`remove` and tuple `==`/`!=`. Still: no `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; mixed-tuple membership uses identity | Complete or explicitly bound the protocol contract before claiming general object compatibility |
 | Text | String length/index/slice use UTF-8 bytes, while `ord`/`chr` use Unicode code points; many methods use ASCII case and whitespace rules | Establish a consistent Unicode string contract and test multibyte, combining, whitespace, and case behavior |
 | Numeric and binding semantics | int/float comparison loses precision beyond 2^53; some possibly unbound scalar locals read default values; dynamic negative integer powers trap | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
 | Generators and dynamism | `yield from` does not forward `send`/`throw`; generator exhaustion uses Optional None in several paths; `Any`, class attributes, inheritance, and class values remain restricted | Stabilize the intended subset and reject unsupported paths clearly; broader CPython dynamism is separate work |
@@ -138,13 +172,13 @@ Ordinary `__next__` exhaustion still runs `else`.
 
 ## Proposed milestones and release gates
 
-The 0.83 and 0.84 scopes are implemented by their linked checklists.
+The 0.83, 0.84, and 0.85 scopes are implemented by their linked checklists.
 The following phases are proposed follow-up work; later version numbers
 should be assigned when each scope is reviewed.
 
 | Phase | Focus | Exit evidence |
 |-------|-------|---------------|
-| **0.85.0, proposed next** | Unicode semantics, numeric/binding correctness, and remaining class/container protocol bounds | A supported-feature matrix links behavior to differential tests; silent wrong behavior is removed from supported paths; residual limitations are explicit |
+| **0.86.0, proposed next** | Unicode semantics, numeric/binding correctness, and remaining protocol bounds (`NotImplemented`, mixed-tuple membership) | A supported-feature matrix links behavior to differential tests; silent wrong behavior is removed from supported paths; residual limitations are explicit |
 | **Reliable validation and delivery** | Strict parity checks, useful failure artifacts, version/link checks, and release dependency handling | Deliberately broken programs fail the parity gate; failure artifacts are retained; an extracted archive builds and runs a sample on each declared clean host |
 | **Sustained workload validation** | GC, resource handling, compile cost, and library-shaped programs | Repeatable memory/stress results and benchmark baselines; long-running programs with containers, cycles, exceptions, closures, and generators stay correct; pure-PyRs library needs are documented |
 | **1.0 release candidate** | Stable supported contract and reproducible release | Full gates pass for the exact candidate; no known silent correctness defects in its supported contract; installation, diagnostics, compatibility limits, and upgrade expectations are documented |
