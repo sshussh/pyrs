@@ -94,7 +94,7 @@ compatibility: release ## Core compatibility probes (native + CPython, O0/O2/O3)
 	$(PYTHON) compatibility/run.py --pyrs $(PYRS) --group core --mode both --opt-levels 0 2 3 --gc-stress --output target/compatibility/core.json
 
 .PHONY: hygiene
-hygiene: ## Version agreement + documentation link checks (and the gates' own tests)
+hygiene: release ## Version agreement + documentation link checks (and the gates' own tests)
 	$(PYTHON) -m unittest discover -s scripts -p 'test_*.py'
 	$(PYTHON) scripts/check_hygiene.py --binary $(PYRS)
 

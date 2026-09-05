@@ -7,7 +7,7 @@
     {"id": "exception-bindings", "file": "cases/exception_bindings.py", "group": "core", "native": "pass"},
     {"id": "text-file-effects", "file": "cases/file_effects.py", "group": "core", "native": "pass"},
     {"id": "unicode-length-gap", "file": "cases/unicode_length.py", "group": "core", "native": "mismatch", "native_stdout": "8\n", "reason": "Native str length/index still operate on bytes."},
-    {"id": "mixed-list-types-gap", "file": "cases/mixed_list_types.py", "group": "core", "native": "mismatch", "native_stdout": "[1.0, 2.5, 1.0]\n", "reason": "Native homogeneous numeric list storage promotes ints to floats."},
+    {"id": "mixed-numeric-list", "file": "cases/mixed_numeric_list.py", "group": "core", "native": "pass"},
     {"id": "numpy-arrays", "file": "cases/numpy_arrays.py", "group": "science", "requires": ["numpy"], "native": "unsupported", "diagnostic": "expected an expression, found ','", "reason": "Multidimensional slice syntax is not parsed."},
     {"id": "numpy-linalg", "file": "cases/numpy_linalg.py", "group": "science", "requires": ["numpy"], "native": "unsupported", "diagnostic": "expected ')' after method arguments, found '@'", "reason": "Matrix multiplication syntax is not parsed."},
     {"id": "numpy-random", "file": "cases/numpy_random.py", "group": "science", "requires": ["numpy"], "native": "unsupported", "diagnostic": "No module named 'numpy'"},

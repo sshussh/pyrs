@@ -76,10 +76,10 @@ Build your own module with `pyrs build-extension -i kernels.py --module kernels_
 --python .venv/bin/python`; import `kernels_native` from that same environment.
 Only the exported kernels run natively; Python and package code keep using CPython.
 
-## The language (v0.88.0)
+## The language (v0.89.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.89.0**, not 1.0) until it is ready for
+milestone after this one is **0.90.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -266,6 +266,13 @@ A statically-typed Python subset:
   reflected, subclass-first); otherwise it still inverts that receiver's
   `__eq__`. Comparison and class-membership operands are evaluated once
   in source order (needle before container).
+  **v0.89:** a class that defines `__eq__` but not `__ne__` (and has no
+  ancestor `__ne__`) gets a synthesized `__ne__` equivalent to
+  `not self.__eq__(other)`, dispatched through the normal virtual method
+  table — the same as CPython placing the default on `object`. Previously
+  the negated-`__eq__` fallback was chosen from the *static* type, so a
+  `Base`-typed variable holding a `Child` that overrides only `__ne__`
+  never reached it.
   **v0.84:** user-iterator `for` / comprehensions treat `StopIteration`
   from `__next__` as the loop terminator only; body and target-binding
   exceptions propagate. List/set/dict comprehensions accept the same
@@ -464,7 +471,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.88.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.89.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -503,8 +510,13 @@ with `None` and same-type identity (heap pointers, scalar slots, float
 bitcast — not CPython int interning); `x ** e` with a *dynamic* negative
 int exponent traps (a constant like `2 ** -1` works and gives float),
 mixed int↔float comparisons preserve the exact integer value,
-list literals coerce mixed numerics to one element type (mixed non-numeric
-literal elements still error unless annotated as a union), `nan in [nan]`
+mixed-numeric list/tuple **literals** keep each element's own type as a
+union (`[1, 2.5, 1]` prints `[1, 2.5, 1]`, not `[1.0, 2.5, 1.0]`); a
+homogeneous literal still gets optimized single-type storage, and
+converting an already-typed `list[int]` into `list[float]` (or into a union)
+by assignment remains unsupported — only the literal's own elements are
+joined (mixed non-numeric literal elements still error unless annotated
+as a union), `nan in [nan]`
 is False (IEEE equality), str methods use ASCII case/whitespace rules,
 `len`/index/slice on `str` are byte-based (`len("é")` is 2) while `ord`/`chr`
 count Unicode characters, GC is
@@ -638,4 +650,4 @@ compatibility probes.
 
 Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
-Release tags: `git tag v0.88.0 && git push origin v0.88.0`.
+Release tags: `git tag v0.89.0 && git push origin v0.89.0`.

@@ -194,7 +194,7 @@ not cover them.
 | Iterable coverage | Closed in 0.84 for `for` and list/set/dict comprehensions | `any` / `all` / `enumerate` / `zip` / `reversed` still use a narrower set |
 | Rich comparisons | Closed in 0.85 for `list[C]` `==`/`!=`/`in`/`index`/`count`/`remove`, tuple `==`/`!=`, and homogeneous `tuple[C, …]` `in`/`index`/`count`. Still: no `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; mixed-tuple membership uses identity | Complete or explicitly bound the protocol contract before claiming general object compatibility |
 | Text | String length/index/slice use UTF-8 bytes, while `ord`/`chr` use Unicode code points; many methods use ASCII case and whitespace rules | Establish a consistent Unicode string contract and test multibyte, combining, whitespace, and case behavior |
-| Numeric and binding semantics | Closed in 0.86 for mixed int/float comparison (exact, including bigints, NaN, infinities and signed zero) and for conditionally assigned locals including generator suspension. Still open: mixed numeric list literals promote ints to floats; dynamic negative integer powers trap; module globals, deletion and static use-before-assignment diagnostics | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
+| Numeric and binding semantics | Closed in 0.86 for mixed int/float comparison and conditionally assigned locals. Closed in 0.89: mixed-numeric list/tuple **literals** keep each element's own type instead of promoting to one. Still open: converting an already-typed `list[int]` into `list[float]`/a union by assignment (only a literal's own elements are joined); dynamic negative integer powers trap; module globals, deletion and static use-before-assignment diagnostics | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
 | Generators and dynamism | `yield from` does not forward `send`/`throw`; generator exhaustion uses Optional None in several paths; `Any`, class attributes, inheritance, and class values remain restricted | Stabilize the intended subset and reject unsupported paths clearly; broader CPython dynamism is separate work |
 | Memory confidence | Conservative roots can retain garbage; abandoned generators do not run user finalizers; collection statistics exclude native/allocator overhead | Continue stress and exception-path tests and measure process memory on sustained workloads; see [GC.md](GC.md) |
 | Example parity gate | 0.86 makes the recipe fail when either process fails; it still uses command substitution, so trailing newlines are stripped and the comparison is not byte-exact | Compare actual bytes and test the gate's own failure paths |
@@ -223,8 +223,8 @@ why correctness rather than new capability sets the near-term order.
 | `"ß".upper()` | `SS` | `ß` | open — Unicode milestone |
 | `len("🐍")` | `1` | `4` | open — Unicode milestone |
 | `2 ** 53 + 1 == 9007199254740992.0` | `False` | `False` | **closed in 0.86** |
-| `[1, 2.5, 1]` | `[1, 2.5, 1]` | `[1.0, 2.5, 1.0]` | open — value-fidelity milestone |
-| `a != b`, `a: Base` holding a `Child` defining `__ne__` | `Child.__ne__` runs | negated `__eq__` | open — value-fidelity milestone |
+| `[1, 2.5, 1]` | `[1, 2.5, 1]` | `[1, 2.5, 1]` | **closed in 0.89** |
+| `a != b`, `a: Base` holding a `Child` defining `__ne__` | `Child.__ne__` runs | `Child.__ne__` runs | **closed in 0.89** |
 | `def f(x: "Base")` | accepted | accepted | **closed in 0.87** |
 
 ## Product contract
@@ -306,11 +306,18 @@ documentation and the relevant gates.
       rules, `*args`/`**kwargs`, decorator factories, stacked decorators.
 - [ ] Class attributes, properties, descriptors, arithmetic and
       reflected/in-place dunders, `NotImplemented`, `__call__`, `__hash__`.
-- [ ] Runtime-type comparison slot selection. Slot *choice* is still static,
-      so a `Base`-typed variable holding a `Child` that defines `__ne__`
-      never reaches it.
+- [x] Default `!=` dispatches virtually (0.89): a class with `__eq__` but no
+      `__ne__` anywhere in its ancestry gets one synthesized, calling
+      `self.__eq__` through the normal vtable. `NotImplemented` fallback and
+      runtime-type slot selection for *other* dunders remain open; slot
+      choice elsewhere is still static.
 - [ ] Decide multiple inheritance/MRO, class decorators/dataclasses, dynamic
       attributes and introspection from corpus requirements.
+- [ ] General `list[T1]` -> `list[T2]` element-wise re-coercion (and into a
+      union), needed for e.g. `fs: list[float] = xs` from `list[int]`, and
+      for comparing/joining two independently-typed numeric lists. Mixed
+      numeric list *literals* already keep exact per-element types (0.89);
+      this item is about values that already have a narrower list type.
 - [ ] Complete iterator protocol: lazy `range`/`enumerate`/`zip`/`reversed`/
       `map`/`filter`, `iter`/`next` defaults, `StopIteration.value`,
       `yield from` send/throw, generator cleanup.
