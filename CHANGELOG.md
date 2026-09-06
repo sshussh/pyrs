@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.98.0 — The eager builtins accept any iterable
+
+`sorted`, `sum`, `max`, `min`, `set`, `list` and `str.join` took a list (and,
+since 0.95, a generator) and rejected everything else — so `sorted(some_set)`,
+`sorted(some_dict)`, `sum(range(n))` and `list(range(n))` were all compile
+errors, even though `for x in` accepts every one of those.
+
+- Those builtins now accept list, tuple, set, dict (its keys, as in CPython),
+  str, range and generator. `key=` and `reverse=` work over all of them.
+- `range` is materialized through the same comprehension path
+  `[x for x in range(n)]` already used, because it is not a first-class value
+  here and so cannot be lowered and then converted. `list(range(n))` and
+  `sum(range(n))` build the list, which CPython does not; that is a memory
+  cost on a very large range, not a wrong answer.
+- `any` and `all` gained dict, and deliberately did *not* gain range: they
+  short-circuit, and materializing would answer `all(range(10**9))` by
+  building a billion elements where CPython returns False on the first one.
+- `tuple()` is unchanged and still needs a fixed-arity tuple — materializing
+  would hand it a list, which is exactly what it cannot accept.
+- The `range` diagnostic no longer says it only works in a `for` loop, which
+  had become false; it now names the places that do accept it.
+
 ## 0.97.0 — Lambda parameter inference
 
 A lambda cannot carry annotations — the first `:` starts the body — so

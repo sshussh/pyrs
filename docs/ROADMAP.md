@@ -8,9 +8,10 @@ strings Unicode: offsets are code points, case transforms and character
 classes follow Unicode 16.0.0, and string literals accept the full escape
 set. **0.93.0** adds conditional expressions, **0.94.0** user-defined
 exception classes, **0.95.0** generators as arguments to the eager builtins
-**0.96.0** generator expressions and **0.97.0** lambda parameter inference.
-The next milestone is **0.98.0**; reaching a particular minor version does not
-establish 1.0 readiness, and no stable release or tag has been created.
+**0.96.0** generator expressions, **0.97.0** lambda parameter inference and
+**0.98.0** iterable coverage for the eager builtins. The next milestone is
+**0.99.0**; reaching a particular minor version does not establish 1.0
+readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -99,6 +100,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.98 on the same host:
+
+| Check | Result after 0.98 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1219 passed; none failed or ignored (11 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 36 pass / 0 known_gap; compat 12 pass |
+| `pyrs --version` | `PyRs 0.98.0` |
 
 After 0.97 on the same host:
 
@@ -274,6 +286,40 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.98.0: the eager builtins accept any iterable
+
+`sorted`, `sum`, `max`, `min`, `set`, `list` and `str.join` took a list (and a
+generator, since 0.95) and rejected everything else, so `sorted(some_set)`,
+`sorted(some_dict)`, `sum(range(n))` and `list(range(n))` were compile errors
+even though `for x in` accepts all of them. A matrix of seven iterable shapes
+against nine operations had 30 rejections; it now has none except the ones
+below.
+
+The milestone contract is:
+
+- Those builtins accept list, tuple, set, dict (its keys, as in CPython), str,
+  range and generator, with `key=` and `reverse=` over all of them.
+- `any` / `all` gain dict but not range, and keep short-circuiting.
+- `tuple()` is unchanged: tuples are fixed-arity here.
+
+The generator drain from 0.95 generalizes into one helper over prepared
+comprehension parts, so the element type and iteration order are exactly what
+a `for` loop would produce. `range` needs the argument-level entry point
+rather than the value-level one, because it cannot be lowered as a value at
+all; the lowering probes, falling back to the comprehension path when the
+expression does not lower.
+
+Two deliberate exclusions, both about not trading a rejection for a wrong or
+ruinous answer. `any` / `all` do not materialize, or `all(range(10**9))` would
+build a billion elements where CPython returns False on the first. And
+`tuple()` must not be materialized: it needs the tuple itself, and a list is
+precisely what it cannot accept -- an earlier cut of this change did
+materialize there and broke `tuple(t)`, which the suite caught.
+
+Materializing a range is a real memory cost `sum(range(n))` does not pay in
+CPython. It is a cost, not a wrong answer, and lazy `range` / `enumerate` /
+`zip` remains its own roadmap item.
 
 ## 0.97.0: lambda parameter inference
 

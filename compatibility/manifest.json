@@ -69,6 +69,12 @@
       "native": "pass"
     },
     {
+      "id": "iterable-builtins",
+      "file": "cases/iterable_builtins.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",

@@ -12339,7 +12339,7 @@ fn lower_str_method(
                     method_span,
                 ));
             }
-            let parts = materialize_if_generator(lower_expr(&args[0], ctx)?, ctx)?;
+            let parts = materialize_iterable_arg(&args[0], ctx)?;
             if parts.ty != ir::list_of(ir::Ty::Str) {
                 return Err(err(
                     format!("join() expects a list[str], found {}", parts.ty),
@@ -18508,24 +18508,15 @@ fn wrap_comp_ifs(ifs: &[ir::Expr], inner: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
     body
 }
 
-/// Materialize a generator into a `list[yield_ty]`, exactly as
-/// `[x for x in gen]` does — it reuses the same comprehension machinery.
-///
-/// This is what lets the eager builtins accept a generator. It is only sound
-/// for consumers that would drain the generator anyway (`list`, `set`,
-/// `tuple`, `sorted`, `sum`, `max`, `min`, `join`): for those the side
-/// effects, order and result are identical to consuming lazily. `any` and
-/// `all` short-circuit, so they must not come through here.
-fn drain_generator_to_list(
-    gen_expr: ir::Expr,
-    yield_ty: ir::Ty,
+/// Build a `list[E]` from prepared comprehension parts — the loop
+/// `[x for x in it]` runs, minus the user-written target binding.
+fn drain_parts_to_list(
+    parts: CompIterParts,
+    setup: Vec<ir::Stmt>,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    let list_ty = ir::list_of(yield_ty);
-    let mut setup = Vec::new();
-    let parts = lower_comp_generator(gen_expr, yield_ty, ctx, &mut setup)?;
-
-    let res_t = ctx.fresh_temp("gen.drain", list_ty);
+    let list_ty = ir::list_of(parts.element.ty);
+    let res_t = ctx.fresh_temp("drain", list_ty);
     let res_local = || ir::Expr {
         ty: list_ty,
         kind: ir::ExprKind::Local(res_t.clone()),
@@ -18540,20 +18531,19 @@ fn drain_generator_to_list(
             },
         },
     });
+    let append = ir::Stmt::ListAppend {
+        list: res_local(),
+        value: parts.element,
+    };
     let level = CompLevel {
         setup: Vec::new(),
         cond: parts.cond,
         step: parts.step,
+        // No target to bind: this drain has no user-written loop variable.
         bind: Vec::new(),
         ifs: Vec::new(),
         cap: parts.cap,
         kind: parts.kind,
-    };
-    // The element is appended directly; there is no target to bind, because
-    // this drain has no user-written loop variable.
-    let append = ir::Stmt::ListAppend {
-        list: res_local(),
-        value: parts.element,
     };
     stmts.extend(wrap_comp_level(level, vec![append]));
     Ok(ir::Expr {
@@ -18565,12 +18555,58 @@ fn drain_generator_to_list(
     })
 }
 
-/// If `value` is a generator, drain it to a list; otherwise pass it through.
-/// Used by the builtins that consume their whole argument.
-fn materialize_if_generator(value: ir::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+/// Materialize a generator into a `list[yield_ty]`, exactly as
+/// `[x for x in gen]` does.
+fn drain_generator_to_list(
+    gen_expr: ir::Expr,
+    yield_ty: ir::Ty,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let mut setup = Vec::new();
+    let parts = lower_comp_generator(gen_expr, yield_ty, ctx, &mut setup)?;
+    drain_parts_to_list(parts, setup, ctx)
+}
+
+/// Materialize any already-lowered iterable into a `list`.
+///
+/// A list passes through untouched — it is already the shape callers want,
+/// and copying it would change identity for no reason. Everything else goes
+/// through the same comprehension machinery `[x for x in it]` uses, so the
+/// element type and iteration order are whatever a `for` loop would produce.
+///
+/// Sound for the builtins that consume their whole argument. `any` and `all`
+/// short-circuit and must not come through here.
+fn materialize_iterable_value(value: ir::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     match value.ty {
+        ir::Ty::List(_) => Ok(value),
         ir::Ty::Generator { yield_ty } => drain_generator_to_list(value, *yield_ty, ctx),
+        ir::Ty::Str | ir::Ty::Tuple(_) | ir::Ty::Dict { .. } | ir::Ty::Set(_) => {
+            let mut setup = Vec::new();
+            let span = Span::default();
+            let parts = lower_comp_indexed(value, false, span, ctx, &mut setup)?;
+            drain_parts_to_list(parts, setup, ctx)
+        }
+        // Not an iterable this handles: leave it for the caller's own
+        // diagnostic, which can name the builtin.
         _ => Ok(value),
+    }
+}
+
+/// Lower an argument that a builtin will iterate, as a `list`.
+///
+/// `range(...)` is not a first-class value here, so it cannot be lowered and
+/// then converted; when lowering fails, the expression is materialized
+/// through a synthesized `[x for x in it]` instead, which is the path the
+/// comprehension machinery already handles it on. Probing rather than
+/// enumerating keeps this correct as more iterables become values.
+fn materialize_iterable_arg(e: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    match lower_expr(e, ctx) {
+        Ok(v) => materialize_iterable_value(v, ctx),
+        Err(direct) => {
+            let mut setup = Vec::new();
+            let parts = lower_comp_iter(e, false, ctx, &mut setup).map_err(|_| direct)?;
+            drain_parts_to_list(parts, setup, ctx)
+        }
     }
 }
 
@@ -21029,8 +21065,7 @@ fn lower_call(
                         span,
                     ));
                 }
-                let arg = lower_expr(args[0], ctx)?;
-                let arg = materialize_if_generator(arg, ctx)?;
+                let arg = materialize_iterable_arg(args[0], ctx)?;
                 lower_set_ctor(arg, args[0].span)
             }
             "list" => {
@@ -21044,8 +21079,17 @@ fn lower_call(
                         span,
                     ));
                 }
-                let arg = lower_expr(args[0], ctx)?;
-                lower_list_ctor(arg, args[0].span, ctx)
+                // `list(range(n))` and friends: range is not a value, so the
+                // argument is materialized through the comprehension path.
+                match lower_expr(args[0], ctx) {
+                    Ok(arg) => lower_list_ctor(arg, args[0].span, ctx),
+                    Err(direct) => {
+                        let mut setup = Vec::new();
+                        let parts =
+                            lower_comp_iter(args[0], false, ctx, &mut setup).map_err(|_| direct)?;
+                        drain_parts_to_list(parts, setup, ctx)
+                    }
+                }
             }
             "dict" => {
                 if args.is_empty() {
@@ -21072,7 +21116,9 @@ fn lower_call(
                     ));
                 }
                 let arg = lower_expr(args[0], ctx)?;
-                let arg = materialize_if_generator(arg, ctx)?;
+                // Not materialized: tuples here are fixed-arity, so
+                // lower_tuple_ctor needs the tuple itself, and a list (which
+                // is what materializing produces) is what it cannot accept.
                 lower_tuple_ctor(arg, args[0].span)
             }
             "len" => {
@@ -21198,7 +21244,10 @@ fn lower_call(
             "sum" => lower_sum_expr(&args, keywords, span, ctx),
             "sorted" => lower_sorted_expr(&args, keywords, span, ctx),
             "range" => Err(err(
-                "range(...) is only supported as the iterable of a 'for' loop",
+                "range(...) is not a value here: it works as the iterable of a \
+                 'for' loop or a comprehension, and as an argument to list, \
+                 set, sorted, sum, min and max, but it cannot be stored in a \
+                 variable or passed anywhere else",
                 span,
             )),
             "input" => {
@@ -21732,10 +21781,14 @@ fn lower_any_all(
         return lower_any_all_generator(is_any, seq, *yield_ty, span, ctx);
     }
     match seq.ty {
-        ir::Ty::List(_) | ir::Ty::Str | ir::Ty::Tuple(_) | ir::Ty::Set(_) => {}
+        ir::Ty::List(_) | ir::Ty::Str | ir::Ty::Tuple(_) | ir::Ty::Set(_) | ir::Ty::Dict { .. } => {
+        }
         other => {
             return Err(err(
-                format!("{name}() expects a list, str, tuple, set, or generator, found {other}"),
+                format!(
+                    "{name}() expects a list, str, tuple, set, dict, or generator, \
+                     found {other}"
+                ),
                 args[0].span,
             ));
         }
@@ -21763,18 +21816,31 @@ fn lower_any_all(
             value: init_acc,
         },
     ];
-    // For set: materialize to list.
-    let (iter_ty, iter_expr) = if let ir::Ty::Set(elem) = seq_ty {
-        let list_ty = ir::list_of(*elem);
+    // Sets and dicts have no index, so their elements (for a dict, its keys,
+    // as in CPython) are materialized first. Neither has side effects on
+    // iteration, so this is invisible -- unlike a generator, which gets its
+    // own short-circuiting walk above.
+    let set_or_dict = match seq_ty {
+        ir::Ty::Set(elem) => Some((*elem, true)),
+        ir::Ty::Dict { key, .. } => Some((*key, false)),
+        _ => Option::None,
+    };
+    let (iter_ty, iter_expr) = if let Some((elem, is_set)) = set_or_dict {
+        let list_ty = ir::list_of(elem);
         let lt = ctx.fresh_temp(&format!("{name}.els"), list_ty);
+        let src = Box::new(ir::Expr {
+            ty: seq_ty,
+            kind: ir::ExprKind::Local(seq_t.clone()),
+        });
         stmts.push(ir::Stmt::Assign {
             name: lt.clone(),
             value: ir::Expr {
                 ty: list_ty,
-                kind: ir::ExprKind::SetToList(Box::new(ir::Expr {
-                    ty: seq_ty,
-                    kind: ir::ExprKind::Local(seq_t.clone()),
-                })),
+                kind: if is_set {
+                    ir::ExprKind::SetToList(src)
+                } else {
+                    ir::ExprKind::DictKeys(src)
+                },
             },
         });
         (
@@ -22586,12 +22652,12 @@ fn lower_sorted_expr(
             span,
         ));
     }
-    let arg = materialize_if_generator(lower_expr(args[0], ctx)?, ctx)?;
+    let arg = materialize_iterable_arg(args[0], ctx)?;
     let elem = match arg.ty {
         ir::Ty::List(e) => *e,
         other => {
             return Err(err(
-                format!("sorted() expects a list, found {other}"),
+                format!("sorted() expects an iterable, found {other}"),
                 args[0].span,
             ));
         }
@@ -22865,13 +22931,13 @@ fn lower_min_max_expr(
         return lower_min_max_multi_plain(func, args, span, ctx);
     }
 
-    // Iterable form (one list, or a generator drained into one).
-    let arg = materialize_if_generator(lower_expr(args[0], ctx)?, ctx)?;
+    // Iterable form: any iterable, materialized into a list.
+    let arg = materialize_iterable_arg(args[0], ctx)?;
     let elem = match arg.ty {
         ir::Ty::List(e) => *e,
         other => {
             return Err(err(
-                format!("{func}() iterable form expects a list, found {other}"),
+                format!("{func}() iterable form expects an iterable, found {other}"),
                 args[0].span,
             ));
         }
@@ -23677,12 +23743,12 @@ fn lower_sum_expr(
             kw.name_span,
         ));
     }
-    let list = materialize_if_generator(lower_expr(args[0], ctx)?, ctx)?;
+    let list = materialize_iterable_arg(args[0], ctx)?;
     let elem = match list.ty {
         ir::Ty::List(e) => *e,
         other => {
             return Err(err(
-                format!("sum() expects a list of numbers, found {other}"),
+                format!("sum() expects an iterable of numbers, found {other}"),
                 args[0].span,
             ));
         }

@@ -76,10 +76,10 @@ Build your own module with `pyrs build-extension -i kernels.py --module kernels_
 --python .venv/bin/python`; import `kernels_native` from that same environment.
 Only the exported kernels run natively; Python and package code keep using CPython.
 
-## The language (v0.97.0)
+## The language (v0.98.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.98.0**, not 1.0) until it is ready for
+milestone after this one is **0.99.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -235,6 +235,9 @@ A statically-typed Python subset:
   (CPython slice bounds; `None` is a type error; miss is the same ValueError).
   **v0.72:** `str.casefold()` — full Unicode case folding since v0.91, so
   `"ß".casefold()` is `"ss"` and matches `"SS".casefold()`.
+  **v0.98:** `sorted` / `sum` / `max` / `min` / `set` / `list` / `join` accept
+  any iterable — tuple, set, dict, str, range, generator (`list(range(n))`
+  materializes; `any`/`all` keep short-circuiting and exclude range).
   **v0.97:** lambda parameter types inferred — from the element type for
   `key=`, otherwise from body usage; `sorted(xs, key=lambda v: -v)` works.
   **v0.96:** generator expressions `(f(x) for x in xs if p(x))` — lazy, bare
@@ -487,7 +490,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.97.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.98.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -667,4 +670,4 @@ compatibility probes.
 
 Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
-Release tags: `git tag v0.97.0 && git push origin v0.97.0`.
+Release tags: `git tag v0.98.0 && git push origin v0.98.0`.
