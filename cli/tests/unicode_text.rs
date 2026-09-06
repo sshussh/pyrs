@@ -742,3 +742,54 @@ print([chr(0x200B), "café"])
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// String literal escapes
+//
+// The lexer previously recognised only \n \t \r \0 \\ \' \", so `"\x00"`
+// survived as the four characters `\`, `x`, `0`, `0` and `len` reported 4.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn numeric_escapes_decode_to_code_points() {
+    matches_python(
+        "escape-numeric",
+        r#"
+print("\x41\x42", "é", "\U0001F40D")
+print(len("\x00"), len("a\x00b"), len("\U0001F40D"))
+print("é" == chr(0xE9), "\U0001F40D" == chr(0x1F40D))
+print("\xe9".upper(), len("中文"))
+"#,
+    );
+}
+
+#[test]
+fn octal_and_control_escapes_decode() {
+    matches_python(
+        "escape-octal",
+        r#"
+print("\101\102", "\0" == chr(0))
+print("\a" == chr(7), "\b" == chr(8), "\f" == chr(12), "\v" == chr(11))
+print(len("\t\n\r"))
+"#,
+    );
+}
+
+#[test]
+fn unknown_escapes_stay_verbatim() {
+    matches_python(
+        "escape-unknown",
+        r#"
+print("\\d" == "\\" + "d")
+print(len("\\q"), "\\q"[0] == "\\")
+"#,
+    );
+}
+
+#[test]
+fn escapes_decode_inside_triple_quoted_and_f_strings() {
+    matches_python(
+        "escape-contexts",
+        "\ns = \"\"\"a\\x41b\"\"\"\nprint(s, len(s))\nn = 5\nprint(f\"\\u00e9{n}\\x21\")\n",
+    );
+}
