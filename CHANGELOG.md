@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.96.0 — Generator expressions
+
+`(elem for target in iter if cond)` was a parse error, which made the four
+most common consuming idioms unavailable at once: `sum(x for x in xs)`,
+`any(... for ...)`, `max(... for ...)` and `",".join(str(x) for x in xs)`.
+
+- Generator expressions work as a parenthesized value and, per CPython, may
+  drop their own parentheses when they are a call's sole argument. Multiple
+  `for` clauses and multiple `if` filters are supported.
+- They are genuinely lazy. The element expression runs on demand, `any` / `all`
+  short-circuit through them, and the outermost iterable is evaluated once when
+  the generator is created — the tests print from inside the producing code, so
+  a comprehension-shaped desugaring would show a different trace even where the
+  final answer agreed.
+- The loop variable does not leak into the enclosing scope, and enclosing
+  locals, parameters and module-level functions are all visible inside.
+- Element types other than `int` are inferred, so `list(str(x) for x in xs)`
+  and `",".join(s + "!" for s in ss)` work.
+- Rejected with a diagnostic rather than a wrong answer: a bare generator
+  expression alongside other call arguments (CPython requires parentheses
+  there), and capturing a *module-level* variable — the closure cell would
+  never be filled because the assignment writes a global. That last case
+  previously failed at run time with a NameError, and did so for lambdas too;
+  both now fail at compile time with guidance to move the code into a function
+  or pass the value in.
+
 ## 0.95.0 — Generators as arguments to the eager builtins
 
 A generator function could only be consumed by a `for` loop or a

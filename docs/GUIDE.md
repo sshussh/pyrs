@@ -834,6 +834,12 @@ def clamp(x: float, lo: float, hi: float) -> float:
   covering return paths.
 - Recursion and mutual recursion work; functions may be called before
   their definition in the file.
+- Generator expressions `(x * 2 for x in xs if x)` are lazy and can drop
+  their parentheses as a call's sole argument (`sum(x for x in xs)`). The
+  loop variable does not leak; the outermost iterable is evaluated when the
+  generator is created. A generator expression is a closure, so at module
+  scope it cannot reference other module-level variables — move the code
+  into a function, or pass the value in (the compiler says so).
 - Generator functions use `yield` / `yield from` list, tuple, str
   (chars), or another generator. A generator can be consumed by a `for`
   loop, a comprehension, and the eager builtins `list`, `set`, `sorted`,

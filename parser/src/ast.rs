@@ -602,6 +602,13 @@ pub enum ExprKind {
         target_span: Span,
         value: Box<Expr>,
     },
+    /// `(elem for target in iter if cond ...)` — a lazy generator
+    /// expression. Same shape as [`ExprKind::ListComp`], but it evaluates to
+    /// a generator rather than a list.
+    GenExp {
+        elem: Box<Expr>,
+        generators: Vec<CompFor>,
+    },
     /// `body if test else orelse` — Python's conditional expression. Exactly
     /// one of the branches is evaluated, after `test`.
     IfExp {

@@ -540,6 +540,48 @@ fn bare_param_infer_err(p: &ast::Param) -> Diagnostic {
     )
 }
 
+thread_local! {
+    /// Types for compiler-synthesized parameters, keyed by their unique names.
+    ///
+    /// A generator expression passes its outermost iterable as a real
+    /// parameter, and that parameter's type is whatever the iterable
+    /// expression lowered to — something neither an annotation nor the
+    /// syntactic default inference can recover. The names are dot-prefixed and
+    /// unique, so they cannot collide with anything a program can write.
+    static SYNTH_PARAM_TYS: RefCell<HashMap<String, ir::Ty>> = RefCell::new(HashMap::new());
+}
+
+fn set_synth_param_ty(name: &str, ty: ir::Ty) {
+    SYNTH_PARAM_TYS.with(|m| m.borrow_mut().insert(name.to_string(), ty));
+}
+
+fn synth_param_ty(name: &str) -> Option<ir::Ty> {
+    SYNTH_PARAM_TYS.with(|m| m.borrow().get(name).copied())
+}
+
+fn clear_synth_param_tys() {
+    SYNTH_PARAM_TYS.with(|m| m.borrow_mut().clear());
+}
+
+thread_local! {
+    /// Yield types for compiler-synthesized generator functions, by name.
+    ///
+    /// A generator expression's element type depends on the loop targets,
+    /// which exist only inside the synthesized body — so neither a return
+    /// annotation nor the first-yield scan can recover it. The lowering
+    /// computes it up front, by binding the targets exactly as a list
+    /// comprehension would, and leaves it here.
+    static SYNTH_YIELD_TYS: RefCell<HashMap<String, ir::Ty>> = RefCell::new(HashMap::new());
+}
+
+fn set_synth_yield_ty(name: &str, ty: ir::Ty) {
+    SYNTH_YIELD_TYS.with(|m| m.borrow_mut().insert(name.to_string(), ty));
+}
+
+fn synth_yield_ty(name: &str) -> Option<ir::Ty> {
+    SYNTH_YIELD_TYS.with(|m| m.borrow().get(name).copied())
+}
+
 /// Resolve all formal params, inferring bare ones monomorphically from body usage.
 fn resolve_params_with_body_infer(
     formals: &[ast::Param],
@@ -555,12 +597,15 @@ fn resolve_params_with_body_infer(
                 p.span,
             ));
         }
-        let ty = match resolve_param_ty_opt(p)? {
+        let ty = match synth_param_ty(&p.name) {
             Some(t) => t,
-            None => {
-                bare_idxs.push(params.len());
-                ir::Ty::Int // placeholder
-            }
+            Option::None => match resolve_param_ty_opt(p)? {
+                Some(t) => t,
+                Option::None => {
+                    bare_idxs.push(params.len());
+                    ir::Ty::Int // placeholder
+                }
+            },
         };
         if ty == ir::Ty::None {
             return Err(err(
@@ -1373,6 +1418,192 @@ fn narrowing_from_condition_with(
         _ => {}
     }
     (then_m, else_m)
+}
+
+/// The type a generator expression yields.
+///
+/// Computed by binding the loop targets exactly as `lower_list_comp` does and
+/// then typing the element — the only way to know it, since the targets exist
+/// only inside the generator. The IR this builds is thrown away; it runs
+/// before the synthesized function is lowered, purely to type it.
+fn gen_exp_elem_ty(
+    elem: &ast::Expr,
+    generators: &[ast::CompFor],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Ty> {
+    // Cell inits belong to the real lowering, not to this probe.
+    let saved_cells = std::mem::take(&mut ctx.pending_cell_inits);
+    let mut renames_pushed = 0usize;
+    let result = (|ctx: &mut FnCtx| -> SResult<ir::Ty> {
+        for clause in generators {
+            let mut setup = Vec::new();
+            let parts = lower_comp_iter(&clause.iter, false, ctx, &mut setup)?;
+            let (_, n_renames) = bind_comp_target(&clause.target, parts.element, ctx)?;
+            renames_pushed += n_renames;
+        }
+        Ok(lower_expr(elem, ctx)?.ty)
+    })(ctx);
+    for _ in 0..renames_pushed {
+        ctx.comp_renames.pop();
+    }
+    ctx.pending_cell_inits = saved_cells;
+    result
+}
+
+/// Lower `(elem for target in iter if cond ...)` to a synthesized nested
+/// generator function, then call it.
+///
+/// Desugaring at the *AST* level rather than building IR directly is what
+/// makes this small: the nested-def path already handles free-variable
+/// capture, `stmts_have_yield` already recognises the body as a generator,
+/// and the ordinary call path already produces the generator object. Nothing
+/// new is needed in the IR.
+///
+/// The nesting is inside-out, so `(x + y for x in xs for y in ys)` becomes
+/// `for x in xs: for y in ys: yield x + y`, which is Python's order.
+fn lower_gen_exp(
+    elem: &ast::Expr,
+    generators: &[ast::CompFor],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if generators.is_empty() {
+        return Err(err(
+            "internal error: generator expression has no generators",
+            span,
+        ));
+    }
+    ctx.temp_counter += 1;
+    let name = format!(".genexp{}", ctx.temp_counter);
+    let iter_param = format!(".genexp{}.iter", ctx.temp_counter);
+
+    // The outermost iterable is evaluated here, into a temp, and passed as a
+    // real argument rather than captured. Two things fall out of that. It is
+    // evaluated once, before the generator runs, which is CPython's rule that
+    // the outermost iterable is consumed eagerly at creation. And it is not a
+    // free variable, which matters at module level: the iterable is usually a
+    // global there, and a function cannot capture one, so `sum(x for x in xs)`
+    // at top level would otherwise fail where the same line inside a function
+    // works.
+    // The element type has to be known before the body is lowered, because
+    // the yield sites are checked against it.
+    let yield_ty = gen_exp_elem_ty(elem, generators, ctx)?;
+    set_synth_yield_ty(&name, yield_ty);
+
+    // Not every iterable is a first-class value here -- `range(...)` is only
+    // legal as a `for` iterable, for one -- so try to lower it, and when that
+    // fails leave it inside the body where the loop handles it natively. The
+    // cost is that such an iterable is evaluated lazily rather than at
+    // creation; probing rather than enumerating keeps this correct as more
+    // iterables become values.
+    let hoisted: Option<(String, ir::Stmt)> = match lower_expr(&generators[0].iter, ctx) {
+        Ok(iter_ir) => {
+            set_synth_param_ty(&iter_param, iter_ir.ty);
+            let iter_t = ctx.fresh_temp("genexp.iter", iter_ir.ty);
+            let setup = ir::Stmt::Assign {
+                name: iter_t.clone(),
+                value: iter_ir,
+            };
+            Some((iter_t, setup))
+        }
+        Err(_) => Option::None,
+    };
+
+    // Innermost first: `yield elem`, wrapped by each clause's filters, then by
+    // that clause's `for`, working outward.
+    let mut body = vec![ast::Stmt {
+        kind: ast::StmtKind::ExprStmt(ast::Expr {
+            kind: ast::ExprKind::Yield(Some(Box::new(elem.clone()))),
+            span: elem.span,
+        }),
+        span: elem.span,
+    }];
+    for (i, clause) in generators.iter().enumerate().rev() {
+        for cond in clause.ifs.iter().rev() {
+            body = vec![ast::Stmt {
+                kind: ast::StmtKind::If {
+                    branches: vec![(cond.clone(), body)],
+                    orelse: Vec::new(),
+                },
+                span: cond.span,
+            }];
+        }
+        let iter = if i == 0 && hoisted.is_some() {
+            ast::Expr {
+                kind: ast::ExprKind::Name(iter_param.clone()),
+                span: clause.iter.span,
+            }
+        } else {
+            clause.iter.clone()
+        };
+        body = vec![ast::Stmt {
+            kind: ast::StmtKind::For {
+                target: clause.target.clone(),
+                iter,
+                body,
+                orelse: Vec::new(),
+            },
+            span,
+        }];
+    }
+
+    let fd = ast::FuncDef {
+        name: name.clone(),
+        params: if hoisted.is_some() {
+            vec![ast::Param {
+                name: iter_param,
+                ty: Option::None,
+                span,
+                default: Option::None,
+            }]
+        } else {
+            Vec::new()
+        },
+        vararg: Option::None,
+        kwarg: Option::None,
+        ret: Option::None,
+        body,
+        span,
+        decorators: Vec::new(),
+    };
+    lower_nested_func_def(&fd, ctx)?;
+
+    // Same cell-init flush the lambda and FuncDef statement paths do: without
+    // it a captured free variable's cell is still null when the generator runs.
+    let mut inits = std::mem::take(&mut ctx.pending_cell_inits);
+    freeze_nested_defaults(&name, span, ctx, &mut inits)?;
+
+    let call = lower_expr(
+        &ast::Expr {
+            kind: ast::ExprKind::Call {
+                func: name,
+                func_span: span,
+                args: match &hoisted {
+                    Some((iter_t, _)) => vec![ast::PosArg::Pos(ast::Expr {
+                        kind: ast::ExprKind::Name(iter_t.clone()),
+                        span,
+                    })],
+                    Option::None => Vec::new(),
+                },
+                keywords: Vec::new(),
+                kwargs: Option::None,
+            },
+            span,
+        },
+        ctx,
+    )?;
+    let mut stmts = Vec::new();
+    if let Some((_, setup)) = hoisted {
+        stmts.push(setup);
+    }
+    stmts.extend(inits);
+    Ok(ir::Expr {
+        ty: call.ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(call),
+        },
+    })
 }
 
 /// Lower `lambda params: body` to a nested function + MakeClosure.
@@ -3081,7 +3312,9 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                 // otherwise infer from the first yield. These must agree with
                 // lower_function, or a call site sees a different element type
                 // than the body produced.
-                let y = if ret != ir::Ty::None {
+                let y = if let Some(t) = synth_yield_ty(&f.name) {
+                    t
+                } else if ret != ir::Ty::None {
                     ret
                 } else {
                     first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
@@ -5371,6 +5604,8 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     assert!(!modules.is_empty(), "a program needs at least one module");
     clear_closure_defaults();
     clear_class_env();
+    clear_synth_param_tys();
+    SYNTH_YIELD_TYS.with(|m| m.borrow_mut().clear());
     // Before regular class collection: an exception class must not acquire a
     // ClassId, a layout or a vtable.
     collect_exception_classes(modules)?;
@@ -6315,10 +6550,13 @@ fn lower_function_inner(
         // Without one, take the first `yield` of a literal or an annotated
         // parameter -- defaulting to Int made `def g(): yield "a"` a hard
         // error, so an unannotated generator could only ever yield ints.
-        let yty = match ctx.ret {
-            ir::Ty::None => first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int),
-            other if !matches!(other, ir::Ty::Generator { .. }) => other,
-            _ => first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int),
+        let yty = match synth_yield_ty(&f.name) {
+            Some(t) => t,
+            Option::None => match ctx.ret {
+                ir::Ty::None => first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int),
+                other if !matches!(other, ir::Ty::Generator { .. }) => other,
+                _ => first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int),
+            },
         };
         ctx.yield_ty = Some(yty);
         gen_yield_ty = Some(yty);
@@ -6913,7 +7151,9 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     let is_generator = stmts_have_yield(&f.body);
     let yield_ty = if is_generator {
         // Must match lower_function's rule; see the note there.
-        let y = if ret != ir::Ty::None {
+        let y = if let Some(t) = synth_yield_ty(&f.name) {
+            t
+        } else if ret != ir::Ty::None {
             ret
         } else {
             first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
@@ -7239,6 +7479,22 @@ fn ensure_cell_unbound(
     if ctx.cell_locals.contains_key(name) {
         return Ok(None);
     }
+    // At module scope the binding this cell stands for is a *global*, so the
+    // assignment writes the global and the cell stays empty — the closure then
+    // fails at run time with a NameError about a free variable. Reject it here
+    // instead. A top-level `def` is unaffected: it is a module function that
+    // reads the global directly, not a capture.
+    if ctx.is_entry {
+        return Err(err(
+            format!(
+                "'{name}' is a module-level variable and cannot be captured by a \
+                 closure here (lambda, generator expression, or a function \
+                 defined inside an expression). Move the code into a function, \
+                 or pass '{name}' in as an argument"
+            ),
+            span,
+        ));
+    }
     // Reject types we cannot store once assigned (same subset as before).
     match ty {
         ir::Ty::Int
@@ -7337,7 +7593,9 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     let is_generator = stmts_have_yield(&f.body);
     let yield_ty = if is_generator {
         // Must match lower_function's rule; see the note there.
-        let y = if ret != ir::Ty::None {
+        let y = if let Some(t) = synth_yield_ty(&f.name) {
+            t
+        } else if ret != ir::Ty::None {
             ret
         } else {
             first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
@@ -7493,6 +7751,11 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     };
 
     // Build a FuncDef with a fully-qualified name for IR.
+    // The body is lowered under the mangled IR name, so a synthesized yield
+    // type registered against the user-visible name has to follow it.
+    if let Some(t) = synth_yield_ty(&f.name) {
+        set_synth_yield_ty(&ir_name, t);
+    }
     let nested_def = ast::FuncDef {
         name: ir_name.clone(),
         params: f.params.clone(),
@@ -16193,6 +16456,9 @@ fn const_none() -> ir::Expr {
 fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     match &expr.kind {
         ast::ExprKind::IfExp { test, body, orelse } => lower_if_exp(test, body, orelse, ctx),
+        ast::ExprKind::GenExp { elem, generators } => {
+            lower_gen_exp(elem, generators, expr.span, ctx)
+        }
         ast::ExprKind::Int(v) => Ok(int_const(*v)),
         ast::ExprKind::IntDigits(s) => Ok(ir::Expr {
             ty: ir::Ty::Int,
