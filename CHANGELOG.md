@@ -1,5 +1,83 @@
 # Changelog
 
+## 0.90.0 — Unicode code point offsets
+
+String offsets are Unicode code points, matching CPython. `PyrsStr` stays a
+UTF-8 buffer and gains a cached code point count as its first header word, so
+`len(s)` is O(1), codegen's `emit_len` is unchanged, and `print`, file I/O,
+hashing, comparison and the CPython bridge keep operating on bytes. ASCII
+strings are recognised as `cplen == len` and keep the existing paths.
+
+- `len`, indexing, slicing (including a step), iteration, `list(str)` and
+  `set(str)` count and select whole characters across 1-, 2-, 3- and 4-byte
+  code points, combining sequences and an embedded NUL. `len("héllo")` is now
+  `5`, `"héllo"[1]` is `é`, and `len("🐍")` is `1`.
+- `find`/`rfind`/`index`/`rindex`/`count` return character offsets and accept
+  character `start`/`end` bounds, as do `startswith`/`endswith`.
+  `"héllo".find("l")` is now `2`.
+- `split`/`rsplit`/`partition`/`rpartition`/`splitlines` and the `strip`
+  family never split a character; `strip(chars)` compares whole code points
+  instead of bytes, so it can no longer leave an invalid sequence behind.
+- `center`/`ljust`/`rjust`/`zfill`/`expandtabs` and f-string format widths and
+  precision measure characters, and a multi-byte fill character is written
+  whole. `translate`/`maketrans` key on code point ordinals. `ord` is O(1).
+- Fixed alongside: four string allocation sites hand-rolled the old header
+  layout (exception messages, object reprs, generator `throw`), one of which
+  corrupted the heap once the header changed.
+- Indexing a non-ASCII string is O(n), not CPython's O(1). A one-entry
+  sequential-access memo, invalidated on every collection, keeps `for c in s`
+  and index loops linear. On this host a string-saturated ASCII workload costs
+  5.3%; code that touches no strings is unaffected.
+- Case transforms (`upper`, `lower`, `title`, …) and the `is*` predicates keep
+  their documented ASCII-only behavior. `"ß".upper()` is still `ß` and
+  `"é".isalpha()` is still `False`; the generated Unicode 16.0.0 tables are the
+  next milestone. Offsets and properties are now separate, so no operation
+  counts bytes while another counts characters.
+- Not addressed, and unrelated to offsets: the lexer accepts no `\xNN` or
+  `\uXXXX` escapes, and an f-string replacement field cannot contain nested
+  quotes.
+
+## 0.89.0 — Value fidelity: numeric literals and default `!=`
+
+- Mixed-numeric list and tuple literals keep each element's own type instead of
+  promoting to one: `[1, 2.5, 1]` prints `[1, 2.5, 1]`, not `[1.0, 2.5, 1.0]`.
+  `join_elem_types` builds a union for mixed `(int, float)`, `(int, bool)` and
+  `(float, bool)` pairs; homogeneous literals are unaffected and keep
+  single-type storage. The default-argument inference path was joining with the
+  scalar-assignment rule and now agrees.
+- A class defining `__eq__` with no `__ne__` anywhere in its ancestry gets one
+  synthesized, calling `self.__eq__` negated through the normal vtable. `a != b`
+  where `a` is `Base`-typed but holds a `Child` defining `__ne__` now reaches
+  `Child.__ne__`, keeping both its result and its side effects. Synthesis walks
+  classes parent-first so an ancestor's explicit `__ne__` is never shadowed.
+- Converting an already-typed `list[int]` to `list[float]` or to a union by
+  assignment remains unsupported; only a literal's own elements are joined.
+  Recorded as its own roadmap item rather than implied closed.
+
+## 0.88.0 — Trustworthy validation gates
+
+- The example parity gate fails when either process fails, instead of comparing
+  only captured output.
+- Integration tests build under `CARGO_TARGET_TMPDIR` (`target/tmp`, the path CI
+  uploads) and retain their inputs when the thread is panicking, so a failing
+  test leaves usable artifacts.
+- `make hygiene` checks version agreement across 20 sites and resolves every
+  relative documentation link, and its own failure paths are tested.
+- `make asan` / `make ubsan` build the adapter, runtime and collector
+  instrumented and run the extension boundary suite. The LLVM-generated kernel
+  object is not instrumented; this is adapter and runtime coverage.
+
+## 0.87.0 — String annotations and `__future__` imports
+
+- Annotations written as string literals are accepted and resolved, including
+  nested generics, unions and `Optional`, forward references to the enclosing
+  class, and local variable annotations.
+- `from __future__ import annotations` is accepted as a no-op, as are the other
+  mandatory-in-Python-3 future features.
+- Multidimensional slice syntax (`a[i, j]`) and matrix multiplication (`@`) are
+  rejected with specific diagnostics naming what is missing, rather than a
+  generic parse error.
+
 ## 0.86.0 — CPython interoperability and stranded correctness fixes
 
 Native compilation is the default; the target workload family is scientific/data

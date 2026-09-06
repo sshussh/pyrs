@@ -434,13 +434,14 @@ range gives `""`, and negative steps walk backwards — `s[::-1]` reverses,
 `s[8:2:-2]` == `"rwo"` for `"hello world"`. A zero step raises
 `ValueError`.
 
-String methods (ASCII case/whitespace rules):
+String methods (offsets are code points; case and `is*` rules are still
+ASCII-only — see the note after this section):
 
 ```python
 "  hi  ".strip()          # also lstrip / rstrip; .strip("x") / None ok
 "abc".upper()             # "ABC"; .lower() / .casefold() / .capitalize() / .title() / .swapcase() too
 "42".zfill(5)             # "00042"; "-42".zfill(5) is "-0042"
-"hi".center(5, "-")       # "--hi-"; also ljust / rjust (1-byte fill)
+"hi".center(5, "-")       # "--hi-"; also ljust / rjust (one-character fill)
 "hello".startswith("he")  # True; .endswith too; tuple of strs and start/end ok
 "banana".find("an")       # 1, or -1 when absent; optional start/end
 "banana".index("an")      # like find, but ValueError if missing
@@ -475,10 +476,31 @@ ord("é")                  # 233 — Unicode code point
 chr(233)                  # "é"; chr(True) is "\x01"
 ```
 
-`len` / indexing / slicing on `str` are **byte**-based (`len("é")` is
-`2`). `ord` / `chr` follow CPython and count **Unicode characters**
-(`ord("é")` is `233`; `ord("éé")` is a TypeError for length 2). Do not
-mix `len(chr(n))` with CPython when `n` is non-ASCII.
+`len`, indexing, slicing, iteration, `list(str)`, `set(str)`, the search
+methods (`find` / `rfind` / `index` / `count`, and their `start`/`end`
+bounds), the `split` / `partition` / `strip` family, the padding widths
+(`center` / `ljust` / `rjust` / `zfill` / `expandtabs`) and f-string format
+widths all count **Unicode code points**, as CPython does: `len("é")` is
+`1`, `len("🐍")` is `1`, and `"héllo".find("l")` is `2`. `ord` / `chr`
+round-trip with them.
+
+Two divergences to know about:
+
+- **Case and character-class methods are still ASCII-only.** `upper`,
+  `lower`, `title`, `capitalize`, `swapcase`, `casefold` and every `is*`
+  predicate ignore non-ASCII characters, so `"ß".upper()` is `"ß"` (CPython
+  gives `"SS"`), `"naïve".upper()` is `"NAïVE"`, and `"é".isalpha()` is
+  `False`. Whitespace-driven `strip()` / `split()` and `splitlines()` use
+  the ASCII whitespace and line-terminator sets. Unicode data tables are the
+  next milestone.
+- **Indexing a non-ASCII string is O(n), not O(1).** Strings are stored as
+  UTF-8, so `s[i]` scans. Sequential access — `for c in s`, or
+  `for i in range(len(s))` — is amortised O(1) per step, so ordinary loops
+  stay linear; random access into a large non-ASCII string does not. ASCII
+  strings are O(1) throughout.
+
+The lexer does not yet accept `\xNN` or `\uXXXX` escapes in string
+literals; use `chr(n)` for a non-literal character.
 
 ### f-strings
 

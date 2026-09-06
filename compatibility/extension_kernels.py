@@ -42,7 +42,10 @@ def joined_text(count: int) -> str:
 
 def invalid_utf8(values: list[float]) -> str:
     if len(values) > 0:
-        return "é"[0]
+        # A lone surrogate. Indexing no longer splits a character (str offsets
+        # are code points as of 0.90), so this is what still produces bytes
+        # the bridge must refuse to hand to CPython as UTF-8.
+        return chr(0xD800)
     return ""
 
 

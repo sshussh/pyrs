@@ -11580,8 +11580,9 @@ fn lower_str_maketrans(
                 args[1].span,
                 "maketrans() arg 2",
             )?;
+            // "equal length" is CPython's character count, not a byte count
             if let (ir::ExprKind::ConstStr(a), ir::ExprKind::ConstStr(b)) = (&x.kind, &y.kind)
-                && a.len() != b.len()
+                && a.chars().count() != b.chars().count()
             {
                 return Err(err(
                     "the first two maketrans arguments must have equal length",
@@ -11612,8 +11613,9 @@ fn lower_str_maketrans(
                 args[2].span,
                 "maketrans() arg 3",
             )?;
+            // "equal length" is CPython's character count, not a byte count
             if let (ir::ExprKind::ConstStr(a), ir::ExprKind::ConstStr(b)) = (&x.kind, &y.kind)
-                && a.len() != b.len()
+                && a.chars().count() != b.chars().count()
             {
                 return Err(err(
                     "the first two maketrans arguments must have equal length",
@@ -11933,8 +11935,9 @@ fn as_fillchar(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             arg.span,
         ));
     }
+    // "one character" is one code point, which may be several UTF-8 bytes
     if let ir::ExprKind::ConstStr(c) = &f.kind
-        && c.len() != 1
+        && c.chars().count() != 1
     {
         return Err(err(
             "The fill character must be exactly one character long",

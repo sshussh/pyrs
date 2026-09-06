@@ -94,8 +94,9 @@ class ExtensionTests(unittest.TestCase):
                 values = array.array("d", [1.0])
                 with self.assertRaises(UnicodeDecodeError):
                     module.invalid_utf8(values)
-                # Byte-based native Unicode indexing is still a known gap;
-                # decoding failure must release input exports and native roots.
+                # Native str offsets are code points as of 0.90, so a lone
+                # surrogate is the remaining way to reach this path; decoding
+                # failure must release input exports and native roots.
                 values.append(2.0)
                 self.assertEqual(module.invalid_utf8([]), "")
                 self.assertEqual(module.ping(), "pong")

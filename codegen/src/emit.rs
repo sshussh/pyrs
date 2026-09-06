@@ -11,7 +11,9 @@
 //! - `**` on ints uses runtime pow (negative exponent traps);
 //!   `0.0 ** negative` traps like Python instead of returning inf
 //!
-//! Strings are length-prefixed `{ i64, [n x i8] }` blobs; lists are
+//! Strings are `{ i64 codepoints, i64 bytes, [n x i8] }` blobs -- the code
+//! point count comes first because `emit_len` loads the first i64 for every
+//! sized object, and `len(s)` must be the Python answer; lists are
 //! `{ len, cap, data }` headers with 8-byte value slots. Both live behind
 //! `ptr` and are managed by the C runtime.
 //!
@@ -1338,18 +1340,22 @@ impl Emitter {
         self.terminated = false;
     }
 
-    /// A string constant as a `{ i64 len, [n x i8] }` global; the pointer
-    /// doubles as the runtime `PyrsStr*`.
+    /// A string constant as a `{ i64 codepoints, i64 bytes, [n x i8] }`
+    /// global; the pointer doubles as the runtime `PyrsStr*`.
     fn intern_string(&mut self, content: &str) -> String {
         if let Some(name) = self.strings.get(content) {
             return name.clone();
         }
         let name = format!("@.str.{}", self.strings.len());
         let (escaped, storage) = escape_bytes(content);
+        // The runtime PyrsStr header is { code points, UTF-8 bytes }. Rust
+        // `&str` is already valid UTF-8, so the count is exact here and no
+        // runtime scan is needed for a literal.
+        let cplen = content.chars().count();
         let len = content.len();
         self.string_defs.push_str(&format!(
-            "{name} = private unnamed_addr constant {{ i64, [{storage} x i8] }} \
-             {{ i64 {len}, [{storage} x i8] c\"{escaped}\" }}\n"
+            "{name} = private unnamed_addr constant {{ i64, i64, [{storage} x i8] }} \
+             {{ i64 {cplen}, i64 {len}, [{storage} x i8] c\"{escaped}\" }}\n"
         ));
         self.strings.insert(content.to_string(), name.clone());
         name
@@ -1835,9 +1841,9 @@ impl Emitter {
     /// Trap with `message` and mark the block terminated.
     fn emit_die(&mut self, message: &str) {
         let msg = self.intern_string(message);
-        // pyrs_die takes a plain C string: skip the 8-byte length header
+        // pyrs_die takes a plain C string: skip the 16-byte PyrsStr header
         self.line(format!(
-            "call void @pyrs_die(ptr getelementptr inbounds (i8, ptr {msg}, i64 8))"
+            "call void @pyrs_die(ptr getelementptr inbounds (i8, ptr {msg}, i64 16))"
         ));
         self.line("unreachable");
         self.terminated = true;
@@ -3378,7 +3384,7 @@ impl Emitter {
                 self.start_block(&msg_some);
                 let data = self.tmp();
                 self.line(format!(
-                    "{data} = getelementptr inbounds i8, ptr {tmsg}, i64 8"
+                    "{data} = getelementptr inbounds i8, ptr {tmsg}, i64 16"
                 ));
                 let data_blk = self.cur_block.clone();
                 self.line(format!("br label %{msg_join}"));
@@ -3405,10 +3411,10 @@ impl Emitter {
             }
             Stmt::Raise { exc, message } => {
                 let m = self.emit_expr(message);
-                // pyrs_raise wants a C string: data pointer after length header
+                // pyrs_raise wants a C string: data pointer after the header
                 let data = self.tmp();
                 self.line(format!(
-                    "{data} = getelementptr inbounds i8, ptr {m}, i64 8"
+                    "{data} = getelementptr inbounds i8, ptr {m}, i64 16"
                 ));
                 // Uncaught raise in a generator (no active try) finishes it.
                 if self.gen_frame.is_some() && self.tries.is_empty() {
@@ -3696,9 +3702,10 @@ impl Emitter {
                 let p = self.intern_string(s);
                 let t = self.tmp();
                 let len = s.len() as i64;
-                // pyrs_int_from_str wants a C pointer to the byte data (skip i64 len header)
+                // pyrs_int_from_str wants a C pointer to the byte data, past
+                // the two i64 header words (code points, then bytes)
                 self.line(format!(
-                    "{t} = call i64 @pyrs_int_from_str(ptr getelementptr inbounds (i8, ptr {p}, i64 8), i64 {len})"
+                    "{t} = call i64 @pyrs_int_from_str(ptr getelementptr inbounds (i8, ptr {p}, i64 16), i64 {len})"
                 ));
                 t
             }

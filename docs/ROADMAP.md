@@ -3,10 +3,10 @@
 Status: implementation in progress. **Not a 1.0 release declaration.**
 
 PyRs has a substantial native compiler and runtime, but it is still a
-statically typed Python subset. Version **0.88.0** makes the validation
-gates trustworthy. The next milestone is **0.89.0**; reaching a particular
-minor version does not establish 1.0 readiness, and no stable release or
-tag has been created.
+statically typed Python subset. Version **0.90.0** makes every string
+offset a Unicode code point. The next milestone is **0.91.0**; reaching a
+particular minor version does not establish 1.0 readiness, and no stable
+release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -96,6 +96,17 @@ After 0.86 on the same host:
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
 
+After 0.90 on the same host:
+
+| Check | Result after 0.90 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1101 passed; none failed or ignored (24 new Unicode tests) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 18 pass / 0 known_gap; compat 6 pass |
+| `pyrs --version` | `PyRs 0.90.0` |
+
 Details live in the [0.83 implementation checklist](superpowers/plans/2026-09-05-comparison-protocols-0.83.md),
 the [0.84 implementation checklist](superpowers/plans/2026-09-05-iterator-exceptions-0.84.md),
 the [0.85 implementation checklist](superpowers/plans/2026-09-05-container-class-eq-0.85.md),
@@ -183,6 +194,47 @@ fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
 
+## 0.90.0: Unicode code point offsets
+
+`PyrsStr` was a UTF-8 byte buffer, and every operation except `ord`, `chr`
+and `ascii` treated it as a plain byte array. Any non-ASCII text therefore
+disagreed with CPython silently: `len("héllo")` was `6`, `"héllo"[1]` was
+half a character, `"héllo".find("l")` reported a byte offset, and `for c in
+s` yielded byte fragments.
+
+The milestone contract is:
+
+- `len`, indexing, slicing (including a step), iteration, `list(str)` and
+  `set(str)` count and select whole code points, for 1-, 2-, 3- and 4-byte
+  characters, combining sequences and an embedded NUL.
+- `find`/`rfind`/`index`/`rindex`/`count` return code point offsets and
+  accept code point `start`/`end` bounds, as do `startswith`/`endswith`.
+  `split`/`rsplit`/`partition`/`splitlines`/`strip` never split a character,
+  and `strip(chars)` compares whole code points.
+- `center`/`ljust`/`rjust`/`zfill`/`expandtabs` and f-string format widths
+  and precision measure characters. `translate`/`maketrans` key on code
+  point ordinals. `ord` is O(1).
+- ASCII strings keep the existing byte paths and behavior exactly.
+
+The representation stays UTF-8; the header gains a cached code point count
+as its *first* word, so `len(s)` is O(1) and codegen's `emit_len` — which
+loads the first `i64` of every sized object — is unchanged, as are `print`,
+file I/O, hashing, comparison and the CPython bridge. `str_alloc` leaves
+that count at `-1` and every producer must finish with `str_done_ascii`,
+`str_done_cplen` or `str_done_scan`, so a missed site reports a negative
+length loudly instead of miscounting silently.
+
+Case transforms and the `is*` predicates are deliberately **not** in scope
+and keep their documented ASCII-only behavior; that is a property boundary,
+not an offset one, so nothing mixes byte and character offsets in between.
+
+Measured on this host: a string-saturated ASCII workload costs 5.3% (141.0
+ms → 148.5 ms, best of 7), from the extra header word and the ASCII branch
+in indexing; `fib(30)`, which touches no strings, is unchanged (15.7 ms →
+15.4 ms). Indexing a non-ASCII string is O(n), against CPython's O(1); a
+one-entry sequential-access memo, invalidated on every collection, keeps a
+forward walk amortised O(1) so `for c in s` and index loops stay linear.
+
 ## Confirmed remaining gaps
 
 These findings remain open after the 0.83 scope. Passing the baseline did
@@ -193,7 +245,7 @@ not cover them.
 | User iterator exception handling | Closed in 0.84: `StopIteration` is caught only around `__next__` | Keep generator `for` on Optional None unless that subset is deliberately changed |
 | Iterable coverage | Closed in 0.84 for `for` and list/set/dict comprehensions | `any` / `all` / `enumerate` / `zip` / `reversed` still use a narrower set |
 | Rich comparisons | Closed in 0.85 for `list[C]` `==`/`!=`/`in`/`index`/`count`/`remove`, tuple `==`/`!=`, and homogeneous `tuple[C, …]` `in`/`index`/`count`. Still: no `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; mixed-tuple membership uses identity | Complete or explicitly bound the protocol contract before claiming general object compatibility |
-| Text | String length/index/slice use UTF-8 bytes, while `ord`/`chr` use Unicode code points; many methods use ASCII case and whitespace rules | Establish a consistent Unicode string contract and test multibyte, combining, whitespace, and case behavior |
+| Text | Closed in 0.90 for offsets: `len`, index, slice, iteration, `find`/`rfind`/`index`/`count`, split/partition/strip, padding and format widths, `list(str)`/`set(str)`, `translate`/`maketrans` and `ord`/`chr` all agree on code points. Still ASCII-only: case transforms and the `is*` predicates, whitespace and line-boundary sets, and the printability rule `repr` escapes by. Indexing a non-ASCII string is O(n) with a sequential-access memo, not CPython's O(1). Separately, the lexer accepts no `\xNN`/`\uXXXX` escapes and no nested quotes inside an f-string replacement field | Land the generated Unicode 16.0.0 tables in 0.91; specify lone-surrogate and encoding-error behavior |
 | Numeric and binding semantics | Closed in 0.86 for mixed int/float comparison and conditionally assigned locals. Closed in 0.89: mixed-numeric list/tuple **literals** keep each element's own type instead of promoting to one. Still open: converting an already-typed `list[int]` into `list[float]`/a union by assignment (only a literal's own elements are joined); dynamic negative integer powers trap; module globals, deletion and static use-before-assignment diagnostics | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
 | Generators and dynamism | `yield from` does not forward `send`/`throw`; generator exhaustion uses Optional None in several paths; `Any`, class attributes, inheritance, and class values remain restricted | Stabilize the intended subset and reject unsupported paths clearly; broader CPython dynamism is separate work |
 | Memory confidence | Conservative roots can retain garbage; abandoned generators do not run user finalizers; collection statistics exclude native/allocator overhead | Continue stress and exception-path tests and measure process memory on sustained workloads; see [GC.md](GC.md) |
@@ -217,11 +269,13 @@ why correctness rather than new capability sets the near-term order.
 
 | Probe | CPython 3.14 | PyRs | Status |
 |-------|--------------|------|--------|
-| `len("héllo")` | `5` | `6` | open — Unicode milestone |
-| `"héllo"[1]` | `é` | broken byte | open — Unicode milestone |
-| `"naïve café".upper()` | `NAÏVE CAFÉ` | `NAïVE CAFé` | open — Unicode milestone |
-| `"ß".upper()` | `SS` | `ß` | open — Unicode milestone |
-| `len("🐍")` | `1` | `4` | open — Unicode milestone |
+| `len("héllo")` | `5` | `5` | **closed in 0.90** |
+| `"héllo"[1]` | `é` | `é` | **closed in 0.90** |
+| `"héllo".find("l")` | `2` | `2` | **closed in 0.90** |
+| `len("🐍")` | `1` | `1` | **closed in 0.90** |
+| `"naïve café".upper()` | `NAÏVE CAFÉ` | `NAïVE CAFé` | open — 0.91 Unicode data |
+| `"ß".upper()` | `SS` | `ß` | open — 0.91 Unicode data |
+| `"é".isalpha()` | `True` | `False` | open — 0.91 Unicode data |
 | `2 ** 53 + 1 == 9007199254740992.0` | `False` | `False` | **closed in 0.86** |
 | `[1, 2.5, 1]` | `[1, 2.5, 1]` | `[1, 2.5, 1]` | **closed in 0.89** |
 | `a != b`, `a: Base` holding a `Child` defining `__ne__` | `Child.__ne__` runs | `Child.__ne__` runs | **closed in 0.89** |
@@ -328,12 +382,19 @@ documentation and the relevant gates.
 
 ### D. Unicode, bytes and I/O
 
-- [ ] One documented Python-compatible representation and a reproducible
-      Unicode data version. `len`/index/slice/search/iteration must agree on
+- [x] One documented representation (0.90): UTF-8 bytes with the code point
+      count cached in the `PyrsStr` header, so `len` stays O(1) and codegen's
+      `emit_len` is unchanged. `len`/index/slice/search/iteration agree on
       code points, including astral and combining characters and embedded
-      NUL. Specify lone-surrogate and encoding-error behavior.
+      NUL. ASCII is recognised as `cplen == len` and keeps the existing byte
+      paths. Still open: a reproducible Unicode data version, and
+      lone-surrogate and encoding-error behavior — a lone surrogate reaches
+      the CPython bridge today and is rejected there as invalid UTF-8.
 - [ ] Unicode case transforms, predicates, whitespace, padding, translation
-      and formatting. Avoid partial fixes mixing byte and character offsets.
+      and formatting. Offsets no longer mix bytes and characters (0.90), so
+      this is now a self-contained property-table change: generate Unicode
+      16.0.0 tables from the CPython oracle and replace the ASCII helpers
+      wholesale rather than one method at a time.
 - [ ] `bytes`/`bytearray`/`memoryview` as the corpus requires; encoding,
       binary and text files, newline handling, seek/tell, resource cleanup.
 - [ ] `sys` streams, `print(file=)`, environment, filesystem primitives,

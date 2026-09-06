@@ -421,6 +421,7 @@ static void gc_collect_inner(uintptr_t stack_top, const void *registers,
         return;
     }
     g_collecting = 1;
+    pyrs_str_cache_invalidate();
 
     PyrsGcRanges ranges = {0};
     for (PyrsGcHeader *header = g_objects; header != NULL;

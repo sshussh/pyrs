@@ -334,7 +334,7 @@ fn expression(e: &ast::Expr, names: &HashSet<String>) -> Result<(), String> {
         }
         E::Index { base, index } => { expression(base, names)?; expression(index, names)?; }
         E::Call { func, args, keywords, kwargs, .. } => {
-            if !names.contains(func) && !matches!(func.as_str(), "len" | "range" | "abs" | "sum" | "min" | "max" | "round" | "pow" | "divmod") {
+            if !names.contains(func) && !matches!(func.as_str(), "len" | "range" | "abs" | "sum" | "min" | "max" | "round" | "pow" | "divmod" | "chr" | "ord") {
                 return Err(format!("extension kernel call '{func}' is not supported; use numerical builtins or functions in this module"));
             }
             if kwargs.is_some() { return Err("extension kernels do not support ** call unpacking yet".into()); }
