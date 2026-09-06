@@ -13,9 +13,10 @@ exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.100.0** `str.format()` / `%` formatting, **0.101.0** tuple sort keys and
 **0.102.0** module-level containers, **0.103.0** annotated attributes and
 **0.104.0** `typing` imports with `Iterator[T]`, **0.105.0** n-ary `zip` with
-`enumerate(start)`, **0.106.0** class-body constants and **0.107.0** tuple
-dict/set keys. The next milestone is **0.108.0**; reaching a particular minor version does not establish 1.0
-readiness, and no stable release or tag has been created.
+`enumerate(start)`, **0.106.0** class-body constants, **0.107.0** tuple
+dict/set keys and **0.108.0** `str()` / `repr()` of containers. The next
+milestone is **0.109.0**; reaching a particular minor version does not
+establish 1.0 readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -104,6 +105,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.108 on the same host:
+
+| Check | Result after 0.108 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1348 passed; none failed or ignored (21 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 66 pass / 0 known_gap; compat 22 pass |
+| `pyrs --version` | `PyRs 0.108.0` |
 
 After 0.107 on the same host:
 
@@ -389,6 +401,37 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.108.0: `str()` and `repr()` of containers
+
+`print([1, 2])` wrote `[1, 2]`, but `str([1, 2])`, `f"{xs}"` and `"%s" % xs`
+were rejected -- so `print(f"result: {xs}")`, about the most ordinary line in
+a Python program, could not be written, and neither could a function that
+*returns* a rendered value.
+
+The formatting logic already existed and was already right. It just could not
+be reached from anything but `print`, because the print routines wrote straight
+to `stdout`. They now write through an output sink, and `str()` captures what
+`print` would have emitted, so the two agree by construction rather than by
+two implementations kept in step. That property is what the tests check:
+several print the value *and* `str()` of it in the same program.
+
+The milestone contract is:
+
+- `str(x)` / `repr(x)` for `list`, `tuple`, `dict`, `set`, nested arbitrarily,
+  over every element type `print` already handled.
+- f-strings, `%` and `str.format()` come with it -- all three already routed
+  through the `str()` lowering.
+- `repr()` and `ascii()` become builtins; they existed only as the f-string
+  `!r` / `!a` conversions.
+- A format spec on a container (`f"{xs:>10}"`) stays rejected, which is
+  CPython's `TypeError` moved to compile time. `ascii()` of a container stays
+  rejected too: unlike `repr` it must escape non-ASCII *inside* the elements,
+  which the shared rendering does not do.
+
+Inherited rather than introduced: sets iterate in insertion order here and in
+hash order in CPython, so `str({3, 1, 2})` differs exactly as
+`print({3, 1, 2})` already did.
 
 ## 0.107.0: tuple dict/set keys
 
@@ -967,7 +1010,7 @@ probes append to it.
 | `a != b`, `a: Base` holding a `Child` defining `__ne__` | `Child.__ne__` runs | `Child.__ne__` runs | **closed in 0.89** |
 | `def f(x: "Base")` | accepted | accepted | **closed in 0.87** |
 | `str(KeyError("k"))` | `'k'` | `k` | open — see below |
-| `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | rejected | open — see below |
+| `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | `(1, 2)`, `[1, 2]` | **closed in 0.108** |
 
 `KeyError.__str__` is CPython's `repr(args[0])`, so a str key displays quoted
 and an int key does not. Every *internal* raise site already formats
@@ -980,12 +1023,12 @@ str key from an int one. An attempt to normalize the raise sites and quote at
 display was reverted for exactly that reason — `s.remove(2)` regressed to
 `KeyError: '2'`.
 
-`str()` and f-string interpolation reject every container — `str((1, 2))`,
-`f"{xs}"` — with `str() cannot convert tuple[int, str] yet`, even though
-`print` formats the same value correctly. So this is a rejection, not a wrong
-answer, and the formatting logic already exists; what is missing is a
-container arm on the `str()`/f-string conversion path that reaches it. Found
-while testing 0.107 tuple keys.
+`str()` and f-string interpolation rejected every container until 0.108, even
+though `print` formatted the same value correctly. The formatting logic was
+right; it was unreachable, because the print routines wrote straight to
+`stdout`. 0.108 routes them through a sink that `str()` can capture, so the
+two now agree by construction. `ascii()` of a container and a format spec on
+one remain rejected, both deliberately.
 
 ## Product contract
 

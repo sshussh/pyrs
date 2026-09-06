@@ -1145,6 +1145,10 @@ pub enum ExprKind {
     StrRepr(Box<Expr>),
     /// `ascii(s)` for a string value (like repr, non-ASCII → `\xHH` / `\uXXXX`); result is `Str`.
     StrAscii(Box<Expr>),
+    /// `str(c)` / `repr(c)` for a list / tuple / dict / set — identical in
+    /// CPython, and identical to what `print` writes. Codegen dispatches on
+    /// the operand's own type, so one node covers every container.
+    ContainerRepr(Box<Expr>),
     /// `format(value, spec)` — free-form format mini-language; `spec` is `Str`.
     /// `value` is Int / Float / Bool / Str. Empty `spec` matches `str(value)`.
     FormatValue {

@@ -123,6 +123,12 @@
       "native": "pass"
     },
     {
+      "id": "container-str",
+      "file": "cases/container_str.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
       "id": "class-constants",
       "file": "cases/class_constants.py",
       "group": "core",
