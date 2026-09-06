@@ -32,6 +32,35 @@ pub const UNICODE_DATA_C: &str = include_str!("../runtime/unicode_data.c");
 /// Declarations and lookup inlines for [`UNICODE_DATA_C`].
 pub const UNICODE_DATA_H: &str = include_str!("../runtime/unicode_data.h");
 
+/// CPython version the Unicode tables and the differential oracle were
+/// generated against, read from the stamp in the generated header.
+///
+/// Tooling needs this to keep a project's interpreter aligned with the one
+/// PyRs was built for: uv picks its own default otherwise, and a mismatch
+/// only shows up when something Unicode- or compatibility-shaped disagrees.
+pub fn oracle_python_version() -> &'static str {
+    const KEY: &str = "#define PYRS_UNIDATA_CPYTHON \"";
+    match UNICODE_DATA_H.find(KEY) {
+        Some(at) => {
+            let rest = &UNICODE_DATA_H[at + KEY.len()..];
+            match rest.find('"') {
+                Some(end) => &rest[..end],
+                None => "3",
+            }
+        }
+        None => "3",
+    }
+}
+
+/// Major.minor of [`oracle_python_version`].
+pub fn oracle_python_minor() -> &'static str {
+    let v = oracle_python_version();
+    match v.match_indices('.').nth(1) {
+        Some((at, _)) => &v[..at],
+        None => v,
+    }
+}
+
 pub fn ping() -> String {
     String::from("pong")
 }

@@ -105,6 +105,27 @@ fn push_unique_root(roots: &mut Vec<PathBuf>, p: PathBuf) {
     }
 }
 
+/// Load a program that belongs to a project, whose declared import root is
+/// searched after the entry script's own directory.
+///
+/// A `src/` layout needs this: the resolver otherwise roots only at the entry
+/// script's directory, so a sibling package one level up is invisible.
+pub fn load_program_in_project(root: &Path, project_root: &Path) -> Result<Vec<Loaded>, LoadError> {
+    let entry = root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut roots = vec![entry];
+    push_unique_root(&mut roots, project_root.to_path_buf());
+    if let Some(p) = env_stdlib_root() {
+        push_unique_root(&mut roots, p);
+    }
+    if let Some(p) = workspace_stdlib_root() {
+        push_unique_root(&mut roots, p);
+    }
+    load_program_with_roots(root, &roots)
+}
+
 /// Like [`load_program`], but uses an explicit import search path for
 /// **filesystem** roots. `roots[0]` should be the entry script directory.
 /// First filesystem root that resolves a name wins; if none match, the

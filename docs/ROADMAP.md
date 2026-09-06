@@ -1182,8 +1182,14 @@ documentation and the relevant gates.
       working directory, exit status.
 - [x] Explicit whole-program compatibility execution against a selected
       CPython environment, never an automatic retry.
-- [ ] Report the selected engine. On Unix the native path `exec`s, so this
-      needs deciding before the call rather than after.
+- [x] Report the selected engine (0.110): `pyrs check` prints the entry
+      point, import root, execution mode and the resolved interpreter with
+      its source, decided before the call rather than after.
+- [x] Project configuration (0.110): `[tool.pyrs]` in `pyproject.toml`,
+      `pyrs init`, discovery, a declared import root for `src/` layouts, and
+      declared -- never inferred -- compatibility mode. uv supplies the
+      interpreter when present and is never required. Project *creation* is
+      `uv init`'s job, so there is no `pyrs new`.
 - [ ] Define compiled compatibility artifacts: dependency discovery,
       relocatability, deployment layout. A Python launcher is not a native
       compilation and must never be labeled as one.

@@ -26,6 +26,7 @@ impl Cli {
                         | "build-extension"
                         | "run"
                         | "check"
+                        | "init"
                         | "lex"
                         | "parse"
                         | "help"
@@ -85,6 +86,19 @@ pub enum Command {
 
     /// Build an experimental CPython extension from native numerical functions
     BuildExtension(ExtensionCommand),
+
+    /// Add a [tool.pyrs] table to this project's pyproject.toml
+    Init(InitCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct InitCommand {
+    /// Project directory (default: the current directory)
+    pub path: Option<path::PathBuf>,
+
+    /// Entry module to record, relative to the project directory
+    #[arg(long)]
+    pub entry: Option<path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -150,13 +164,17 @@ pub struct RunCommand {
     #[arg(long)]
     pub compat: bool,
 
+    /// Compile and run natively even when the manifest asks for compat
+    #[arg(long, conflicts_with = "compat")]
+    pub no_compat: bool,
+
     /// CPython executable for --compat (default: PYRS_PYTHON or python3)
-    #[arg(long, requires = "compat")]
+    #[arg(long)]
     pub python: Option<path::PathBuf>,
 
-    /// Optimization level (0-3)
-    #[arg(short = 'O', long = "opt-level", default_value_t = 2, value_parser = clap::value_parser!(u8).range(0..=3))]
-    pub opt_level: u8,
+    /// Optimization level (0-3); defaults to the manifest, then 2
+    #[arg(short = 'O', long = "opt-level", value_parser = clap::value_parser!(u8).range(0..=3))]
+    pub opt_level: Option<u8>,
 
     /// Recompile from scratch, reusing and publishing nothing
     #[arg(long)]
@@ -169,24 +187,26 @@ pub struct RunCommand {
 
 #[derive(Debug, Args)]
 pub struct CheckCommand {
-    /// Input file path
+    /// Input file path (default: the project's [tool.pyrs] entry)
     #[arg(short, long)]
-    pub input: path::PathBuf,
+    pub input: Option<path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct ExtensionCommand {
     /// Source containing numerical function definitions
+    /// (default: [tool.pyrs.extension] source)
     #[arg(short, long)]
-    pub input: path::PathBuf,
+    pub input: Option<path::PathBuf>,
 
     /// Import name of the resulting extension (an ASCII identifier)
+    /// (default: [tool.pyrs.extension] module)
     #[arg(long)]
-    pub module: String,
+    pub module: Option<String>,
 
     /// CPython executable whose headers and ABI to target
-    #[arg(long, default_value = "python3")]
-    pub python: path::PathBuf,
+    #[arg(long)]
+    pub python: Option<path::PathBuf>,
 
     /// Output extension path (defaults to MODULE plus Python's extension suffix)
     #[arg(short, long)]

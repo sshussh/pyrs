@@ -4,14 +4,73 @@ use std::{collections::HashSet, fs, path::PathBuf, process::Command};
 use ir::Ty;
 use parser::ast::{self, ExprKind as E, StmtKind as S};
 
-use crate::{cli::ExtensionCommand, read_source, render_diag, temp_workdir, temp_workdir_in};
+use crate::{
+    cli::ExtensionCommand, interpreter, read_source, render_diag, temp_workdir, temp_workdir_in,
+};
 
 const BRIDGE: &str = include_str!("../../codegen/runtime/python_bridge.c");
 
-pub fn build(cmd: ExtensionCommand) -> Result<(), String> {
+/// An extension build with every input decided.
+pub struct Resolved {
+    pub input: PathBuf,
+    pub module: String,
+    pub python: PathBuf,
+    pub output: Option<PathBuf>,
+    pub opt_level: u8,
+}
+
+/// Fill the command from `[tool.pyrs.extension]` where flags were omitted.
+fn resolve(cmd: ExtensionCommand) -> Result<Resolved, String> {
+    let project = match std::env::current_dir()
+        .ok()
+        .map(|d| crate::manifest::discover(&d))
+    {
+        Some(found) => found?,
+        None => None,
+    };
+    let manifest = match &project {
+        Some(path) => Some(crate::manifest::load(path)?),
+        None => None,
+    };
+    let declared = manifest.as_ref().and_then(|m| m.extension.clone());
+
+    let input = cmd
+        .input
+        .or_else(|| {
+            let m = manifest.as_ref()?;
+            Some(m.dir.join(&declared.as_ref()?.source))
+        })
+        .ok_or("no extension source: pass -i, or record [tool.pyrs.extension] in pyproject.toml")?;
+    let module = cmd
+        .module
+        .or_else(|| declared.as_ref().map(|e| e.module.clone()))
+        .ok_or(
+            "no extension module name: pass --module, or record [tool.pyrs.extension] in \
+             pyproject.toml",
+        )?;
+    let python = cmd
+        .python
+        .or_else(|| {
+            let m = manifest.as_ref()?;
+            Some(m.dir.join(m.python.as_ref()?))
+        })
+        .unwrap_or_else(crate::interpreter::discover);
+    Ok(Resolved {
+        input,
+        module,
+        python,
+        output: cmd.output,
+        opt_level: cmd.opt_level,
+    })
+}
+
+pub fn build(raw: ExtensionCommand) -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         return Err("build-extension currently supports Linux only".into());
     }
+    // `--module` and `-i` were required on every invocation; a project can
+    // record them once in [tool.pyrs.extension] instead. Flags still win.
+    let cmd = resolve(raw)?;
     if !identifier(&cmd.module) {
         return Err("extension module name must be an ASCII Python identifier".into());
     }
@@ -76,6 +135,7 @@ pub fn build(cmd: ExtensionCommand) -> Result<(), String> {
         return Err("extension source has no public numerical functions".into());
     }
 
+    interpreter::warn_on_version_mismatch(&cmd.python);
     let config = Command::new(&cmd.python).args(["-I", "-c", r#"
 import sys, sysconfig
 if sys.implementation.name != 'cpython' or sys.version_info < (3, 12):

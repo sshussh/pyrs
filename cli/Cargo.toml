@@ -1,6 +1,6 @@
 [package]
 name = "pyrs"
-version = "0.109.0"
+version = "0.110.0"
 edition = "2024"
 
 [dependencies]
@@ -12,3 +12,4 @@ ir = { path="../ir" }
 codegen = { path="../codegen" }
 
 clap = { version = "4.6.0", default-features = false, features = ["std", "derive", "help", "usage"] }
+toml = { version = "1.1.5", default-features = false, features = ["parse"] }

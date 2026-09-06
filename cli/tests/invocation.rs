@@ -227,12 +227,28 @@ fn rejects_invalid_execution_options() {
         vec!["compile", "-i", "missing.py", "-O", "4"],
         vec!["-O", "255", "missing.py"],
         vec!["-m", "json"],
-        vec!["--python", "python3", "missing.py"],
     ] {
-        let output = Command::new(PYRS).args(args).output().unwrap();
-        assert_eq!(output.status.code(), Some(2));
+        let output = Command::new(PYRS).args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(output.stdout.is_empty());
     }
+}
+
+#[test]
+fn python_without_compat_warns_rather_than_refusing() {
+    // `--python` stopped requiring `--compat` once [tool.pyrs] could select
+    // compatibility mode, so this is no longer a usage error -- but a flag
+    // that cannot take effect should still say so.
+    let output = Command::new(PYRS)
+        .args(["--python", "python3", "missing.py"])
+        .output()
+        .unwrap();
+    assert_ne!(output.status.code(), Some(2), "should not be a usage error");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--python has no effect"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(unix)]

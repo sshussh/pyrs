@@ -5,6 +5,12 @@ manifest and `pyrs init`, **0.111.0** uv-backed interpreter resolution. The
 first depends on neither of the others and carries the only measured cost, so
 it goes first.
 
+**Status: implemented.** 0.109 shipped as planned. 0.110 and 0.111 landed
+together, because interpreter resolution turned out to be a few functions
+that the manifest and `build-extension` both needed rather than a milestone
+of its own. What the implementation changed about this plan is recorded at
+the end.
+
 ## The posture
 
 PyRs source is **valid Python**, not a dialect. That is what lets the existing
@@ -260,3 +266,47 @@ near zero.
 **Workspaces, path and git dependencies, binary distribution, a native
 library ABI.** Each needs its own design, and library layout and import-name
 ownership have to be settled before pinning revisions means anything.
+
+
+## What implementation changed
+
+Recorded because the plan was wrong in ways worth keeping.
+
+**0.111 was not a separate milestone.** Interpreter resolution is one small
+module that `--compat`, `build-extension` and `pyrs check` all needed as soon
+as the manifest existed. Splitting it out would have meant shipping a
+manifest whose `python` key did nothing.
+
+**uv had to be restricted to project environments.** The plan said "`uv
+python find` when uv is present and the project has a venv"; the first
+implementation dropped the second clause. Outside a project `uv python find`
+still answers, with uv's own default — 3.12 here, against the system 3.14
+PyRs is built for — so every compat run on the machine was silently
+retargeted. Caught by running the command outside a project rather than by
+reasoning about it.
+
+**Two cache defects that testing found and design did not.** The runtime key
+is computed over preprocessed C, whose line markers embed the per-run
+temporary path, so the key never repeated and the runtime cache never hit —
+visible only as six cache entries where there should have been one. And
+computing any key ran `cc --version` and `cc -dumpmachine`, including on
+cache hits, until the toolchain identity was recorded under a stamp of the
+compiler binary. The second was caught by a test that counts compiler
+invocations, which is exactly why that test counts rather than times.
+
+**`--python` stopped requiring `--compat`.** Once `[tool.pyrs]` could select
+compatibility mode, requiring the flag made the manifest's `python` key
+unusable. It now warns when it cannot take effect rather than refusing, and
+the invocation test that encoded the old constraint was repointed.
+
+**A malformed `pyproject.toml` is reported, not skipped.** Discovery
+originally treated an unparseable manifest as "no project here", which turns
+a typo into a confusing absence of configuration.
+
+Measured after the work, on the same machine as the 2.61 s baseline:
+
+| | Before | After |
+|---|---|---|
+| Unchanged `pyrs run` | 2610 ms | **11 ms** |
+| New program, warm runtime cache | 2610 ms | **84 ms** |
+| `--no-cache` | 2610 ms | 2586 ms |

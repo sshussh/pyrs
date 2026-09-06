@@ -14,6 +14,8 @@ mod cache;
 mod cli;
 mod extension;
 mod hash;
+mod interpreter;
+mod manifest;
 mod modules;
 
 fn main() {
@@ -60,33 +62,77 @@ fn run(args: cli::Cli) -> Result<i32, String> {
             Ok(0)
         }
         cli::Command::Run(cmd) => run_program(cmd),
-        cli::Command::Check(cmd) => {
-            analyze(modules::load_program(&cmd.input).map_err(|e| e.0)?)?;
-            Ok(0)
-        }
+        cli::Command::Check(cmd) => check_program(cmd),
         cli::Command::BuildExtension(cmd) => {
             extension::build(cmd)?;
             Ok(0)
         }
+        cli::Command::Init(cmd) => init_project(cmd),
     }
 }
 
 fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
-    let input = cmd.input.take().or_else(|| {
+    let mut input = cmd.input.take().or_else(|| {
         if cmd.code.is_none() && cmd.module.is_none() && !cmd.args.is_empty() {
             Some(PathBuf::from(cmd.args.remove(0)))
         } else {
             None
         }
     });
-    if cmd.compat {
+
+    // An explicit source bypasses discovery entirely; the manifest only fills
+    // in what was not asked for on the command line.
+    // An explicit source, `-c` or `-m` bypasses discovery entirely.
+    let project = if input.is_none() && cmd.code.is_none() && cmd.module.is_none() {
+        match std::env::current_dir() {
+            Ok(dir) => manifest::discover(&dir)?,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let mut compat = cmd.compat;
+    let mut import_root: Option<PathBuf> = None;
+    let mut manifest_python: Option<PathBuf> = None;
+    if let Some(path) = &project {
+        let m = manifest::load(path)?;
+        import_root = Some(m.root_path());
+        if let Some(entry) = m.entry_path() {
+            input = Some(entry);
+        }
+        if cmd.opt_level.is_none() {
+            cmd.opt_level = m.opt_level;
+        }
+        // Declared, never inferred -- and `--no-compat` exists so a project
+        // can test whether its program has become natively compilable
+        // without editing the file.
+        if m.execution == manifest::Execution::Compat && !cmd.no_compat {
+            compat = true;
+        }
+        if cmd.python.is_none() {
+            manifest_python = m.python.map(|p| m.dir.join(p));
+        }
+    }
+
+    // `--python` selects the interpreter for compatibility mode, which the
+    // manifest may enable -- so it no longer requires `--compat` on the
+    // command line. It is still worth saying when it cannot matter, rather
+    // than swallowing a flag the user expected to have an effect.
+    if !compat && cmd.python.is_some() {
+        eprintln!(
+            "warning: --python has no effect without compatibility mode; \
+             pass --compat or set execution = \"compat\" in [tool.pyrs]"
+        );
+    }
+
+    if compat {
         // Explicit whole-program execution. Never execute part of a program
         // natively and then retry its side effects in another engine.
-        let python = cmd.python.unwrap_or_else(|| {
-            std::env::var_os("PYRS_PYTHON")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("python3"))
-        });
+        let (python, source) = interpreter::resolve(cmd.python, manifest_python);
+        if std::env::var_os("PYRS_QUIET").is_none() {
+            interpreter::warn_on_version_mismatch(&python);
+        }
+        let _ = source;
         let mut process = process::Command::new(&python);
         if let Some(code) = cmd.code {
             process.args(["-c", &code]);
@@ -112,10 +158,11 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
             OsString::from("-c"),
         )
     } else if let Some(path) = input.filter(|p| p != Path::new("-")) {
-        (
-            modules::load_program(&path).map_err(|e| e.0)?,
-            path.into_os_string(),
-        )
+        let loaded = match &import_root {
+            Some(root) => modules::load_program_in_project(&path, root),
+            None => modules::load_program(&path),
+        };
+        (loaded.map_err(|e| e.0)?, path.into_os_string())
     } else {
         let mut source = String::new();
         io::stdin()
@@ -126,9 +173,10 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
             OsString::from("-"),
         )
     };
+    let opt_level = cmd.opt_level.unwrap_or(2);
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let key =
-        (!cmd.no_cache).then(|| cache::program_key(&program_sources(&loaded), cmd.opt_level, &cc));
+        (!cmd.no_cache).then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc));
 
     // A hit skips analysis and code generation as well as the C compile:
     // the program is unchanged, so there is nothing left to decide about it.
@@ -151,26 +199,25 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     let module = analyze(loaded)?;
     let workdir = temp_workdir()?;
     let exe = workdir.join("program");
-    let result =
-        compile_module(&module, &exe, cmd.opt_level, false, !cmd.no_cache).and_then(|()| {
-            if let Some(key) = &key {
-                cache::program_store(key, &exe);
-            }
-            let mut process = process::Command::new(&exe);
-            process.args(&cmd.args);
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                process.arg0(&argv0);
-            }
-            #[cfg(not(unix))]
-            let _ = argv0;
-            // Keep the parent alive to clean up the native executable afterwards.
-            process
-                .status()
-                .map(exit_code)
-                .map_err(|e| format!("failed to run compiled program: {e}"))
-        });
+    let result = compile_module(&module, &exe, opt_level, false, !cmd.no_cache).and_then(|()| {
+        if let Some(key) = &key {
+            cache::program_store(key, &exe);
+        }
+        let mut process = process::Command::new(&exe);
+        process.args(&cmd.args);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            process.arg0(&argv0);
+        }
+        #[cfg(not(unix))]
+        let _ = argv0;
+        // Keep the parent alive to clean up the native executable afterwards.
+        process
+            .status()
+            .map(exit_code)
+            .map_err(|e| format!("failed to run compiled program: {e}"))
+    });
     drop(workdir);
     result
 }
@@ -329,6 +376,120 @@ fn program_sources(loaded: &[modules::Loaded]) -> Vec<(String, String)> {
         .iter()
         .map(|m| (m.name.clone(), m.source.clone()))
         .collect()
+}
+
+/// `pyrs check`, and the report of what the project resolved to.
+///
+/// Which entry point, import root, mode and interpreter are in play should
+/// never be a guess -- especially the interpreter, whose default now depends
+/// on whether uv is installed and whether this is a uv project.
+fn check_program(cmd: cli::CheckCommand) -> Result<i32, String> {
+    let project = match std::env::current_dir().ok().map(|d| manifest::discover(&d)) {
+        Some(found) => found?,
+        None => None,
+    };
+    let m = match &project {
+        Some(path) => Some(manifest::load(path)?),
+        None => None,
+    };
+
+    let input = match (cmd.input, m.as_ref().and_then(|m| m.entry_path())) {
+        (Some(i), _) => i,
+        (None, Some(e)) => e,
+        (None, None) => {
+            return Err(
+                "no input: pass -i, or run inside a project with [tool.pyrs] entry".to_string(),
+            );
+        }
+    };
+
+    if let Some(m) = &m {
+        let path = project.as_ref().expect("a manifest implies its path");
+        println!("project:     {}", path.display());
+        println!("entry:       {}", input.display());
+        println!("import root: {}", m.root_path().display());
+        println!(
+            "execution:   {}",
+            match m.execution {
+                manifest::Execution::Native => "native",
+                manifest::Execution::Compat => "compat",
+            }
+        );
+        let (python, source) = interpreter::resolve(None, m.python.as_ref().map(|p| m.dir.join(p)));
+        let version = interpreter::version_of(&python).unwrap_or_else(|| "unavailable".into());
+        println!(
+            "interpreter: {} ({}, Python {version}; PyRs targets {})",
+            python.display(),
+            source.describe(),
+            codegen::oracle_python_minor()
+        );
+    }
+
+    let loaded = match m.as_ref().map(|m| m.root_path()) {
+        Some(root) => modules::load_program_in_project(&input, &root),
+        None => modules::load_program(&input),
+    };
+    analyze(loaded.map_err(|e| e.0)?)?;
+    Ok(0)
+}
+
+/// `pyrs init`: record a `[tool.pyrs]` table for this project.
+///
+/// Project *creation* is `uv init`'s job — this only adds the one table PyRs
+/// needs, and writes a minimal `pyproject.toml` when there is not one yet so
+/// the command works without uv installed.
+fn init_project(cmd: cli::InitCommand) -> Result<i32, String> {
+    let dir = cmd.path.unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    let path = dir.join("pyproject.toml");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains("[tool.pyrs]") {
+        return Err(format!(
+            "{} already has a [tool.pyrs] table; edit it rather than re-running init",
+            path.display()
+        ));
+    }
+
+    let entry = cmd.entry.unwrap_or_else(|| PathBuf::from("main.py"));
+    let mut text = existing.clone();
+    if text.trim().is_empty() {
+        let name = dir
+            .canonicalize()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "app".to_string());
+        let name: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect();
+        // `requires-python` is pinned to the interpreter PyRs was built
+        // against: uv otherwise picks its own default, and a mismatch shows up
+        // only when something Unicode- or compat-shaped disagrees.
+        text = format!(
+            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\nrequires-python = \">={}\"\n",
+            codegen::oracle_python_minor()
+        );
+    } else if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "\n[tool.pyrs]\nentry = \"{}\"\nopt-level = 2\nexecution = \"native\"\n",
+        entry.display()
+    ));
+    fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+
+    let entry_path = dir.join(&entry);
+    if !entry_path.exists() {
+        if let Some(parent) = entry_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(
+            &entry_path,
+            "def main() -> None:\n    print(\"Hello from PyRs!\")\n\n\nmain()\n",
+        );
+    }
+    println!("wrote [tool.pyrs] to {}", path.display());
+    Ok(0)
 }
 
 fn read_source(path: &Path) -> Result<String, String> {

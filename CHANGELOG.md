@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.110.0 — Projects: `[tool.pyrs]`, `pyrs init`, and uv
+
+Configuration goes in **`pyproject.toml`** under `[tool.pyrs]`, the table
+Python tooling already agrees on. PyRs source is valid Python, so a PyRs
+project is a Python project; a second config file would make PyRs a foreign
+object in a Python repo.
+
+- `entry`, `root`, `opt-level`, `execution`, `python`, and a
+  `[tool.pyrs.extension]` table so `build-extension` stops retyping
+  `--module` and `--python` on every call. Unknown keys are rejected, not
+  ignored.
+- `pyrs init [path]` adds the table to an existing `pyproject.toml`, or
+  writes a minimal one. **There is no `pyrs new`** — project creation is
+  `uv init`'s job, and PyRs contributes one table to what it produced.
+- Discovery walks up to the nearest `pyproject.toml` containing
+  `[tool.pyrs]`. One without that table belongs to another project; one that
+  does not parse is reported rather than silently skipped. An explicit `-i`,
+  `-c` or `-m` bypasses discovery, and flags override the manifest.
+- `root` gives the resolver a declared import root, which is what makes a
+  `src/` layout work — the layout `uv init` scaffolds.
+- `execution = "compat"` is **declared, never inferred.** `--no-compat`
+  overrides it, so a project can test whether its program has become natively
+  compilable without editing the file.
+- uv provides the CPython interpreter when present and is **never required**:
+  `pyrs compile -i prog.py` still works with no uv, no virtual environment
+  and no manifest. uv is consulted only for a project environment, since
+  outside one it answers with a default that is not the project's choice.
+- `pyrs check` reports the entry point, import root, execution mode and
+  resolved interpreter, and warns when that interpreter's version differs
+  from the one PyRs was built against — `uv init` defaults to 3.12 where PyRs
+  targets 3.14, which would otherwise surface only when something Unicode- or
+  compatibility-shaped disagreed.
+
+Execution mode is not inferred from `dependencies`, deliberately: the
+implication fails in both directions, and it would mean `uv add` silently
+turning a native binary into an interpreted program. See
+[docs/TOOLING.md](docs/TOOLING.md).
+
+This adds the workspace's second external dependency, `toml`. The file is
+shared with tools that parse TOML fully, so "almost TOML" would be
+user-hostile in a way a private format would not.
+
 ## 0.109.0 — Build caching
 
 A one-line program took **2.61 s** to build, of which **2.39 s** was
