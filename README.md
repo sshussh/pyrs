@@ -53,10 +53,13 @@ Requires Rust (edition 2024), LLVM (`llvm-config` on `PATH`), CMake and a C
 compiler.
 
 ```console
-cargo build --release
+git clone https://github.com/sshussh/pyrs.git
+cd pyrs
+make doctor
+make install
 ```
 
-The resulting `target/release/pyrs` is self-contained: the C runtime,
+The resulting `pyrs` is self-contained: the C runtime,
 collector, Unicode tables and PyRs standard library are embedded in the
 binary, so compiled executables need no PyRs installation at run time.
 
@@ -71,10 +74,10 @@ pyrs prog.py arg1 arg2           # python-style invocation
 
 Builds are cached, so an unchanged `pyrs run` recompiles nothing:
 
-| | cold | cached |
-|---|---:|---:|
+|                   |    cold |    cached |
+| ----------------- | ------: | --------: |
 | unchanged program | 2610 ms | **11 ms** |
-| new program | 2610 ms | **84 ms** |
+| new program       | 2610 ms | **84 ms** |
 
 For a project, configuration lives in `pyproject.toml` — the file the rest of
 the Python toolchain already reads:
@@ -161,21 +164,21 @@ A Cargo workspace with strictly unidirectional data flow (see
 [SPECIFICATIONS.md](docs/SPECIFICATIONS.md)):
 
 ```
-source ─→ lexer ─→ parser ─→ semantic ─→ ir ─→ codegen ─→ executable
-          logos    AST       typecheck   typed  LLVM IR    LLVM opt+emit,
-          INDENT/  recursive + lower     tree   text       linked by cc
-          DEDENT   descent
+source  ->  lexer   ->  parser    ->  semantic ->  ir ->  codegen ->  executable
+            logos       AST           typecheck    typed  LLVM IR     LLVM opt+emit,
+            INDENT/     recursive     + lower      tree   text        linked by cc
+            DEDENT      descent
 ```
 
-| Crate | Responsibility |
-|---|---|
-| `common` | Spans and diagnostics shared by every phase |
-| `lexer` | `logos` scanner with an indent stack for semantic whitespace |
-| `parser` | Hand-written recursive descent, precedence-layered |
+| Crate      | Responsibility                                                    |
+| ---------- | ----------------------------------------------------------------- |
+| `common`   | Spans and diagnostics shared by every phase                       |
+| `lexer`    | `logos` scanner with an indent stack for semantic whitespace      |
+| `parser`   | Hand-written recursive descent, precedence-layered                |
 | `semantic` | Name resolution, type checking, numeric promotion, lowering to IR |
-| `ir` | Fully typed tree — the contract handed to the backend |
-| `codegen` | LLVM IR text; a C++ shim verifies, optimizes and emits objects |
-| `cli` | Driver, module loading, build cache, project manifest |
+| `ir`       | Fully typed tree — the contract handed to the backend             |
+| `codegen`  | LLVM IR text; a C++ shim verifies, optimizes and emits objects    |
+| `cli`      | Driver, module loading, build cache, project manifest             |
 
 The C runtime provides Python-faithful operations, runtime traps and a
 nonmoving mark–sweep [collector](docs/GC.md).
@@ -185,17 +188,17 @@ nonmoving mark–sweep [collector](docs/GC.md).
 `benchmarks/run.sh` compiles each program with `pyrs -O2`, checks its output
 is byte-identical to `python3`'s, then reports best-of-3 wall times:
 
-| benchmark  | workload                                   | python3 | PyRs   | speedup |
-|------------|--------------------------------------------|--------:|-------:|--------:|
-| fib        | recursion, 12M calls (`fib(35)`)           |  1.163s | 0.025s |   45.8× |
-| listcomp   | comprehensions, 3M-element map/filter      |  0.570s | 0.033s |   17.0× |
-| mandelbrot | float math, 500×500 escape iterations      |  0.944s | 0.017s |   54.8× |
-| matmul     | nested lists, 250×250 matrix multiply      |  0.783s | 0.018s |   44.7× |
-| nbody      | float + list, 5-body gravity, 100k steps   |  1.352s | 0.008s |  172.7× |
-| primes     | int loops, trial division to 300k          |  0.629s | 0.064s |    9.8× |
-| sort       | list indexing, bubble sort of 5000         |  1.008s | 0.022s |   46.6× |
-| strings    | per-char iteration, 2.6M comparisons       |  0.656s | 0.103s |    6.4× |
-| **total**  |                                            |  6.535s | 0.257s |   25.4× |
+| benchmark  | workload                                 | python3 |   PyRs | speedup |
+| ---------- | ---------------------------------------- | ------: | -----: | ------: |
+| fib        | recursion, 12M calls (`fib(35)`)         |  1.163s | 0.025s |   45.8× |
+| listcomp   | comprehensions, 3M-element map/filter    |  0.570s | 0.033s |   17.0× |
+| mandelbrot | float math, 500×500 escape iterations    |  0.944s | 0.017s |   54.8× |
+| matmul     | nested lists, 250×250 matrix multiply    |  0.783s | 0.018s |   44.7× |
+| nbody      | float + list, 5-body gravity, 100k steps |  1.352s | 0.008s |  172.7× |
+| primes     | int loops, trial division to 300k        |  0.629s | 0.064s |    9.8× |
+| sort       | list indexing, bubble sort of 5000       |  1.008s | 0.022s |   46.6× |
+| strings    | per-char iteration, 2.6M comparisons     |  0.656s | 0.103s |    6.4× |
+| **total**  |                                          |  6.535s | 0.257s |   25.4× |
 
 (Linux, LLVM 22, CPython 3.14; run `./benchmarks/run.sh` to reproduce.)
 
@@ -209,12 +212,12 @@ make ci        # the full local gate
 `make ci` runs format, clippy with `-D warnings`, the workspace tests,
 `make hygiene`, byte-exact example parity and the compatibility probes.
 
-| Target | What it checks |
-|---|---|
-| `make examples` | Example parity against `python3`, comparing **stdout bytes, stderr bytes and exit status**. Building and running are separate steps so toolchain warnings are never mistaken for program output. (`make examples-all-opts` for O0/O2/O3) |
-| `make hygiene` | Version agreement across the 7 crates, `Cargo.lock` and the docs; the Unicode tables' generating interpreter; every relative documentation link; and the gates' own failure paths |
-| `make asan` / `make ubsan` | The extension boundary suite with the C adapter, runtime and collector instrumented |
-| `make compatibility` | Native and CPython probes at O0/O2/O3 under GC stress |
+| Target                     | What it checks                                                                                                                                                                                                                           |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `make examples`            | Example parity against `python3`, comparing **stdout bytes, stderr bytes and exit status**. Building and running are separate steps so toolchain warnings are never mistaken for program output. (`make examples-all-opts` for O0/O2/O3) |
+| `make hygiene`             | Version agreement across the 7 crates, `Cargo.lock` and the docs; the Unicode tables' generating interpreter; every relative documentation link; and the gates' own failure paths                                                        |
+| `make asan` / `make ubsan` | The extension boundary suite with the C adapter, runtime and collector instrumented                                                                                                                                                      |
+| `make compatibility`       | Native and CPython probes at O0/O2/O3 under GC stress                                                                                                                                                                                    |
 
 Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
@@ -226,14 +229,14 @@ Release tags: `git tag v0.110.0 && git push origin v0.110.0`.
 
 ## Documentation
 
-| Document | What it is for |
-|---|---|
-| [GUIDE.md](docs/GUIDE.md) | The reference: language, CLI, diagnostics, differences from CPython |
-| [TOOLING.md](docs/TOOLING.md) | Projects, the `[tool.pyrs]` manifest, build caching, uv |
-| [ROADMAP.md](docs/ROADMAP.md) | Open gaps, workstreams and the 1.0 release gates |
-| [CHANGELOG.md](CHANGELOG.md) | What changed in every release |
-| [SPECIFICATIONS.md](docs/SPECIFICATIONS.md) | Architecture and phase contracts |
-| [PRIMITIVES.md](docs/PRIMITIVES.md) | The runtime primitive inventory |
-| [GC.md](docs/GC.md) | The collector's design and invariants |
-| [EXTENDING.md](docs/EXTENDING.md) | Adding language features to the compiler |
-| [INTEROPERABILITY.md](docs/INTEROPERABILITY.md) | The experimental CPython bridge |
+| Document                                        | What it is for                                                      |
+| ----------------------------------------------- | ------------------------------------------------------------------- |
+| [GUIDE.md](docs/GUIDE.md)                       | The reference: language, CLI, diagnostics, differences from CPython |
+| [TOOLING.md](docs/TOOLING.md)                   | Projects, the `[tool.pyrs]` manifest, build caching, uv             |
+| [ROADMAP.md](docs/ROADMAP.md)                   | Open gaps, workstreams and the 1.0 release gates                    |
+| [CHANGELOG.md](CHANGELOG.md)                    | What changed in every release                                       |
+| [SPECIFICATIONS.md](docs/SPECIFICATIONS.md)     | Architecture and phase contracts                                    |
+| [PRIMITIVES.md](docs/PRIMITIVES.md)             | The runtime primitive inventory                                     |
+| [GC.md](docs/GC.md)                             | The collector's design and invariants                               |
+| [EXTENDING.md](docs/EXTENDING.md)               | Adding language features to the compiler                            |
+| [INTEROPERABILITY.md](docs/INTEROPERABILITY.md) | The experimental CPython bridge                                     |
