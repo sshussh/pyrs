@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.97.0 — Lambda parameter inference
+
+A lambda cannot carry annotations — the first `:` starts the body — so
+requiring them made lambdas unusable, and `sorted(xs, key=lambda v: -v)`, the
+idiom they exist for, was a compile error. Named functions already worked as
+`key=`, so the whole gap was parameter typing.
+
+- A `key=` lambda takes its parameter type from the element type of the
+  iterable being sorted or scanned. That covers the case body inference cannot
+  reach: `lambda s: len(s)` says nothing about `s`, but the consumer knows.
+  Works for `sorted`, `list.sort`, `min` and `max`, with `reverse=`, and for
+  any sortable return type.
+- Other lambdas now get the same body-usage inference nested `def`s already
+  had, so `f = lambda a: a + 1` works. Previously `lower_lambda` required an
+  annotation up front and never reached that inference.
+- Defaults, captures, multiple parameters and returning a lambda from a
+  function all work.
+- Still rejected: a lambda whose body constrains nothing about its parameter
+  and that has no consumer to ask (`f = lambda x: len(x)`). Use a `def`, which
+  can be annotated.
+- The type hint is scoped to the lambda being lowered. It is keyed by the
+  parameter's own name, so without scoping a `key=lambda s: ...` would leave
+  `s` typed for any later parameter that happened to share the name.
+
 ## 0.96.0 — Generator expressions
 
 `(elem for target in iter if cond)` was a parse error, which made the four

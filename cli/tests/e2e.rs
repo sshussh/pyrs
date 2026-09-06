@@ -8268,9 +8268,12 @@ print(check(4))
 
 #[test]
 fn bare_lambda_param_without_default_rejected() {
-    let (_, stderr) = run_program_expect_fail("bare_lam", "f = lambda x: x + 1\nprint(f(1))\n");
-    // Lambdas cannot carry type annotations (first `:` is the body); bare
-    // params still need a default for monomorphic inference.
+    // `lambda x: x + 1` is inferable from the body and now works; what still
+    // cannot be inferred is a body that constrains nothing about the
+    // parameter. Lambdas cannot carry annotations (the first `:` starts the
+    // body), so the fix is to give the consumer a type or use a `def`.
+    let (_, stderr) =
+        run_program_expect_fail("bare_lam", "f = lambda x: len(x)\nprint(f(\"ab\"))\n");
     assert!(
         stderr.contains("missing a type annotation")
             || stderr.contains("lambda parameter")
