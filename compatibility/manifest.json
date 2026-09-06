@@ -117,6 +117,12 @@
       "native": "pass"
     },
     {
+      "id": "tuple-keys",
+      "file": "cases/tuple_keys.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
       "id": "class-constants",
       "file": "cases/class_constants.py",
       "group": "core",

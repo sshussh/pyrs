@@ -259,13 +259,14 @@ fn malformed_string_annotation_is_rejected() {
 }
 
 #[test]
-fn tuple_subscript_reports_its_own_limitation() {
-    // Previously "expected ']' to close the subscript, found ','", which did
-    // not say what was actually unsupported.
+fn a_tuple_subscript_on_a_list_is_a_type_error() {
+    // `a[i, j]` parsed as a tuple subscript since 0.107, so this is no longer
+    // a parse-level limitation -- it is the type error CPython also raises,
+    // just at compile time.
     rejected_with(
         "tuple-subscript",
         "xs = [[1, 2], [3, 4]]\nprint(xs[0, 1])\n",
-        "tuple subscripts",
+        "expected int, found tuple[int, int]",
     );
 }
 

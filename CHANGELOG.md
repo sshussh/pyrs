@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.107.0 — Tuple dict and set keys
+
+Dict keys and set elements were restricted to `int` and `str`, so the composite
+key a transition table, a sparse grid or a two-argument memo wants had to be
+flattened into a string by hand.
+
+- `int`, `str`, and tuples whose elements are themselves hashable — nested
+  arbitrarily — now work as dict keys and set elements everywhere: literals,
+  subscripts, `in`, `get` / `pop` / `setdefault` / `del`, iteration, `dict()`,
+  and both dict and set comprehensions.
+- `d[i, j]` is `d[(i, j)]`, trailing comma included (`d[3,]` is a 1-tuple).
+  This parse-level rejection had been carried since 0.87 and named the key
+  restriction as its reason. A tuple subscript of a *list* is now the type
+  error CPython also raises, rather than a parse error.
+- `bool` keys stay rejected on purpose: CPython's `True == 1` would require a
+  bool key to collide with an int one, which this subset does not model.
+  Unhashable types are still rejected, now naming what is allowed —
+  `int, str, or a tuple of those`.
+
+Only hashing was ever missing. `slot_eq` already compared tuple slots
+structurally, so equal tuples already compared equal; there was no way to reach
+the right bucket. `hash_key` gained a `TAG_TUPLE` arm that folds the element
+hashes and recurses. The hash is internal and never observed, so it needs to
+agree with that existing equality and nothing else.
+
+Found while testing: `str()` and f-strings cannot stringify any container
+(`str((1, 2))`, `f"{xs}"`) even though `print` formats them. Recorded as a gap
+in the roadmap.
+
 ## 0.106.0 — Class-body constants
 
 Any assignment in a class body was rejected, so a class could not carry a

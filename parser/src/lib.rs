@@ -1949,16 +1949,23 @@ impl Parser {
                             span,
                         };
                     } else {
-                        let index = lo.expect("index expression parsed above");
-                        // `a[i, j]` is `a[(i, j)]` in Python. PyRs restricts
-                        // dict keys to int and str, so no type can accept a
-                        // tuple subscript; report that rather than a bare
-                        // "expected ']'".
+                        let mut index = lo.expect("index expression parsed above");
+                        // `a[i, j]` is `a[(i, j)]` in Python: the subscript is
+                        // one tuple, not several indices. A trailing comma is
+                        // allowed, so `a[i,]` is a 1-tuple.
                         if self.peek() == &Token::Comma {
-                            return Err(self.error(
-                                "tuple subscripts like 'a[i, j]' are not supported; \
-                                 dict keys are limited to int and str",
-                            ));
+                            let mut items = vec![index];
+                            while self.eat(&Token::Comma) {
+                                if self.peek() == &Token::RBracket {
+                                    break;
+                                }
+                                items.push(self.parse_expr()?);
+                            }
+                            let span = items[0].span.to(items[items.len() - 1].span);
+                            index = Expr {
+                                kind: ExprKind::TupleLit(items),
+                                span,
+                            };
                         }
                         let close = self.expect(Token::RBracket, "to close the subscript")?;
                         let span = expr.span.to(close);
