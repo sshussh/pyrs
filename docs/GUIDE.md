@@ -1390,7 +1390,10 @@ rules: `FileNotFoundError` / `PermissionError` / `IsADirectoryError`
 ⊂ `OSError` ⊂ `Exception`; other named traps ⊂ `Exception`;
 `GeneratorExit` is **not** under `Exception` (BaseException-only, like
 CPython). Multi-type handlers work: `except (A, B) as e:`. Bare
-`except:` catches all. The bound name is a first-class **exception
+`except:` catches all. A bare `raise` inside a handler re-raises what that
+handler caught, keeping its type and message (`except E: log(); raise`);
+outside a handler it is a compile error, where CPython raises `RuntimeError`
+at run time. The bound name is a first-class **exception
 object**: `print`/`str` → message body; always truthy in `if`/`not`;
 `isinstance(e, OSError)` (and multi-filter / multi-assign unions that
 include the exception type) work. Not yet: exception attributes, `repr` /

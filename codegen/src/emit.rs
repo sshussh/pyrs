@@ -234,6 +234,10 @@ struct Emitter {
     loops: Vec<(String, String)>,
     /// Enclosing try scopes (innermost last).
     tries: Vec<TryScope>,
+    /// Exception object of each active `except` handler, innermost last, so a
+    /// bare `raise` re-raises the one its handler caught. Captured before
+    /// `pyrs_exc_clear()`, which the handler prologue calls.
+    handler_exc: Vec<String>,
     /// Current function return type (for try-return plumbing).
     fn_ret: Ty,
     /// Shared alloca for a pending return value while unwinding through finally.
@@ -280,6 +284,7 @@ impl Default for Emitter {
             terminated: false,
             loops: Vec::new(),
             tries: Vec::new(),
+            handler_exc: Vec::new(),
             fn_ret: Ty::None,
             try_ret_ptr: None,
             gen_frame: None,
@@ -404,7 +409,7 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         Stmt::ListExtend { list, other } => {
             max_try_depth_in_expr(list).max(max_try_depth_in_expr(other))
         }
-        Stmt::Return(None) | Stmt::Die(_) | Stmt::Break | Stmt::Continue => 0,
+        Stmt::Return(None) | Stmt::Die(_) | Stmt::Break | Stmt::Continue | Stmt::Reraise => 0,
     }
 }
 
@@ -3474,6 +3479,22 @@ impl Emitter {
                 self.line("unreachable");
                 self.terminated = true;
             }
+            Stmt::Reraise => {
+                // Semantic rejects a bare `raise` outside a handler, so the
+                // stack is non-empty here.
+                let obj = self
+                    .handler_exc
+                    .last()
+                    .cloned()
+                    .expect("bare raise outside an except handler");
+                if self.gen_frame.is_some() && self.tries.is_empty() {
+                    let frame = self.gen_frame.clone().unwrap();
+                    self.line(format!("call void @pyrs_gen_set_done(ptr {frame})"));
+                }
+                self.line(format!("call void @pyrs_raise_exc(ptr {obj})"));
+                self.line("unreachable");
+                self.terminated = true;
+            }
             Stmt::RaiseExc { value } => {
                 let v = self.emit_expr(value);
                 if self.gen_frame.is_some() && self.tries.is_empty() {
@@ -6032,6 +6053,11 @@ impl Emitter {
                 }
             }
             self.start_block(&match_l);
+            // Built before pyrs_exc_clear() below, which wipes the pending
+            // exception: a bare `raise` in this handler re-raises this object.
+            let caught = self.tmp();
+            self.line(format!("{caught} = call ptr @pyrs_exc_object()"));
+            self.handler_exc.push(caught);
             if let Some(name) = bind {
                 // Bind a first-class exception object (type tag + message).
                 let obj = self.tmp();
@@ -6058,6 +6084,7 @@ impl Emitter {
             // Frame remains live so traps/raises in the handler longjmp here
             // with phase=1 and take hraise_l → finally.
             self.emit_block(hbody);
+            self.handler_exc.pop();
             if !self.terminated {
                 self.emit_try_exit(TRY_EXIT_NORMAL, None);
             }
