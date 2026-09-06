@@ -135,6 +135,74 @@ fn park(lex: &mut logos::Lexer<Token>, r: Result<String, String>) -> Option<Stri
     }
 }
 
+/// Scan a single-quoted f-string after its opening `f"` / `f'`.
+///
+/// A regex cannot do this: PEP 701 lets a replacement field contain the same
+/// quote that delimits the f-string (`f"{d["k"]}"`), so the closing quote is
+/// only the one seen at brace depth zero and outside any nested literal.
+/// Returns `None` (unterminated) after consuming the rest of the line.
+fn lex_fstring(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
+    let rem = lex.remainder();
+    let b = rem.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    // Open quotes of string literals inside a replacement field.
+    let mut nested: Vec<u8> = Vec::new();
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' {
+            // An escape hides the next byte from every rule below. Landing
+            // mid-sequence on a multi-byte character is harmless: its bytes
+            // are all >= 0x80 and match nothing here.
+            i += 2;
+            continue;
+        }
+        if c == b'\n' {
+            break;
+        }
+        if let Some(&q) = nested.last() {
+            if c == q {
+                nested.pop();
+            }
+            i += 1;
+            continue;
+        }
+        if depth == 0 && c == quote {
+            let inner = rem[..i].to_string();
+            lex.bump(i + 1);
+            return park(lex, unescape_contents(&inner));
+        }
+        match c {
+            // `{{` / `}}` are escaped braces, but only outside a field.
+            b'{' if depth == 0 && b.get(i + 1) == Some(&b'{') => {
+                i += 2;
+                continue;
+            }
+            b'}' if depth == 0 && b.get(i + 1) == Some(&b'}') => {
+                i += 2;
+                continue;
+            }
+            // Inside a field a brace is a dict/set literal or a nested
+            // field; either way it nests.
+            b'{' => depth += 1,
+            b'}' if depth > 0 => depth -= 1,
+            b'\'' | b'"' if depth > 0 => nested.push(c),
+            _ => {}
+        }
+        i += 1;
+    }
+    lex.bump(i.min(b.len()));
+    None
+}
+
+fn lex_fstring_double(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    lex_fstring(lex, b'"')
+}
+
+fn lex_fstring_single(lex: &mut logos::Lexer<Token>) -> Option<String> {
+    lex_fstring(lex, b'\'')
+}
+
 /// After matching the opening `"""`, scan for the closing delimiter,
 /// apply escapes, and extend the logos span via `bump`. Returns `None`
 /// (unterminated) after consuming the rest of the input so the error
@@ -399,8 +467,8 @@ pub enum Token {
     /// as empty `f""`/`f''` plus junk.
     #[token("f\"\"\"", lex_triple_fstring)]
     #[token("f'''", lex_triple_fstring)]
-    #[regex(r#"f"([^"\\\n]|\\.)*""#, |lex| { let s = lex.slice()[1..].to_string(); unescape(lex, &s) })]
-    #[regex(r#"f'([^'\\\n]|\\.)*'"#, |lex| { let s = lex.slice()[1..].to_string(); unescape(lex, &s) })]
+    #[token("f\"", lex_fstring_double)]
+    #[token("f'", lex_fstring_single)]
     FStrlit(String),
 
     // operators
@@ -774,6 +842,8 @@ impl<'a> Iterator for Lexer<'a> {
                         "unterminated triple-quoted f-string literal".to_string()
                     } else if slice.starts_with("\"\"\"") || slice.starts_with("'''") {
                         "unterminated triple-quoted string literal".to_string()
+                    } else if slice.starts_with("f\"") || slice.starts_with("f'") {
+                        "unterminated f-string literal".to_string()
                     } else if let Some(kind) = invalid_int_prefix(slice) {
                         format!("invalid {kind} literal")
                     } else {

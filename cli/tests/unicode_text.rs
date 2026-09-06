@@ -793,3 +793,70 @@ fn escapes_decode_inside_triple_quoted_and_f_strings() {
         "\ns = \"\"\"a\\x41b\"\"\"\nprint(s, len(s))\nn = 5\nprint(f\"\\u00e9{n}\\x21\")\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// f-string replacement fields (PEP 701)
+//
+// The f-string token was a regex that stopped at the first unescaped quote,
+// so a replacement field could not contain a string literal: `f"{d["k"]}"`
+// lexed as `f"{`, then `d`, and fell apart. The parser's brace scan and its
+// `!`/`:` split had the same blind spot for quotes and braces inside a
+// nested literal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replacement_fields_accept_the_outer_quote() {
+    matches_python(
+        "fstring-same-quote",
+        "\nd = {\"k\": 7}\nprint(f\"{d[\"k\"]}\")\nprint(f'{d['k']}')\nprint(f\"{\"a\" + \"b\"}\")\n",
+    );
+}
+
+#[test]
+fn replacement_fields_accept_the_other_quote() {
+    matches_python(
+        "fstring-other-quote",
+        r#"
+d = {"k": 7}
+print(f"{d['k']}")
+print(f"{'a' + 'b'}")
+"#,
+    );
+}
+
+#[test]
+fn braces_and_delimiters_inside_a_nested_literal_are_opaque() {
+    matches_python(
+        "fstring-opaque",
+        r#"
+print(f"{'}'}")
+print(f"{'{'}")
+print(f"{'a:b'}")
+print(f"{'!r'}")
+d = {":": 1, "}": 2}
+print(f"{d[':']}", f"{d['}']}")
+"#,
+    );
+}
+
+#[test]
+fn nested_f_strings_and_format_specs_still_work() {
+    matches_python(
+        "fstring-nested",
+        "\ns = \"héllo\"\nn = 4\nprint(f\"[{f\"{s:>8}\"}]\")\nprint(f\"{n:{n}d}\")\nprint(f\"{{literal}} {n}\")\nprint(f\"{s.upper()}\")\n",
+    );
+}
+
+#[test]
+fn empty_and_adjacent_f_strings_are_unchanged() {
+    matches_python(
+        "fstring-basic",
+        r#"
+n = 1
+print(f"")
+print(f"{n}{n}")
+print(f"a" + f'b')
+print(f"a{n}b", f'c{n}d')
+"#,
+    );
+}

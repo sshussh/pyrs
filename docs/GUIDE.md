@@ -508,9 +508,16 @@ Divergences to know about:
   Lone-surrogate behavior is unspecified: `chr(0xD800)` produces bytes that
   the CPython extension bridge rejects.
 
-The lexer does not yet accept `\xNN` or `\uXXXX` escapes in string
-literals; use `chr(n)` for a non-literal character. An f-string replacement
-field cannot contain nested quotes.
+String literals accept the full set of CPython escapes: `\n` `\t` `\r`
+`\a` `\b` `\f` `\v` `\\` `\'` `\"`, one-to-three-digit octal (`\101`),
+`\xNN`, `\uXXXX` and `\UXXXXXXXX`. Unknown escapes survive verbatim, as in
+CPython. Two forms are rejected with a diagnostic rather than accepted:
+a lone surrogate (`"\ud800"`), which has no UTF-8 form — `chr(0xD800)`
+still produces the bytes at run time — and `\N{NAME}`, which needs the
+Unicode name database the compiler does not carry.
+
+Replacement fields may contain string literals using either quote,
+including the one delimiting the f-string (`f"{d["k"]}"`), per PEP 701.
 
 ### f-strings
 
