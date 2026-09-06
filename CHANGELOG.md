@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.108.0 — `str()` and `repr()` of containers
+
+`print([1, 2])` wrote `[1, 2]`, but `str([1, 2])`, `f"{xs}"` and `"%s" % xs`
+were rejected with `str() cannot convert list[int] yet` — so the most ordinary
+line in a Python program, `print(f"result: {xs}")`, could not be written, and
+neither could a function that *returns* a rendered value.
+
+- `str(x)` and `repr(x)` render `list`, `tuple`, `dict` and `set`, nested
+  arbitrarily, with every element type `print` already handled.
+- f-strings, `%` formatting and `str.format()` all route through the same
+  `str()` lowering, so `f"{xs}"`, `f"{xs!r}"`, `"%s" % xs` and
+  `"{}".format(xs)` work.
+- `repr()` and `ascii()` are builtins now. They existed only as the f-string
+  `!r` / `!a` conversions; the lowering is shared, so this binds a name to it.
+- A format *spec* on a container (`f"{xs:>10}"`) stays rejected — CPython
+  raises `TypeError: unsupported format string passed to list.__format__`, so
+  this is the same rejection at compile time. `ascii()` of a container also
+  stays rejected: unlike `repr` it would have to escape non-ASCII *inside* the
+  elements, which the shared rendering does not do.
+
+The formatting logic already existed and was already right; it just could not
+be reached from anything but `print`, because the print routines wrote straight
+to `stdout`. They now write through an output sink, and `str()` captures what
+`print` would have emitted — so the two agree by construction rather than by
+two implementations kept in step.
+
+Inherited, not introduced: sets iterate in insertion order here and in hash
+order in CPython, so `str({3, 1, 2})` differs exactly as `print({3, 1, 2})`
+already did.
+
 ## 0.107.0 — Tuple dict and set keys
 
 Dict keys and set elements were restricted to `int` and `str`, so the composite

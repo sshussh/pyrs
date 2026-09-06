@@ -2029,7 +2029,7 @@ fn qual(module: &str, name: &str) -> String {
 }
 
 /// The builtins that cannot be shadowed by a user `def`.
-const BUILTINS: [&str; 26] = [
+const BUILTINS: [&str; 28] = [
     "print",
     "len",
     "range",
@@ -2056,6 +2056,8 @@ const BUILTINS: [&str; 26] = [
     "oct",
     "divmod",
     "pow",
+    "repr",
+    "ascii",
 ];
 
 /// A call to a module's run-once init function, `<mod>.__init__()`.
@@ -21579,6 +21581,16 @@ fn lower_call(
                 })
             }
             "round" => lower_round_expr(&args, keywords, span, ctx),
+            "repr" | "ascii" => {
+                if args.len() != 1 {
+                    return Err(err(
+                        format!("{func}() takes exactly one argument ({} given)", args.len()),
+                        span,
+                    ));
+                }
+                let arg = lower_expr(args[0], ctx)?;
+                lower_repr_like(arg, func == "ascii", args[0].span)
+            }
             "ord" => {
                 if args.len() != 1 {
                     return Err(err(
@@ -25084,6 +25096,14 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
                 kind: ir::ExprKind::ExcToStr(Box::new(value)),
             }),
             ir::Ty::Class(id) => lower_class_to_str(value, id, span),
+            // A container renders as the text `print` writes -- CPython's
+            // `str` and `repr` agree there, elements included.
+            ir::Ty::List(_) | ir::Ty::Tuple(_) | ir::Ty::Dict { .. } | ir::Ty::Set(_) => {
+                Ok(ir::Expr {
+                    ty: ir::Ty::Str,
+                    kind: ir::ExprKind::ContainerRepr(Box::new(value)),
+                })
+            }
             other => Err(err(format!("str() cannot convert {other} yet"), span)),
         },
         // Cast form `list[T](x)` is not supported; use call form `list(x)`.
@@ -25569,6 +25589,15 @@ fn lower_repr_like(value: ir::Expr, ascii: bool, span: Span) -> SResult<ir::Expr
             ty: ir::Ty::Str,
             kind: ir::ExprKind::ExcRepr(Box::new(value)),
         }),
+        // `repr` of a container is its `str`, which is what `print` writes.
+        // `ascii` is not: it would have to escape non-ASCII *inside* the
+        // elements, and the shared rendering does not do that.
+        ir::Ty::List(_) | ir::Ty::Tuple(_) | ir::Ty::Dict { .. } | ir::Ty::Set(_) if !ascii => {
+            Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::ContainerRepr(Box::new(value)),
+            })
+        }
         other => Err(err(
             format!(
                 "{}() cannot convert {other} yet",
@@ -30230,8 +30259,23 @@ print(count([]))
     }
 
     #[test]
-    fn error_fstring_of_list() {
-        let e = analyze_err("xs = [1]\ns = f\"{xs}\"\nprint(s)\n");
+    fn fstring_of_a_list_renders_it() {
+        // Rejected before 0.108; now the same text `print` writes.
+        let m = analyze_ok("xs = [1]\ns = f\"{xs}\"\nprint(s)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!();
+        };
+        assert!(
+            matches!(&value.kind, ir::ExprKind::ContainerRepr(_)),
+            "{value:?}"
+        );
+    }
+
+    #[test]
+    fn error_fstring_spec_on_a_list() {
+        // A format *spec* on a container is still rejected, as in CPython.
+        let e = analyze_err("xs = [1]\ns = f\"{xs:>4}\"\nprint(s)\n");
         assert!(e.message.contains("convert"), "{}", e.message);
     }
 

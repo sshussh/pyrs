@@ -283,8 +283,8 @@ value.
 | `file`  | open file handle | from `open(...)`; usable in params/returns; not in lists |
 | `list[T]` | growable homogeneous list | `T` is any type incl. another list or Optional; not `file` |
 | `tuple[T1, …]` | fixed-arity heterogeneous tuple | empty `tuple[()]`; index / len / unpack / iterate (homogeneous); `count`/`index` |
-| `dict[K, V]` | hash map, insertion order | `K` is `int` or `str`; `V` may be Optional/union; empty `{}` needs annotation |
-| `set[T]` | hash set, insertion order | `T` is `int` or `str`; empty via `s: set[int] = set()` |
+| `dict[K, V]` | hash map, insertion order | `K` is `int`, `str`, or a tuple of those; `V` may be Optional/union; empty `{}` needs annotation |
+| `set[T]` | hash set, insertion order | `T` is `int`, `str`, or a tuple of those; empty via `s: set[int] = set()` |
 
 Implicit promotions (mypy-flavored): `bool → int → float`. They apply in
 arithmetic, assignments, arguments, and returns. A concrete value may be
@@ -411,7 +411,7 @@ print(s[6:], s[:5], s[::-1])   # slicing with steps (see below)
 print(len(s))                  # length (bytes; see note below)
 for c in s:                    # iterate characters (each is a 1-char str)
     print(c)
-label = str(42)                # str() converts int/float/bool
+label = str(42)                # str() converts int/float/bool/containers
 
 block = """line one
 line two"""                    # multi-line; value contains a real newline
@@ -592,7 +592,9 @@ print(f'''{{x}} is {n}''')     # f'''…''' also works
 
 Expressions inside `{...}` may include slices, calls, nested f-strings,
 and the usual operators. Interpolated values are converted with the
-`str()` rules (int/float/bool/str). `{{` and `}}` produce literal braces.
+`str()` rules (int / float / bool / str, and list / tuple / dict / set,
+which render exactly as `print` writes them). `{{` and `}}` produce
+literal braces.
 Triple-quoted forms (`f"""…"""` / `f'''…'''`) allow multi-line *literal*
 content with the same escape and newline rules as plain triple strings.
 
@@ -633,8 +635,8 @@ print(f'''{"""nested"""}''')   # ok
 - empty format (`{x}` / `{x:}`) matches `str(x)` for int/float/bool/str
 
 Not supported yet (clear errors): self-documenting `{x=}`, grouping
-(`,` / `_`), types `n` / `c`. Containers cannot appear in f-strings
-(same as `str()`).
+(`,` / `_`), types `n` / `c`. A container interpolates (`f"{xs}"`) but
+takes no format spec, as in CPython.
 
 ### Lists
 

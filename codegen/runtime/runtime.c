@@ -20,6 +20,7 @@
 #include <limits.h>
 #include <math.h>
 #include <setjmp.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,19 +110,77 @@ static long long user_exc_index(int tag) {
     return i;
 }
 
+_Noreturn void pyrs_die(const char *msg);
+
+/* ---- output sink ----
+ *
+ * Every print routine writes through out_*() rather than straight to stdout,
+ * so the same code can render into a buffer. That is what makes `str(xs)`
+ * and `print(xs)` agree by construction rather than by two implementations
+ * kept in step: `pyrs_repr_*` just captures what `pyrs_print_*` would emit.
+ *
+ * Capture is thread-local and saves/restores the enclosing buffer, so a
+ * nested capture is harmless. The buffer itself is plain malloc rather than
+ * GC memory -- it holds no object references, and it is freed as soon as its
+ * contents have been copied into the result string. */
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} OutBuf;
+
+static _Thread_local OutBuf *g_capture = NULL;
+
+static void out_write(const char *p, size_t n) {
+    OutBuf *o = g_capture;
+    if (o == NULL) {
+        fwrite(p, 1, n, stdout);
+        return;
+    }
+    if (o->len + n + 1 > o->cap) {
+        size_t want = o->cap ? o->cap * 2 : 128;
+        while (want < o->len + n + 1) {
+            want *= 2;
+        }
+        char *grown = realloc(o->buf, want);
+        if (grown == NULL) {
+            pyrs_die("MemoryError: out of memory formatting a value");
+        }
+        o->buf = grown;
+        o->cap = want;
+    }
+    memcpy(o->buf + o->len, p, n);
+    o->len += n;
+}
+
+static void out_puts(const char *s) { out_write(s, strlen(s)); }
+
+static void out_putc(char c) { out_write(&c, 1); }
+
+static void out_printf(const char *fmt, ...) {
+    char buf[64];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        out_write(buf, (size_t)n < sizeof buf ? (size_t)n : sizeof buf - 1);
+    }
+}
+
 void pyrs_print_class_instance(void *obj) {
     if (obj == NULL) {
-        fputs("<object>", stdout);
+        out_puts("<object>");
         return;
     }
     long long tid = *(long long *)obj;
     if (g_class_names != NULL && tid >= 0 && tid < g_class_n && g_class_names[tid] != NULL) {
-        fputc('<', stdout);
-        fputs(g_class_names[tid], stdout);
-        fputs(" object>", stdout);
+        out_putc('<');
+        out_puts(g_class_names[tid]);
+        out_puts(" object>");
         return;
     }
-    fputs("<object>", stdout);
+    out_puts("<object>");
 }
 
 /* Layout shared with codegen: two i64 header words, then UTF-8 bytes (+ NUL).
@@ -523,7 +582,7 @@ void pyrs_print_exc(PyrsExc *e) {
     if (e == NULL || e->msg == NULL) {
         return;
     }
-    fwrite(e->msg->data, 1, (size_t)e->msg->len, stdout);
+    out_write(e->msg->data, (size_t)e->msg->len);
 }
 
 PyrsStr *pyrs_str_from_exc(PyrsExc *e) {
@@ -2452,7 +2511,7 @@ static char *int_to_base_str(long long t, int base, int upper, long long *out_le
 void pyrs_print_int(long long v) {
     long long n;
     char *s = int_to_dec(v, &n);
-    fwrite(s, 1, (size_t)n, stdout);
+    out_write(s, (size_t)n);
     free(s);
 }
 
@@ -2469,16 +2528,16 @@ PyrsStr *pyrs_str_from_int(long long v) {
 void pyrs_print_float(double v) {
     char buf[40];
     format_double(v, buf);
-    fputs(buf, stdout);
+    out_puts(buf);
 }
 
 void pyrs_print_bool(int v) {
-    fputs(v ? "True" : "False", stdout);
+    out_puts(v ? "True" : "False");
 }
 
 void pyrs_print_str(const PyrsStr *s) {
     check_ref(s);
-    fwrite(s->data, 1, (size_t)s->len, stdout);
+    out_write(s->data, (size_t)s->len);
 }
 
 /* CPython repr of a str: single quotes unless the string contains a
@@ -2495,34 +2554,34 @@ static void print_str_repr(const PyrsStr *s) {
         }
     }
     char quote = (has_single && !has_double) ? '"' : '\'';
-    fputc(quote, stdout);
+    out_putc(quote);
     /* Same rule as pyrs_str_repr: escape by Unicode printability. */
     for (long long i = 0; i < s->len;) {
         unsigned int cp;
         int adv = utf8_next(s, i, &cp);
         if (cp == (unsigned int)quote || cp == '\\') {
-            fputc('\\', stdout);
-            fputc((int)cp, stdout);
+            out_putc('\\');
+            out_putc((char)cp);
         } else if (cp == '\n') {
-            fputs("\\n", stdout);
+            out_puts("\\n");
         } else if (cp == '\r') {
-            fputs("\\r", stdout);
+            out_puts("\\r");
         } else if (cp == '\t') {
-            fputs("\\t", stdout);
+            out_puts("\\t");
         } else if ((pyrs_u_flags(cp) & PYRS_U_PRINTABLE) == 0) {
             if (cp < 0x100) {
-                printf("\\x%02x", cp);
+                out_printf("\\x%02x", cp);
             } else if (cp < 0x10000) {
-                printf("\\u%04x", cp);
+                out_printf("\\u%04x", cp);
             } else {
-                printf("\\U%08x", cp);
+                out_printf("\\U%08x", cp);
             }
         } else {
-            fwrite(s->data + i, 1, (size_t)adv, stdout);
+            out_write(s->data + i, (size_t)adv);
         }
         i += adv;
     }
-    fputc(quote, stdout);
+    out_putc(quote);
 }
 
 /* forward decls for nested printing */
@@ -2560,7 +2619,7 @@ static void print_slot(long long slot, int tag) {
         break;
     }
     case TAG_BOOL:
-        fputs(slot ? "True" : "False", stdout);
+        out_puts(slot ? "True" : "False");
         break;
     case TAG_STR:
         print_str_repr((const PyrsStr *)(uintptr_t)slot);
@@ -2576,22 +2635,22 @@ static void print_slot(long long slot, int tag) {
         break;
     case TAG_UNION: {
         if (slot == 0) {
-            fputs("None", stdout);
+            out_puts("None");
             break;
         }
         const PyrsUnionBox *u = (const PyrsUnionBox *)(uintptr_t)slot;
         if (u->print_tag < 0) {
-            fputs("None", stdout);
+            out_puts("None");
         } else {
             print_slot(u->payload, u->print_tag);
         }
         break;
     }
     case TAG_CLOSURE:
-        fputs("<function>", stdout);
+        out_puts("<function>");
         break;
     case TAG_GENERATOR:
-        fputs("<generator>", stdout);
+        out_puts("<generator>");
         break;
     case TAG_EXC:
         pyrs_print_exc((PyrsExc *)(uintptr_t)slot);
@@ -2606,7 +2665,7 @@ static void print_slot(long long slot, int tag) {
         if (tag >= 4 && ((tag - 4) % 8) == 0) {
             pyrs_print_list((const PyrsList *)(uintptr_t)slot, (tag - 4) / 8);
         } else {
-            printf("<object>");
+            out_puts("<object>");
         }
         break;
     }
@@ -2617,12 +2676,12 @@ static void print_slot(long long slot, int tag) {
  * via print_slot. List/container printing still uses repr for str elems. */
 void pyrs_print_any(long long slot) {
     if (slot == 0) {
-        fputs("None", stdout);
+        out_puts("None");
         return;
     }
     const PyrsUnionBox *u = (const PyrsUnionBox *)(uintptr_t)slot;
     if (u->print_tag < 0) {
-        fputs("None", stdout);
+        out_puts("None");
     } else if (u->print_tag == TAG_STR) {
         pyrs_print_str((const PyrsStr *)(uintptr_t)u->payload);
     } else {
@@ -2692,14 +2751,14 @@ int pyrs_any_truth(long long slot) {
  * 5=tuple 6=dict 7=set */
 void pyrs_print_list(const PyrsList *l, int tag) {
     check_ref(l);
-    fputc('[', stdout);
+    out_putc('[');
     for (long long i = 0; i < l->len; i++) {
         if (i > 0) {
-            fputs(", ", stdout);
+            out_puts(", ");
         }
         print_slot(l->data[i], tag);
     }
-    fputc(']', stdout);
+    out_putc(']');
 }
 
 void pyrs_print_sep(void) {
@@ -5697,17 +5756,17 @@ long long pyrs_tuple_get(const PyrsTuple *t, long long i) {
 
 void pyrs_print_tuple(const PyrsTuple *t) {
     check_ref(t);
-    fputc('(', stdout);
+    out_putc('(');
     for (long long i = 0; i < t->len; i++) {
         if (i > 0) {
-            fputs(", ", stdout);
+            out_puts(", ");
         }
         print_slot(t->data[i], t->tags[i]);
     }
     if (t->len == 1) {
-        fputc(',', stdout);
+        out_putc(',');
     }
-    fputc(')', stdout);
+    out_putc(')');
 }
 
 int pyrs_tuple_eq(const PyrsTuple *a, const PyrsTuple *b) {
@@ -6406,7 +6465,7 @@ int pyrs_dict_iter_key(const PyrsDict *d, long long i, long long *out_key) {
 
 void pyrs_print_dict(const PyrsDict *d) {
     check_ref(d);
-    fputc('{', stdout);
+    out_putc('{');
     int first = 1;
     for (long long i = 0; i < d->order_len; i++) {
         DictSlot *s = &d->table[d->order[i]];
@@ -6414,14 +6473,14 @@ void pyrs_print_dict(const PyrsDict *d) {
             continue;
         }
         if (!first) {
-            fputs(", ", stdout);
+            out_puts(", ");
         }
         first = 0;
         print_slot(s->key, s->key_tag);
-        fputs(": ", stdout);
+        out_puts(": ");
         print_slot(s->val, s->val_tag);
     }
-    fputc('}', stdout);
+    out_putc('}');
 }
 
 /* structural equality (order-independent; values compared with slot_eq) */
@@ -6650,10 +6709,10 @@ int pyrs_set_iter_elem(const PyrsSet *s, long long i, long long *out) {
 void pyrs_print_set(const PyrsSet *s) {
     check_ref(s);
     if (s->len == 0) {
-        fputs("set()", stdout);
+        out_puts("set()");
         return;
     }
-    fputc('{', stdout);
+    out_putc('{');
     int first = 1;
     for (long long i = 0; i < s->order_len; i++) {
         SetSlot *e = &s->table[s->order[i]];
@@ -6661,12 +6720,62 @@ void pyrs_print_set(const PyrsSet *s) {
             continue;
         }
         if (!first) {
-            fputs(", ", stdout);
+            out_puts(", ");
         }
         first = 0;
         print_slot(e->key, e->key_tag);
     }
-    fputc('}', stdout);
+    out_putc('}');
+}
+
+/* ---- repr through capture ----
+ *
+ * `str(xs)` and `repr(xs)` of a container are the same text `print` writes,
+ * so these render through the print routines rather than duplicating them.
+ * Each redirects the sink into a local buffer and copies the result out.
+ * The previous sink is saved and restored, so nesting is harmless. */
+static OutBuf *capture_begin(OutBuf *buf) {
+    buf->buf = NULL;
+    buf->len = 0;
+    buf->cap = 0;
+    OutBuf *prev = g_capture;
+    g_capture = buf;
+    return prev;
+}
+
+static PyrsStr *capture_end(OutBuf *buf, OutBuf *prev) {
+    g_capture = prev;
+    PyrsStr *r = str_from_utf8(buf->len ? buf->buf : "", (long long)buf->len);
+    free(buf->buf);
+    return r;
+}
+
+PyrsStr *pyrs_repr_list(const PyrsList *l, int tag) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_list(l, tag);
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_repr_tuple(const PyrsTuple *t) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_tuple(t);
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_repr_dict(const PyrsDict *d) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_dict(d);
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_repr_set(const PyrsSet *s) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_set(s);
+    return capture_end(&buf, prev);
 }
 
 int pyrs_set_eq(const PyrsSet *a, const PyrsSet *b) {
