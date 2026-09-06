@@ -593,6 +593,13 @@ pub enum ExprKind {
         target_span: Span,
         value: Box<Expr>,
     },
+    /// `body if test else orelse` — Python's conditional expression. Exactly
+    /// one of the branches is evaluated, after `test`.
+    IfExp {
+        test: Box<Expr>,
+        body: Box<Expr>,
+        orelse: Box<Expr>,
+    },
     /// `yield value` / bare `yield` (None). Only valid inside functions.
     Yield(Option<Box<Expr>>),
     /// `yield from iterable`.
