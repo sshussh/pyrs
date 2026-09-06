@@ -19,13 +19,13 @@ pub fn ping() -> String {
 /// Physical newlines are normalized like CPython's tokenizer: `\r\n` and
 /// lone `\r` become `\n`. A backslash immediately before a physical newline
 /// is a line continuation and contributes no characters.
-fn unescape_contents(inner: &str) -> String {
+fn unescape_contents(inner: &str) -> Result<String, String> {
     let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
+    let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\r' {
             // universal-newline: \r\n and \r → \n
-            if chars.as_str().starts_with('\n') {
+            if chars.peek() == Some(&'\n') {
                 chars.next();
             }
             out.push('\n');
@@ -39,14 +39,71 @@ fn unescape_contents(inner: &str) -> String {
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
             Some('r') => out.push('\r'),
-            Some('0') => out.push('\0'),
+            Some('a') => out.push('\u{7}'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('v') => out.push('\u{b}'),
             Some('\\') => out.push('\\'),
             Some('\'') => out.push('\''),
             Some('"') => out.push('"'),
+            // \ooo: one to three octal digits, wrapping like CPython at \777
+            Some(d @ '0'..='7') => {
+                let mut v = d.to_digit(8).unwrap();
+                for _ in 0..2 {
+                    match chars.peek().and_then(|c| c.to_digit(8)) {
+                        Some(n) => {
+                            v = v * 8 + n;
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+                out.push(char::from_u32(v).expect("octal escape is at most 0o777"));
+            }
+            Some(kind @ ('x' | 'u' | 'U')) => {
+                let (want, label) = match kind {
+                    'x' => (2, "\\xXX"),
+                    'u' => (4, "\\uXXXX"),
+                    _ => (8, "\\UXXXXXXXX"),
+                };
+                let mut v: u32 = 0;
+                for _ in 0..want {
+                    match chars.peek().and_then(|c| c.to_digit(16)) {
+                        Some(n) => {
+                            v = v * 16 + n;
+                            chars.next();
+                        }
+                        None => return Err(format!("truncated {label} escape")),
+                    }
+                }
+                match char::from_u32(v) {
+                    Some(ch) => out.push(ch),
+                    // Surrogates and out-of-range values have no UTF-8 form.
+                    // PyRs strings are UTF-8 throughout, so rather than
+                    // silently substituting, say so.
+                    None if (0xd800..=0xdfff).contains(&v) => {
+                        return Err(format!(
+                            "lone surrogate U+{v:04X} in a {label} escape has no UTF-8 \
+                             form and is not supported"
+                        ));
+                    }
+                    None => return Err(format!("illegal Unicode character U+{v:X}")),
+                }
+            }
+            // \N{NAME} needs the Unicode name database, which PyRs does not
+            // carry. Reject it rather than silently keeping it verbatim.
+            // CPython also rejects a bare \N ("malformed \N character escape"),
+            // so this is not a case where keeping it verbatim would be right.
+            Some('N') => {
+                return Err(
+                    "\\N{...} named Unicode escapes are not supported; use \\u or chr()"
+                        .to_string(),
+                );
+            }
             // line continuation inside the literal: consume the newline
             Some('\n') => {}
             Some('\r') => {
-                if chars.as_str().starts_with('\n') {
+                if chars.peek() == Some(&'\n') {
                     chars.next();
                 }
             }
@@ -58,12 +115,24 @@ fn unescape_contents(inner: &str) -> String {
             None => out.push('\\'),
         }
     }
-    out
+    Ok(out)
 }
 
 /// Strip one surrounding quote character from each end, then unescape.
-fn unescape(slice: &str) -> String {
-    unescape_contents(&slice[1..slice.len() - 1])
+/// A malformed escape parks its message in `extras` and fails the token.
+fn unescape(lex: &mut logos::Lexer<Token>, slice: &str) -> Option<String> {
+    park(lex, unescape_contents(&slice[1..slice.len() - 1]))
+}
+
+/// Move a decode failure into `extras` so the driver can report it.
+fn park(lex: &mut logos::Lexer<Token>, r: Result<String, String>) -> Option<String> {
+    match r {
+        Ok(v) => Some(v),
+        Err(msg) => {
+            lex.extras = Some(msg);
+            None
+        }
+    }
 }
 
 /// After matching the opening `"""`, scan for the closing delimiter,
@@ -102,9 +171,9 @@ fn lex_triple(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
             continue;
         }
         if bytes[i] == quote && bytes[i + 1] == quote && bytes[i + 2] == quote {
-            let inner = &rem[..i];
+            let inner = rem[..i].to_string();
             lex.bump(i + 3);
-            return Some(unescape_contents(inner));
+            return park(lex, unescape_contents(&inner));
         }
         i += 1;
     }
@@ -195,7 +264,13 @@ fn lex_triple_fstring(lex: &mut logos::Lexer<Token>) -> Option<String> {
     lex_triple(lex, quote)
 }
 
+/// A malformed escape can only be signalled from a string callback as
+/// `None`, which the driver would otherwise report as "unexpected
+/// character". The callback parks the real message here instead.
+pub type LexExtras = Option<String>;
+
 #[derive(Logos, Debug, Clone, PartialEq)]
+#[logos(extras = LexExtras)]
 #[logos(skip r"[ \t\f]+")] // skip basic horizontal whitespace
 #[logos(skip(r"#[^\n]*", allow_greedy = true))] // skip comments
 #[logos(skip r"\\\r?\n")] // explicit line joining with backslash
@@ -315,8 +390,8 @@ pub enum Token {
     // preserves interior newlines as part of the string value.
     #[token("\"\"\"", lex_triple_double)]
     #[token("'''", lex_triple_single)]
-    #[regex(r#""([^"\\\n]|\\.)*""#, |lex| unescape(lex.slice()))]
-    #[regex(r#"'([^'\\\n]|\\.)*'"#, |lex| unescape(lex.slice()))]
+    #[regex(r#""([^"\\\n]|\\.)*""#, |lex| { let s = lex.slice().to_string(); unescape(lex, &s) })]
+    #[regex(r#"'([^'\\\n]|\\.)*'"#, |lex| { let s = lex.slice().to_string(); unescape(lex, &s) })]
     Strlit(String),
     /// f-string raw content, escapes processed but `{`/`}` preserved for
     /// the parser to split into literal and expression parts.
@@ -324,8 +399,8 @@ pub enum Token {
     /// as empty `f""`/`f''` plus junk.
     #[token("f\"\"\"", lex_triple_fstring)]
     #[token("f'''", lex_triple_fstring)]
-    #[regex(r#"f"([^"\\\n]|\\.)*""#, |lex| unescape(&lex.slice()[1..]))]
-    #[regex(r#"f'([^'\\\n]|\\.)*'"#, |lex| unescape(&lex.slice()[1..]))]
+    #[regex(r#"f"([^"\\\n]|\\.)*""#, |lex| { let s = lex.slice()[1..].to_string(); unescape(lex, &s) })]
+    #[regex(r#"f'([^'\\\n]|\\.)*'"#, |lex| { let s = lex.slice()[1..].to_string(); unescape(lex, &s) })]
     FStrlit(String),
 
     // operators
@@ -559,7 +634,7 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     pub fn new(source: &'a str) -> Self {
         Self {
-            inner: Token::lexer(source),
+            inner: Token::lexer_with_extras(source, None),
             indent_stack: vec![0],
             pending: VecDeque::new(),
             paren_depth: 0,
@@ -691,8 +766,11 @@ impl<'a> Iterator for Lexer<'a> {
                 Some(Err(())) => {
                     let slice = self.inner.slice();
                     // Callbacks return None for unclosed triple-quoted
-                    // strings / f-strings (span bumped through remainder).
-                    let message = if slice.starts_with("f\"\"\"") || slice.starts_with("f'''") {
+                    // strings / f-strings (span bumped through remainder),
+                    // and for a malformed escape, which parks its message.
+                    let message = if let Some(escape) = self.inner.extras.take() {
+                        escape
+                    } else if slice.starts_with("f\"\"\"") || slice.starts_with("f'''") {
                         "unterminated triple-quoted f-string literal".to_string()
                     } else if slice.starts_with("\"\"\"") || slice.starts_with("'''") {
                         "unterminated triple-quoted string literal".to_string()
@@ -1473,6 +1551,89 @@ mod test {
     fn test_unexpected_char_is_error() {
         let result = lex("x = 1 ?\n");
         assert!(result.is_err());
+    }
+
+    /// Decode a single string literal, or return the lex diagnostic message.
+    fn lex_str(src: &str) -> Result<String, String> {
+        match lex(src) {
+            Ok(tokens) => match &tokens[0].0 {
+                Token::Strlit(v) => Ok(v.clone()),
+                other => panic!("expected a string literal, got {other:?}"),
+            },
+            Err(d) => Err(d.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_numeric_escapes_decode_to_code_points() {
+        assert_eq!(lex_str(r#""\x41\x42""#).unwrap(), "AB");
+        assert_eq!(lex_str(r#""\u00e9""#).unwrap(), "é");
+        assert_eq!(lex_str(r#""\U0001F40D""#).unwrap(), "🐍");
+        // \x00 is a real NUL, not the four characters that used to survive.
+        assert_eq!(lex_str(r#""a\x00b""#).unwrap().chars().count(), 3);
+    }
+
+    #[test]
+    fn test_octal_and_control_escapes() {
+        assert_eq!(lex_str(r#""\101\102""#).unwrap(), "AB");
+        assert_eq!(lex_str(r#""\0""#).unwrap(), "\u{0}");
+        // CPython wraps past \377 rather than rejecting.
+        assert_eq!(lex_str(r#""\777""#).unwrap(), "\u{1ff}");
+        assert_eq!(lex_str(r#""\a\b\f\v""#).unwrap(), "\u{7}\u{8}\u{c}\u{b}");
+    }
+
+    #[test]
+    fn test_unknown_escapes_stay_verbatim_like_cpython() {
+        assert_eq!(lex_str(r#""\d""#).unwrap(), r"\d");
+        assert_eq!(lex_str(r#""\q""#).unwrap(), r"\q");
+    }
+
+    #[test]
+    fn test_truncated_numeric_escapes_are_errors() {
+        assert!(lex_str(r#""a\x""#).unwrap_err().contains(r"truncated \xXX"));
+        assert!(
+            lex_str(r#""\u12""#)
+                .unwrap_err()
+                .contains(r"truncated \uXXXX")
+        );
+        assert!(
+            lex_str(r#""\U0001""#)
+                .unwrap_err()
+                .contains(r"truncated \UXXXXXXXX")
+        );
+    }
+
+    #[test]
+    fn test_out_of_range_and_surrogate_escapes_are_errors() {
+        assert!(
+            lex_str(r#""\U0011FFFF""#)
+                .unwrap_err()
+                .contains("illegal Unicode character")
+        );
+        // PyRs strings are UTF-8 throughout, so a lone surrogate has no form;
+        // rejecting beats silently substituting a replacement character.
+        assert!(
+            lex_str(r#""\ud800""#)
+                .unwrap_err()
+                .contains("lone surrogate")
+        );
+    }
+
+    #[test]
+    fn test_named_escapes_are_rejected_not_kept_verbatim() {
+        let err = lex_str(r#""\N{GREEK SMALL LETTER ALPHA}""#).unwrap_err();
+        assert!(
+            err.contains("named Unicode escapes are not supported"),
+            "{err}"
+        );
+        // CPython rejects a bare \N too, so verbatim would be wrong here.
+        assert!(lex_str(r#""\N""#).is_err());
+    }
+
+    #[test]
+    fn test_escapes_decode_inside_triple_quoted_strings() {
+        let tokens = lex("\"\"\"a\\x41b\"\"\"\n").unwrap();
+        assert_eq!(tokens[0].0, Token::Strlit("aAb".to_string()));
     }
 
     #[test]
