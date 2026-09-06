@@ -76,10 +76,10 @@ Build your own module with `pyrs build-extension -i kernels.py --module kernels_
 --python .venv/bin/python`; import `kernels_native` from that same environment.
 Only the exported kernels run natively; Python and package code keep using CPython.
 
-## The language (v0.101.0)
+## The language (v0.102.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.102.0**, not 1.0) until it is ready for
+milestone after this one is **0.103.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -235,6 +235,9 @@ A statically-typed Python subset:
   (CPython slice bounds; `None` is a type error; miss is the same ValueError).
   **v0.72:** `str.casefold()` — full Unicode case folding since v0.91, so
   `"ß".casefold()` is `"ss"` and matches `"SS".casefold()`.
+  **v0.102:** module-level lists / dicts / sets / tuples are readable from
+  functions (scalars already were); an empty `[]` nested in a container takes
+  the surrounding element type.
   **v0.101:** `key=` may return a tuple or list, so multi-criteria sorting
   (`key=lambda p: (-p[1], p[0])`) works for sorted / sort / min / max.
   **v0.100:** `"{}".format(...)` and `"%d" % ...` on literal format strings —
@@ -498,7 +501,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.101.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.102.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -678,4 +681,4 @@ compatibility probes.
 
 Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
-Release tags: `git tag v0.101.0 && git push origin v0.101.0`.
+Release tags: `git tag v0.102.0 && git push origin v0.102.0`.

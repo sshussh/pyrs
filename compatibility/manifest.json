@@ -93,6 +93,12 @@
       "native": "pass"
     },
     {
+      "id": "module-globals",
+      "file": "cases/module_globals.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.102.0 — Module-level containers are visible to functions
+
+A module-level scalar could already be read from a function; a list, dict, set
+or tuple could not, and reported `name 'X' is not defined`. A lookup table or
+config dict at module scope is ordinary Python.
+
+- Global storage types are seeded from container literals as well as scalars,
+  including nested ones, so `edges = {"a": ["b"], ...}` is readable from a
+  function. An element the seeder cannot type leaves that global unseeded,
+  which is the safe direction: the name is simply not in scope, exactly as
+  before.
+- An empty `[]` nested inside a container now takes the surrounding element
+  type instead of being rejected. `[["a"], []]` and `{"a": ["b"], "d": []}`
+  are ordinary Python; the empty literal has no element type of its own and is
+  provisionally `list[Any]`, and the runtime value — a length-zero list — is
+  the same either way. `xs: list[str] = []` and `f([])` already worked, so
+  this closes the nested case.
+- Global containers stay shared state: mutating one from a function is visible
+  outside, as in CPython.
+
+Found by running small realistic programs against CPython. A graph-traversal
+script needed the first item, and the second surfaced while fixing it.
+
 ## 0.101.0 — Tuple sort keys
 
 `sorted(items, key=lambda p: (-p[1], p[0]))` is *the* way to sort by more than
