@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.103.0 — Annotated attribute assignment
+
+`self.x: T = value` was rejected: the parser allowed an annotation only on a
+bare name. That made an attribute whose initial value has no inferable type
+unwritable — `self.xs = []` reported `'C' object has no attribute 'xs'` and
+`self.d = {}` could not infer a dict type, so an empty list or dict attribute
+could not be created at all.
+
+- `self.x: T = value` in `__init__` declares the field's type, for scalars,
+  containers, nested containers and unions (`self.opt: int | None = None`).
+- The annotation is the field's declared type; an unannotated attribute still
+  infers from its value exactly as before.
+- An annotation that disagrees with its value is a type error. CPython does
+  not check annotations at run time, but a typed compiler does, consistently
+  with every other annotation here.
+- An annotation on a subscript (`xs[0]: int = 5`) stays rejected: it is legal
+  Python but has no effect there.
+
+Found by running small realistic programs against CPython; a state-machine
+script kept a `self.log: list[str] = []`. With this, all five programs in that
+batch compile and match.
+
 ## 0.102.0 — Module-level containers are visible to functions
 
 A module-level scalar could already be read from a function; a list, dict, set

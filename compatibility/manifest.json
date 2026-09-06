@@ -99,6 +99,12 @@
       "native": "pass"
     },
     {
+      "id": "annotated-attributes",
+      "file": "cases/annotated_attributes.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",
