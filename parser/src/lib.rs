@@ -933,10 +933,32 @@ impl Parser {
     fn parse_raise(&mut self) -> PResult<Stmt> {
         let start = self.expect(Token::Raise, "")?;
         let (exc, exc_span) = self.parse_exc_type("after 'raise'")?;
-        self.expect(
-            Token::LParen,
-            "after exception type (e.g. raise ValueError(\"msg\"))",
-        )?;
+        // `raise E`, `raise E()` and `raise E("msg")` are all Python; the
+        // first two carry an empty message.
+        let empty = || Expr {
+            kind: ExprKind::Str(String::new()),
+            span: exc_span,
+        };
+        if !self.eat(&Token::LParen) {
+            return Ok(Stmt {
+                kind: StmtKind::Raise {
+                    exc,
+                    message: empty(),
+                },
+                span: start.to(exc_span),
+            });
+        }
+        if self.peek() == &Token::RParen {
+            let close = self.peek_span();
+            self.advance();
+            return Ok(Stmt {
+                kind: StmtKind::Raise {
+                    exc,
+                    message: empty(),
+                },
+                span: start.to(close).to(exc_span),
+            });
+        }
         let message = self.parse_expr()?;
         let close = self.expect(Token::RParen, "after raise argument")?;
         Ok(Stmt {
@@ -945,38 +967,7 @@ impl Parser {
         })
     }
 
-    fn parse_exc_type_name(name: &str, span: Span) -> PResult<ExcType> {
-        match name {
-            "ValueError" => Ok(ExcType::ValueError),
-            "KeyError" => Ok(ExcType::KeyError),
-            "IndexError" => Ok(ExcType::IndexError),
-            "ZeroDivisionError" => Ok(ExcType::ZeroDivisionError),
-            "TypeError" => Ok(ExcType::TypeError),
-            "RuntimeError" => Ok(ExcType::RuntimeError),
-            "GeneratorExit" => Ok(ExcType::GeneratorExit),
-            "OverflowError" => Ok(ExcType::OverflowError),
-            "EOFError" => Ok(ExcType::EOFError),
-            "FileNotFoundError" => Ok(ExcType::FileNotFoundError),
-            "OSError" => Ok(ExcType::OSError),
-            "NameError" => Ok(ExcType::NameError),
-            "UnboundLocalError" => Ok(ExcType::UnboundLocalError),
-            "StopIteration" => Ok(ExcType::StopIteration),
-            "Exception" => Ok(ExcType::Exception),
-            "PermissionError" => Ok(ExcType::PermissionError),
-            "IsADirectoryError" => Ok(ExcType::IsADirectoryError),
-            "AssertionError" => Ok(ExcType::AssertionError),
-            other => Err(Diagnostic::new(
-                Phase::Parse,
-                format!(
-                    "unknown exception type '{other}'; supported: {}",
-                    ExcType::all_names()
-                ),
-                span,
-            )),
-        }
-    }
-
-    fn parse_exc_type(&mut self, context: &str) -> PResult<(ExcType, Span)> {
+    fn parse_exc_type(&mut self, context: &str) -> PResult<(ExcName, Span)> {
         let span = self.peek_span();
         let name = match self.peek().clone() {
             Token::Ident(n) => {
@@ -991,12 +982,15 @@ impl Parser {
                 )));
             }
         };
-        let exc = Self::parse_exc_type_name(&name, span)?;
+        let exc = ExcName {
+            name: name.clone(),
+            span,
+        };
         Ok((exc, span))
     }
 
     /// Single type or parenthesized multi-type: `E` or `(A, B, …)`.
-    fn parse_except_types(&mut self) -> PResult<Vec<ExcType>> {
+    fn parse_except_types(&mut self) -> PResult<Vec<ExcName>> {
         if self.peek() == &Token::LParen {
             self.advance();
             let mut types = Vec::new();

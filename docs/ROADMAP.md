@@ -6,9 +6,10 @@ PyRs has a substantial native compiler and runtime, but it is still a
 statically typed Python subset. Versions **0.90.0** through **0.92.0** make
 strings Unicode: offsets are code points, case transforms and character
 classes follow Unicode 16.0.0, and string literals accept the full escape
-set. **0.93.0** adds conditional expressions. The next milestone is
-**0.94.0**; reaching a particular minor version does not establish 1.0
-readiness, and no stable release or tag has been created.
+set. **0.93.0** adds conditional expressions and **0.94.0** user-defined
+exception classes. The next milestone is **0.95.0**; reaching a particular
+minor version does not establish 1.0 readiness, and no stable release or tag
+has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -97,6 +98,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.94 on the same host:
+
+| Check | Result after 0.94 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1169 passed; none failed or ignored (21 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 24 pass / 0 known_gap; compat 8 pass |
+| `pyrs --version` | `PyRs 0.94.0` |
 
 After 0.93 on the same host:
 
@@ -228,6 +240,42 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.94.0: user-defined exception classes
+
+`class E(Exception)` had no spelling at all. The exception type in `raise` and
+`except` was resolved by the *parser* against a hardcoded list of builtins, so
+a custom exception could not be named — and unlike most gaps there was no
+workaround, only falling back to a builtin type that loses the distinction the
+program is drawing.
+
+The milestone contract is:
+
+- `class E(Exception): pass`, and chains of them. A subclass is caught by any
+  ancestor and by `except Exception`; a base is *not* caught by its subclass;
+  unrelated user exceptions do not catch each other. A tuple filter may mix
+  user and builtin types.
+- `raise E`, `raise E()` and `raise E("msg")`, for user classes and builtins
+  alike. An uncaught exception with no message prints the type name alone, as
+  CPython does.
+- Builtin exceptions, including the `OSError` family, are unchanged.
+
+Name resolution moved out of the parser, which cannot know what classes exist,
+into the semantic phase. `ExcType` gained a `User(tag)` variant rather than a
+parallel type, so the ~130 existing builtin uses were untouched; `tag()` is now
+spelled out per variant so the compiler catches a new builtin that forgets one.
+Exception classes are registered before regular class collection and never
+receive a ClassId, layout or vtable — they are a tag, a name and a parent.
+Codegen emits name and parent tables the same way it already emits class
+names, and the runtime walks the parent chain in `pyrs_exc_matches`.
+
+Registration is a single source-order pass, not a fixed point: an earlier draft
+resolved `class B(A)` written above `class A(Exception)`, which made PyRs accept
+a program CPython rejects with NameError.
+
+Out of scope, each rejected with a diagnostic that names the actual problem:
+methods or fields on an exception class, using one as a value, subclassing
+`GeneratorExit`, `raise ... from ...`, and `.args` as a tuple.
 
 ## 0.93.0: conditional expressions
 

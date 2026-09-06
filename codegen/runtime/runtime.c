@@ -53,6 +53,9 @@
 #define PYRS_EXC_ISADIR 17
 #define PYRS_EXC_ASSERT 18
 #define PYRS_EXC_OTHER 99
+/* First tag for a user-defined `class E(Exception)`; must match
+ * ir::USER_EXC_BASE. Builtins own 1..=18 and 99. */
+#define PYRS_EXC_USER_BASE 1000
 
 /* value tags for heterogeneous containers */
 #define TAG_INT 0
@@ -79,6 +82,31 @@ static long long g_class_n = 0;
 void pyrs_set_class_names(const char **names, long long n) {
     g_class_names = names;
     g_class_n = n;
+}
+
+/* User exception classes, filled by compiled main. Tags are contiguous from
+ * PYRS_EXC_USER_BASE, so both tables are indexed by `tag - PYRS_EXC_USER_BASE`. */
+static const char **g_exc_names = NULL;
+static const int *g_exc_parents = NULL;
+static long long g_exc_n = 0;
+
+void pyrs_set_exc_classes(const char **names, const int *parents, long long n) {
+    g_exc_names = names;
+    g_exc_parents = parents;
+    g_exc_n = n;
+}
+
+static const char **user_exc_names(void) {
+    return g_exc_names;
+}
+
+/* Index of a user exception tag in the tables, or -1. */
+static long long user_exc_index(int tag) {
+    long long i = (long long)tag - PYRS_EXC_USER_BASE;
+    if (i < 0 || i >= g_exc_n) {
+        return -1;
+    }
+    return i;
 }
 
 void pyrs_print_class_instance(void *obj) {
@@ -212,7 +240,18 @@ static _Noreturn void pyrs_jump_current(void) {
     longjmp(frame->buf, 1);
 }
 
+static long long user_exc_index(int tag);
+static const char **user_exc_names(void);
+
 static const char *exc_type_name(int ty) {
+    if (ty >= PYRS_EXC_USER_BASE) {
+        long long i = user_exc_index(ty);
+        const char **names = user_exc_names();
+        if (i >= 0 && names != NULL && names[i] != NULL) {
+            return names[i];
+        }
+        return "Exception";
+    }
     switch (ty) {
     case PYRS_EXC_VALUE:
         return "ValueError";
@@ -325,6 +364,29 @@ int pyrs_exc_matches(int filter, int actual) {
     if (filter == PYRS_EXC_EXCEPTION) {
         return actual != PYRS_EXC_GENEXIT && actual != 0;
     }
+    /* A user class is caught by any ancestor: walk its parent chain, which
+     * ends at a builtin (usually Exception). The chain is acyclic by
+     * construction -- a class is only registered once its base already is --
+     * but the table length bounds the walk anyway. */
+    if (actual >= PYRS_EXC_USER_BASE) {
+        int at = actual;
+        for (long long guard = 0; guard <= g_exc_n && at >= PYRS_EXC_USER_BASE; guard++) {
+            long long i = user_exc_index(at);
+            if (i < 0 || g_exc_parents == NULL) {
+                return 0;
+            }
+            at = g_exc_parents[i];
+            if (filter == at) {
+                return 1;
+            }
+        }
+        /* `at` is now a builtin ancestor; fall through so OSError-style
+         * builtin rules still apply to it. */
+        if (at != actual) {
+            return pyrs_exc_matches(filter, at);
+        }
+        return 0;
+    }
     /* OSError catches FileNotFoundError / PermissionError / IsADirectoryError. */
     if (filter == PYRS_EXC_OS) {
         return actual == PYRS_EXC_FILENOTFOUND || actual == PYRS_EXC_PERMISSION ||
@@ -333,13 +395,29 @@ int pyrs_exc_matches(int filter, int actual) {
     return 0;
 }
 
+/* Format the pending-exception string. CPython prints the type name alone
+ * when there is no message -- `raise ValueError()` reports "ValueError", not
+ * "ValueError: " -- so the separator is omitted, and exc_msg_body reads that
+ * back as an empty body. Every writer of g_exc_msg goes through here or
+ * supplies a die string, which always carries its own "Type: " prefix. */
+static void set_exc_msg(int type, const char *body) {
+    if (body == NULL || body[0] == '\0') {
+        snprintf(g_exc_msg, sizeof g_exc_msg, "%s", exc_type_name(type));
+    } else {
+        snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(type), body);
+    }
+}
+
 /* strip "Type: " prefix for the bound exception message */
 static const char *exc_msg_body(const char *full) {
     const char *colon = strchr(full, ':');
     if (colon != NULL && colon[1] == ' ') {
         return colon + 2;
     }
-    return full;
+    /* No ": " is how set_exc_msg spells "type name, no message", so the body
+     * is empty -- `except ValueError as e` after `raise ValueError()` binds
+     * an empty message and `e.args` is empty, as in CPython. */
+    return "";
 }
 
 _Noreturn static void die_uncaught(const char *msg) {
@@ -351,7 +429,7 @@ _Noreturn static void die_uncaught(const char *msg) {
 
 _Noreturn void pyrs_raise(int type, const char *msg) {
     g_exc_type = type;
-    snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(type), msg ? msg : "");
+    set_exc_msg(type, msg);
     if (g_exc_frames != NULL) {
         pyrs_jump_current();
     }
@@ -497,7 +575,7 @@ void pyrs_exc_clear(void) {
  * still run their try's finally before re-raising). */
 void pyrs_set_exc(int type, const char *msg) {
     g_exc_type = type;
-    snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(type), msg ? msg : "");
+    set_exc_msg(type, msg);
 }
 
 /* Like pyrs_set_exc but `msg` is already a full "Type: body" or bare body
@@ -524,7 +602,7 @@ _Noreturn void pyrs_raise_exc(PyrsExc *e) {
     /* `data` is a flexible array member, so it can never be null; testing it
      * was dead code and clang reports it as a tautological comparison. */
     const char *body = (e->msg != NULL) ? e->msg->data : "";
-    snprintf(g_exc_msg, sizeof g_exc_msg, "%s: %s", exc_type_name(e->type_tag), body);
+    set_exc_msg(e->type_tag, body);
     if (g_exc_frames != NULL) {
         pyrs_jump_current();
     }

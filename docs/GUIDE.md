@@ -1363,9 +1363,9 @@ Supported exception types for `raise` / typed `except`: `ValueError`,
 `KeyError`, `IndexError`, `ZeroDivisionError`, `TypeError`, `RuntimeError`,
 `GeneratorExit`, `OverflowError`, `EOFError`, `FileNotFoundError`,
 `OSError`, `PermissionError`, `IsADirectoryError`, `NameError`,
-`UnboundLocalError`, `StopIteration`, `Exception`. Matching follows
-CPython-like **subclass** rules for the fixed kit hierarchy (not user
-classes): `FileNotFoundError` / `PermissionError` / `IsADirectoryError`
+`UnboundLocalError`, `StopIteration`, `Exception` — plus any exception class
+the program defines (see below). Matching follows CPython-like **subclass**
+rules: `FileNotFoundError` / `PermissionError` / `IsADirectoryError`
 ⊂ `OSError` ⊂ `Exception`; other named traps ⊂ `Exception`;
 `GeneratorExit` is **not** under `Exception` (BaseException-only, like
 CPython). Multi-type handlers work: `except (A, B) as e:`. Bare
@@ -1380,6 +1380,37 @@ exception; exceptions raised in `else` are not caught by the same `try`'s
 handlers). `else` requires at least one `except` (not `try`/`finally`
 alone). `return` / `break` / `continue` inside `try` run `finally` and
 pop the catch frame before leaving (CPython-compatible).
+
+### User-defined exception classes
+
+```python
+class AppError(Exception):
+    pass
+
+class NotFound(AppError):
+    pass
+
+try:
+    raise NotFound("no such row")
+except AppError as e:        # any ancestor catches it, as does Exception
+    print(e)
+```
+
+A subclass is caught by any ancestor and by `except Exception`; a base is not
+caught by its subclass; unrelated exception classes do not catch each other. A
+tuple filter may mix user and builtin types. `raise E`, `raise E()` and
+`raise E("msg")` are all accepted — the first two carry an empty message, and
+an uncaught one prints just the type name, as CPython does.
+
+The base must be declared before the subclass, as in CPython, and must be
+`Exception` or another exception class. `GeneratorExit` cannot be subclassed:
+it is BaseException-only, so `except Exception` would miss the subclass.
+
+An exception class here is a type tag, a name and a parent — it has no
+instance layout. So the body must be `pass` or a docstring (no methods or
+fields), and the class cannot be used as a value: `x = E("m")` is rejected,
+though `raise E("m")` and `except E` are fine. `raise X from Y` and `.args`
+as a tuple are not supported.
 
 | error | raised by |
 |-------|-----------|

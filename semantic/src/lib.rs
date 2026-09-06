@@ -74,6 +74,56 @@ thread_local! {
     static CLASS_ENV: RefCell<ClassEnv> = RefCell::new(ClassEnv::default());
 }
 
+/// User-defined exception classes. Kept apart from [`ClassEnv`] because they
+/// are not instantiable objects here: they carry a runtime tag and a parent,
+/// which is all `raise` and `except` need, and they never get an instance
+/// layout or a vtable.
+#[derive(Default)]
+struct ExcEnv {
+    /// In tag order from [`ir::USER_EXC_BASE`].
+    classes: Vec<ir::ExcClass>,
+    /// `(module_name, ClassName)` → runtime tag.
+    by_key: HashMap<(String, String), u32>,
+}
+
+thread_local! {
+    static EXC_ENV: RefCell<ExcEnv> = RefCell::new(ExcEnv::default());
+}
+
+fn clear_exc_env() {
+    EXC_ENV.with(|e| *e.borrow_mut() = ExcEnv::default());
+}
+
+fn with_exc_env<R>(f: impl FnOnce(&ExcEnv) -> R) -> R {
+    EXC_ENV.with(|e| f(&e.borrow()))
+}
+
+/// Resolve an exception class name to its tag: this module first, then a
+/// unique match anywhere (the same order `lookup_class` uses).
+fn lookup_exc_class(module: &str, name: &str) -> Option<u32> {
+    with_exc_env(|e| {
+        if let Some(tag) = e.by_key.get(&(module.to_string(), name.to_string())) {
+            return Some(*tag);
+        }
+        let hits: Vec<u32> = e
+            .by_key
+            .iter()
+            .filter(|((_, n), _)| n == name)
+            .map(|(_, t)| *t)
+            .collect();
+        if hits.len() == 1 {
+            Some(hits[0])
+        } else {
+            Option::None
+        }
+    })
+}
+
+/// Is this a user exception class name visible from `module`?
+fn is_exc_class_name(module: &str, name: &str) -> bool {
+    lookup_exc_class(module, name).is_some()
+}
+
 fn clear_class_env() {
     CLASS_ENV.with(|e| *e.borrow_mut() = ClassEnv::default());
 }
@@ -740,27 +790,31 @@ fn check_hashable_key(ty: ir::Ty, span: Span, what: &str) -> SResult<()> {
     }
 }
 
-fn ast_exc_to_ir(e: ast::ExcType) -> ir::ExcType {
-    match e {
-        ast::ExcType::ValueError => ir::ExcType::ValueError,
-        ast::ExcType::KeyError => ir::ExcType::KeyError,
-        ast::ExcType::IndexError => ir::ExcType::IndexError,
-        ast::ExcType::ZeroDivisionError => ir::ExcType::ZeroDivisionError,
-        ast::ExcType::TypeError => ir::ExcType::TypeError,
-        ast::ExcType::RuntimeError => ir::ExcType::RuntimeError,
-        ast::ExcType::GeneratorExit => ir::ExcType::GeneratorExit,
-        ast::ExcType::OverflowError => ir::ExcType::OverflowError,
-        ast::ExcType::EOFError => ir::ExcType::EOFError,
-        ast::ExcType::FileNotFoundError => ir::ExcType::FileNotFoundError,
-        ast::ExcType::OSError => ir::ExcType::OSError,
-        ast::ExcType::NameError => ir::ExcType::NameError,
-        ast::ExcType::UnboundLocalError => ir::ExcType::UnboundLocalError,
-        ast::ExcType::StopIteration => ir::ExcType::StopIteration,
-        ast::ExcType::Exception => ir::ExcType::Exception,
-        ast::ExcType::PermissionError => ir::ExcType::PermissionError,
-        ast::ExcType::IsADirectoryError => ir::ExcType::IsADirectoryError,
-        ast::ExcType::AssertionError => ir::ExcType::AssertionError,
+/// Resolve an exception type written in `raise` / `except`.
+///
+/// Builtins win over a user class of the same name, matching the shadowing a
+/// program would get from CPython's builtins scope. This runs in the semantic
+/// phase rather than the parser because only here is the set of
+/// `class E(Exception)` declarations known.
+fn resolve_exc_name(e: &ast::ExcName) -> SResult<ir::ExcType> {
+    if let Ok(builtin) = name_to_exc_type(&e.name, e.span) {
+        return Ok(builtin);
     }
+    // Same module context bare class lookups use.
+    let module = with_class_env(|env| env.current_module.clone());
+    if let Some(tag) = lookup_exc_class(&module, &e.name) {
+        return Ok(ir::ExcType::User(tag));
+    }
+    Err(err(
+        format!(
+            "unknown exception type '{}'; define it with \
+             `class {}(Exception): pass`, or use a builtin ({})",
+            e.name,
+            e.name,
+            ir::ExcType::all_names()
+        ),
+        e.span,
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1783,8 +1837,18 @@ fn collect_class_asts<'a>(modules: &'a [ModuleInput<'a>]) -> SResult<Vec<ClassAs
     let mut out = Vec::new();
     for (i, m) in modules.iter().enumerate() {
         let is_root = i == root_idx;
+        let module_key = if is_root {
+            ENTRY_NAME.to_string()
+        } else {
+            m.name.clone()
+        };
         for stmt in &m.ast.body {
             if let ast::StmtKind::ClassDef(c) = &stmt.kind {
+                // Exception classes were registered separately and have no
+                // instance layout, methods or vtable.
+                if is_exc_class_name(&module_key, &c.name) {
+                    continue;
+                }
                 if c.bases.len() > 1 {
                     return Err(err(
                         "multiple inheritance is not supported yet (single base only)",
@@ -2216,6 +2280,89 @@ fn collect_self_fields(
     }
 }
 
+/// Register every `class E(Exception)` in the program, before regular class
+/// collection so those classes never enter the instance/vtable pipeline.
+///
+/// Runs to a fixed point rather than in source order, because a chain can be
+/// written in any order and across modules: `class B(A)` may precede
+/// `class A(Exception)`. Each round registers the classes whose base is now
+/// known to be an exception, and stops when a round adds nothing.
+fn collect_exception_classes(modules: &[ModuleInput<'_>]) -> SResult<()> {
+    clear_exc_env();
+    let root_idx = modules.len() - 1;
+    // Source order, not a fixed point: a class statement executes where it is
+    // written, so its base must already exist. CPython raises NameError for
+    // `class B(A)` above `class A(Exception)`, and resolving it anyway would
+    // make PyRs accept a program Python rejects. Modules arrive in topological
+    // order, so an imported base is already registered.
+    for (i, m) in modules.iter().enumerate() {
+        let module = if i == root_idx {
+            ENTRY_NAME.to_string()
+        } else {
+            m.name.clone()
+        };
+        for stmt in &m.ast.body {
+            let ast::StmtKind::ClassDef(c) = &stmt.kind else {
+                continue;
+            };
+            if c.bases.len() != 1 {
+                continue;
+            }
+            let (base_name, _) = &c.bases[0];
+            let parent_tag = match builtin_exc_base(base_name) {
+                Some(builtin) => builtin.tag(),
+                Option::None => match lookup_exc_class(&module, base_name) {
+                    Some(tag) => tag as i32,
+                    // Not an exception class: leave it to the regular class
+                    // pipeline, which reports an unknown base itself.
+                    Option::None => continue,
+                },
+            };
+            // The body has to be empty: an exception class here is a tag and a
+            // name, with no instance layout to hold fields or methods.
+            for b in &c.body {
+                let ok = matches!(&b.kind, ast::StmtKind::Pass)
+                    || matches!(&b.kind, ast::StmtKind::ExprStmt(e)
+                        if matches!(e.kind, ast::ExprKind::Str(_)));
+                if !ok {
+                    return Err(err(
+                        format!(
+                            "exception class '{}' may only contain 'pass' or a \
+                             docstring; methods and fields on exception classes \
+                             are not supported yet",
+                            c.name
+                        ),
+                        b.span,
+                    )
+                    .with_file(i));
+                }
+            }
+            EXC_ENV.with(|e| {
+                let mut env = e.borrow_mut();
+                let tag = ir::USER_EXC_BASE + env.classes.len() as u32;
+                env.classes.push(ir::ExcClass {
+                    name: c.name.clone(),
+                    tag,
+                    parent_tag,
+                });
+                env.by_key.insert((module.clone(), c.name.clone()), tag);
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A builtin exception usable as a base for a user class. `GeneratorExit` is
+/// excluded: it is BaseException-only in CPython, and subclassing it would
+/// make `except Exception` miss the subclass.
+fn builtin_exc_base(name: &str) -> Option<ir::ExcType> {
+    let ty = name_to_exc_type(name, Span::default()).ok()?;
+    if ty == ir::ExcType::GeneratorExit {
+        return Option::None;
+    }
+    Some(ty)
+}
+
 /// Pass A: assign ClassIds only (no base resolution yet).
 fn register_class_ids(classes: &[ClassAst<'_>]) -> SResult<()> {
     clear_class_env();
@@ -2306,6 +2453,14 @@ fn resolve_class_bases(classes: &[ClassAst<'_>]) -> SResult<()> {
                 })
             })
             .ok_or_else(|| {
+                if base_name == "GeneratorExit" {
+                    return err(
+                        "GeneratorExit cannot be subclassed: it is BaseException-only \
+                         in CPython, so `except Exception` would not catch the \
+                         subclass. Inherit from Exception instead",
+                        *base_span,
+                    );
+                }
                 err(
                     format!(
                         "unknown base class '{base_name}' \
@@ -5214,6 +5369,9 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     assert!(!modules.is_empty(), "a program needs at least one module");
     clear_closure_defaults();
     clear_class_env();
+    // Before regular class collection: an exception class must not acquire a
+    // ClassId, a layout or a vtable.
+    collect_exception_classes(modules)?;
     let root_idx = modules.len() - 1;
 
     // pass 0: class ids → import aliases for bases/annotations → bases → layouts
@@ -5748,10 +5906,12 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     }
 
     let classes = with_class_env(|e| e.infos.clone());
+    let exc_classes = with_exc_env(|e| e.classes.clone());
     Ok(ir::Module {
         funcs: out_funcs,
         globals: out_globals,
         classes,
+        exc_classes,
         entry: ENTRY_NAME.to_string(),
     })
 }
@@ -8717,7 +8877,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             let msg = lower_expr(message, ctx)?;
             let msg = coerce(msg, ir::Ty::Str, message.span, "raise message")?;
             out.push(ir::Stmt::Raise {
-                exc: ast_exc_to_ir(*exc),
+                exc: resolve_exc_name(exc)?,
                 message: msg,
             });
             Ok(())
@@ -8790,10 +8950,14 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     None
                 };
                 let body_h = lower_nested_block(&h.body, ctx)?;
-                let filter = h
-                    .exc
-                    .as_ref()
-                    .map(|ts| ts.iter().copied().map(ast_exc_to_ir).collect::<Vec<_>>());
+                let filter = match &h.exc {
+                    Some(ts) => Some(
+                        ts.iter()
+                            .map(resolve_exc_name)
+                            .collect::<SResult<Vec<_>>>()?,
+                    ),
+                    Option::None => Option::None,
+                };
                 handlers_ir.push((filter, name, body_h));
             }
             let orelse_ir = lower_nested_block(orelse, ctx)?;
@@ -20682,6 +20846,16 @@ fn lower_call(
             "enumerate" => lower_enumerate_expr(&args, keywords, span, ctx),
             "zip" => lower_zip_expr(&args, span, ctx),
             "reversed" => lower_reversed_expr(&args, span, ctx),
+            _ if is_exc_class_name(&with_class_env(|e| e.current_module.clone()), func) => {
+                Err(err(
+                    format!(
+                        "'{func}' is an exception class; it can only be used in \
+                         `raise {func}(...)` and `except {func}`, not constructed \
+                         as a value"
+                    ),
+                    func_span,
+                ))
+            }
             _ => Err(err(format!("function '{func}' is not defined"), func_span)),
         }
     }

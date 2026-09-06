@@ -45,6 +45,12 @@
       "native": "pass"
     },
     {
+      "id": "user-exceptions",
+      "file": "cases/user_exceptions.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",

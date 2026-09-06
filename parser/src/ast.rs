@@ -321,7 +321,7 @@ pub enum StmtKind {
     },
     /// `raise ExcType(msg)` — msg is a str expression.
     Raise {
-        exc: ExcType,
+        exc: ExcName,
         message: Expr,
     },
     /// `assert test` / `assert test, msg` — desugared in semantic to raise AssertionError.
@@ -403,11 +403,20 @@ pub enum Pattern {
     },
 }
 
+/// An exception type as written: a builtin name or a user class name.
+/// Resolution happens in the semantic phase, which is the only place that
+/// knows which `class E(Exception)` declarations exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcName {
+    pub name: String,
+    pub span: Span,
+}
+
 /// One `except` clause under a `try`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExceptHandler {
     /// `None` = bare `except:`. One or more types for `except E:` / `except (A, B):`.
-    pub exc: Option<Vec<ExcType>>,
+    pub exc: Option<Vec<ExcName>>,
     /// Optional `as name` binding (exception **object** at runtime).
     pub bind: Option<(String, Span)>,
     pub body: Vec<Stmt>,

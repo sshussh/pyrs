@@ -1183,6 +1183,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_class_instance(ptr)\n");
         out.push_str("declare ptr @pyrs_str_from_object(ptr)\n");
         out.push_str("declare void @pyrs_set_class_names(ptr, i64)\n\n");
+        out.push_str("declare void @pyrs_set_exc_classes(ptr, ptr, i64)\n\n");
         // glibc pointer-mangles the frame-pointer slot in jmp_buf on x86-64.
         // Functions containing setjmp reserve that register as an actual frame
         // pointer, so every managed value restored by longjmp is either in a
@@ -1239,6 +1240,38 @@ impl Emitter {
                 let _ = self.intern_string(&label);
             }
         }
+        // User exception classes: the runtime needs a name (to print an
+        // uncaught one) and a parent tag (to walk the chain in `except`).
+        // Tags are contiguous from ir::USER_EXC_BASE, so the tables are
+        // indexed by `tag - USER_EXC_BASE` and need no key column.
+        if !module.exc_classes.is_empty() {
+            let n = module.exc_classes.len();
+            for (i, e) in module.exc_classes.iter().enumerate() {
+                let (esc, len) = escape_bytes(&e.name);
+                self.global_defs.push_str(&format!(
+                    "@.en.{i} = private unnamed_addr constant [{len} x i8] c\"{esc}\", align 1\n"
+                ));
+            }
+            let mut name_ptrs = String::new();
+            let mut parents = String::new();
+            for (i, e) in module.exc_classes.iter().enumerate() {
+                if i > 0 {
+                    name_ptrs.push_str(", ");
+                    parents.push_str(", ");
+                }
+                let blen = e.name.len() + 1;
+                name_ptrs.push_str(&format!(
+                    "ptr getelementptr inbounds ([{blen} x i8], ptr @.en.{i}, i32 0, i32 0)"
+                ));
+                parents.push_str(&format!("i32 {}", e.parent_tag));
+            }
+            self.global_defs.push_str(&format!(
+                "@pyrs_exc_name_ptrs = internal constant [{n} x ptr] [{name_ptrs}]\n"
+            ));
+            self.global_defs.push_str(&format!(
+                "@pyrs_exc_parents = internal constant [{n} x i32] [{parents}]\n"
+            ));
+        }
         // module globals, zero/null-initialized; assigned when the entry
         // function runs its top-level statements
         for (name, ty) in &module.globals {
@@ -1283,6 +1316,15 @@ impl Emitter {
                 module.classes.len()
             )
         };
+        let exc_setup = if module.exc_classes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  call void @pyrs_set_exc_classes(ptr @pyrs_exc_name_ptrs, \
+                 ptr @pyrs_exc_parents, i64 {})\n",
+                module.exc_classes.len()
+            )
+        };
         let mut root_setup = String::new();
         for (name, ty) in &module.globals {
             if let Some(size) = gc_root_range_size(*ty) {
@@ -1298,6 +1340,7 @@ impl Emitter {
              {root_setup}  \
              call void @pyrs_set_args(i32 %argc, ptr %argv)\n\
              {class_setup}  \
+             {exc_setup}  \
              call void @{entry}()\n  ret i32 0\n}}\n\n"
         ));
     }
