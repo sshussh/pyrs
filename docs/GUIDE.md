@@ -696,8 +696,10 @@ float NaN sorts last on the primitive path (stable total order via runtime
 `ListSort`). Class elements use a stable `<` insertion sort (may reflect
 to `__gt__`). With monomorphic `key=f` (`T → K`, `K` in
 `int|float|bool|str` — same-module free function, imported free function,
-nested function, lambda with typed/defaulted params, or bare `len` /
-`abs` / `int` / `float` / `bool` / `str`), any `list[T]` is accepted; keys
+nested function, lambda, or bare `len` / `abs` / `int` / `float` / `bool` /
+`str`), any `list[T]` is accepted. A `key=` lambda needs no annotation: its
+parameter is the element type, so `sorted(ss, key=lambda s: len(s))` works
+even though the body says nothing about `s`. Keys keys
 are evaluated once into an auxiliary GC-managed `list[K]` of length `n`,
 then a stable insertion sort rearranges both lists. Float keys use
 ordinary `<`/`>` compares (not the no-key NaN-last order). `reverse=` uses
@@ -808,6 +810,11 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - `*args: T` packs extra positionals into `list[T]`; `**kwargs: T` packs
   extra keywords into `dict[str, T]`. Call-site unpacking `f(1, *xs)` and
   `f(**d)` works for homogeneous `list` / `dict[str, …]` values.
+- A lambda cannot carry annotations (the first `:` starts the body), so its
+  parameter types are inferred: from the consumer where one knows (`key=`),
+  otherwise from body usage, so `lambda a: a + 1` is fine. A body that
+  constrains nothing and has no consumer to ask (`f = lambda x: len(x)`) is
+  rejected — use a `def`, which can be annotated.
 - Nested `def` and `lambda` are first-class: free variables from an
   enclosing function are captured through **cells** (CPython-like, so
   later assignments in the outer function are visible to escaped

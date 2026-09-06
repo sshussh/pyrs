@@ -559,6 +559,19 @@ fn synth_param_ty(name: &str) -> Option<ir::Ty> {
     SYNTH_PARAM_TYS.with(|m| m.borrow().get(name).copied())
 }
 
+/// Restore (or remove) an entry, so a hint scoped to one lambda cannot leak
+/// onto an unrelated parameter that happens to share its name.
+fn restore_synth_param_ty(name: &str, prev: Option<ir::Ty>) {
+    SYNTH_PARAM_TYS.with(|m| match prev {
+        Some(t) => {
+            m.borrow_mut().insert(name.to_string(), t);
+        }
+        Option::None => {
+            m.borrow_mut().remove(name);
+        }
+    });
+}
+
 fn clear_synth_param_tys() {
     SYNTH_PARAM_TYS.with(|m| m.borrow_mut().clear());
 }
@@ -1613,10 +1626,39 @@ fn lower_lambda(
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
+    lower_lambda_typed(params, body, &[], span, ctx)
+}
+
+/// Lower a lambda, with types for its leading parameters supplied by the
+/// context that consumes it.
+///
+/// A lambda's parameters are almost never annotated -- `key=lambda s: len(s)`
+/// is the whole point -- and the body alone cannot always type them: `len(s)`
+/// says nothing about `s`. Where the consumer knows (a `key=` argument knows
+/// the element type it will pass), it says so here. Otherwise the same
+/// body-usage inference nested `def`s get applies, which handles the common
+/// `lambda a: a + 1`.
+fn lower_lambda_typed(
+    params: &[ast::Param],
+    body: &ast::Expr,
+    param_tys: &[ir::Ty],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
     ctx.temp_counter += 1;
     let name = format!(".lambda{}", ctx.temp_counter);
-    for p in params {
-        resolve_param_ty(p)?;
+    // A lambda's parameters carry the names the user wrote, so a hint left in
+    // the shared map would apply to any later parameter of the same name.
+    // Scope it: set, lower, restore.
+    let mut hinted: Vec<(String, Option<ir::Ty>)> = Vec::new();
+    for (i, p) in params.iter().enumerate() {
+        // A written annotation wins; the hint only fills a bare parameter.
+        if p.ty.is_none()
+            && let Some(t) = param_tys.get(i)
+        {
+            hinted.push((p.name.clone(), synth_param_ty(&p.name)));
+            set_synth_param_ty(&p.name, *t);
+        }
     }
     // Leave return unannotated; lower_function infers from the return stmt body.
     let body_stmt = ast::Stmt {
@@ -1633,7 +1675,11 @@ fn lower_lambda(
         span,
         decorators: Vec::new(),
     };
-    lower_nested_func_def(&fd, ctx)?;
+    let lowered = lower_nested_func_def(&fd, ctx);
+    for (name, prev) in hinted {
+        restore_synth_param_ty(&name, prev);
+    }
+    lowered?;
     // Patch ret type from the lowered IR return (actual body type).
     if let Some(info) = ctx.nested_funcs.get(&name).cloned() {
         let ir_name = info.ir_name.clone();
@@ -22226,7 +22272,14 @@ fn resolve_sort_key(
             ));
         }
     }
-    let key_val = lower_expr(key_ast, ctx)?;
+    // A `key=` lambda is passed one element, so its parameter type is known
+    // here even when the body cannot reveal it (`lambda s: len(s)`).
+    let key_val = match &key_ast.kind {
+        ast::ExprKind::Lambda { params, body } => {
+            lower_lambda_typed(params, body, &[elem_ty], key_ast.span, ctx)?
+        }
+        _ => lower_expr(key_ast, ctx)?,
+    };
     match key_val.ty {
         ir::Ty::Closure { .. } => validate_sort_key_closure(key_val, elem_ty, key_ast.span),
         other => Err(err(

@@ -8,9 +8,9 @@ strings Unicode: offsets are code points, case transforms and character
 classes follow Unicode 16.0.0, and string literals accept the full escape
 set. **0.93.0** adds conditional expressions, **0.94.0** user-defined
 exception classes, **0.95.0** generators as arguments to the eager builtins
-and **0.96.0** generator expressions. The next milestone is **0.97.0**;
-reaching a particular minor version does not establish 1.0 readiness, and no
-stable release or tag has been created.
+**0.96.0** generator expressions and **0.97.0** lambda parameter inference.
+The next milestone is **0.98.0**; reaching a particular minor version does not
+establish 1.0 readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -99,6 +99,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.97 on the same host:
+
+| Check | Result after 0.97 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1208 passed; none failed or ignored (10 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 33 pass / 0 known_gap; compat 11 pass |
+| `pyrs --version` | `PyRs 0.97.0` |
 
 After 0.96 on the same host:
 
@@ -263,6 +274,31 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.97.0: lambda parameter inference
+
+A lambda cannot carry annotations -- the first `:` starts the body -- so
+requiring them made lambdas unusable, and `sorted(xs, key=lambda v: -v)`, the
+idiom they exist for, was a compile error. Named functions already worked as
+`key=`, so the entire gap was parameter typing.
+
+The milestone contract is:
+
+- A `key=` lambda takes its parameter type from the element type, covering the
+  case body inference cannot reach: `lambda s: len(s)` says nothing about `s`.
+  `sorted`, `list.sort`, `min`, `max`, with `reverse=` and any sortable return.
+- Every other lambda gets the body-usage inference nested `def`s already had.
+  `lower_lambda` was requiring an annotation up front and never reaching it.
+- A lambda whose body constrains nothing and that has no consumer to ask is
+  still rejected; a `def` can be annotated.
+
+The hint travels through the same side channel generator expressions use, but
+a lambda's parameters carry user-chosen names, so it is scoped: set, lower,
+restore. Without that a `key=lambda s: ...` would leave `s` typed as `str` for
+any later bare parameter named `s`, which a test pins.
+
+One existing test asserted the old limitation -- that `f = lambda x: x + 1` is
+rejected -- and now pins what genuinely cannot be inferred instead.
 
 ## 0.96.0: generator expressions
 
