@@ -13,8 +13,8 @@ exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.100.0** `str.format()` / `%` formatting, **0.101.0** tuple sort keys and
 **0.102.0** module-level containers, **0.103.0** annotated attributes and
 **0.104.0** `typing` imports with `Iterator[T]`, **0.105.0** n-ary `zip` with
-`enumerate(start)` and **0.106.0** class-body constants. The next milestone is
-**0.107.0**; reaching a particular minor version does not establish 1.0
+`enumerate(start)`, **0.106.0** class-body constants and **0.107.0** tuple
+dict/set keys. The next milestone is **0.108.0**; reaching a particular minor version does not establish 1.0
 readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
@@ -104,6 +104,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.107 on the same host:
+
+| Check | Result after 0.107 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1327 passed; none failed or ignored (24 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 63 pass / 0 known_gap; compat 21 pass |
+| `pyrs --version` | `PyRs 0.107.0` |
 
 After 0.106 on the same host:
 
@@ -378,6 +389,36 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.107.0: tuple dict/set keys
+
+Dict keys and set elements were `int` or `str` only, so the composite key that
+a transition table, a sparse grid or a two-argument memo wants had to be
+flattened into a string by hand. The restriction was found the direct way: a
+state machine keyed by `(state, event)` was rejected outright.
+
+Only *hashing* was missing. `slot_eq` already compared `TAG_TUPLE` slots
+structurally through `pyrs_tuple_eq`, so equal tuples already compared equal --
+there was just no way to reach the right bucket. `hash_key` now has a
+`TAG_TUPLE` arm that folds the element hashes and recurses, so nesting and
+unhashable elements both fall out of the existing dispatch. The GC needed
+nothing: dict and set key slots are already traced, conservatively, which was
+verified under collection pressure rather than assumed.
+
+The milestone contract is:
+
+- `int`, `str` and tuples of hashable things, nested arbitrarily, work as keys
+  and set elements everywhere: literals, subscripts, `in`, `get`/`pop`/`del`,
+  iteration, `dict()`, and both comprehension forms.
+- `d[i, j]` means `d[(i, j)]`, trailing comma included -- the parse-level
+  rejection carried since 0.87 is gone. A tuple subscript of a *list* is now
+  the type error CPython also raises, rather than a parse error.
+- `bool` stays rejected on purpose: CPython's `True == 1` would require a bool
+  key to collide with an int one, which this subset does not model.
+
+Three further key-type gates (`dict()` from pairs, set comprehensions, dict
+comprehensions) each carried their own hardcoded `Int | Str` match; they now
+share one predicate, which is why they moved together.
 
 ## 0.106.0: class-body constants
 
@@ -926,6 +967,7 @@ probes append to it.
 | `a != b`, `a: Base` holding a `Child` defining `__ne__` | `Child.__ne__` runs | `Child.__ne__` runs | **closed in 0.89** |
 | `def f(x: "Base")` | accepted | accepted | **closed in 0.87** |
 | `str(KeyError("k"))` | `'k'` | `k` | open — see below |
+| `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | rejected | open — see below |
 
 `KeyError.__str__` is CPython's `repr(args[0])`, so a str key displays quoted
 and an int key does not. Every *internal* raise site already formats
@@ -937,6 +979,13 @@ distinction on the exception itself: quoting the stored message would make
 str key from an int one. An attempt to normalize the raise sites and quote at
 display was reverted for exactly that reason — `s.remove(2)` regressed to
 `KeyError: '2'`.
+
+`str()` and f-string interpolation reject every container — `str((1, 2))`,
+`f"{xs}"` — with `str() cannot convert tuple[int, str] yet`, even though
+`print` formats the same value correctly. So this is a rejection, not a wrong
+answer, and the formatting logic already exists; what is missing is a
+container arm on the `str()`/f-string conversion path that reaches it. Found
+while testing 0.107 tuple keys.
 
 ## Product contract
 
@@ -1011,9 +1060,11 @@ documentation and the relevant gates.
 - [ ] Runtime operations for `Any` and mixed containers; call-site inference
       for unannotated functions and lambdas.
 - [ ] Dynamic-length heterogeneous tuples; general hash/equality protocol;
-      hashable tuple/float/bool/frozenset keys; dict views. Tuple keys also
-      unblock `a[i, j]` subscripts, rejected with a specific diagnostic
-      since 0.87.
+      `float`/`bool`/`frozenset` keys; dict views.
+- [x] Tuple keys (0.107): dict keys and set elements may be tuples of
+      hashable things, nested arbitrarily, which also unblocked the `a[i, j]`
+      subscript rejected with a specific diagnostic since 0.87. `bool` stays
+      out because `True == 1` would demand collision with an int key.
 - [ ] Callable metadata, signature binding, positional-only and keyword-only
       rules, `*args`/`**kwargs`, decorator factories, stacked decorators.
 - [ ] Class attributes, properties, descriptors, arithmetic and

@@ -264,7 +264,10 @@ closure values.
 `int`, `float`, `bool`, `str`, `None`, unions (`T | U | …`),
 `Optional[T]` (= `T | None`), `file`, `list[T]`, `tuple[T1, T2, …]`
 (empty: `tuple[()]`), `dict[K, V]`, `set[T]`.
-Dict keys and set elements are restricted to `int` and `str`. List
+Dict keys and set elements must be hashable: `int`, `str`, or a tuple
+whose elements are themselves hashable (nested arbitrarily). `bool` is
+excluded deliberately — CPython's `True == 1` would make a bool key
+collide with an int one, which this subset does not model. List
 elements and dict values may be Optional/unions. Function `-> None`
 still means “returns nothing” (void); expression-level `None` is a real
 value.
@@ -1603,7 +1606,8 @@ Container notes (v0.20.1):
   (compatible element tags only for heterogeneous tuples). Homogeneous
   closures (same params/ret and capture env shape) and generators may be
   tuple/list elements; call via `t[i](args)`.
-- **dict:** keys are `int` or `str` only; bare `get(k)` returns
+- **dict:** keys are `int`, `str`, or tuples of those (`d[i, j]` is the
+  same subscript as `d[(i, j)]`); bare `get(k)` returns
   `Optional[V]` (`None` on miss); `get(k, default)` keeps value type;
   `setdefault(k, default)` inserts on miss and returns `V`; bare
   `setdefault(k)` requires `V` to include `None`;
@@ -1613,7 +1617,8 @@ Container notes (v0.20.1):
   value is `None`; iterable is list/set of int or str, or a str);
   insertion-order iteration over keys; mapping match
   supports `**rest`.
-- **set:** elements are `int` or `str`; empty via `s: set[int] = set()`;
+- **set:** elements are `int`, `str`, or tuples of those; empty via
+  `s: set[int] = set()`;
   `{}` is always an empty dict; `|` / `.union` / `|=` / `.update` and
   `&` / `-` / `^` for same element type; in-place `&=` /
   `.intersection_update`, `-=` / `.difference_update`, `^=` /

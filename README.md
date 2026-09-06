@@ -76,10 +76,10 @@ Build your own module with `pyrs build-extension -i kernels.py --module kernels_
 --python .venv/bin/python`; import `kernels_native` from that same environment.
 Only the exported kernels run natively; Python and package code keep using CPython.
 
-## The language (v0.106.0)
+## The language (v0.107.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.107.0**, not 1.0) until it is ready for
+milestone after this one is **0.108.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -97,7 +97,7 @@ A statically-typed Python subset:
   **`Any`** (dynamic slot box; concrete↔Any coerces with a runtime
   TypeError check — not full CPython dynamism), `list[T]`,
   `tuple[T1, T2, …]`, `dict[K, V]`, `set[T]` — including nested lists
-  (`list[list[float]]` matrices). Dict/set keys are `int` or `str` only;
+  (`list[list[float]]` matrices). Dict/set keys are `int`, `str`, or tuples of those;
   list elements and dict values may be Optional/unions/`Any`; homogeneous
   closures (same params/ret and capture env shape, with or without
   captures) and user class instances may be list/tuple elements.
@@ -235,6 +235,8 @@ A statically-typed Python subset:
   (CPython slice bounds; `None` is a type error; miss is the same ValueError).
   **v0.72:** `str.casefold()` — full Unicode case folding since v0.91, so
   `"ß".casefold()` is `"ss"` and matches `"SS".casefold()`.
+  **v0.107:** tuple dict/set keys — `{("idle", "go"): "running"}`, nested
+  tuples, and the `d[i, j]` subscript form they unblock.
   **v0.106:** class-body constants `class C: LIMIT = 10` — read via `C.LIMIT`
   or `self.LIMIT`, inherited, literal-valued (substituted at use, so not
   assignable; an instance field of the same name shadows it).
@@ -340,9 +342,8 @@ A statically-typed Python subset:
   module; nesting (`"list[Item]"`) and unions (`"int | None"`) work.
   `from __future__ import ...` is accepted as the no-op directive it is in
   Python 3, and an unknown feature is rejected with CPython's wording.
-  Two syntaxes are rejected with an explicit reason instead of a confusing
-  parse error: tuple subscripts (`a[i, j]`, since dict keys are int/str
-  only) and the `@` matrix-multiply operator (no array type)
+  The `@` matrix-multiply operator is rejected with an explicit reason
+  (no array type) instead of a confusing parse error
 - **Functions:** `def` with optional parameter/return annotations
   (defaults infer param types; bare params inferred from body when unique;
   return type inferred from `return` when omitted), defaults and keyword
@@ -511,7 +512,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.106.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.107.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -691,4 +692,4 @@ compatibility probes.
 
 Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
-Release tags: `git tag v0.106.0 && git push origin v0.106.0`.
+Release tags: `git tag v0.107.0 && git push origin v0.107.0`.

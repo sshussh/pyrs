@@ -894,17 +894,29 @@ fn reject_exception_container_elem(ty: ir::Ty, span: Span, what: &str) -> SResul
     }
 }
 
-/// Keys for dict/set: only int and str in the current language surface.
+/// Keys for dict/set. `bool` is excluded deliberately even though it hashes:
+/// CPython's `True == 1` means a bool key would collide with an int one, and
+/// this subset does not model that.
 fn check_hashable_key(ty: ir::Ty, span: Span, what: &str) -> SResult<()> {
+    if is_hashable_key_ty(ty) {
+        return Ok(());
+    }
+    Err(err(
+        format!(
+            "{what} keys/elements of type {other} are not supported yet \
+             (int, str, or a tuple of those)",
+            other = ty
+        ),
+        span,
+    ))
+}
+
+/// Hashable as a dict/set key: int, str, and tuples of hashable things.
+fn is_hashable_key_ty(ty: ir::Ty) -> bool {
     match ty {
-        ir::Ty::Int | ir::Ty::Str => Ok(()),
-        other => Err(err(
-            format!(
-                "{what} keys/elements of type {other} are not supported yet \
-                 (only int and str)"
-            ),
-            span,
-        )),
+        ir::Ty::Int | ir::Ty::Str => true,
+        ir::Ty::Tuple(elems) => elems.iter().all(|e| is_hashable_key_ty(*e)),
+        _ => false,
     }
 }
 
@@ -12003,9 +12015,9 @@ fn lower_dict_ctor(arg: ir::Expr, span: Span) -> SResult<ir::Expr> {
             ir::Ty::Tuple(ts) if ts.len() == 2 => {
                 let k = ts[0];
                 let v = ts[1];
-                if !matches!(k, ir::Ty::Int | ir::Ty::Str) {
+                if !is_hashable_key_ty(k) {
                     return Err(err(
-                        format!("dict() keys must be int or str, found {k}"),
+                        format!("dict() keys must be int, str, or a tuple of those, found {k}"),
                         span,
                     ));
                 }
@@ -19170,9 +19182,12 @@ fn lower_set_comp(
     }
     let elem_ir = elem_ir?;
     let elem_ty = elem_of(elem_ir.ty, elem.span)?;
-    if !matches!(elem_ty, ir::Ty::Int | ir::Ty::Str) {
+    if !is_hashable_key_ty(elem_ty) {
         return Err(err(
-            format!("set comprehension elements must be int or str, found {elem_ty}"),
+            format!(
+                "set comprehension elements must be int, str, or a tuple of \
+                 those, found {elem_ty}"
+            ),
             elem.span,
         ));
     }
@@ -19223,9 +19238,12 @@ fn lower_dict_comp(
     let val_ir = val_ir?;
     let key_ty = key_ir.ty;
     let val_ty = val_ir.ty;
-    if !matches!(key_ty, ir::Ty::Int | ir::Ty::Str) {
+    if !is_hashable_key_ty(key_ty) {
         return Err(err(
-            format!("dict comprehension keys must be int or str, found {key_ty}"),
+            format!(
+                "dict comprehension keys must be int, str, or a tuple of those, \
+                 found {key_ty}"
+            ),
             key.span,
         ));
     }

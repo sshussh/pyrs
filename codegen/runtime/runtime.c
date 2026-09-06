@@ -5897,9 +5897,31 @@ static void die_keyerror_int(long long key) {
     pyrs_die(buf);
 }
 
+static unsigned long long hash_key(long long key, int tag);
+
+/* Combine element hashes for a tuple key. Any order-sensitive mix works --
+ * this hash is internal and never observed -- as long as it agrees with
+ * pyrs_tuple_eq, which slot_eq already uses for these keys. Nested tuples
+ * recurse; an unhashable element still dies in hash_key. An empty tuple is a
+ * valid key and hashes to the FNV basis. Note bool is deliberately not a
+ * hashable key type here, at any depth: CPython's True == 1 would require
+ * (True, 1) and (1, 1) to be the same key, which pyrs_tuple_eq's tag check
+ * does not do. */
+static unsigned long long hash_tuple_key(const PyrsTuple *t) {
+    unsigned long long h = 14695981039346656037ULL;
+    for (long long i = 0; i < t->len; i++) {
+        h ^= hash_key(t->data[i], t->tags[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 static unsigned long long hash_key(long long key, int tag) {
     if (tag == TAG_INT) {
         return pyrs_int_hash(key);
+    }
+    if (tag == TAG_TUPLE) {
+        return hash_tuple_key((const PyrsTuple *)(uintptr_t)key);
     }
     if (tag == TAG_STR) {
         const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
