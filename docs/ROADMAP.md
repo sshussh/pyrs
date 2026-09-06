@@ -12,9 +12,10 @@ exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.98.0** iterable coverage for the eager builtins, **0.99.0** bare `raise`
 **0.100.0** `str.format()` / `%` formatting, **0.101.0** tuple sort keys and
 **0.102.0** module-level containers, **0.103.0** annotated attributes and
-**0.104.0** `typing` imports with `Iterator[T]`. The next milestone is
-**0.105.0**; reaching a particular minor version does not establish 1.0
-readiness, and no stable release or tag has been created.
+**0.104.0** `typing` imports with `Iterator[T]` and **0.105.0** n-ary `zip`
+with `enumerate(start)`. The next milestone is **0.106.0**; reaching a
+particular minor version does not establish 1.0 readiness, and no stable
+release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -103,6 +104,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.105 on the same host:
+
+| Check | Result after 0.105 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1291 passed; none failed or ignored (10 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 57 pass / 0 known_gap; compat 19 pass |
+| `pyrs --version` | `PyRs 0.105.0` |
 
 After 0.104 on the same host:
 
@@ -355,6 +367,22 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.105.0: n-ary `zip` and `enumerate(start)`
+
+`zip` accepted exactly two arguments and `enumerate` only a keyword `start=`,
+so `zip(a, b, c)` and `enumerate(xs, 1)` were compile errors.
+
+The milestone contract is:
+
+- `zip` over one or more iterables, truncating to the shortest, producing a
+  tuple of that arity.
+- `enumerate` with `start` positional or keyword, rejecting both together.
+- Both accept every iterable, as the other eager builtins have since 0.98.
+
+Small, and the point is where it came from: a survey of eighteen builtin
+argument forms against CPython found exactly these two, which is the useful
+result of such a survey -- the other sixteen already matched.
 
 ## 0.104.0: `typing` imports and `Iterator[T]` annotations
 

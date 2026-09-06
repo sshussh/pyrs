@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.105.0 — n-ary `zip` and `enumerate(start)`
+
+`zip` accepted exactly two arguments and `enumerate` only a keyword `start=`,
+so `zip(a, b, c)` and `enumerate(xs, 1)` — both ordinary Python — were compile
+errors.
+
+- `zip` takes any number of iterables (one or more) and truncates to the
+  shortest, producing a tuple of that arity.
+- `enumerate` takes `start` positionally as well as by keyword, and rejects
+  being given both.
+- Both materialize their arguments the way the other eager builtins have since
+  0.98, so `zip(range(3), "ab")`, `zip(gen(), xs)` and
+  `enumerate(range(3), 10)` work too — previously all three took only lists,
+  strs and homogeneous tuples.
+
+Found by running realistic programs against CPython.
+
 ## 0.104.0 — `typing` imports and `Iterator[T]` annotations
 
 Two gaps, one blocking the other.

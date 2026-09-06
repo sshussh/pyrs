@@ -24028,19 +24028,29 @@ fn lower_enumerate_expr(
             ));
         }
     }
-    if args.is_empty() || args.len() > 1 {
+    // CPython takes `start` positionally as well as by keyword.
+    if args.is_empty() || args.len() > 2 {
         return Err(err(
             format!(
-                "enumerate() takes 1 positional argument ({} given)",
+                "enumerate() takes 1 or 2 positional arguments ({} given)",
                 args.len()
             ),
             span,
         ));
     }
-    let seq = lower_expr(args[0], ctx)?;
+    if args.len() == 2 && keywords.iter().any(|k| k.name == "start") {
+        return Err(err(
+            "enumerate() got multiple values for argument 'start'",
+            span,
+        ));
+    }
+    let seq = materialize_iterable_arg(args[0], ctx)?;
     let start = if let Some(kw) = keywords.iter().find(|k| k.name == "start") {
         let s = lower_expr(&kw.value, ctx)?;
         coerce(s, ir::Ty::Int, kw.value.span, "enumerate start")?
+    } else if let Some(a) = args.get(1) {
+        let s = lower_expr(a, ctx)?;
+        coerce(s, ir::Ty::Int, a.span, "enumerate start")?
     } else {
         int_const(0)
     };
@@ -24056,7 +24066,7 @@ fn lower_enumerate_expr(
         }
         other => {
             return Err(err(
-                format!("enumerate() expects a list, str, or tuple, found {other}"),
+                format!("enumerate() expects an iterable, found {other}"),
                 args[0].span,
             ));
         }
@@ -24199,159 +24209,111 @@ fn lower_enumerate_expr(
     })
 }
 
+/// `zip(a, b, ...)` over any number of iterables, truncating to the shortest.
+///
+/// Materializes each argument into a list first (`zip(range(3), xs)` and
+/// `zip(gen(), xs)` are ordinary Python), then walks them in lockstep. The
+/// result is a `list[tuple[...]]` with one component per argument.
 fn lower_zip_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
-    if args.len() != 2 {
+    if args.is_empty() {
         return Err(err(
-            format!(
-                "zip() takes exactly 2 arguments in this subset ({} given)",
-                args.len()
-            ),
+            "zip() with no arguments is always empty; this subset needs at \
+             least one iterable",
             span,
         ));
     }
-    let a = lower_expr(args[0], ctx)?;
-    let b = lower_expr(args[1], ctx)?;
-    let elem_a = match a.ty {
-        ir::Ty::List(e) => *e,
-        ir::Ty::Str => ir::Ty::Str,
-        ir::Ty::Tuple(es) if !es.is_empty() && es.iter().all(|e| e == &es[0]) => es[0],
-        other => {
-            return Err(err(
-                format!("zip() expects list/str/homogeneous tuple, found {other}"),
-                args[0].span,
-            ));
+    // Element type of each argument, with the argument materialized to a list.
+    let mut lists: Vec<ir::Expr> = Vec::with_capacity(args.len());
+    let mut elems: Vec<ir::Ty> = Vec::with_capacity(args.len());
+    for a in args {
+        let v = materialize_iterable_arg(a, ctx)?;
+        match v.ty {
+            ir::Ty::List(e) => elems.push(*e),
+            other => {
+                return Err(err(
+                    format!("zip() expects iterables, found {other}"),
+                    a.span,
+                ));
+            }
         }
-    };
-    let elem_b = match b.ty {
-        ir::Ty::List(e) => *e,
-        ir::Ty::Str => ir::Ty::Str,
-        ir::Ty::Tuple(es) if !es.is_empty() && es.iter().all(|e| e == &es[0]) => es[0],
-        other => {
-            return Err(err(
-                format!("zip() expects list/str/homogeneous tuple, found {other}"),
-                args[1].span,
-            ));
-        }
-    };
-    let pair_ty = ir::tuple_of(&[elem_a, elem_b]);
-    let out_ty = ir::list_of(pair_ty);
-    let a_t = ctx.fresh_temp("zip.a", a.ty);
-    let b_t = ctx.fresh_temp("zip.b", b.ty);
+        lists.push(v);
+    }
+
+    let tup_ty = ir::tuple_of(&elems);
+    let out_ty = ir::list_of(tup_ty);
     let out_t = ctx.fresh_temp("zip.out", out_ty);
     let i_t = ctx.fresh_temp("zip.i", ir::Ty::Int);
-    let na = ctx.fresh_temp("zip.na", ir::Ty::Int);
-    let nb = ctx.fresh_temp("zip.nb", ir::Ty::Int);
     let n_t = ctx.fresh_temp("zip.n", ir::Ty::Int);
-    let mut stmts = vec![
-        ir::Stmt::Assign {
-            name: a_t.clone(),
-            value: a.clone(),
-        },
-        ir::Stmt::Assign {
-            name: b_t.clone(),
-            value: b.clone(),
-        },
-        ir::Stmt::Assign {
-            name: na.clone(),
-            value: ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Len(Box::new(ir::Expr {
-                    ty: a.ty,
-                    kind: ir::ExprKind::Local(a_t.clone()),
-                })),
-            },
-        },
-        ir::Stmt::Assign {
-            name: nb.clone(),
-            value: ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Len(Box::new(ir::Expr {
-                    ty: b.ty,
-                    kind: ir::ExprKind::Local(b_t.clone()),
-                })),
-            },
-        },
-        ir::Stmt::Assign {
-            name: n_t.clone(),
-            value: ir::Expr {
+
+    let mut stmts = Vec::new();
+    let mut list_locals: Vec<ir::Expr> = Vec::with_capacity(lists.len());
+    for (k, v) in lists.into_iter().enumerate() {
+        let t = ctx.fresh_temp(&format!("zip.s{k}"), v.ty);
+        let ty = v.ty;
+        stmts.push(ir::Stmt::Assign {
+            name: t.clone(),
+            value: v,
+        });
+        list_locals.push(local_expr(t, ty));
+    }
+
+    // n = min(len(...)) across every argument -- zip stops at the shortest.
+    let mut n_expr: Option<ir::Expr> = Option::None;
+    for l in &list_locals {
+        let len = ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Len(Box::new(l.clone())),
+        };
+        n_expr = Some(match n_expr {
+            Option::None => len,
+            Some(prev) => ir::Expr {
                 ty: ir::Ty::Int,
                 kind: ir::ExprKind::Min {
-                    left: Box::new(ir::Expr {
-                        ty: ir::Ty::Int,
-                        kind: ir::ExprKind::Local(na),
-                    }),
-                    right: Box::new(ir::Expr {
-                        ty: ir::Ty::Int,
-                        kind: ir::ExprKind::Local(nb),
-                    }),
+                    left: Box::new(prev),
+                    right: Box::new(len),
                 },
             },
-        },
-        ir::Stmt::Assign {
-            name: out_t.clone(),
-            value: ir::Expr {
-                ty: out_ty,
-                kind: ir::ExprKind::ListNew {
-                    cap: Box::new(ir::Expr {
-                        ty: ir::Ty::Int,
-                        kind: ir::ExprKind::Local(n_t.clone()),
-                    }),
-                },
-            },
-        },
-        ir::Stmt::Assign {
-            name: i_t.clone(),
-            value: int_const(0),
-        },
-    ];
-    let cond = ir::Expr {
-        ty: ir::Ty::Bool,
-        kind: ir::ExprKind::Binary {
-            op: ir::BinOp::Lt,
-            left: Box::new(ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Local(i_t.clone()),
-            }),
-            right: Box::new(ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Local(n_t),
-            }),
-        },
-    };
-    let ea = ir::Expr {
-        ty: elem_a,
-        kind: ir::ExprKind::Index {
-            base: Box::new(ir::Expr {
-                ty: a.ty,
-                kind: ir::ExprKind::Local(a_t),
-            }),
-            index: Box::new(ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Local(i_t.clone()),
-            }),
-        },
-    };
-    let eb = ir::Expr {
-        ty: elem_b,
-        kind: ir::ExprKind::Index {
-            base: Box::new(ir::Expr {
-                ty: b.ty,
-                kind: ir::ExprKind::Local(b_t),
-            }),
-            index: Box::new(ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Local(i_t.clone()),
-            }),
-        },
-    };
-    let body = vec![ir::Stmt::ListAppend {
-        list: ir::Expr {
-            ty: out_ty,
-            kind: ir::ExprKind::Local(out_t.clone()),
-        },
+        });
+    }
+    stmts.push(ir::Stmt::Assign {
+        name: n_t.clone(),
+        value: n_expr.expect("at least one argument"),
+    });
+    stmts.push(ir::Stmt::Assign {
+        name: out_t.clone(),
         value: ir::Expr {
-            ty: pair_ty,
-            kind: ir::ExprKind::TupleLit(vec![ea, eb]),
+            ty: out_ty,
+            kind: ir::ExprKind::ListNew {
+                cap: Box::new(local_expr(n_t.clone(), ir::Ty::Int)),
+            },
+        },
+    });
+    stmts.push(ir::Stmt::Assign {
+        name: i_t.clone(),
+        value: int_const(0),
+    });
+
+    let cond = key_cmp(
+        ir::BinOp::Lt,
+        local_expr(i_t.clone(), ir::Ty::Int),
+        local_expr(n_t, ir::Ty::Int),
+    );
+    let components: Vec<ir::Expr> = list_locals
+        .iter()
+        .zip(elems.iter())
+        .map(|(l, e)| ir::Expr {
+            ty: *e,
+            kind: ir::ExprKind::Index {
+                base: Box::new(l.clone()),
+                index: Box::new(local_expr(i_t.clone(), ir::Ty::Int)),
+            },
+        })
+        .collect();
+    let body = vec![ir::Stmt::ListAppend {
+        list: local_expr(out_t.clone(), out_ty),
+        value: ir::Expr {
+            ty: tup_ty,
+            kind: ir::ExprKind::TupleLit(components),
         },
     }];
     let step = ir::Stmt::Assign {
@@ -24360,10 +24322,7 @@ fn lower_zip_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<i
             ty: ir::Ty::Int,
             kind: ir::ExprKind::Binary {
                 op: ir::BinOp::Add,
-                left: Box::new(ir::Expr {
-                    ty: ir::Ty::Int,
-                    kind: ir::ExprKind::Local(i_t),
-                }),
+                left: Box::new(local_expr(i_t, ir::Ty::Int)),
                 right: Box::new(int_const(1)),
             },
         },
@@ -24377,10 +24336,7 @@ fn lower_zip_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<i
         ty: out_ty,
         kind: ir::ExprKind::Block {
             stmts,
-            result: Box::new(ir::Expr {
-                ty: out_ty,
-                kind: ir::ExprKind::Local(out_t),
-            }),
+            result: Box::new(local_expr(out_t, out_ty)),
         },
     })
 }
