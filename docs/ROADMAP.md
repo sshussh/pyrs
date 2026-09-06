@@ -9,10 +9,10 @@ classes follow Unicode 16.0.0, and string literals accept the full escape
 set. **0.93.0** adds conditional expressions, **0.94.0** user-defined
 exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.96.0** generator expressions, **0.97.0** lambda parameter inference and
-**0.98.0** iterable coverage for the eager builtins and **0.99.0** bare
-`raise`. The next milestone is **0.100.0**; reaching a particular minor
-version does not establish 1.0 readiness, and no stable release or tag has
-been created.
+**0.98.0** iterable coverage for the eager builtins, **0.99.0** bare `raise`
+and **0.100.0** `str.format()` / `%` formatting. The next milestone is
+**0.101.0**; reaching a particular minor version does not establish 1.0
+readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -101,6 +101,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.100 on the same host:
+
+| Check | Result after 0.100 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1243 passed; none failed or ignored (12 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 42 pass / 0 known_gap; compat 14 pass |
+| `pyrs --version` | `PyRs 0.100.0` |
 
 After 0.99 on the same host:
 
@@ -298,6 +309,32 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.100.0: `str.format()` and `%` formatting
+
+Neither existed -- `.format` was absent from the str method table and `%` was
+rejected as an operator on str -- so a large amount of ordinary Python could
+not be compiled. f-strings cover new code, but rewriting an existing codebase
+by hand is not a workaround.
+
+The milestone contract is:
+
+- `.format()` in every addressing mode (auto, indexed, keyword, mixed) with
+  the spec mini-language and `!r` / `!s` / `!a`.
+- `%` with the common conversions, flags, width, precision and `%%`, for both
+  the tuple and bare-value forms.
+- Argument-count and field-name mistakes are compile errors, where CPython
+  raises at run time.
+
+Both desugar into the `JoinedStr` parts f-strings already produce, so the
+mini-language is implemented once and nothing new reaches the runtime; `%d`
+becomes `{:d}`, `%-5s` becomes `{:<5}`, and so on. That is also what requires
+a *literal* format string, and the rejection now says so and points at
+f-strings instead of reporting an unsupported method or operator.
+
+A nested `{}` inside a format spec is rejected rather than reused from the
+f-string splitter: it names an argument in `.format()` and an expression in an
+f-string, and quietly picking one interpretation would be wrong.
 
 ## 0.99.0: bare `raise`
 

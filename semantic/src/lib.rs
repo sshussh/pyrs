@@ -12258,6 +12258,17 @@ fn lower_str_method(
 ) -> SResult<ir::Expr> {
     use ir::StrFn::*;
 
+    // `.format()` on a literal is handled before lowering; reaching here means
+    // the format string is a runtime value.
+    if method == "format" {
+        return Err(err(
+            "format() needs a literal format string, because the fields are \
+             resolved at compile time; use an f-string, or inline the format \
+             string",
+            method_span,
+        ));
+    }
+
     // (runtime function, result type, extra str args expected)
     let (func, ret, str_args): (ir::StrFn, ir::Ty, usize) = match method {
         "upper" => (Upper, ir::Ty::Str, 0),
@@ -17138,6 +17149,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     *method_span,
                 ));
             }
+            // `"...".format(...)` on a literal, before the keyword guard:
+            // `.format(name=x)` is one of its two normal spellings.
+            if method == "format"
+                && let ast::ExprKind::Str(fmt) = &base.kind
+            {
+                return lower_str_format(fmt, args, keywords, *method_span, ctx);
+            }
             // `list.sort(key=…, reverse=…)` is statement-only (returns None).
             if method == "sort" && !keywords.is_empty() {
                 let base_ir = lower_expr(base, ctx)?;
@@ -17498,6 +17516,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             lower_compare_chain(first_ir, rest, expr.span, ctx)
         }
         ast::ExprKind::Binary { op, left, right } => {
+            // `"%d items" % n` on a literal format string, before either side
+            // is lowered: the arguments are needed individually.
+            if matches!(op, ast::BinOp::Mod)
+                && let ast::ExprKind::Str(fmt) = &left.kind
+            {
+                return lower_percent_format(fmt, right, expr.span, ctx);
+            }
             // and/or yield an operand (not always bool), with short-circuit.
             // Mid-expression refine: `x is not None and x > 0` types the RHS
             // under the left's then-refinements; `x is None or x < 0` under
@@ -24742,6 +24767,333 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
 }
 
 /// Lower `f"…"` / nested format-spec joined strings to concat of pieces.
+/// `"...".format(a, b)` on a *literal* format string.
+///
+/// Desugared into the same `JoinedStr` parts an f-string produces, so the
+/// whole format mini-language — `{:.2f}`, `{!r}`, alignment, width — comes
+/// from the code that already implements it, and nothing new reaches the
+/// runtime. The format string has to be a literal for that: a runtime one
+/// would need a runtime parser and a heterogeneous argument list, which this
+/// subset does not have.
+fn lower_str_format(
+    fmt: &str,
+    args: &[ast::PosArg],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let mut positional: Vec<&ast::Expr> = Vec::new();
+    for a in args {
+        match a {
+            ast::PosArg::Pos(e) => positional.push(e),
+            ast::PosArg::Star(_) => {
+                return Err(err(
+                    "format() does not support * unpacking; pass the arguments \
+                     individually",
+                    span,
+                ));
+            }
+        }
+    }
+
+    let mut parts: Vec<ast::FStringPart> = Vec::new();
+    let mut lit = String::new();
+    let mut auto = 0usize;
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                lit.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                lit.push('}');
+            }
+            '}' => {
+                return Err(err(
+                    "single '}' is not allowed in a format string; use '}}'",
+                    span,
+                ));
+            }
+            '{' => {
+                // Collect the field, tracking nesting so a format spec that
+                // contains its own `{}` stays with it.
+                let mut field = String::new();
+                let mut depth = 1;
+                loop {
+                    match chars.next() {
+                        Some('{') => {
+                            depth += 1;
+                            field.push('{');
+                        }
+                        Some('}') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            field.push('}');
+                        }
+                        Some(ch) => field.push(ch),
+                        Option::None => {
+                            return Err(err("unterminated '{' in a format string", span));
+                        }
+                    }
+                }
+                // Split the name off the `!conv` / `:spec` tail and reuse the
+                // f-string fragment splitter for the rest.
+                let head_len = field.find(['!', ':']).unwrap_or(field.len());
+                let (name, tail) = field.split_at(head_len);
+                let value = resolve_format_field(name, &mut auto, &positional, keywords, span)?;
+                let (conversion, format_spec) = split_format_tail(tail, span)?;
+                if !lit.is_empty() {
+                    parts.push(ast::FStringPart::Literal(std::mem::take(&mut lit)));
+                }
+                parts.push(ast::FStringPart::Expr {
+                    expr: value.clone(),
+                    conversion,
+                    format_spec,
+                });
+            }
+            _ => lit.push(c),
+        }
+    }
+    if !lit.is_empty() {
+        parts.push(ast::FStringPart::Literal(lit));
+    }
+    if parts.is_empty() {
+        return Ok(const_str_expr(""));
+    }
+    lower_joined_str(&parts, ctx)
+}
+
+/// `"%d of %s" % (n, name)` on a *literal* format string.
+///
+/// Translated into the same `JoinedStr` parts `.format()` and f-strings use,
+/// by rewriting each printf conversion into the brace mini-language: `%d` is
+/// `{:d}`, `%.2f` is `{:.2f}`, `%-5s` is `{:<5}`. Only a literal format
+/// string is handled, for the same reason as `.format()`.
+fn lower_percent_format(
+    fmt: &str,
+    rhs: &ast::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    // `"%s" % x` takes a bare value; a tuple supplies several.
+    let values: Vec<&ast::Expr> = match &rhs.kind {
+        ast::ExprKind::TupleLit(items) => items.iter().collect(),
+        _ => vec![rhs],
+    };
+
+    let mut parts: Vec<ast::FStringPart> = Vec::new();
+    let mut lit = String::new();
+    let mut next = 0usize;
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            lit.push(c);
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            lit.push('%');
+            continue;
+        }
+        // flags, width, .precision, then the conversion character
+        let mut flags = String::new();
+        while matches!(chars.peek(), Some('-' | '+' | '0' | ' ')) {
+            flags.push(chars.next().unwrap());
+        }
+        let mut width = String::new();
+        while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+            width.push(chars.next().unwrap());
+        }
+        let mut precision = String::new();
+        if chars.peek() == Some(&'.') {
+            precision.push(chars.next().unwrap());
+            while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+                precision.push(chars.next().unwrap());
+            }
+        }
+        let Some(conv) = chars.next() else {
+            return Err(err(
+                "incomplete format specifier at the end of a % format string",
+                span,
+            ));
+        };
+        // Brace spec equivalent. `-` is `<`, and a leading `0` is `0` in both.
+        let mut spec = String::new();
+        if flags.contains('-') {
+            spec.push('<');
+        }
+        if flags.contains('+') {
+            spec.push('+');
+        }
+        if flags.contains('0') && !flags.contains('-') {
+            spec.push('0');
+        }
+        spec.push_str(&width);
+        spec.push_str(&precision);
+        let conversion = match conv {
+            // `%s` is str(), which is the default conversion.
+            's' => Option::None,
+            'r' => Some(ast::FStringConversion::Repr),
+            'a' => Some(ast::FStringConversion::Ascii),
+            'd' | 'i' => {
+                spec.push('d');
+                Option::None
+            }
+            'f' | 'F' => {
+                if precision.is_empty() {
+                    // CPython's %f defaults to 6 places; `{:f}` does too.
+                    spec.push('f');
+                } else {
+                    spec.push('f');
+                }
+                Option::None
+            }
+            'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o' | 'b' => {
+                spec.push(conv);
+                Option::None
+            }
+            other => {
+                return Err(err(
+                    format!("unsupported format character '%{other}' in a % format string"),
+                    span,
+                ));
+            }
+        };
+        let Some(value) = values.get(next).copied() else {
+            return Err(err("not enough arguments for the % format string", span));
+        };
+        next += 1;
+        if !lit.is_empty() {
+            parts.push(ast::FStringPart::Literal(std::mem::take(&mut lit)));
+        }
+        let format_spec = if spec.is_empty() {
+            Option::None
+        } else {
+            Some(Box::new(ast::Expr {
+                kind: ast::ExprKind::JoinedStr(vec![ast::FStringPart::Literal(spec)]),
+                span,
+            }))
+        };
+        parts.push(ast::FStringPart::Expr {
+            expr: value.clone(),
+            conversion,
+            format_spec,
+        });
+    }
+    if next < values.len() {
+        return Err(err("not all arguments converted during % formatting", span));
+    }
+    if !lit.is_empty() {
+        parts.push(ast::FStringPart::Literal(lit));
+    }
+    if parts.is_empty() {
+        return Ok(const_str_expr(""));
+    }
+    lower_joined_str(&parts, ctx)
+}
+
+/// Split a field's `!conv` and `:spec` tail.
+///
+/// Parsed here rather than through the f-string splitter because a nested
+/// `{}` inside a spec means different things in the two syntaxes: in an
+/// f-string it is an expression, in `.format()` it names another argument.
+/// Rather than quietly do the wrong one, a nested field is rejected.
+fn split_format_tail(
+    tail: &str,
+    span: Span,
+) -> SResult<(Option<ast::FStringConversion>, Option<Box<ast::Expr>>)> {
+    let mut rest = tail;
+    let mut conversion = Option::None;
+    if let Some(after) = rest.strip_prefix('!') {
+        let (c, r) = after.split_at(after.len().min(1));
+        conversion = Some(match c {
+            "s" => ast::FStringConversion::Str,
+            "r" => ast::FStringConversion::Repr,
+            "a" => ast::FStringConversion::Ascii,
+            other => {
+                return Err(err(
+                    format!("unknown conversion '!{other}' in a format string (use !s, !r or !a)"),
+                    span,
+                ));
+            }
+        });
+        rest = r;
+    }
+    let spec = match rest.strip_prefix(':') {
+        Some(spec) => spec,
+        Option::None => {
+            if !rest.is_empty() {
+                return Err(err(
+                    format!("unexpected '{rest}' in a format string field"),
+                    span,
+                ));
+            }
+            return Ok((conversion, Option::None));
+        }
+    };
+    if spec.contains('{') {
+        return Err(err(
+            "a nested '{...}' inside a format spec is not supported in \
+             format(); use an f-string",
+            span,
+        ));
+    }
+    Ok((
+        conversion,
+        Some(Box::new(ast::Expr {
+            kind: ast::ExprKind::JoinedStr(vec![ast::FStringPart::Literal(spec.to_string())]),
+            span,
+        })),
+    ))
+}
+
+/// Pick the argument a `{...}` field names: empty is the next positional,
+/// digits are an explicit index, anything else is a keyword.
+fn resolve_format_field<'a>(
+    name: &str,
+    auto: &mut usize,
+    positional: &[&'a ast::Expr],
+    keywords: &'a [ast::Keyword],
+    span: Span,
+) -> SResult<&'a ast::Expr> {
+    if name.is_empty() {
+        let i = *auto;
+        *auto += 1;
+        return positional.get(i).copied().ok_or_else(|| {
+            err(
+                format!(
+                    "format() needs at least {} positional argument{}, got {}",
+                    i + 1,
+                    if i == 0 { "" } else { "s" },
+                    positional.len()
+                ),
+                span,
+            )
+        });
+    }
+    if let Ok(i) = name.parse::<usize>() {
+        return positional.get(i).copied().ok_or_else(|| {
+            err(
+                format!(
+                    "format() index {i} is out of range ({} positional argument{} given)",
+                    positional.len(),
+                    if positional.len() == 1 { "" } else { "s" }
+                ),
+                span,
+            )
+        });
+    }
+    keywords
+        .iter()
+        .find(|k| k.name == name)
+        .map(|k| &k.value)
+        .ok_or_else(|| err(format!("format() has no keyword argument '{name}'"), span))
+}
+
 fn lower_joined_str(parts: &[ast::FStringPart], ctx: &mut FnCtx<'_>) -> SResult<ir::Expr> {
     let mut result: Option<ir::Expr> = Option::None;
     for part in parts {
@@ -26613,6 +26965,14 @@ fn lower_str_binary(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SRe
                 },
             })
         }
+        // `%` on a literal is handled before lowering; reaching here means the
+        // format string is a runtime value.
+        ast::BinOp::Mod if l.ty == ir::Ty::Str => Err(err(
+            "% formatting needs a literal format string, because the \
+             conversions are resolved at compile time; use an f-string, or \
+             inline the format string",
+            span,
+        )),
         other => Err(err(
             format!("operator '{other}' is not supported for str"),
             span,
