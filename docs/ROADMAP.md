@@ -10,9 +10,9 @@ set. **0.93.0** adds conditional expressions, **0.94.0** user-defined
 exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.96.0** generator expressions, **0.97.0** lambda parameter inference and
 **0.98.0** iterable coverage for the eager builtins, **0.99.0** bare `raise`
-and **0.100.0** `str.format()` / `%` formatting. The next milestone is
-**0.101.0**; reaching a particular minor version does not establish 1.0
-readiness, and no stable release or tag has been created.
+**0.100.0** `str.format()` / `%` formatting and **0.101.0** tuple sort keys.
+The next milestone is **0.102.0**; reaching a particular minor version does
+not establish 1.0 readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -101,6 +101,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.101 on the same host:
+
+| Check | Result after 0.101 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1253 passed; none failed or ignored (10 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 45 pass / 0 known_gap; compat 15 pass |
+| `pyrs --version` | `PyRs 0.101.0` |
 
 After 0.100 on the same host:
 
@@ -309,6 +320,32 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.101.0: tuple sort keys
+
+`sorted(items, key=lambda p: (-p[1], p[0]))` is the way to sort by more than
+one criterion, and it was rejected: a `key=` function had to return a bare
+scalar.
+
+The milestone contract is:
+
+- `key=` may return a tuple or list of orderable values, compared
+  lexicographically, for `sorted`, `list.sort`, `min` and `max` in both forms,
+  with `reverse=`, from a lambda or a named function.
+- A key type with no ordering is still rejected, and the message says what is
+  accepted.
+
+The restriction sat only on the key path: tuples were already orderable
+everywhere else, so this is the key path adopting the compiler's existing
+`is_orderable_ty` rule and the lexicographic lowering `(1, 2) < (1, 3)` uses.
+A raw `Binary` node on a tuple is not something codegen handles, which is why
+the three places that compare key values had to route through it.
+
+How this was found is worth recording. Micro-construct probes had stopped
+turning up anything of this size; running four small *realistic* programs
+against CPython did — three matched and the fourth, a word-frequency script,
+needed exactly this. An existing test asserted the old limitation (a `list`
+key rejected) and now pins a genuinely unorderable one instead.
 
 ## 0.100.0: `str.format()` and `%` formatting
 

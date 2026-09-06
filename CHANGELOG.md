@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.101.0 — Tuple sort keys
+
+`sorted(items, key=lambda p: (-p[1], p[0]))` is *the* way to sort by more than
+one criterion in Python, and it was rejected: a `key=` function had to return
+a bare scalar.
+
+- `key=` may return a tuple or a list of orderable values, compared
+  lexicographically. Works for `sorted`, `list.sort`, `min` and `max`, in both
+  their iterable and multi-argument forms, with `reverse=`, and for a named
+  function as well as a lambda.
+- Tuples were already orderable everywhere else — `(1, 2) < (1, 3)`,
+  `sorted(list_of_tuples)`, `min`/`max` of tuples — so the restriction sat
+  only on the key path; it now uses the same `is_orderable_ty` rule as the
+  rest of the compiler, and the same lexicographic lowering.
+- A key type with no ordering at all is still rejected, and the message names
+  what is accepted.
+
+Found by running small realistic programs against CPython rather than by
+probing constructs: three of four matched, and the fourth was a word-frequency
+script that needed exactly this.
+
 ## 0.100.0 — `str.format()` and `%` formatting
 
 Neither existed: `.format` was not in the str method table and `%` was
