@@ -7,10 +7,10 @@ statically typed Python subset. Versions **0.90.0** through **0.92.0** make
 strings Unicode: offsets are code points, case transforms and character
 classes follow Unicode 16.0.0, and string literals accept the full escape
 set. **0.93.0** adds conditional expressions, **0.94.0** user-defined
-exception classes and **0.95.0** generators as arguments to the eager
-builtins. The next milestone is **0.96.0**; reaching a particular minor
-version does not establish 1.0 readiness, and no stable release or tag has
-been created.
+exception classes, **0.95.0** generators as arguments to the eager builtins
+and **0.96.0** generator expressions. The next milestone is **0.97.0**;
+reaching a particular minor version does not establish 1.0 readiness, and no
+stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -99,6 +99,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.96 on the same host:
+
+| Check | Result after 0.96 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1198 passed; none failed or ignored (15 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 30 pass / 0 known_gap; compat 10 pass |
+| `pyrs --version` | `PyRs 0.96.0` |
 
 After 0.95 on the same host:
 
@@ -252,6 +263,48 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.96.0: generator expressions
+
+`(elem for target in iter if cond)` was a parse error, which made the four
+most common consuming idioms unavailable at once: `sum(x for x in xs)`,
+`any(...)`, `max(...)` and `",".join(...)`. It was the largest single cluster
+in a survey of common constructs against CPython, and 0.95 was its
+prerequisite — a generator object nothing could consume would not have helped.
+
+The milestone contract is:
+
+- Parenthesized, and bare when it is a call's sole argument, as in CPython.
+  Multiple `for` clauses and `if` filters.
+- Genuinely lazy: the element expression runs on demand, `any` / `all`
+  short-circuit through it, and the outermost iterable is evaluated once at
+  creation. The loop variable does not leak.
+- Element types other than `int` are inferred.
+
+Desugared at the *AST* level into a synthesized nested generator function,
+which is what keeps it small: free-variable capture, generator detection and
+the call path all already exist, and no new IR was needed.
+
+Two things did not come for free. The element type has to be known before the
+body is lowered, because the yield sites are checked against it, and it
+depends on the loop targets — which exist only inside the body. It is computed
+up front by binding the targets exactly as a list comprehension does, and
+passed to the lowering through a side channel; that channel has to follow the
+function to its mangled IR name, or the body is checked against the wrong
+type. And the outermost iterable is passed as a real argument rather than
+captured, which gives CPython's eager evaluation *and* sidesteps a module-level
+problem: a global cannot be captured by a closure here, so `sum(x for x in xs)`
+at top level would otherwise fail where the same line inside a function works.
+
+An iterable that is not a first-class value (`range(...)` is only legal as a
+`for` iterable) cannot be hoisted, so the lowering probes: if the iterable does
+not lower as an expression, it stays in the body where the loop handles it
+natively. Probing rather than enumerating keeps this correct as more iterables
+become values.
+
+Capturing a module-level variable is now a compile error rather than a runtime
+NameError -- the closure's cell is never filled, because the assignment writes
+a global. That was pre-existing and affected lambdas identically.
 
 ## 0.95.0: generators as arguments to the eager builtins
 

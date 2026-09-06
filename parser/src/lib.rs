@@ -989,6 +989,37 @@ impl Parser {
         Ok((exc, span))
     }
 
+    /// The `for target in iter [if cond] [for ...]` tail shared by list, set
+    /// and dict comprehensions and by generator expressions.
+    fn parse_comp_generators(&mut self) -> PResult<Vec<CompFor>> {
+        self.expect(Token::For, "to start the comprehension")?;
+        self.parse_comp_generators_after_for()
+    }
+
+    /// Same, with the leading `for` already consumed.
+    fn parse_comp_generators_after_for(&mut self) -> PResult<Vec<CompFor>> {
+        let mut generators = Vec::new();
+        loop {
+            let target_expr = self.parse_target_tuple_or_expr()?;
+            let target = self.expr_to_target(target_expr)?;
+            self.expect(Token::In, "after the comprehension target")?;
+            // `_nocond`: a trailing `if` here starts a comprehension filter,
+            // not a conditional expression.
+            let iter = self.parse_expr_nocond()?;
+            let mut ifs = Vec::new();
+            while self.eat(&Token::If) {
+                ifs.push(self.parse_expr_nocond()?);
+            }
+            generators.push(CompFor { target, iter, ifs });
+            if self.peek() == &Token::For {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(generators)
+    }
+
     /// Single type or parenthesized multi-type: `E` or `(A, B, …)`.
     fn parse_except_types(&mut self) -> PResult<Vec<ExcName>> {
         if self.peek() == &Token::LParen {
@@ -1990,7 +2021,35 @@ impl Parser {
                     if kwargs.is_some() {
                         return Err(self.error("arguments cannot follow ** unpacking"));
                     }
-                    args.push(PosArg::Pos(self.parse_expr()?));
+                    let value = self.parse_expr()?;
+                    // `f(x for x in xs)` — a generator expression may drop its
+                    // own parentheses only when it is the call's sole argument,
+                    // as in CPython.
+                    if self.peek() == &Token::For {
+                        if !args.is_empty() || !keywords.is_empty() {
+                            return Err(self.error(
+                                "a generator expression must be parenthesized when it is not \
+                                 the only argument",
+                            ));
+                        }
+                        let vspan = value.span;
+                        let generators = self.parse_comp_generators()?;
+                        if self.peek() != &Token::RParen {
+                            return Err(self.error(
+                                "a generator expression must be parenthesized when it is not \
+                                 the only argument",
+                            ));
+                        }
+                        args.push(PosArg::Pos(Expr {
+                            kind: ExprKind::GenExp {
+                                elem: Box::new(value),
+                                generators,
+                            },
+                            span: vspan,
+                        }));
+                        break;
+                    }
+                    args.push(PosArg::Pos(value));
                 }
                 if !self.eat(&Token::Comma) {
                     break;
@@ -2250,6 +2309,17 @@ impl Parser {
                     });
                 }
                 let first = self.parse_expr()?;
+                if self.peek() == &Token::For {
+                    let generators = self.parse_comp_generators()?;
+                    let close = self.expect(Token::RParen, "to close the generator expression")?;
+                    return Ok(Expr {
+                        kind: ExprKind::GenExp {
+                            elem: Box::new(first),
+                            generators,
+                        },
+                        span: span.to(close),
+                    });
+                }
                 if self.peek() == &Token::Comma {
                     let mut items = vec![first];
                     while self.eat(&Token::Comma) {
@@ -2295,24 +2365,7 @@ impl Parser {
                 // `[elem for target in iter if ... for ...]` — a comprehension
                 if self.peek() == &Token::For {
                     self.advance();
-                    let mut generators = Vec::new();
-                    loop {
-                        let target_expr = self.parse_target_tuple_or_expr()?;
-                        let target = self.expr_to_target(target_expr)?;
-                        self.expect(Token::In, "after the comprehension target")?;
-                        // `_nocond`: a trailing `if` here starts a comprehension
-                        // filter, not a conditional expression.
-                        let iter = self.parse_expr_nocond()?;
-                        let mut ifs = Vec::new();
-                        while self.eat(&Token::If) {
-                            ifs.push(self.parse_expr_nocond()?);
-                        }
-                        generators.push(CompFor { target, iter, ifs });
-                        if self.eat(&Token::For) {
-                            continue;
-                        }
-                        break;
-                    }
+                    let generators = self.parse_comp_generators_after_for()?;
                     let close = self.expect(Token::RBracket, "to close the comprehension")?;
                     return Ok(Expr {
                         kind: ExprKind::ListComp {
@@ -2349,24 +2402,7 @@ impl Parser {
                     // dict: `{k: v, ...}` or `{k: v for ...}`
                     let first_v = self.parse_expr()?;
                     if self.eat(&Token::For) {
-                        let mut generators = Vec::new();
-                        loop {
-                            let target_expr = self.parse_target_tuple_or_expr()?;
-                            let target = self.expr_to_target(target_expr)?;
-                            self.expect(Token::In, "after the comprehension target")?;
-                            // `_nocond`: a trailing `if` here starts a comprehension
-                            // filter, not a conditional expression.
-                            let iter = self.parse_expr_nocond()?;
-                            let mut ifs = Vec::new();
-                            while self.eat(&Token::If) {
-                                ifs.push(self.parse_expr_nocond()?);
-                            }
-                            generators.push(CompFor { target, iter, ifs });
-                            if self.eat(&Token::For) {
-                                continue;
-                            }
-                            break;
-                        }
+                        let generators = self.parse_comp_generators_after_for()?;
                         let close =
                             self.expect(Token::RBrace, "to close the dict comprehension")?;
                         return Ok(Expr {
@@ -2395,24 +2431,7 @@ impl Parser {
                     })
                 } else if self.eat(&Token::For) {
                     // set comprehension: `{x for ...}`
-                    let mut generators = Vec::new();
-                    loop {
-                        let target_expr = self.parse_target_tuple_or_expr()?;
-                        let target = self.expr_to_target(target_expr)?;
-                        self.expect(Token::In, "after the comprehension target")?;
-                        // `_nocond`: a trailing `if` here starts a comprehension
-                        // filter, not a conditional expression.
-                        let iter = self.parse_expr_nocond()?;
-                        let mut ifs = Vec::new();
-                        while self.eat(&Token::If) {
-                            ifs.push(self.parse_expr_nocond()?);
-                        }
-                        generators.push(CompFor { target, iter, ifs });
-                        if self.eat(&Token::For) {
-                            continue;
-                        }
-                        break;
-                    }
+                    let generators = self.parse_comp_generators_after_for()?;
                     let close = self.expect(Token::RBrace, "to close the set comprehension")?;
                     Ok(Expr {
                         kind: ExprKind::SetComp {
@@ -3386,6 +3405,15 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
             }
         }
         ExprKind::NamedExpr { value, .. } => rebase_spans(value, span),
+        ExprKind::GenExp { elem, generators } => {
+            rebase_spans(elem, span);
+            for g in generators {
+                rebase_spans(&mut g.iter, span);
+                for c in &mut g.ifs {
+                    rebase_spans(c, span);
+                }
+            }
+        }
         ExprKind::IfExp { test, body, orelse } => {
             rebase_spans(test, span);
             rebase_spans(body, span);
