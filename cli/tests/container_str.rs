@@ -379,3 +379,24 @@ fn repr_takes_exactly_one_argument() {
         "unexpected diagnostic: {msg}"
     );
 }
+
+#[test]
+fn an_exception_inside_a_container_renders_as_repr() {
+    // A container element is a repr, like every other slot: CPython prints
+    // [ValueError('x')], not [x]. Only a top-level print uses str.
+    matches_python(
+        "exc-element",
+        r#"
+try:
+    raise ValueError("x")
+except ValueError as e:
+    print([e])
+    print(str([e]))
+    print(e, str(e), repr(e))
+try:
+    raise KeyError("k")
+except KeyError as e:
+    print([e], repr(e))
+"#,
+    );
+}

@@ -1013,6 +1013,10 @@ probes append to it.
 | `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | `(1, 2)`, `[1, 2]` | **closed in 0.108** |
 | `list(zip(infinite(), [1]))` | `[(0, 1)]` | does not terminate | open — see below |
 | `(x for x in range(bound()))` | `bound()` at creation | `bound()` at first iteration | open — see below |
+| `"ΟΣ".lower()` | `ος` | `ος` | **closed in review** |
+| `"{0} {0}".format(side())` | one call | one call | **closed in review** |
+| `print([e])` for a caught `e` | `[ValueError('x')]` | `[ValueError('x')]` | **closed in review** |
+| `repr(RuntimeError(""))` | `RuntimeError('')` | `RuntimeError()` | open — see below |
 
 `KeyError.__str__` is CPython's `repr(args[0])`, so a str key displays quoted
 and an int key does not. Every *internal* raise site already formats
@@ -1031,6 +1035,13 @@ right; it was unreachable, because the print routines wrote straight to
 `stdout`. 0.108 routes them through a sink that `str()` can capture, so the
 two now agree by construction. `ascii()` of a container and a format spec on
 one remain rejected, both deliberately.
+
+`repr` cannot tell an exception raised with no argument from one raised with
+an empty string: both store an empty message, so `RuntimeError()` and
+`RuntimeError("")` render alike. CPython distinguishes them because it keeps
+`args`. This is the same display-vs-storage distinction the KeyError row
+needs, and it is now consistent between `repr(e)` and `[e]`, which is what
+review raised.
 
 Two divergences share one root cause: the eager builtins and generator
 expressions **materialize their inputs** instead of advancing them lazily.

@@ -25177,7 +25177,36 @@ fn lower_str_format(
         }
     }
 
-    let mut parts: Vec<ast::FStringPart> = Vec::new();
+    // Evaluate every argument exactly once, in call order, before any field
+    // is rendered. These are call arguments, so CPython evaluates all of them
+    // at the call and none of them again: `"{0} {0}".format(side())` runs
+    // `side()` once, and an argument no field names still runs. Substituting
+    // the argument expression into each field did neither.
+    let mut prelude: Vec<ir::Stmt> = Vec::new();
+    let mut pos_vals: Vec<ir::Expr> = Vec::with_capacity(positional.len());
+    for e in &positional {
+        let v = lower_expr(e, ctx)?;
+        let ty = v.ty;
+        let name = ctx.fresh_temp("fmtarg", ty);
+        prelude.push(ir::Stmt::Assign {
+            name: name.clone(),
+            value: v,
+        });
+        pos_vals.push(local_expr(name, ty));
+    }
+    let mut kw_vals: Vec<(String, ir::Expr)> = Vec::with_capacity(keywords.len());
+    for k in keywords {
+        let v = lower_expr(&k.value, ctx)?;
+        let ty = v.ty;
+        let name = ctx.fresh_temp("fmtkw", ty);
+        prelude.push(ir::Stmt::Assign {
+            name: name.clone(),
+            value: v,
+        });
+        kw_vals.push((k.name.clone(), local_expr(name, ty)));
+    }
+
+    let mut parts: Vec<FormatPart> = Vec::new();
     let mut lit = String::new();
     let mut auto = 0usize;
     let mut chars = fmt.chars().peekable();
@@ -25225,13 +25254,13 @@ fn lower_str_format(
                 // f-string fragment splitter for the rest.
                 let head_len = field.find(['!', ':']).unwrap_or(field.len());
                 let (name, tail) = field.split_at(head_len);
-                let value = resolve_format_field(name, &mut auto, &positional, keywords, span)?;
+                let value = resolve_format_field(name, &mut auto, &pos_vals, &kw_vals, span)?;
                 let (conversion, format_spec) = split_format_tail(tail, span)?;
                 if !lit.is_empty() {
-                    parts.push(ast::FStringPart::Literal(std::mem::take(&mut lit)));
+                    parts.push(FormatPart::Literal(std::mem::take(&mut lit)));
                 }
-                parts.push(ast::FStringPart::Expr {
-                    expr: value.clone(),
+                parts.push(FormatPart::Field {
+                    value,
                     conversion,
                     format_spec,
                 });
@@ -25240,12 +25269,57 @@ fn lower_str_format(
         }
     }
     if !lit.is_empty() {
-        parts.push(ast::FStringPart::Literal(lit));
+        parts.push(FormatPart::Literal(lit));
     }
-    if parts.is_empty() {
-        return Ok(const_str_expr(""));
+
+    let mut result: Option<ir::Expr> = Option::None;
+    for part in parts {
+        let piece = match part {
+            FormatPart::Literal(s) => ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::ConstStr(s),
+            },
+            FormatPart::Field {
+                value,
+                conversion,
+                format_spec,
+            } => render_field(value, conversion, format_spec.as_deref(), span, ctx)?,
+        };
+        result = Some(match result {
+            Option::None => piece,
+            Some(acc) => ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Add,
+                    left: Box::new(acc),
+                    right: Box::new(piece),
+                },
+            },
+        });
     }
-    lower_joined_str(&parts, ctx)
+    let joined = result.unwrap_or_else(|| const_str_expr(""));
+    if prelude.is_empty() {
+        return Ok(joined);
+    }
+    // The prelude runs even when no field names a given argument.
+    Ok(ir::Expr {
+        ty: ir::Ty::Str,
+        kind: ir::ExprKind::Block {
+            stmts: prelude,
+            result: Box::new(joined),
+        },
+    })
+}
+
+/// A piece of a `.format()` result: literal text, or a field bound to an
+/// argument that has already been evaluated into a temporary.
+enum FormatPart {
+    Literal(String),
+    Field {
+        value: ir::Expr,
+        conversion: Option<ast::FStringConversion>,
+        format_spec: Option<Box<ast::Expr>>,
+    },
 }
 
 /// `"%d of %s" % (n, name)` on a *literal* format string.
@@ -25434,17 +25508,17 @@ fn split_format_tail(
 
 /// Pick the argument a `{...}` field names: empty is the next positional,
 /// digits are an explicit index, anything else is a keyword.
-fn resolve_format_field<'a>(
+fn resolve_format_field(
     name: &str,
     auto: &mut usize,
-    positional: &[&'a ast::Expr],
-    keywords: &'a [ast::Keyword],
+    positional: &[ir::Expr],
+    keywords: &[(String, ir::Expr)],
     span: Span,
-) -> SResult<&'a ast::Expr> {
+) -> SResult<ir::Expr> {
     if name.is_empty() {
         let i = *auto;
         *auto += 1;
-        return positional.get(i).copied().ok_or_else(|| {
+        return positional.get(i).cloned().ok_or_else(|| {
             err(
                 format!(
                     "format() needs at least {} positional argument{}, got {}",
@@ -25457,7 +25531,7 @@ fn resolve_format_field<'a>(
         });
     }
     if let Ok(i) = name.parse::<usize>() {
-        return positional.get(i).copied().ok_or_else(|| {
+        return positional.get(i).cloned().ok_or_else(|| {
             err(
                 format!(
                     "format() index {i} is out of range ({} positional argument{} given)",
@@ -25470,8 +25544,8 @@ fn resolve_format_field<'a>(
     }
     keywords
         .iter()
-        .find(|k| k.name == name)
-        .map(|k| &k.value)
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
         .ok_or_else(|| err(format!("format() has no keyword argument '{name}'"), span))
 }
 
@@ -25489,46 +25563,7 @@ fn lower_joined_str(parts: &[ast::FStringPart], ctx: &mut FnCtx<'_>) -> SResult<
                 format_spec,
             } => {
                 let v = lower_expr(e, ctx)?;
-                let converted = lower_fstring_conversion(v, *conversion, e.span)?;
-                match format_spec {
-                    None => {
-                        // No `:` → `str(value)` (after optional conversion).
-                        if converted.ty == ir::Ty::Str {
-                            converted
-                        } else {
-                            lower_cast(ast::TypeName::Str, converted, e.span)?
-                        }
-                    }
-                    Some(spec) => {
-                        let spec_ir = lower_expr(spec, ctx)?;
-                        if spec_ir.ty != ir::Ty::Str {
-                            return Err(err(
-                                format!(
-                                    "f-string format specifier must be str, got {}",
-                                    spec_ir.ty
-                                ),
-                                e.span,
-                            ));
-                        }
-                        // Static check: only scalar types we can format.
-                        match converted.ty {
-                            ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => {}
-                            other => {
-                                return Err(err(
-                                    format!("format() cannot convert {other} yet"),
-                                    e.span,
-                                ));
-                            }
-                        }
-                        ir::Expr {
-                            ty: ir::Ty::Str,
-                            kind: ir::ExprKind::FormatValue {
-                                value: Box::new(converted),
-                                spec: Box::new(spec_ir),
-                            },
-                        }
-                    }
-                }
+                render_field(v, *conversion, format_spec.as_deref(), e.span, ctx)?
             }
         };
         result = Some(match result {
@@ -25547,6 +25582,55 @@ fn lower_joined_str(parts: &[ast::FStringPart], ctx: &mut FnCtx<'_>) -> SResult<
         ty: ir::Ty::Str,
         kind: ir::ExprKind::ConstStr(String::new()),
     }))
+}
+
+/// Render one replacement field: optional `!s` / `!r` / `!a` conversion, then
+/// either `str(value)` or the format mini-language for a `:spec`.
+///
+/// Takes an already-lowered value rather than the source expression, because
+/// `.format()` must evaluate each argument once even when several fields
+/// name it.
+fn render_field(
+    value: ir::Expr,
+    conversion: Option<ast::FStringConversion>,
+    format_spec: Option<&ast::Expr>,
+    span: Span,
+    ctx: &mut FnCtx<'_>,
+) -> SResult<ir::Expr> {
+    let converted = lower_fstring_conversion(value, conversion, span)?;
+    match format_spec {
+        Option::None => {
+            // No `:` → `str(value)` (after optional conversion).
+            if converted.ty == ir::Ty::Str {
+                Ok(converted)
+            } else {
+                lower_cast(ast::TypeName::Str, converted, span)
+            }
+        }
+        Some(spec) => {
+            let spec_ir = lower_expr(spec, ctx)?;
+            if spec_ir.ty != ir::Ty::Str {
+                return Err(err(
+                    format!("f-string format specifier must be str, got {}", spec_ir.ty),
+                    span,
+                ));
+            }
+            // Static check: only scalar types we can format.
+            match converted.ty {
+                ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => {}
+                other => {
+                    return Err(err(format!("format() cannot convert {other} yet"), span));
+                }
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::FormatValue {
+                    value: Box::new(converted),
+                    spec: Box::new(spec_ir),
+                },
+            })
+        }
+    }
 }
 
 /// Apply f-string `!s` / `!r` / `!a` conversion (or leave value unchanged).

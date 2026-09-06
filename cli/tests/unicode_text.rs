@@ -860,3 +860,31 @@ print(f"a{n}b", f'c{n}d')
 "#,
     );
 }
+
+#[test]
+fn a_final_sigma_lowercases_to_its_final_form() {
+    // Lowercasing is not a pure per-character map: U+03A3 takes the final
+    // form when it ends a word. Tables generated from single-character calls
+    // cannot express that, so the rule is applied over the string.
+    matches_python(
+        "final-sigma",
+        r#"
+for w in ["ΟΣ", "ΟΣΤΙ", "ΟΔΥΣΣΕΥΣ", "Σ", "ΣΑ", "ΑΣ-ΒΣ", "ΑΣ ΒΣ", "ΣΟΦΟΣ"]:
+    print(w.lower(), w.capitalize(), w.title(), w.swapcase(), w.casefold())
+"#,
+    );
+}
+
+#[test]
+fn final_sigma_looks_through_case_ignorable_characters() {
+    // The rule skips case-ignorables on both sides, so an apostrophe or a
+    // combining accent after the sigma does not make it medial, and a
+    // leading space does not make it final.
+    matches_python(
+        "final-sigma-ignorable",
+        r#"
+for w in ["ΟΣ'", "ΟΣ\u0301", "ΟΣ\u00ad", " Σ", " ΟΣ", "Σ'Σ", "ΟΣ.", "ΟΣ1"]:
+    print(w.lower(), w.capitalize(), w.swapcase())
+"#,
+    );
+}

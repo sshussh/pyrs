@@ -274,3 +274,60 @@ print(f"{n:{'0'}5d}" if False else f"{n:05d}")
 "#,
     );
 }
+
+#[test]
+fn a_format_argument_is_evaluated_once_per_call() {
+    // The argument expression used to be substituted into every field that
+    // named it, so a repeated field ran its argument again.
+    matches_python(
+        "eval-once",
+        r#"
+def side() -> str:
+    print("called")
+    return "v"
+
+
+print("{0} {0}".format(side()))
+print("{x} {x}".format(x=side()))
+"#,
+    );
+}
+
+#[test]
+fn an_unreferenced_format_argument_is_still_evaluated() {
+    // These are call arguments: CPython evaluates all of them at the call,
+    // whether or not a field names them.
+    matches_python(
+        "eval-all",
+        r#"
+def a() -> str:
+    print("a")
+    return "A"
+
+
+def b() -> str:
+    print("b")
+    return "B"
+
+
+print("{0}".format(a(), b()))
+print("{1}".format(a(), b()))
+print("no fields".format(a()))
+"#,
+    );
+}
+
+#[test]
+fn format_arguments_are_evaluated_in_call_order() {
+    matches_python(
+        "eval-order",
+        r#"
+def p(n: str) -> str:
+    print("eval", n)
+    return n
+
+
+print("{1} {0} {k}".format(p("first"), p("second"), k=p("kw")))
+"#,
+    );
+}

@@ -23,6 +23,21 @@ Review fixes on the 0.90–0.108 series.
   `numpy-linalg` expected a generic parse error where the dedicated
   matrix-multiply diagnostic is now reported. Both now match reality, and the
   sweep is clean.
+- **Lowercasing ignored the Final_Sigma rule.** `"ΟΣ".lower()` gave `"οσ"`
+  where CPython gives `"ος"`: the tables are generated from single-character
+  calls, and this mapping depends on the neighbours. The rule is now applied
+  over the string — a sigma preceded by a cased character and not followed by
+  one takes the final form — in `lower`, `capitalize`, `title` and
+  `swapcase`. Two generated properties back it, `Cased` and `Case_Ignorable`.
+  A differential sweep of 279 sigma contexts and 600 random mixed-script
+  strings across all six case operations matches CPython; the sweep caught a
+  seeding bug in `capitalize` that the reported examples did not.
+- **`.format()` re-evaluated its arguments.** The argument expression was
+  substituted into every field naming it, so `"{0} {0}".format(side())` ran
+  `side()` twice and an argument no field named never ran at all. Arguments
+  are now evaluated once each, in call order, into temporaries.
+- **An exception inside a container rendered as `str`, not `repr`.**
+  `print([e])` gave `[x]` where CPython gives `[ValueError('x')]`.
 - **The hygiene gate** claimed to pin the Unicode tables to the interpreter
   that generated them but compared only the UCD version, which two CPython
   releases can share. It now also compares the `PYRS_UNIDATA_CPYTHON` stamp,
