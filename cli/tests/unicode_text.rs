@@ -888,3 +888,32 @@ for w in ["ΟΣ'", "ΟΣ\u0301", "ΟΣ\u00ad", " Σ", " ΟΣ", "Σ'Σ", "ΟΣ.",
 "#,
     );
 }
+
+#[test]
+fn random_access_into_a_non_ascii_string_is_correct() {
+    // Scattered indexing is served by a sampled code-point index rather than
+    // a rescan from the start; this pins the values it returns, forwards and
+    // backwards, against the one-entry memo's forward-walk path.
+    matches_python(
+        "random-access",
+        r#"
+s = "h\u00e9llo w\u00f6rld " * 200
+n = len(s)
+i = 0
+k = 0
+acc = ""
+while k < 400:
+    i = (i + 719) % n
+    acc += s[i]
+    k += 1
+print(len(s), len(acc), acc[:40])
+j = n - 1
+tail = ""
+while j > n - 50:
+    tail += s[j]
+    j -= 1
+print(tail)
+print(s[1000], s[0], s[n - 1], s[500:520])
+"#,
+    );
+}

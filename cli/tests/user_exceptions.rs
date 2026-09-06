@@ -521,3 +521,56 @@ except E as e:
 "#,
     );
 }
+
+#[test]
+fn keyerror_displays_its_argument_as_a_repr() {
+    // CPython's KeyError.__str__ is repr(args[0]), not str of it: a str key
+    // quotes, an int key does not. Storage stays raw, so `e.args[0]` is the
+    // key itself -- storing the quoted form made a one-character key three
+    // characters, a wrong value rather than merely wrong text.
+    matches_python(
+        "keyerror-display",
+        r#"
+try:
+    raise KeyError("k")
+except KeyError as e:
+    print(str(e), repr(e), e.args[0], len(e.args[0]))
+
+d = {"a": 1}
+try:
+    d["z"]
+except KeyError as e:
+    print(str(e), repr(e), e.args[0], len(e.args[0]))
+
+s = {2}
+try:
+    s.remove(3)
+except KeyError as e:
+    print(str(e), repr(e))
+
+try:
+    raise ValueError("v")
+except ValueError as e:
+    print(str(e), repr(e), e.args[0])
+"#,
+    );
+}
+
+#[test]
+fn keyerror_from_empty_containers_keeps_its_message() {
+    matches_python(
+        "keyerror-empty-containers",
+        r#"
+d: dict[str, int] = {}
+try:
+    d.popitem()
+except KeyError as e:
+    print(str(e), e.args[0])
+s: set[int] = set()
+try:
+    s.pop()
+except KeyError as e:
+    print(str(e), e.args[0])
+"#,
+    );
+}

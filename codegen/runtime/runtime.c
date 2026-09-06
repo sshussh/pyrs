@@ -130,6 +130,9 @@ typedef struct {
 } OutBuf;
 
 static _Thread_local OutBuf *g_capture = NULL;
+/* ascii() renders exactly like repr() except that non-ASCII escapes. Scoped
+ * to a capture, so it reaches the nested elements the shared printer walks. */
+static _Thread_local int g_repr_ascii = 0;
 
 static void out_write(const char *p, size_t n) {
     OutBuf *o = g_capture;
@@ -212,6 +215,11 @@ static PyrsStr *str_from_utf8(const char *buf, long long len);
 typedef struct {
     int type_tag;
     PyrsStr *msg;
+    /* Tag of args[0], so display can differ from storage. `msg` is always
+     * the *raw* argument; KeyError shows repr(args[0]) rather than str of
+     * it, which is the one place the two differ, and which needs the
+     * argument's type to get right (a str key quotes, an int key does not). */
+    int args_tag;
 } PyrsExc;
 
 /* stable header; data grows by reallocation */
@@ -257,6 +265,8 @@ typedef struct PyrsExcFrame {
 static PyrsExcFrame *g_exc_frames = NULL;
 static int g_exc_type = 0;
 static char g_exc_msg[512];
+/* Tag of the pending exception's args[0]; see PyrsExc::args_tag. */
+static int g_exc_args_tag = TAG_STR;
 
 static void *xmalloc(size_t n);
 
@@ -467,6 +477,19 @@ static void set_exc_msg(int type, const char *body) {
     }
 }
 
+/* CPython's KeyError.__str__ is repr(args[0]), not str of it: a str key
+ * displays quoted and an int key bare. Every other exception displays its
+ * argument as-is. Storage stays raw so `e.args[0]` is the key itself --
+ * getting that wrong is a wrong *value*, not just wrong text, which is why
+ * this is a tag rather than pre-quoted storage. */
+static void exc_display_body(int type, const char *raw, int tag, char *out, size_t n) {
+    if (type == PYRS_EXC_KEY && tag == TAG_STR) {
+        snprintf(out, n, "'%s'", raw);
+    } else {
+        snprintf(out, n, "%s", raw);
+    }
+}
+
 /* strip "Type: " prefix for the bound exception message */
 static const char *exc_msg_body(const char *full) {
     const char *colon = strchr(full, ':');
@@ -486,13 +509,28 @@ _Noreturn static void die_uncaught(const char *msg) {
     exit(1);
 }
 
-_Noreturn void pyrs_raise(int type, const char *msg) {
+/* `raise E(msg)`: msg is args[0]. Stored raw; the uncaught banner shows the
+ * display form, which only differs for KeyError. */
+_Noreturn void pyrs_raise_tagged(int type, const char *msg, int args_tag) {
     g_exc_type = type;
+    g_exc_args_tag = args_tag;
     set_exc_msg(type, msg);
     if (g_exc_frames != NULL) {
         pyrs_jump_current();
     }
-    die_uncaught(g_exc_msg);
+    char disp[512];
+    exc_display_body(type, msg ? msg : "", args_tag, disp, sizeof disp);
+    char full[600];
+    if (disp[0] == '\0') {
+        snprintf(full, sizeof full, "%s", exc_type_name(type));
+    } else {
+        snprintf(full, sizeof full, "%s: %s", exc_type_name(type), disp);
+    }
+    die_uncaught(full);
+}
+
+_Noreturn void pyrs_raise(int type, const char *msg) {
+    pyrs_raise_tagged(type, msg, TAG_STR);
 }
 
 _Noreturn void pyrs_die(const char *msg) {
@@ -574,12 +612,19 @@ PyrsExc *pyrs_exc_object(void) {
     PyrsExc *e = pyrs_gc_alloc(sizeof(PyrsExc), PYRS_GC_EXCEPTION);
     e->type_tag = g_exc_type;
     e->msg = pyrs_exc_message();
+    e->args_tag = g_exc_args_tag;
     return e;
 }
 
-/* print(e) / str(e) → message body only (CPython). */
+/* print(e) / str(e) → args[0] as the type displays it (CPython). */
 void pyrs_print_exc(PyrsExc *e) {
     if (e == NULL || e->msg == NULL) {
+        return;
+    }
+    if (e->type_tag == PYRS_EXC_KEY && e->args_tag == TAG_STR && e->msg->len > 0) {
+        out_putc('\'');
+        out_write(e->msg->data, (size_t)e->msg->len);
+        out_putc('\'');
         return;
     }
     out_write(e->msg->data, (size_t)e->msg->len);
@@ -588,6 +633,11 @@ void pyrs_print_exc(PyrsExc *e) {
 PyrsStr *pyrs_str_from_exc(PyrsExc *e) {
     if (e == NULL || e->msg == NULL) {
         return str_from_utf8("", 0);
+    }
+    if (e->type_tag == PYRS_EXC_KEY && e->args_tag == TAG_STR && e->msg->len > 0) {
+        char buf[600];
+        exc_display_body(e->type_tag, e->msg->data, e->args_tag, buf, sizeof buf);
+        return str_from_utf8(buf, (long long)strlen(buf));
     }
     return e->msg;
 }
@@ -610,6 +660,8 @@ PyrsStr *pyrs_repr_from_exc(PyrsExc *e) {
     char buf[640];
     if (body[0] == '\0') {
         snprintf(buf, sizeof buf, "%s()", name);
+    } else if (e != NULL && e->args_tag != TAG_STR) {
+        snprintf(buf, sizeof buf, "%s(%s)", name, body);
     } else {
         snprintf(buf, sizeof buf, "%s('%s')", name, body);
     }
@@ -736,10 +788,62 @@ static _Thread_local const PyrsStr *cp_memo_str;
 static _Thread_local long long cp_memo_cp;
 static _Thread_local long long cp_memo_byte;
 
+/* The memo only helps a *forward* walk. Random access -- `s[i]` for scattered
+ * i, which a one-entry memo cannot serve -- rescans from the start every
+ * time, so it was O(n) per lookup: measured 59x slower than the same loop
+ * over ASCII text, and 9x slower than CPython.
+ *
+ * So the hot string also gets a sampled index: the byte offset of every
+ * CP_INDEX_STRIDE'th code point. A lookup jumps to the nearest sample and
+ * scans at most CP_INDEX_STRIDE code points from there, which is O(1) with a
+ * small constant. One string's index is kept at a time, which is what a loop
+ * indexing one string needs; the table costs len/stride words and is built
+ * once, lazily, only for strings long enough to be worth it.
+ *
+ * Both caches key on the object address, so pyrs_str_cache_invalidate clears
+ * them whenever the collector runs and an address could be reused. */
+#define CP_INDEX_STRIDE 32
+#define CP_INDEX_MIN_CP 256
+
+static _Thread_local const PyrsStr *cp_index_str;
+static _Thread_local long long *cp_index_offsets;
+static _Thread_local long long cp_index_len;
+
 void pyrs_str_cache_invalidate(void) {
     cp_memo_str = NULL;
     cp_memo_cp = 0;
     cp_memo_byte = 0;
+    cp_index_str = NULL;
+    cp_index_len = 0;
+    /* The table itself is kept for reuse; only its owner is forgotten. */
+}
+
+/* Build (or reuse) the sampled index for `s`. Returns 0 if there is none,
+ * which is not an error: callers fall back to the memo walk. */
+static int cp_index_ensure(const PyrsStr *s) {
+    if (cp_index_str == s) {
+        return 1;
+    }
+    if (s->cplen < CP_INDEX_MIN_CP) {
+        return 0;
+    }
+    long long n = s->cplen / CP_INDEX_STRIDE + 1;
+    long long *table = realloc(cp_index_offsets, (size_t)n * sizeof *table);
+    if (table == NULL) {
+        return 0; /* no index is a slow path, not a failure */
+    }
+    cp_index_offsets = table;
+    long long b = 0;
+    for (long long k = 0; k < n; k++) {
+        table[k] = b;
+        for (long long j = 0; j < CP_INDEX_STRIDE && b < s->len; j++) {
+            unsigned int cp;
+            b += utf8_next(s, b, &cp);
+        }
+    }
+    cp_index_str = s;
+    cp_index_len = n;
+    return 1;
 }
 
 /* Byte offset of code point `i` (0 <= i <= s->cplen). */
@@ -752,6 +856,15 @@ static long long str_byte_of_cp(const PyrsStr *s, long long i) {
     if (cp_memo_str == s && cp_memo_cp <= i) {
         b = cp_memo_byte;
         at = cp_memo_cp;
+    }
+    /* Prefer whichever start is closer: the memo is ahead for a forward
+     * walk, the index for a jump backwards or far forwards. */
+    if (cp_index_ensure(s)) {
+        long long k = i / CP_INDEX_STRIDE;
+        if (k < cp_index_len && k * CP_INDEX_STRIDE > at) {
+            at = k * CP_INDEX_STRIDE;
+            b = cp_index_offsets[k];
+        }
     }
     while (at < i && b < s->len) {
         unsigned int cp;
@@ -2568,7 +2681,8 @@ static void print_str_repr(const PyrsStr *s) {
             out_puts("\\r");
         } else if (cp == '\t') {
             out_puts("\\t");
-        } else if ((pyrs_u_flags(cp) & PYRS_U_PRINTABLE) == 0) {
+        } else if ((g_repr_ascii && cp > 0x7f) ||
+                   (pyrs_u_flags(cp) & PYRS_U_PRINTABLE) == 0) {
             if (cp < 0x100) {
                 out_printf("\\x%02x", cp);
             } else if (cp < 0x10000) {
@@ -2800,6 +2914,42 @@ static PyrsStr *capture_end(OutBuf *buf, OutBuf *prev) {
     PyrsStr *r = str_from_utf8(buf->len ? buf->buf : "", (long long)buf->len);
     free(buf->buf);
     return r;
+}
+
+PyrsStr *pyrs_ascii_list(const PyrsList *l, int tag) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    g_repr_ascii = 1;
+    pyrs_print_list(l, tag);
+    g_repr_ascii = 0;
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_ascii_tuple(const PyrsTuple *t) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    g_repr_ascii = 1;
+    pyrs_print_tuple(t);
+    g_repr_ascii = 0;
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_ascii_dict(const PyrsDict *d) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    g_repr_ascii = 1;
+    pyrs_print_dict(d);
+    g_repr_ascii = 0;
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_ascii_set(const PyrsSet *s) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    g_repr_ascii = 1;
+    pyrs_print_set(s);
+    g_repr_ascii = 0;
+    return capture_end(&buf, prev);
 }
 
 PyrsStr *pyrs_repr_list(const PyrsList *l, int tag) {
@@ -6096,15 +6246,24 @@ struct PyrsDict {
  * because pyrs_die unwinds to an enclosing `except` rather than exiting: a
  * caught KeyError in a loop must not leak per iteration. */
 static void die_keyerror(long long key, int key_tag) {
+    /* Store args[0] raw and let the display rule quote it, so `e.args[0]`
+     * is the key itself while `str(e)` is CPython's repr(args[0]). Storing
+     * the quoted form instead is what used to make `e.args[0]` three
+     * characters for a one-character key. */
     OutBuf out;
     OutBuf *prev = capture_begin(&out);
-    print_slot(key, key_tag);
+    if (key_tag == TAG_STR) {
+        const PyrsStr *k = (const PyrsStr *)(uintptr_t)key;
+        out_write(k->data, (size_t)k->len);
+    } else {
+        print_slot(key, key_tag);
+    }
     g_capture = prev;
-    char buf[512];
+    char raw[512];
     int n = (int)(out.len < 490 ? out.len : 490);
-    snprintf(buf, sizeof buf, "KeyError: %.*s", n, out.len ? out.buf : "");
+    snprintf(raw, sizeof raw, "%.*s", n, out.len ? out.buf : "");
     free(out.buf);
-    pyrs_die(buf);
+    pyrs_raise_tagged(PYRS_EXC_KEY, raw, key_tag == TAG_STR ? TAG_STR : TAG_INT);
 }
 
 static unsigned long long hash_key(long long key, int tag);
@@ -6552,7 +6711,7 @@ PyrsTuple *pyrs_dict_popitem(PyrsDict *d) {
         d->order_len--;
         return t;
     }
-    pyrs_die("KeyError: 'popitem(): dictionary is empty'");
+    pyrs_raise_tagged(PYRS_EXC_KEY, "popitem(): dictionary is empty", TAG_STR);
     return NULL;
 }
 
@@ -6990,7 +7149,7 @@ long long pyrs_set_pop(PyrsSet *s) {
         s->order_len--;
         return key;
     }
-    pyrs_die("KeyError: 'pop from an empty set'");
+    pyrs_raise_tagged(PYRS_EXC_KEY, "pop from an empty set", TAG_STR);
 }
 
 /* Shallow set copy. */
@@ -7924,6 +8083,7 @@ void pyrs_gen_close(PyrsGen *g) {
         return;
     }
     int saved_type = g_exc_type;
+    int saved_args_tag = g_exc_args_tag;
     char saved_msg[sizeof g_exc_msg];
     memcpy(saved_msg, g_exc_msg, sizeof g_exc_msg);
 
@@ -7942,6 +8102,7 @@ void pyrs_gen_close(PyrsGen *g) {
         /* Restore any outer exception before dying. */
         if (saved_type != 0) {
             g_exc_type = saved_type;
+            g_exc_args_tag = saved_args_tag;
             memcpy(g_exc_msg, saved_msg, sizeof g_exc_msg);
         }
         pyrs_die("RuntimeError: generator ignored GeneratorExit");
@@ -7951,6 +8112,7 @@ void pyrs_gen_close(PyrsGen *g) {
     if (saved_type != 0) {
         /* Preserve outer pending exception (e.g. outer GeneratorExit). */
         g_exc_type = saved_type;
+        g_exc_args_tag = saved_args_tag;
         memcpy(g_exc_msg, saved_msg, sizeof g_exc_msg);
     } else if (g_exc_type == PYRS_EXC_GENEXIT) {
         /* Swallow GeneratorExit produced by this close only. */

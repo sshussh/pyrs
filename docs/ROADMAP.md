@@ -1009,7 +1009,11 @@ probes append to it.
 | `[1, 2.5, 1]` | `[1, 2.5, 1]` | `[1, 2.5, 1]` | **closed in 0.89** |
 | `a != b`, `a: Base` holding a `Child` defining `__ne__` | `Child.__ne__` runs | `Child.__ne__` runs | **closed in 0.89** |
 | `def f(x: "Base")` | accepted | accepted | **closed in 0.87** |
-| `str(KeyError("k"))` | `'k'` | `k` | open — see below |
+| `str(KeyError("k"))` | `'k'` | `'k'` | **closed in review** |
+| `e.args[0]` after `d["z"]` | `z` | `z` | **closed in review** |
+| `ascii(["é"])` | `['\xe9']` | `['\xe9']` | **closed in review** |
+| `f"{xs:}"` | `[1, 2]` | `[1, 2]` | **closed in review** |
+| `e.args` display | `('z',)` | `['z']` | open — see below |
 | `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | `(1, 2)`, `[1, 2]` | **closed in 0.108** |
 | `list(zip(infinite(), [1]))` | `[(0, 1)]` | does not terminate | open — see below |
 | `(x for x in range(bound()))` | `bound()` at creation | `bound()` at first iteration | open — see below |
@@ -1019,22 +1023,31 @@ probes append to it.
 | `repr(RuntimeError(""))` | `RuntimeError('')` | `RuntimeError()` | open — see below |
 
 `KeyError.__str__` is CPython's `repr(args[0])`, so a str key displays quoted
-and an int key does not. Every *internal* raise site already formats
-correctly, because it knows the key's type: `d["z"]` reports `KeyError: 'z'`
-and `s.remove(2)` reports `KeyError: 2`, both matching. Only an explicit
-`raise KeyError("k")` is unquoted. Fixing it needs a display-vs-storage
-distinction on the exception itself: quoting the stored message would make
-`e.args[0]` wrong, which today is right, and quoting at display cannot tell a
-str key from an int one. An attempt to normalize the raise sites and quote at
-display was reverted for exactly that reason — `s.remove(2)` regressed to
-`KeyError: '2'`.
+and an int key does not. This is now handled by the display-vs-storage
+distinction the earlier attempt lacked: the exception stores `args[0]` **raw**
+and carries the tag of that argument, so display can apply the repr rule while
+`e.args[0]` stays the key itself. The earlier attempt failed because, without
+the tag, quoting at display could not tell a str key from an int one and
+regressed `s.remove(2)` to `KeyError: '2'`; that case is now a test.
+
+Storing the pre-quoted form, which is what the internal sites used to do, was
+also a wrong *value* and not merely wrong text: `e.args[0]` for `d["z"]` came
+back as three characters rather than one.
+
+What remains is the shape of `args`, not its contents: PyRs models it as a
+`list`, so it displays as `['z']` where CPython shows the tuple `('z',)`.
+Tuples here are fixed-arity, and `args` is 0-or-1 elements decided at runtime,
+so there is no tuple type to give it without variable-length tuples.
 
 `str()` and f-string interpolation rejected every container until 0.108, even
 though `print` formatted the same value correctly. The formatting logic was
 right; it was unreachable, because the print routines wrote straight to
 `stdout`. 0.108 routes them through a sink that `str()` can capture, so the
-two now agree by construction. `ascii()` of a container and a format spec on
-one remain rejected, both deliberately.
+two now agree by construction. `ascii()` of a container now works — it is the same rendering with non-ASCII
+escaped inside the elements, which the shared printer does under a flag. A
+*non-empty* format spec on a container stays rejected, matching CPython's
+`TypeError`; the **empty** spec (`f"{xs:}"`) was rejected too, which was
+wrong, since CPython treats it as `str(x)` for every type.
 
 `repr` cannot tell an exception raised with no argument from one raised with
 an empty string: both store an empty message, so `RuntimeError()` and
@@ -1042,6 +1055,26 @@ an empty string: both store an empty message, so `RuntimeError()` and
 `args`. This is the same display-vs-storage distinction the KeyError row
 needs, and it is now consistent between `repr(e)` and `[e]`, which is what
 review raised.
+
+Set iteration order is **not** a divergence that can be closed, and the
+measurement says so plainly: CPython's own order for str elements is not
+stable across runs, because string hashing is randomized per process. Three
+consecutive runs of `print({'apple','banana','cherry','date'})` gave two
+different orders. There is therefore no single CPython order to match, and a
+differential test asserting one would be flaky against CPython itself. Int
+sets are deterministic there (ints hash to themselves) and could be matched by
+replicating CPython's table geometry, but doing so for ints alone would make
+our order depend on element type while still not matching for strings.
+Insertion order is kept, is documented, and programs needing deterministic
+output should use `sorted(s)` — which CPython users need for the same reason.
+
+Non-ASCII indexing is no longer O(n) per lookup. The one-entry memo made a
+forward walk amortised O(1) but did nothing for scattered access, which
+rescanned from the start: measured 118 ms against 2 ms for the same loop over
+ASCII, and 12 ms for CPython. The hot string now also gets a sampled index —
+the byte offset of every 32nd code point — so a lookup jumps to the nearest
+sample and scans at most 32 code points. The same benchmark is now 3 ms, and
+the sequential walk is unchanged.
 
 Two divergences share one root cause: the eager builtins and generator
 expressions **materialize their inputs** instead of advancing them lazily.

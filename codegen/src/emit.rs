@@ -444,6 +444,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | StrRepr(operand)
         | StrAscii(operand)
         | ContainerRepr(operand)
+        | ContainerAscii(operand)
         | IsNone { value: operand, .. }
         | CellNew(operand)
         | CellLoad(operand)
@@ -741,6 +742,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | StrRepr(operand)
         | StrAscii(operand)
         | ContainerRepr(operand)
+        | ContainerAscii(operand)
         | IsNone { value: operand, .. }
         | CellNew(operand)
         | CellLoad(operand)
@@ -914,6 +916,10 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_repr_tuple(ptr)\n");
         out.push_str("declare ptr @pyrs_repr_dict(ptr)\n");
         out.push_str("declare ptr @pyrs_repr_set(ptr)\n");
+        out.push_str("declare ptr @pyrs_ascii_list(ptr, i32)\n");
+        out.push_str("declare ptr @pyrs_ascii_tuple(ptr)\n");
+        out.push_str("declare ptr @pyrs_ascii_dict(ptr)\n");
+        out.push_str("declare ptr @pyrs_ascii_set(ptr)\n");
         out.push_str("declare void @pyrs_print_any(i64)\n");
         out.push_str("declare i32 @pyrs_any_truth(i64)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
@@ -4762,17 +4768,22 @@ impl Emitter {
                 self.line(format!("{t} = call ptr @pyrs_str_ascii(ptr {v})"));
                 t
             }
-            ExprKind::ContainerRepr(inner) => {
+            ExprKind::ContainerRepr(inner) | ExprKind::ContainerAscii(inner) => {
+                let f = if matches!(expr.kind, ExprKind::ContainerAscii(_)) {
+                    "ascii"
+                } else {
+                    "repr"
+                };
                 let v = self.emit_expr(inner);
                 let t = self.tmp();
                 let call = match inner.ty {
                     Ty::List(elem) => {
-                        format!("call ptr @pyrs_repr_list(ptr {v}, i32 {})", elem_tag(elem))
+                        format!("call ptr @pyrs_{f}_list(ptr {v}, i32 {})", elem_tag(elem))
                     }
-                    Ty::Tuple(_) => format!("call ptr @pyrs_repr_tuple(ptr {v})"),
-                    Ty::Dict { .. } => format!("call ptr @pyrs_repr_dict(ptr {v})"),
-                    Ty::Set(_) => format!("call ptr @pyrs_repr_set(ptr {v})"),
-                    other => unreachable!("semantic restricts ContainerRepr, got {other}"),
+                    Ty::Tuple(_) => format!("call ptr @pyrs_{f}_tuple(ptr {v})"),
+                    Ty::Dict { .. } => format!("call ptr @pyrs_{f}_dict(ptr {v})"),
+                    Ty::Set(_) => format!("call ptr @pyrs_{f}_set(ptr {v})"),
+                    other => unreachable!("semantic restricts container repr, got {other}"),
                 };
                 self.line(format!("{t} = {call}"));
                 t

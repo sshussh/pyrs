@@ -563,8 +563,10 @@ joined (mixed non-numeric literal elements still error unless annotated
 as a union), `nan in [nan]`
 is False (IEEE equality), str offsets, case transforms and `is*` methods
 follow Unicode 16.0.0 (no normalization or locale-sensitive casing),
-indexing a non-ASCII `str` is O(n) rather than CPython's O(1) (sequential
-access is amortised O(1)), GC is
+indexing a non-ASCII `str` is amortised rather than exactly O(1) (a memo
+serves sequential access, a lazily built sampled index serves scattered
+access), sets iterate in insertion order where CPython's order is unspecified
+and varies per run, GC is
 nonmoving mark–sweep with conservative native roots (so reclamation can be
 delayed by pointer-like stack values), files support text modes "r"/"w"/"a"
 only and still require `with` or explicit `close()` for deterministic resource

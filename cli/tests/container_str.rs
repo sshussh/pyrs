@@ -341,20 +341,6 @@ print(total, last)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ascii_of_a_container_is_rejected() {
-    let msg = rejects(
-        "ascii-container",
-        r#"
-print(ascii([1, 2]))
-"#,
-    );
-    assert!(
-        msg.contains("ascii() cannot convert list[int]"),
-        "unexpected diagnostic: {msg}"
-    );
-}
-
-#[test]
 fn a_format_spec_on_a_container_is_rejected() {
     // CPython raises TypeError: unsupported format string passed to
     // list.__format__ -- the same rejection, at compile time.
@@ -397,6 +383,35 @@ try:
     raise KeyError("k")
 except KeyError as e:
     print([e], repr(e))
+"#,
+    );
+}
+
+#[test]
+fn ascii_of_a_container_escapes_non_ascii_elements() {
+    matches_python(
+        "ascii-container",
+        r#"
+print(ascii(["h\u00e9llo", "\U0001f40d", "ok"]))
+print(ascii(("\u00e9",)), ascii({"k\u00e9": "v\u00e9"}), ascii({"\u00e9"}))
+print(ascii([["n\u00e4sted"]]), ascii([1, 2]))
+print(repr(["h\u00e9llo"]), str(["h\u00e9llo"]))
+"#,
+    );
+}
+
+#[test]
+fn an_empty_format_spec_renders_a_container() {
+    // `{x:}` is `{x}` for every type in CPython; only a *non-empty* spec
+    // reaches list.__format__ and raises.
+    matches_python(
+        "empty-spec",
+        r#"
+xs = [1, 2]
+d = {"a": 1}
+print(f"{xs:}", f"{d:}")
+print("{:}".format(xs))
+print(f"{5:}", f"{'s':}", f"{2.5:}")
 "#,
     );
 }

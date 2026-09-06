@@ -500,13 +500,22 @@ Divergences to know about:
 
 - **No normalization or grapheme clusters.** `len` counts code points, as
   CPython does, so `"e"` followed by a combining acute is `2`, not `1`.
+- **Sets iterate in insertion order.** CPython iterates in hash order, which
+  it does not specify and which *varies between runs* for str elements
+  because string hashing is randomized per process — three consecutive runs
+  of `print({"apple", "banana", "cherry", "date"})` will not agree. So there
+  is no CPython order to match; sort (`sorted(s)`) when output order matters,
+  which CPython requires for the same reason.
 - **Casing is not locale-sensitive.** `"İ".lower()` matches CPython's
   default two-code-point result, not the Turkish-locale one.
-- **Indexing a non-ASCII string is O(n), not O(1).** Strings are stored as
-  UTF-8, so `s[i]` scans. Sequential access — `for c in s`, or
-  `for i in range(len(s))` — is amortised O(1) per step, so ordinary loops
-  stay linear; random access into a large non-ASCII string does not. ASCII
-  strings are O(1) throughout.
+- **Indexing a non-ASCII string is amortised O(1), not exactly O(1).**
+  Strings are stored as UTF-8, so `s[i]` has to find the i-th code point.
+  Sequential access — `for c in s`, or `for i in range(len(s))` — is served
+  by a one-entry memo, and scattered access by a sampled index built lazily
+  for the string being indexed (the byte offset of every 32nd code point, so
+  a lookup scans at most 32). Both are O(1) with a small constant; the index
+  costs one word per 32 code points, for one string at a time. ASCII strings
+  are exactly O(1) and build nothing.
 - **No `bytes` / `bytearray` / `.encode()`, and no codec but UTF-8.**
   Lone-surrogate behavior is unspecified: `chr(0xD800)` produces bytes that
   the CPython extension bridge rejects.

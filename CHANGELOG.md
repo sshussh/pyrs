@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+Review follow-ups: the shortcomings recorded during the 0.90-0.108 series.
+
+- **`KeyError` display vs storage.** `str(KeyError("k"))` was unquoted where
+  CPython gives `'k'`, and the internal raise sites had the mirror-image bug:
+  they stored the *pre-quoted* text, so `e.args[0]` for `d["z"]` came back as
+  three characters rather than one — a wrong value, not just wrong text. The
+  exception now stores `args[0]` raw plus the tag of that argument, so display
+  applies CPython's `repr(args[0])` rule while storage stays the key itself.
+  The tag is what the earlier reverted attempt lacked: without it, quoting at
+  display could not tell a str key from an int one and regressed
+  `s.remove(2)` to `KeyError: '2'`, which is now a test.
+- **`ascii()` of a container** now works: the same rendering as `repr`, with
+  non-ASCII escaped inside the elements.
+- **An empty format spec on a container** (`f"{xs:}"`) was rejected. CPython
+  treats `{x:}` as `str(x)` for every type; only a *non-empty* spec reaches
+  `list.__format__` and raises, and that stays rejected.
+- **Scattered indexing of a non-ASCII string** was O(n) per lookup: 118 ms
+  against 2 ms for the same loop over ASCII, and 12 ms for CPython. The hot
+  string now gets a lazily built sampled index — the byte offset of every 32nd
+  code point — alongside the existing forward memo. The same benchmark is
+  3 ms, sequential walks are unchanged, and ASCII still builds nothing.
+
+Set iteration order is documented rather than changed, because it cannot be
+matched: CPython's order for str elements varies between runs (randomized
+string hashing), so there is no single order to target. `sorted()` is the
+answer there, in CPython too.
+
+
 Review fixes on the 0.90–0.108 series.
 
 - **A missing tuple key crashed instead of raising `KeyError`.** All four miss

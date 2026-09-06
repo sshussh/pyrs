@@ -1149,6 +1149,9 @@ pub enum ExprKind {
     /// CPython, and identical to what `print` writes. Codegen dispatches on
     /// the operand's own type, so one node covers every container.
     ContainerRepr(Box<Expr>),
+    /// `ascii(c)` for a container: the same rendering with non-ASCII escaped
+    /// inside the elements.
+    ContainerAscii(Box<Expr>),
     /// `format(value, spec)` — free-form format mini-language; `spec` is `Str`.
     /// `value` is Int / Float / Bool / Str. Empty `spec` matches `str(value)`.
     FormatValue {

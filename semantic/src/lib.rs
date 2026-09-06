@@ -25615,6 +25615,16 @@ fn render_field(
                     span,
                 ));
             }
+            // `{x:}` is `{x}`: CPython's empty spec means `str(x)` for every
+            // type, containers included -- only a *non-empty* spec reaches
+            // list.__format__ and raises.
+            if matches!(&spec_ir.kind, ir::ExprKind::ConstStr(t) if t.is_empty()) {
+                return if converted.ty == ir::Ty::Str {
+                    Ok(converted)
+                } else {
+                    lower_cast(ast::TypeName::Str, converted, span)
+                };
+            }
             // Static check: only scalar types we can format.
             match converted.ty {
                 ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => {}
@@ -25675,15 +25685,17 @@ fn lower_repr_like(value: ir::Expr, ascii: bool, span: Span) -> SResult<ir::Expr
             ty: ir::Ty::Str,
             kind: ir::ExprKind::ExcRepr(Box::new(value)),
         }),
-        // `repr` of a container is its `str`, which is what `print` writes.
-        // `ascii` is not: it would have to escape non-ASCII *inside* the
-        // elements, and the shared rendering does not do that.
-        ir::Ty::List(_) | ir::Ty::Tuple(_) | ir::Ty::Dict { .. } | ir::Ty::Set(_) if !ascii => {
-            Ok(ir::Expr {
-                ty: ir::Ty::Str,
-                kind: ir::ExprKind::ContainerRepr(Box::new(value)),
-            })
-        }
+        // `repr` of a container is its `str`, which is what `print` writes;
+        // `ascii` is the same rendering with non-ASCII escaped inside the
+        // elements, which the shared printer does under a flag.
+        ir::Ty::List(_) | ir::Ty::Tuple(_) | ir::Ty::Dict { .. } | ir::Ty::Set(_) => Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: if ascii {
+                ir::ExprKind::ContainerAscii(Box::new(value))
+            } else {
+                ir::ExprKind::ContainerRepr(Box::new(value))
+            },
+        }),
         other => Err(err(
             format!(
                 "{}() cannot convert {other} yet",
