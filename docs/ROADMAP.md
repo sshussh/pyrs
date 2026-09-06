@@ -673,6 +673,18 @@ probes append to it.
 | `[1, 2.5, 1]` | `[1, 2.5, 1]` | `[1, 2.5, 1]` | **closed in 0.89** |
 | `a != b`, `a: Base` holding a `Child` defining `__ne__` | `Child.__ne__` runs | `Child.__ne__` runs | **closed in 0.89** |
 | `def f(x: "Base")` | accepted | accepted | **closed in 0.87** |
+| `str(KeyError("k"))` | `'k'` | `k` | open — see below |
+
+`KeyError.__str__` is CPython's `repr(args[0])`, so a str key displays quoted
+and an int key does not. Every *internal* raise site already formats
+correctly, because it knows the key's type: `d["z"]` reports `KeyError: 'z'`
+and `s.remove(2)` reports `KeyError: 2`, both matching. Only an explicit
+`raise KeyError("k")` is unquoted. Fixing it needs a display-vs-storage
+distinction on the exception itself: quoting the stored message would make
+`e.args[0]` wrong, which today is right, and quoting at display cannot tell a
+str key from an int one. An attempt to normalize the raise sites and quote at
+display was reverted for exactly that reason — `s.remove(2)` regressed to
+`KeyError: '2'`.
 
 ## Product contract
 
