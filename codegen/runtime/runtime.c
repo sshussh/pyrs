@@ -2761,6 +2761,56 @@ void pyrs_print_list(const PyrsList *l, int tag) {
     out_putc(']');
 }
 
+/* ---- repr through capture ----
+ *
+ * `str(xs)` and `repr(xs)` of a container are the same text `print` writes,
+ * so these render through the print routines rather than duplicating them.
+ * Each redirects the sink into a local buffer and copies the result out.
+ * The previous sink is saved and restored, so nesting is harmless. */
+static OutBuf *capture_begin(OutBuf *buf) {
+    buf->buf = NULL;
+    buf->len = 0;
+    buf->cap = 0;
+    OutBuf *prev = g_capture;
+    g_capture = buf;
+    return prev;
+}
+
+static PyrsStr *capture_end(OutBuf *buf, OutBuf *prev) {
+    g_capture = prev;
+    PyrsStr *r = str_from_utf8(buf->len ? buf->buf : "", (long long)buf->len);
+    free(buf->buf);
+    return r;
+}
+
+PyrsStr *pyrs_repr_list(const PyrsList *l, int tag) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_list(l, tag);
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_repr_tuple(const PyrsTuple *t) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_tuple(t);
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_repr_dict(const PyrsDict *d) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_dict(d);
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_repr_set(const PyrsSet *s) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_set(s);
+    return capture_end(&buf, prev);
+}
+
 void pyrs_print_sep(void) {
     fputc(' ', stdout);
 }
@@ -5947,12 +5997,24 @@ struct PyrsDict {
 };
 
 
-static void die_keyerror_int(long long key) {
-    long long n;
-    char *s = int_to_dec(key, &n);
+/* CPython's KeyError text is repr(key): an int bare, a str quoted, a tuple
+ * parenthesised. print_slot already renders every key tag exactly that way,
+ * so capture it rather than formatting per tag -- which is what the four
+ * call sites used to do, and why a tuple key reached the integer path and
+ * read the tuple pointer as a tagged bigint.
+ *
+ * The message is copied to the stack and the buffer freed before dying,
+ * because pyrs_die unwinds to an enclosing `except` rather than exiting: a
+ * caught KeyError in a loop must not leak per iteration. */
+static void die_keyerror(long long key, int key_tag) {
+    OutBuf out;
+    OutBuf *prev = capture_begin(&out);
+    print_slot(key, key_tag);
+    g_capture = prev;
     char buf[512];
-    snprintf(buf, sizeof buf, "KeyError: %.496s", s);
-    free(s);
+    int n = (int)(out.len < 490 ? out.len : 490);
+    snprintf(buf, sizeof buf, "KeyError: %.*s", n, out.len ? out.buf : "");
+    free(out.buf);
     pyrs_die(buf);
 }
 
@@ -6125,20 +6187,7 @@ long long pyrs_dict_get(const PyrsDict *d, long long key, int key_tag) {
     int found;
     long long idx = dict_lookup(d, key, key_tag, &found);
     if (!found) {
-        /* KeyError message like CPython */
-        if (key_tag == TAG_STR) {
-            /* build KeyError: '...' using repr-ish single quotes for simple keys */
-            const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
-            char buf[256];
-            if (s->len < 200) {
-                snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)s->len, s->data);
-            } else {
-                snprintf(buf, sizeof buf, "KeyError");
-            }
-            pyrs_die(buf);
-        } else {
-            die_keyerror_int(key);
-        }
+        die_keyerror(key, key_tag);
     }
     return d->table[idx].val;
 }
@@ -6305,14 +6354,7 @@ void pyrs_dict_del(PyrsDict *d, long long key, int key_tag) {
     int found;
     long long idx = dict_lookup(d, key, key_tag, &found);
     if (!found) {
-        if (key_tag == TAG_STR) {
-            const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
-            char buf[256];
-            snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)s->len, s->data);
-            pyrs_die(buf);
-        } else {
-            die_keyerror_int(key);
-        }
+        die_keyerror(key, key_tag);
     }
     d->table[idx].state = 2;
     d->len--;
@@ -6363,14 +6405,7 @@ long long pyrs_dict_pop(PyrsDict *d, long long key, int key_tag, int has_default
             *out = default_slot;
             return 1;
         }
-        if (key_tag == TAG_STR) {
-            const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
-            char buf[256];
-            snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)s->len, s->data);
-            pyrs_die(buf);
-        } else {
-            die_keyerror_int(key);
-        }
+        die_keyerror(key, key_tag);
     }
     *out = d->table[idx].val;
     d->table[idx].state = 2;
@@ -6639,14 +6674,7 @@ void pyrs_set_remove(PyrsSet *s, long long key, int key_tag) {
     int found;
     long long idx = set_lookup(s, key, key_tag, &found);
     if (!found) {
-        if (key_tag == TAG_STR) {
-            const PyrsStr *str = (const PyrsStr *)(uintptr_t)key;
-            char buf[256];
-            snprintf(buf, sizeof buf, "KeyError: '%.*s'", (int)str->len, str->data);
-            pyrs_die(buf);
-        } else {
-            die_keyerror_int(key);
-        }
+        die_keyerror(key, key_tag);
     }
     s->table[idx].state = 2;
     s->len--;
@@ -6726,56 +6754,6 @@ void pyrs_print_set(const PyrsSet *s) {
         print_slot(e->key, e->key_tag);
     }
     out_putc('}');
-}
-
-/* ---- repr through capture ----
- *
- * `str(xs)` and `repr(xs)` of a container are the same text `print` writes,
- * so these render through the print routines rather than duplicating them.
- * Each redirects the sink into a local buffer and copies the result out.
- * The previous sink is saved and restored, so nesting is harmless. */
-static OutBuf *capture_begin(OutBuf *buf) {
-    buf->buf = NULL;
-    buf->len = 0;
-    buf->cap = 0;
-    OutBuf *prev = g_capture;
-    g_capture = buf;
-    return prev;
-}
-
-static PyrsStr *capture_end(OutBuf *buf, OutBuf *prev) {
-    g_capture = prev;
-    PyrsStr *r = str_from_utf8(buf->len ? buf->buf : "", (long long)buf->len);
-    free(buf->buf);
-    return r;
-}
-
-PyrsStr *pyrs_repr_list(const PyrsList *l, int tag) {
-    OutBuf buf;
-    OutBuf *prev = capture_begin(&buf);
-    pyrs_print_list(l, tag);
-    return capture_end(&buf, prev);
-}
-
-PyrsStr *pyrs_repr_tuple(const PyrsTuple *t) {
-    OutBuf buf;
-    OutBuf *prev = capture_begin(&buf);
-    pyrs_print_tuple(t);
-    return capture_end(&buf, prev);
-}
-
-PyrsStr *pyrs_repr_dict(const PyrsDict *d) {
-    OutBuf buf;
-    OutBuf *prev = capture_begin(&buf);
-    pyrs_print_dict(d);
-    return capture_end(&buf, prev);
-}
-
-PyrsStr *pyrs_repr_set(const PyrsSet *s) {
-    OutBuf buf;
-    OutBuf *prev = capture_begin(&buf);
-    pyrs_print_set(s);
-    return capture_end(&buf, prev);
 }
 
 int pyrs_set_eq(const PyrsSet *a, const PyrsSet *b) {

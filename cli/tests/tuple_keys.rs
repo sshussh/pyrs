@@ -422,6 +422,70 @@ print(len(counts), total, counts[("k0", 0)])
 }
 
 // ---------------------------------------------------------------------------
+// Misses
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_tuple_key_raises_keyerror_showing_the_tuple() {
+    // Every miss path fed the key to an int-only formatter, so a tuple key
+    // was read as a tagged bigint -- MemoryError, not KeyError.
+    matches_python(
+        "miss-paths",
+        r#"
+dt = {(1, 2): "a"}
+try:
+    print(dt[(9, 9)])
+except KeyError as e:
+    print("get:", e)
+try:
+    del dt[(7, 8)]
+except KeyError as e:
+    print("del:", e)
+try:
+    dt.pop((7, 8))
+except KeyError as e:
+    print("pop:", e)
+st = {(1, 2)}
+try:
+    st.remove((3, 4))
+except KeyError as e:
+    print("remove:", e)
+nested = {("a", (1, 2)): 1}
+try:
+    print(nested[("a", (3, 4))])
+except KeyError as e:
+    print("nested:", e)
+"#,
+    );
+}
+
+#[test]
+fn int_and_str_key_misses_keep_cpythons_quoting() {
+    // KeyError text is repr(key): a str quoted, an int bare. Both now go
+    // through the same renderer as the tuple case.
+    matches_python(
+        "miss-scalars",
+        r#"
+ds = {"s": 1}
+di = {5: 2}
+try:
+    print(ds["zz"])
+except KeyError as e:
+    print("str:", e)
+try:
+    print(di[7])
+except KeyError as e:
+    print("int:", e)
+sl = {2}
+try:
+    sl.remove(3)
+except KeyError as e:
+    print("set int:", e)
+"#,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Rejections
 // ---------------------------------------------------------------------------
 

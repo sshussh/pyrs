@@ -153,7 +153,7 @@
         "numpy"
       ],
       "native": "unsupported",
-      "diagnostic": "expected ')' after method arguments, found '@'",
+      "diagnostic": "the matrix multiplication operator '@' is not supported",
       "reason": "Matrix multiplication syntax is not parsed."
     },
     {
@@ -174,8 +174,7 @@
         "pandas"
       ],
       "native": "unsupported",
-      "diagnostic": "expected ']' to close the subscript, found ','",
-      "reason": "Tuple subscript syntax is not parsed."
+      "diagnostic": "No module named 'pandas'"
     },
     {
       "id": "pandas-csv-effects",

@@ -141,6 +141,12 @@ fn park(lex: &mut logos::Lexer<Token>, r: Result<String, String>) -> Option<Stri
 /// quote that delimits the f-string (`f"{d["k"]}"`), so the closing quote is
 /// only the one seen at brace depth zero and outside any nested literal.
 /// Returns `None` (unterminated) after consuming the rest of the line.
+///
+/// Escapes are decoded in the *literal* chunks only. Replacement-field source
+/// is handed on verbatim, because the parser re-lexes it: decoding it here
+/// too would apply the outer string's escaping to the inner literal as well,
+/// so `f"{'\\n'}"` -- two characters, backslash and `n` -- would collapse to a
+/// newline. The depth tracking this scan already does marks the boundaries.
 fn lex_fstring(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
     let rem = lex.remainder();
     let b = rem.as_bytes();
@@ -148,6 +154,9 @@ fn lex_fstring(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
     let mut depth = 0i32;
     // Open quotes of string literals inside a replacement field.
     let mut nested: Vec<u8> = Vec::new();
+    // Payload assembled so far, and the start of the pending literal chunk.
+    let mut out = String::new();
+    let mut chunk = 0usize;
     while i < b.len() {
         let c = b[i];
         if c == b'\\' {
@@ -168,9 +177,13 @@ fn lex_fstring(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
             continue;
         }
         if depth == 0 && c == quote {
-            let inner = rem[..i].to_string();
             lex.bump(i + 1);
-            return park(lex, unescape_contents(&inner));
+            let tail = match unescape_contents(&rem[chunk..i]) {
+                Ok(v) => v,
+                Err(msg) => return park(lex, Err(msg)),
+            };
+            out.push_str(&tail);
+            return Some(out);
         }
         match c {
             // `{{` / `}}` are escaped braces, but only outside a field.
@@ -184,8 +197,28 @@ fn lex_fstring(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
             }
             // Inside a field a brace is a dict/set literal or a nested
             // field; either way it nests.
-            b'{' => depth += 1,
-            b'}' if depth > 0 => depth -= 1,
+            b'{' => {
+                if depth == 0 {
+                    // End of a literal chunk: decode it, then copy the field
+                    // source through untouched.
+                    match unescape_contents(&rem[chunk..i]) {
+                        Ok(v) => out.push_str(&v),
+                        Err(msg) => {
+                            lex.bump(i);
+                            return park(lex, Err(msg));
+                        }
+                    }
+                    chunk = i;
+                }
+                depth += 1;
+            }
+            b'}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push_str(&rem[chunk..=i]);
+                    chunk = i + 1;
+                }
+            }
             b'\'' | b'"' if depth > 0 => nested.push(c),
             _ => {}
         }
@@ -217,10 +250,53 @@ fn lex_triple_single(lex: &mut logos::Lexer<Token>) -> Option<String> {
 }
 
 fn lex_triple(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
+    lex_triple_inner(lex, quote, false)
+}
+
+/// Shared by plain and f-string triples. When `fstring`, escapes are decoded
+/// in the literal chunks only and replacement-field source is passed through
+/// verbatim, for the reason given on [`lex_fstring`]: the parser re-lexes the
+/// field, so decoding it here would apply the outer escaping twice.
+fn lex_triple_inner(lex: &mut logos::Lexer<Token>, quote: u8, fstring: bool) -> Option<String> {
     let rem = lex.remainder();
     let bytes = rem.as_bytes();
     let mut i = 0;
+    let mut depth = 0i32;
+    let mut out = String::new();
+    let mut chunk = 0usize;
     while i + 2 < bytes.len() {
+        if fstring && depth == 0 && bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
+            i += 2;
+            continue;
+        }
+        if fstring && depth == 0 && bytes[i] == b'}' && bytes.get(i + 1) == Some(&b'}') {
+            i += 2;
+            continue;
+        }
+        if fstring && bytes[i] == b'{' {
+            if depth == 0 {
+                match unescape_contents(&rem[chunk..i]) {
+                    Ok(v) => out.push_str(&v),
+                    Err(msg) => {
+                        lex.bump(i);
+                        return park(lex, Err(msg));
+                    }
+                }
+                chunk = i;
+            }
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if fstring && bytes[i] == b'}' && depth > 0 {
+            depth -= 1;
+            if depth == 0 {
+                out.push_str(&rem[chunk..=i]);
+                chunk = i + 1;
+            }
+            i += 1;
+            continue;
+        }
         if bytes[i] == b'\\' {
             // skip the backslash and the escaped unit; for line
             // continuation also skip a full \r\n pair so the closer is
@@ -239,9 +315,13 @@ fn lex_triple(lex: &mut logos::Lexer<Token>, quote: u8) -> Option<String> {
             continue;
         }
         if bytes[i] == quote && bytes[i + 1] == quote && bytes[i + 2] == quote {
-            let inner = rem[..i].to_string();
             lex.bump(i + 3);
-            return park(lex, unescape_contents(&inner));
+            let tail = match unescape_contents(&rem[chunk..i]) {
+                Ok(v) => v,
+                Err(msg) => return park(lex, Err(msg)),
+            };
+            out.push_str(&tail);
+            return Some(out);
         }
         i += 1;
     }
@@ -329,7 +409,7 @@ fn lex_triple_fstring(lex: &mut logos::Lexer<Token>) -> Option<String> {
         Some(b'\'') => b'\'',
         _ => return None,
     };
-    lex_triple(lex, quote)
+    lex_triple_inner(lex, quote, true)
 }
 
 /// A malformed escape can only be signalled from a string callback as
