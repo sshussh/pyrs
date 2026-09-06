@@ -3621,7 +3621,7 @@ fn try_type_ast_expr(
                     None => t,
                     // Element joining, not scalar storage joining: keep mixed
                     // numerics as a union so the literal's values survive.
-                    Some(prev) => join_elem_types(prev, t)?,
+                    Some(prev) => seed_join(prev, t)?,
                 });
             }
             Some(ir::list_of(elem?))
@@ -6273,6 +6273,24 @@ fn seed_globals_from_script(
     }
 }
 
+/// Join two seeded element types.
+///
+/// The literal rule (`join_elem_types`) is what lowering will use, so the seed
+/// has to agree with it or the global's storage type and its initializer
+/// disagree. It declines a provisional `list[Any]` from an empty literal,
+/// though — `{"a": ["b"], "d": []}` is a `dict[str, list[str]]` — so that one
+/// case falls back to the assignment join, which resolves it the same way.
+fn seed_join(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
+    if let Some(t) = join_elem_types(a, b) {
+        return Some(t);
+    }
+    let provisional = |t: ir::Ty| matches!(t, ir::Ty::List(e) if *e == ir::Ty::Any);
+    if provisional(a) || provisional(b) {
+        return Some(join_types(a, b));
+    }
+    Option::None
+}
+
 fn seed_ty_from_expr(e: &ast::Expr) -> Option<ir::Ty> {
     match &e.kind {
         ast::ExprKind::Int(_) | ast::ExprKind::IntDigits(_) => Some(ir::Ty::Int),
@@ -6283,6 +6301,59 @@ fn seed_ty_from_expr(e: &ast::Expr) -> Option<ir::Ty> {
         // Module-level empty lists: pre-seed as list[Any] so nested free reads
         // (before entry init runs) resolve the name.
         ast::ExprKind::ListLit(items) if items.is_empty() => Some(ir::list_of(ir::Ty::Any)),
+        // Container literals, so a module-level table or config is visible to
+        // functions the way a module-level scalar already is. Any element this
+        // cannot type leaves the whole global unseeded, which is the safe
+        // direction: the name is then simply not in scope, as before.
+        ast::ExprKind::ListLit(items) => {
+            let mut elem: Option<ir::Ty> = Option::None;
+            for it in items {
+                let ast::ListElem::Item(e) = it else {
+                    return Option::None;
+                };
+                let t = seed_ty_from_expr(e)?;
+                elem = Some(match elem {
+                    Option::None => t,
+                    Some(prev) => seed_join(prev, t)?,
+                });
+            }
+            Some(ir::list_of(elem?))
+        }
+        ast::ExprKind::TupleLit(items) => {
+            let mut ts = Vec::with_capacity(items.len());
+            for it in items {
+                ts.push(seed_ty_from_expr(it)?);
+            }
+            Some(ir::tuple_of(&ts))
+        }
+        ast::ExprKind::DictLit(items) if !items.is_empty() => {
+            let mut kt: Option<ir::Ty> = Option::None;
+            let mut vt: Option<ir::Ty> = Option::None;
+            for (k, v) in items {
+                let k = seed_ty_from_expr(k)?;
+                let v = seed_ty_from_expr(v)?;
+                kt = Some(match kt {
+                    Option::None => k,
+                    Some(prev) => seed_join(prev, k)?,
+                });
+                vt = Some(match vt {
+                    Option::None => v,
+                    Some(prev) => seed_join(prev, v)?,
+                });
+            }
+            Some(ir::dict_of(kt?, vt?))
+        }
+        ast::ExprKind::SetLit(items) if !items.is_empty() => {
+            let mut elem: Option<ir::Ty> = Option::None;
+            for it in items {
+                let t = seed_ty_from_expr(it)?;
+                elem = Some(match elem {
+                    Option::None => t,
+                    Some(prev) => seed_join(prev, t)?,
+                });
+            }
+            Some(ir::set_of(elem?))
+        }
         ast::ExprKind::Unary {
             op: ast::UnaryOp::Neg | ast::UnaryOp::Invert,
             operand,
@@ -7510,7 +7581,7 @@ fn guess_expr_ty(
                 let t = guess_expr_ty(e, params, globals, known)?;
                 ety = Some(match ety {
                     None => t,
-                    Some(prev) => join_elem_types(prev, t)?,
+                    Some(prev) => seed_join(prev, t)?,
                 });
             }
             ety.map(ir::list_of)
@@ -15646,6 +15717,23 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
     if value.ty == target {
         return Ok(value);
     }
+    // An empty `[]` has no element type to infer, so it is typed provisionally
+    // as `list[Any]`. It is compatible with any list, and the runtime value --
+    // a length-zero list -- is identical, so it just takes the target's type.
+    // Without this, an empty literal nested in a container is rejected:
+    // `[["a"], []]` and `{"a": ["b"], "d": []}` are ordinary Python.
+    if matches!(target, ir::Ty::List(_))
+        && value.ty == ir::list_of(ir::Ty::Any)
+        && matches!(
+            value.kind,
+            ir::ExprKind::ListLit(ref items) if items.is_empty()
+        )
+    {
+        return Ok(ir::Expr {
+            ty: target,
+            kind: value.kind,
+        });
+    }
     // Concrete → Any (dynamic box).
     if target == ir::Ty::Any {
         if !can_box_as_any(value.ty) {
@@ -18967,7 +19055,11 @@ fn lower_list_lit(
                     LoweredElem::Item(item, item_span) => {
                         ty_opt = Some(match ty_opt {
                             None => item.ty,
-                            Some(prev) => join_elem_types(prev, item.ty).ok_or_else(|| {
+                            // `seed_join`, not `join_elem_types`: an empty `[]`
+                            // element is a provisional `list[Any]`, so
+                            // `[["a"], []]` is a `list[list[str]]` rather than
+                            // a type error.
+                            Some(prev) => seed_join(prev, item.ty).ok_or_else(|| {
                                 err(
                                     format!(
                                         "list elements must share one type; found {} and {}",
@@ -19178,10 +19270,12 @@ fn lower_dict_lit(
                         *kspan,
                     )
                 })?;
-                vt = join_elem_types(vt, vr.ty).unwrap_or(vt);
+                // `seed_join`, not `join_elem_types`: an empty `[]` value is a
+                // provisional `list[Any]`, so `{"a": ["b"], "d": []}` is a
+                // `dict[str, list[str]]` rather than a type error.
+                vt = seed_join(vt, vr.ty).unwrap_or(vt);
                 if vt != vr.ty {
-                    // try join for values
-                    vt = join_elem_types(vt, vr.ty).ok_or_else(|| {
+                    vt = seed_join(vt, vr.ty).ok_or_else(|| {
                         err(
                             format!("dict values must share one type; found {vt} and {}", vr.ty),
                             *vspan,

@@ -10,9 +10,10 @@ set. **0.93.0** adds conditional expressions, **0.94.0** user-defined
 exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.96.0** generator expressions, **0.97.0** lambda parameter inference and
 **0.98.0** iterable coverage for the eager builtins, **0.99.0** bare `raise`
-**0.100.0** `str.format()` / `%` formatting and **0.101.0** tuple sort keys.
-The next milestone is **0.102.0**; reaching a particular minor version does
-not establish 1.0 readiness, and no stable release or tag has been created.
+**0.100.0** `str.format()` / `%` formatting, **0.101.0** tuple sort keys and
+**0.102.0** module-level containers. The next milestone is **0.103.0**;
+reaching a particular minor version does not establish 1.0 readiness, and no
+stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -101,6 +102,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.102 on the same host:
+
+| Check | Result after 0.102 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1261 passed; none failed or ignored (8 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 48 pass / 0 known_gap; compat 16 pass |
+| `pyrs --version` | `PyRs 0.102.0` |
 
 After 0.101 on the same host:
 
@@ -320,6 +332,34 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.102.0: module-level containers are visible to functions
+
+A module-level scalar could already be read from a function; a list, dict, set
+or tuple could not, and reported `name 'X' is not defined`. A lookup table or
+config dict at module scope is ordinary Python.
+
+The milestone contract is:
+
+- Global storage types are seeded from container literals, nested ones
+  included, so a module-level table is readable from a function. Anything the
+  seeder cannot type leaves that global unseeded -- the safe direction, since
+  the name is then simply not in scope as before.
+- An empty `[]` nested inside a container takes the surrounding element type
+  rather than being rejected.
+- Global containers remain shared state, not copies.
+
+The second item is the interesting one. `[]` has no element type, so it is
+typed provisionally as `list[Any]`; `xs: list[str] = []` and `f([])` already
+worked because an annotation or a parameter supplied the type, but nested in a
+container literal nothing did, and `[["a"], []]` was a type error. Both the
+list-element and dict-value joins now accept a provisional empty list, and
+`coerce` gives it the target list type -- the runtime value, a length-zero
+list, is identical either way.
+
+Found by running small realistic programs against CPython rather than probing
+constructs; a graph-traversal script needed the first item, and the second
+surfaced while fixing it.
 
 ## 0.101.0: tuple sort keys
 
@@ -798,8 +838,9 @@ documentation and the relevant gates.
 - [x] Exact mixed integer/float comparisons, including bigints, NaN,
       infinities, signed zero and boxed/container equality.
 - [ ] Definite assignment for every binding kind. Locals and generator
-      suspension are done; module globals, deleted bindings and static
-      use-before-assignment diagnostics remain.
+      suspension are done; deleted bindings and static use-before-assignment
+      diagnostics remain. Module-level containers became readable from
+      functions in 0.102 (scalars already were).
 - [ ] Preserve Python numeric types across assignments, annotations,
       heterogeneous literals, `min`/`max` and boolean operand selection.
 - [ ] Audit evaluation order and once-only evaluation for calls, chained
