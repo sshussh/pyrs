@@ -2,27 +2,11 @@
 
 [![CI](https://github.com/sshussh/pyrs/actions/workflows/ci.yml/badge.svg)](https://github.com/sshussh/pyrs/actions/workflows/ci.yml)
 
-A Python compiler built in Rust, targeting native code through LLVM.
+A Python compiler written in Rust, emitting native code through LLVM.
 
-PyRs compiles a statically-typed subset of Python straight to machine code —
-no interpreter, no VM. Compute-bound code runs 45–60× faster than CPython
-(see [Benchmarks](#benchmarks)).
-
-**New here? The [PyRs Guide](docs/GUIDE.md) covers everything**: the CLI,
-the Makefile, the full language reference, every difference from CPython,
-runtime errors, and performance notes.
-
-**Toward 1.0:** the [roadmap](docs/ROADMAP.md) targets scientific/data
-workloads with native execution by default and explicit CPython compatibility
-mode for packages such as NumPy and pandas. See the [unreleased changes](CHANGELOG.md)
-and [compatibility probes](compatibility/README.md). This is ongoing work;
-0.82.0 is not a declaration of 1.0 readiness.
-
-This work landed on `main` in 0.86.0. The experimental
-[CPython bridge](docs/INTEROPERABILITY.md) compiles numerical functions into
-importable native extensions and can read NumPy float64 buffers without copying.
-It is the first step toward mixed Python/native execution and reusable native
-libraries. Stable 1.0 requires the release gates and user testing in the plan.
+PyRs compiles a **statically typed subset of Python** straight to machine
+code — no interpreter, no VM, no runtime dependency on CPython. Compute-bound
+code runs 6–170× faster than CPython ([benchmarks](#benchmarks)).
 
 ```console
 $ cat examples/fib.py
@@ -33,597 +17,148 @@ def fib(n: int) -> int:
 
 print(fib(30))
 
-$ pyrs compile -i examples/fib.py -o fib
-$ ./fib
+$ pyrs run -i examples/fib.py
 832040
 ```
 
-## Usage
+## What this is, and is not
+
+**It is a compiler for a subset.** Programs that compile are ordinary Python
+files — valid input to `python3`, ruff, black and mypy, with no pragmas,
+magic comments or custom syntax. That is a deliberate constraint, not a
+coincidence: it is what lets the existing Python ecosystem work on PyRs code
+unmodified.
+
+**It is not a CPython replacement.** The subset is statically typed and
+closed-world. There is no `eval`, no monkey-patching, no metaclasses, and the
+standard library is a small pure-PyRs core rather than a port. Code outside
+the subset is rejected at compile time with a diagnostic naming the feature,
+never silently mistranslated.
+
+**It is pre-1.0 and under active development.** Version numbers advance by
+milestone; reaching a particular minor version is not a readiness claim. No
+stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
+1.0 requires.
+
+Current milestone: **v0.110.0**.
+
+Correctness is measured rather than asserted: language features are
+differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
+[compatibility probes](compatibility/README.md) run whole programs under both
+engines and compare bytes.
+
+## Install
+
+Requires Rust (edition 2024), LLVM (`llvm-config` on `PATH`), CMake and a C
+compiler.
 
 ```console
-pyrs compile -i prog.py -o prog     # build a native executable
-pyrs run     -i prog.py             # compile and run immediately
-pyrs lex     -i prog.py             # dump tokens
-pyrs parse   -i prog.py             # dump the AST
-pyrs check   -i prog.py             # native frontend check; no execution
-pyrs prog.py arg1                   # native compile and run
-pyrs -c 'print(6 * 7)'              # native inline source
-pyrs --compat analysis.py          # whole-program CPython execution
-pyrs --compat --python .venv/bin/python -m package
+cargo build --release
 ```
 
-`compile` options: `-O 0..3` (optimization level, default 2) and
-`--emit-llvm` (also write the generated LLVM IR to `<output>.ll`).
+The resulting `target/release/pyrs` is self-contained: the C runtime,
+collector, Unicode tables and PyRs standard library are embedded in the
+binary, so compiled executables need no PyRs installation at run time.
 
-`--compat` uses the selected CPython environment, including its installed
-NumPy/pandas packages. It does not compile those libraries or provide a speedup.
-Select the interpreter with `--python`, then `PYRS_PYTHON`, otherwise `python3`.
-Native compilation never falls back automatically; `-m` currently requires
-compatibility mode. `pyrs -` reads source from stdin.
+## Using it
 
-To try native functions inside a Python environment with NumPy and pandas
-(Linux, CPython 3.12+ with development headers):
-
-```sh
-cargo build --release -p pyrs
-python3 examples/interop/demo.py --pyrs target/release/pyrs
+```console
+pyrs run -i prog.py              # compile and run
+pyrs compile -i prog.py -o prog  # build a native executable
+pyrs check -i prog.py            # type-check without building
+pyrs prog.py arg1 arg2           # python-style invocation
 ```
 
-The demo compiles [numerical kernels](examples/interop/kernels.py), passes pandas
-columns through NumPy buffers, checks results against Python and reports complete
-call timings. It also measures NumPy vectorized implementations for comparison.
-Build your own module with `pyrs build-extension -i kernels.py --module kernels_native
---python .venv/bin/python`; import `kernels_native` from that same environment.
-Only the exported kernels run natively; Python and package code keep using CPython.
+Builds are cached, so an unchanged `pyrs run` recompiles nothing:
 
-## The language (v0.110.0)
+| | cold | cached |
+|---|---:|---:|
+| unchanged program | 2610 ms | **11 ms** |
+| new program | 2610 ms | **84 ms** |
 
-Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.111.0**, not 1.0) until it is ready for
-**real-world use**; only then **1.0.0**. Crate versions and
-`pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
-for remaining readiness work. PyRs now ships its first default heap
-collector: a **nonmoving mark–sweep** backend with conservative native-root
-discovery. This replaces the old never-free runtime; it is the safe first
-backend, not the eventual moving generational/Immix design. See
-[Garbage collection](docs/GC.md). Classes remain a closed-world subset
-(v0.21 adds `__str__`/`__repr__`, zero-arg `super()`, and more kit — see
-below). No new stdlib until the language can host pure-PyRs libraries.
+For a project, configuration lives in `pyproject.toml` — the file the rest of
+the Python toolchain already reads:
 
-A statically-typed Python subset:
-
-- **Types:** `int` (arbitrary precision; tagged small / heap limbs), `float` (f64), `bool`, `str`, `None`,
-  unions (`int | None`, `str | int | None`), `Optional[T]`, limited
-  **`Any`** (dynamic slot box; concrete↔Any coerces with a runtime
-  TypeError check — not full CPython dynamism), `list[T]`,
-  `tuple[T1, T2, …]`, `dict[K, V]`, `set[T]` — including nested lists
-  (`list[list[float]]` matrices). Dict/set keys are `int`, `str`, or tuples of those;
-  list elements and dict values may be Optional/unions/`Any`; homogeneous
-  closures (same params/ret and capture env shape, with or without
-  captures) and user class instances may be list/tuple elements.
-  Multi-assign joins storage types
-  (`x = 1; x = "a"` → `int | str`; numeric multi-assign promotes).
-  Bare params may be inferred monomorphically from body usage
-  (arithmetic, comparisons, methods, indexing, `isinstance` branches);
-  empty `xs = []` followed by `xs.append(v)` / `insert` fixes `list[T]`;
-  unannotated empty `[]` with no append/insert defaults to **`list[Any]`**;
-  class names are valid type annotations (`def f(p: Point)`); annotations
-  still **fix** storage when present (not silently widened)
-- **Classes (v0.21):** `class C:` / `class D(C):` with instance methods
-  (`def m(self, …)`), fields assigned in `__init__` only (no class-body
-  attributes), construction `C(...)`, attribute load/store,
-  `self.method()`, single inheritance with override + virtual dispatch
-  when the static type is a base, **zero-arg `super().m(...)`** (static
-  parent call; cooperative `super().__init__`), `isinstance(obj, C)` with
-  inheritance, **`isinstance` flow narrowing to a more-specific subclass**
-  (subclass fields/methods after peel; mid-expression `isinstance(x, B)
-  and x.b`), subclass assignable where a base is expected (params,
-  returns, list append of `list[Base]`, unions containing the base),
-  cross-module `from m import C` / subclassing. **`__str__` / `__repr__`**
-  (must return `str`): used by `print`/`str()` with virtual dispatch when
-  present; default remains `<Name object>` (no address; runtime type_id).
-  **Also (v0.23+):** `@staticmethod` / `@classmethod` / read-only `@property`, bound methods as values,
-  `__iter__`/`__next__` for-loops, `__len__`/`__bool__`, class `with` context managers, single free-function
-  decorators, match class patterns.
-  **v0.25 protocol completion:** `__exit__` suppress (truthy return swallows the body exception);
-  exception path passes `__exit__(None, exc, None)` (type and traceback remain `None` — no exception
-  type objects / traceback objects yet); builtin `next(it)` / `next(it, default)` for user iterators
-  and generators; user-class `__contains__` for `in` / `not in`.
-  **v0.26:** `sorted(xs, key=f)`, `min(xs, key=f)`, `max(xs, key=f)` with a monomorphic
-  `key=` callable (`T →` sortable `int|float|bool|str`); desugared in semantic (no C comparator).
-  **v0.27:** `list.sort(key=f)` in-place with the same monomorphic `key=` surface (shared
-  desugar with `sorted`; `reverse=` still residual).
-  **v0.28:** `sorted(..., reverse=bool)` and `list.sort(reverse=bool)` (stable
-  reverse-sort-reverse; works with `key=`; `reverse=` must be `bool`).
-  **v0.29:** multi-arg `min(a, b, c, …)` / `max(…)` (numeric fold with
-  `bool`→`int`→`float` unify) and multi-arg with monomorphic `key=`
-  (`min(a, b[, c…], key=f)`); positionals must share one type when `key=` is used.
-  **v0.30:** `min`/`max` iterable `default=` (`min(xs, default=d)` /
-  `min(xs, key=f, default=d)`); empty → default (result type is
-  `join(elem, default)`); multi-arg form rejects `default=` like CPython.
-  **v0.31:** bare builtins as monomorphic `key=` — `len`, `abs`, and
-  casts `int`/`float`/`bool`/`str` on `sorted` / `list.sort` / `min` / `max`
-  (IR ops, not first-class values); other builtins still need a wrapper.
-  **v0.32:** lexicographic `min`/`max` for homogeneous `str` (multi-arg and
-  `list[str]` without `key=`); numeric multi-arg/list path unchanged.
-  **v0.33:** `sorted` / `list.sort` `reverse=` uses CPython truthiness
-  (`reverse=1` / runtime int, not only `bool`); const-folds 0/1/True/False.
-  **v0.34:** lexicographic tuple ordering (`<`/`<=`/`>`/`>=`), multi-arg and
-  list `min`/`max` over orderable tuples, and `sorted`/`list.sort` for
-  `list[tuple[…]]` (elements: int|float|bool|str or nested orderable tuples).
-  **v0.35:** lexicographic list ordering (`[1,2] < [1,3]`), multi-arg and
-  list `min`/`max` over orderable lists, and `sorted`/`list.sort` for
-  nested `list[list[…]]` of orderable elements.
-  **v0.36:** bare `key=len` on class instances that define `__len__` → `int`
-  (`sorted` / `list.sort` / `min` / `max`).
-  **v0.37:** `in` / `not in` for nested lists (`[1, 2] in [[1, 2], [3]]`),
-  using the same recursive equality as `==` / `list.index` / `list.remove`.
-  **v0.38:** `list.count(x)` with the same recursive equality (including
-  nested lists).
-  **v0.39:** `list.reverse()` in-place (statement only; `reversed(xs)` /
-  `xs[::-1]` still allocate a copy).
-  **v0.40:** `sum(xs, start)` / `sum(xs, start=s)` — numeric start (default
-  0 / 0.0); result type is `elem ⊔ start`.
-  **v0.41:** `del xs[i]` for lists (negative indices; OOB → same
-  `IndexError` as list assignment).
-  **v0.42:** class `==` / `!=` — `__eq__` when defined (virtual), else
-  pointer identity.
-  **v0.43:** list slice assignment `xs[lo:hi:step] = ys` and `del xs[lo:hi]`
-  (same-elem list RHS; extended slices require matching length).
-  **v0.44:** set `==` / `!=`, subset operators `<` / `<=` / `>` / `>=`, and
-  `issubset` / `issuperset` / `isdisjoint`.
-  **v0.45:** `round(x)` / `round(x, ndigits)` — ties to even; one-arg yields
-  `int`; two-arg keeps `int` or `float`.
-  **v0.46:** `ord(s)` / `chr(n)` — Unicode code point of a one-character
-  string, and the inverse (`chr` accepts `0 ..= 0x10FFFF`; `bool` → `int`).
-  String `len`/index agree with them since v0.90.
-  **v0.47:** integer literals `0x` / `0b` / `0o` (any case, PEP 515
-  underscores) convert to the same `int` as decimal; invalid prefixes
-  are compile errors.
-  **v0.48:** `print(..., sep=..., end=...)` — `sep`/`end` are `str` or
-  `None` (`None` restores the defaults `" "` / `"\\n"`).
-  **v0.49:** `hex(n)` / `bin(n)` / `oct(n)` — lowercase `0x` / `0b` / `0o`
-  strings (`hex(-10)` is `'-0xa'`); `bool` → `int` like `chr`.
-  **v0.50:** `dict.setdefault(k[, default])` — insert on miss and return the
-  stored value; bare form requires a value type that includes `None`.
-  **v0.51:** `divmod(a, b)` — `(a // b, a % b)` for int/bool/float (operands
-  evaluated once; mixed numeric promotes like `//`).
-  **v0.52:** `print(..., flush=...)` — CPython truthiness (`True`/`1` flush
-  stdout after writing; `False`/`0`/`None` no-op); `file=` still residual.
-  **v0.53:** `dict.popitem()` — LIFO last-inserted `(k, v)` pair; empty dict
-  raises `KeyError: 'popitem(): dictionary is empty'`.
-  **v0.54:** `str.removeprefix` / `str.removesuffix` — drop an exact prefix or
-  suffix when present (empty affix is a no-op).
-  **v0.55:** `str.partition` / `str.rpartition` — first/last split into
-  `(head, sep, tail)`; empty separator is `ValueError`.
-  **v0.56:** `pow(base, exp)` is `**`; `pow(base, exp, mod)` is modular
-  exponentiation (ints; negative exp is modular inverse).
-  **v0.57:** `str.rsplit` and optional `maxsplit` on `split`/`rsplit`
-  (`None` sep is whitespace; `maxsplit < 0` is unlimited).
-  **v0.58:** `int(s[, base])` and `float(s)` parse strings (CPython rules;
-  ASCII whitespace; `int` bases 0 and 2..=36; `float` accepts `inf`/`nan`).
-  **v0.59:** `str.index` and optional `start`/`end` on `find`/`index`/`rfind`/
-  `rindex` (CPython slice bounds; `None` allowed; miss is `-1` or ValueError).
-  **v0.60:** `str.replace(old, new[, count])` — `count < 0` is unlimited;
-  empty `old` inserts `new` between characters (capped by `count`).
-  **v0.61:** `str.splitlines([keepends])` — CPython line boundaries
-  (`\\n`/`\\r`/`\\r\\n`/`\\v`/`\\f`/C0 seps, UTF-8 U+0085/U+2028/U+2029);
-  truthy `keepends` keeps the break; trailing break does not add `''`.
-  **v0.62:** `str.count(sub[, start[, end]])` — same slice bounds as find;
-  empty needle is `len(slice)+1`; start past `len` is 0.
-  **v0.63:** `str.startswith`/`endswith` accept a tuple of strs and optional
-  `start`/`end` (same slice bounds as find).
-  **v0.64:** `str.capitalize` / `title` / `swapcase` (Unicode-aware since
-  v0.91; title words break on cased characters and use the titlecase
-  mapping, so `'` starts a new word like CPython).
-  **v0.65:** `str.zfill` / `center` / `ljust` / `rjust` — pad to width
-  (`zfill` keeps a leading `+`/`-`; fillchar is one character, counted in
-  code points since v0.90; extra center pad matches CPython 3.14).
-  **v0.66:** `str.isalnum` / `istitle` / `isascii` — ASCII predicates
-  (empty `isalnum`/`istitle` are False; empty `isascii` is True).
-  **v0.67:** `str.expandtabs([tabsize])` — tab stops (default 8);
-  `\\n`/`\\r` reset the column; `tabsize <= 0` deletes tabs.
-  **v0.68:** `str.strip` / `lstrip` / `rstrip` accept optional `chars`
-  (`None` or omitted is Unicode whitespace since v0.91; empty `chars` is a
-  no-op).
-  **v0.69:** `str.isdecimal` / `isnumeric` / `isidentifier` / `isprintable`
-  (Unicode 16.0.0 since v0.91: `"²"` is a digit but not a decimal, `café`
-  and `π` are identifiers, empty is printable).
-  **v0.70:** `tuple.count(x)` / `tuple.index(x)` — same tag+equality as `in`
-  (homogeneous coerces; miss is `ValueError: tuple.index(x): x not in tuple`).
-  **v0.71:** `list.index` / `tuple.index` accept optional `start`/`end`
-  (CPython slice bounds; `None` is a type error; miss is the same ValueError).
-  **v0.72:** `str.casefold()` — full Unicode case folding since v0.91, so
-  `"ß".casefold()` is `"ss"` and matches `"SS".casefold()`.
-  **v0.110:** projects — `[tool.pyrs]` in `pyproject.toml`, `pyrs init`,
-  project discovery, a declared import `root` for `src/` layouts, and
-  `execution = "compat"` declared rather than inferred; uv provides the
-  CPython interpreter when present, and is never required.
-  **v0.109:** build caching — the compiled C runtime and whole programs are
-  reused, so an unchanged `pyrs run` skips compilation entirely (2.6 s to
-  11 ms). `--no-cache` bypasses it.
-  **v0.108:** `str()` / `repr()` of a list / tuple / dict / set, so
-  `f"{xs}"` and `"%s" % xs` render the same text `print` writes; `repr` and
-  `ascii` are builtins.
-  **v0.107:** tuple dict/set keys — `{("idle", "go"): "running"}`, nested
-  tuples, and the `d[i, j]` subscript form they unblock.
-  **v0.106:** class-body constants `class C: LIMIT = 10` — read via `C.LIMIT`
-  or `self.LIMIT`, inherited, literal-valued (substituted at use, so not
-  assignable; an instance field of the same name shadows it).
-  **v0.105:** `zip` takes any number of iterables and `enumerate` takes
-  `start` positionally; both accept every iterable.
-  **v0.104:** `from typing import ...` loads (annotation-only), and
-  `Iterator[T]` / `Generator[T, None, None]` annotate a generator, so a
-  generator can be passed to a function.
-  **v0.103:** `self.x: T = value` declares an attribute's type, so empty
-  container attributes (`self.xs: list[int] = []`) are writable.
-  **v0.102:** module-level lists / dicts / sets / tuples are readable from
-  functions (scalars already were); an empty `[]` nested in a container takes
-  the surrounding element type.
-  **v0.101:** `key=` may return a tuple or list, so multi-criteria sorting
-  (`key=lambda p: (-p[1], p[0])`) works for sorted / sort / min / max.
-  **v0.100:** `"{}".format(...)` and `"%d" % ...` on literal format strings —
-  full spec mini-language, `!r`/`!s`/`!a`, printf flags/width/precision;
-  argument mistakes are compile errors.
-  **v0.99:** bare `raise` re-raises the exception the enclosing `except`
-  caught, keeping its type and message; outside a handler it is a compile
-  error.
-  **v0.98:** `sorted` / `sum` / `max` / `min` / `set` / `list` / `join` accept
-  any iterable — tuple, set, dict, str, range, generator (`list(range(n))`
-  materializes; `any`/`all` keep short-circuiting and exclude range).
-  **v0.97:** lambda parameter types inferred — from the element type for
-  `key=`, otherwise from body usage; `sorted(xs, key=lambda v: -v)` works.
-  **v0.96:** generator expressions `(f(x) for x in xs if p(x))` — lazy, bare
-  as a call's sole argument, `any`/`all` short-circuit through them.
-  **v0.95:** generators work with `list` / `set` / `sorted` / `sum` / `max` /
-  `min` / `join` / `any` / `all` (`any` and `all` short-circuit); an
-  unannotated generator infers its yield type from the first `yield`.
-  **v0.94:** user-defined exception classes `class E(Exception)` — full
-  hierarchy matching, `raise E` / `raise E()` / `raise E("msg")`; the class
-  is a tag and a name, so no methods, fields or use as a value.
-  **v0.93:** conditional expressions `a if c else b` — lazy (only the taken
-  branch runs), right-associative, `or`/`not` bind tighter; mixed numeric
-  branches keep each branch's own type.
-  **v0.73:** `str.maketrans` / `str.translate` — 2-arg maps strings of
-  equal character length; 3-arg also deletes; `translate` accepts
-  `dict[int, int]` or `dict[int, int | None]` (code point ordinals since
-  v0.90, as `ord` produces; replacements via `chr`).
-  **v0.74:** `set.copy()` — shallow copy (independent of later add/remove).
-  **v0.75:** `set.pop()` — remove and return an element (last-inserted);
-  empty is `KeyError: 'pop from an empty set'`.
-  **v0.76:** `set.intersection_update` / `difference_update` /
-  `symmetric_difference_update` and `&=` / `-=` / `^=` (in-place, same
-  element type; aliases see the mutation).
-  **v0.77:** `dict.fromkeys(iterable[, value])` — keys from `list`/`set` of
-  int or str, or a `str` (chars); omitted value is `None`.
-  **v0.78:** class `<` / `<=` / `>` / `>=` — `__lt__` / `__le__` / `__gt__` /
-  `__ge__` when defined on the left class (virtual, including inherited);
-  no identity fallback.
-  **v0.79:** `sorted` / `list.sort` / `min` / `max` of class instances that
-  define `__lt__` (virtual, including inherited; CPython uses `<` only);
-  empty iterable `min`/`max` matches the usual ValueError / `default=`.
-  **v0.80:** reflected class ordering — `a < b` tries `b.__gt__(a)` when the
-  left type has no `__lt__` (and the other swap pairs); subclass-first when
-  the right type is a proper subclass and defines the reflected slot.
-  No `NotImplemented` fallthrough. `sorted` / `min` / `max` accept `__gt__`
-  as well as `__lt__`.
-  **v0.81:** reflected class `==` / `!=` — `1 == P()` calls `P.__eq__(1)`
-  when the left type has no `__eq__` and the left type is assignable to
-  `other` (subclass-first when the right type is a proper subclass).
-  Identity remains only when neither side provides a usable `__eq__`.
-  **v0.82:** class `__getitem__` / `__setitem__` / `__delitem__` — `obj[k]`,
-  `obj[k] = v`, `del obj[k]`, and `obj[k] += v` (virtual, including
-  inherited). Slice syntax on a class is still residual.
-  **v0.83:** class `!=` uses `__ne__` when present (virtual, inherited,
-  reflected, subclass-first); otherwise it still inverts that receiver's
-  `__eq__`. Comparison and class-membership operands are evaluated once
-  in source order (needle before container).
-  **v0.89:** a class that defines `__eq__` but not `__ne__` (and has no
-  ancestor `__ne__`) gets a synthesized `__ne__` equivalent to
-  `not self.__eq__(other)`, dispatched through the normal virtual method
-  table — the same as CPython placing the default on `object`. Previously
-  the negated-`__eq__` fallback was chosen from the *static* type, so a
-  `Base`-typed variable holding a `Child` that overrides only `__ne__`
-  never reached it.
-  **v0.84:** user-iterator `for` / comprehensions treat `StopIteration`
-  from `__next__` as the loop terminator only; body and target-binding
-  exceptions propagate. List/set/dict comprehensions accept the same
-  iterables as `for` (range, list, str, tuple, dict keys, set, file,
-  generator, class `__iter__`).
-  **v0.85:** `list[C]` `==` / `!=` / `in` / `index` / `count` / `remove`
-  and tuple `==` / `!=` use class `__eq__` (virtual, inherited, identity
-  fallback). List `!=` negates element `==`, not `__ne__`. Homogeneous
-  `tuple[C, …]` `in` / `index` / `count` use the same protocol; mixed-tuple
-  membership stays slot identity.
-  **Not yet:** multiple inheritance, metaclasses, `__new__`/`__slots__`, open
-  `__dict__`, nested classes, class decorators, stacked free-function
-  decorators, two-arg `super()`, class-body attrs, first-class class values;
-  mixed non-numeric list **literals** need a union annotation (empty `[]` +
-  mixed appends join; common fields on class unions are readable;
-  exclusive subclass fields after multi-class `isinstance` use a
-  **runtime type_id switch** — AttributeError when the live instance
-  lacks the field; method calls on bare `Any` and open setattr remain
-  unsupported)
-- **Annotation syntax (v0.87):** annotations may be written as string
-  literals (`def f(other: "Node")`, `xs: "list[int]"`, `-> "int"`), the
-  PEP 484 forward-reference form that real typed Python uses everywhere and
-  that was mandatory before CPython 3.14 for a class naming itself. Quotes
-  add no meaning in PyRs, which resolves names after parsing the whole
-  module; nesting (`"list[Item]"`) and unions (`"int | None"`) work.
-  `from __future__ import ...` is accepted as the no-op directive it is in
-  Python 3, and an unknown feature is rejected with CPython's wording.
-  The `@` matrix-multiply operator is rejected with an explicit reason
-  (no array type) instead of a confusing parse error
-- **Functions:** `def` with optional parameter/return annotations
-  (defaults infer param types; bare params inferred from body when unique;
-  return type inferred from `return` when omitted), defaults and keyword
-  args, recursion, forward references;
-  pass/return tuples and other containers; nested `def` / `lambda` as
-  first-class closures (including in containers and sibling/forward
-  nested calls); late free-var binding (`def f(): return n` then
-  `n = 5`); `nonlocal`; generator functions with `yield` / `yield from`
-  (may escape, capture free vars, use `try`/`except`/`finally` including
-  yield in finally; `send` / `throw` / `close`)
-- **Statements:** `if`/`elif`/`else`, `while` / `for` (including
-  `else` on loops — runs only if no `break`),
-  `for x in range(...)` / lists / strings / files / tuples / dict keys /
-  sets / generators (including unpack targets `for a, b in xs` and
-  `for a, *rest in xs`), `break`/`continue`, assignments (plain, annotated,
-  multi-target, unpacking `a, b = t`, augmented — including
-  `xs[i] += v` and `s |= t` for sets), `del xs[i]` / `del xs[i:j]` / `del d[k]`, `return`, `pass`,
-  `raise ExcType("msg")`, `assert test` / `assert test, msg`
-  (`AssertionError`), `try`/`except`/`except (A, B)`/`else`/`finally`
-  (including inside generators),
-  `match`/`case` (literal, wildcard, capture, or-patterns, guards,
-  sequence with optional `*rest`, mapping with optional `**rest`,
-  `as` patterns, class patterns with positional/keyword fields)
-- **Expressions:** full arithmetic including `**`, comparisons with
-  chaining (`0 < x < 10`), `in`/`not in` (substring, list/tuple/set
-  membership including nested lists, dict keys),
-  assignment expressions `name := value` (walrus),
-  `is`/`is not` (None checks plus pointer/slot identity for same-type
-  heap objects and scalars), bitwise `& | ^ ~ << >>`
-  (and augassign) on int/bool; set `|` / `.union` / `|=`,
-  `and`/`or`/`not`
-  (short-circuit; `and`/`or` return an operand, not always `bool`, and
-  may yield a union when operands differ, e.g. `0 or "x"`), casts
-  `int()`/`float()`/`bool()`/`str()` (including `int(s[, base])` / `float(s)`
-  from strings), `len()`, `abs()`, `round()`, `hex()`/`bin()`/`oct()`, `divmod()`, `pow()`, `min()`/`max()`
-  (two-or-more numeric args, or one list: without `key=`
-  `list[int|float|bool|str|orderable tuple|orderable list|class with __lt__ or __gt__]`;
-  with monomorphic `key=` any `list[T]` or
-  multi-arg homogeneous candidates),
-  `sum()` on `list[int]`/`list[float]` (optional numeric `start=` /
-  positional start), `isinstance(x, T)` /
-  `isinstance(x, (T1,T2))` with flow-sensitive narrowing, `any`/`all`,
-  `enumerate`/`zip`/`reversed` (materialize to lists when used as values),
-  indexing with negative indices, full slicing `s[a:b:c]` including
-  `[::-1]` reversal, `print(...)` with any mix of values (including
-  tuples/dicts/sets) and `sep=` / `end=` (`str` or `None`) and `flush=`
-  (truthy → `fflush(stdout)`)
-- **f-strings:** `f"x={x}, next={x + 1}"` and multi-line `f"""…"""` /
-  `f'''…'''` with `{{`/`}}` escapes, nesting, conversions `!s`/`!r`/`!a`,
-  and free-form format specs (fill/align/sign/`#`/`0`/width/precision/
-  types `dboxXfeEgGs%`, nested `{x:{w}.{p}f}`); no `{x=}`, grouping
-  `,`/`_`, or types `n`/`c` yet; multi-line *expressions* inside `{...}`
-  need parentheses; same-delimiter triples inside `{...}` unsupported —
-  use the other quote style
-- **Strings:** immutable; single/double and triple-quoted literals
-  (`"""…"""` / `'''…'''`, multi-line; escapes as for single-line);
-  module/function first-statement string docstrings are accepted as
-  no-op expression statements (no `__doc__` attribute yet); `+` concat,
-  `*` repeat, lexicographic comparisons, indexing, slicing, `in`,
-  iteration, `len()`, `str(x)` conversions, and methods: `upper` `lower`
-  `casefold` `capitalize` `title` `swapcase` `zfill` `center` `ljust` `rjust`
-  `strip`/`lstrip`/`rstrip` (optional `chars`) `startswith` `endswith` `find` `index` `rfind`
-  `rindex` `count` `replace` `split` `rsplit` `join` `isdigit` `isalpha`
-  `isspace` `isupper` `islower` `isalnum` `istitle` `isascii` `isdecimal` `isnumeric`
-  `isidentifier` `isprintable` `removeprefix` `removesuffix`
-  `partition` `rpartition` `splitlines` `expandtabs` `maketrans` `translate`
-- **Lists:** homogeneous, growable; literals, comprehensions
-  (`[x * x for x in xs if x > 0]`, multi-`for` / multi-`if`, unpack
-  targets `[a+b for a, b in pairs]`; simple names use Python 3 scoping
-  and do not leak — and faster than the equivalent loop when length is
-  knowable: results are pre-sized and appends inlined),
-  indexing (read/write), `del xs[i]` / `del xs[i:j]`, slicing (copies, like Python),
-  slice assignment `xs[i:j] = ys` / `xs[::2] = ys` (same-elem list),
-  `append`/`pop`/`insert`/`remove`/`index` (optional start/end)/`count`/`clear`/`reverse`/`sort`/`extend`/`copy` (homogeneous
-  list arg), `list(iterable)`, `sorted(xs)` / `sorted(xs, key=f)` /
-  `sorted(xs, reverse=…)` / `sorted(xs, key=f, reverse=…)`
-  (class elements need `__lt__` or `__gt__` when `key=` is omitted),
-  `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` (and both kwargs),
-  `+`/`*` (concat / repeat), `==`/`!=`, `in` / `not in` (including nested
-  lists, same recursive equality as `==`), `len`, iteration;
-  assignment aliases like Python
-- **Tuples:** fixed-arity, heterogeneous; literals `(a, b)`, `(a,)`,
-  `()`; index (incl. negative); `len`; unpacking; `count`/`index` (optional
-  start/end; same equality as `in`; miss is ValueError); print like CPython
-- **Dicts:** `dict[K, V]` with `K` in `{int, str}`; literal `{k: v}`,
-  `{}` (needs annotation); get/set, `del d[k]`, `in` on keys, `len`,
-  insertion-order key iteration; methods `get` (with default, or bare
-  `get(k)` → `Optional[V]` / `None` on miss),
-  `pop`, `setdefault` (insert on miss; bare form needs `None` in `V`),
-  `popitem` (LIFO last-inserted pair),
-  `keys`/`values`/`items` (return lists), `clear`, `update`, `copy`, `fromkeys`, `dict(pairs)`, dict comps
-- **Sets:** `set[T]` with `T` in `{int, str}`; nonempty `{a, b}`, empty
-  `s: set[int] = set()`; `add`/`remove`/`discard`/`clear`/`union`/`intersection`/`difference`/`symmetric_difference`/`update` /
-  `issubset`/`issuperset`/`isdisjoint`/`copy`/`pop` /
-  `intersection_update`/`difference_update`/`symmetric_difference_update`,
-  `|` / `&` / `-` / `^` / `|=` / `&=` / `-=` / `^=`, `==` / `!=` / `<` / `<=` / `>` / `>=`, `set(iterable)`, set comps, `in`, `len`, iteration
-- **Exceptions:** `raise ExcType("msg")` for ValueError, KeyError,
-  IndexError, ZeroDivisionError, TypeError, RuntimeError, GeneratorExit,
-  OverflowError, EOFError, FileNotFoundError, OSError, PermissionError,
-  IsADirectoryError, NameError, UnboundLocalError, StopIteration,
-  Exception, **AssertionError** (`assert test` / `assert test, msg`);
-  `try`/`except`/`except Type as e` / `except (A, B)`/`else`/
-  `finally`; CPython-like hierarchy match (`except OSError` catches
-  `FileNotFoundError`/`PermissionError`/`IsADirectoryError`; `except
-  Exception` catches normal exceptions but not `GeneratorExit`);
-  `except … as e` binds a first-class **exception object** (`print(e)` /
-  `str(e)` → message; truthy in conditions; `isinstance(e, OSError)` /
-  multi-filter / unions with Exception); uncaught traps print
-  CPython-like messages and exit 1. Exception objects may be list/tuple elements; `e.args` is `list[str]` (empty or one message);
-  `repr(e)` / `!r` via ExcRepr. Residuals: full CPython `args` as tuple; dict/set of exceptions
-- **Globals:** top-level variables are readable from any function;
-  writing needs a `global x` declaration, exactly like Python
-- **I/O:** `input([prompt])` from stdin; `import sys` + `sys.argv` for
-  command-line arguments; files via `open(path, mode)` with
-  `.read()`/`.readline()`/`.readlines()`/`.write()`/`.close()`,
-  `with open(...) as f:` blocks, and CPython's exact error messages —
-  compiled programs are real CLI tools
-- **Modules & packages:** split a program across files and packages —
-  `import utils`, `import a, b as c` (multi-name), `import pkg.mod` /
-  `import pkg.mod as m`, `from pkg.mod import name`, `from pkg import mod`,
-  package re-exports in `__init__.py` (`from .mod import f` / `from .
-  import mod`; last top-level binding wins, with CPython fromlist hasattr
-  short-circuit so assign/`def` then `from . import same_name` keeps the
-  value and does not run the submodule), relative forms inside packages,
-  and partial package init (child module top level may read simple parent
-  assigns set before the child import; child function bodies may use
-  deferred parent attrs/calls after full init); a directory with
-  `__init__.py` is a regular package; a directory **without** `__init__.py`
-  is a **namespace package** (PEP 420 subset: single origin, no multi-path
-  split; prefer `__init__.py` > `name.py` > namespace dir); `from M import *`
-  expands public names (or static `__all__` list/tuple of string lits) at
-  module level only; module bodies run once at the import site
-  (like Python). Import search order (stacked, first hit wins): (1) entry
-  script directory, (2) `PYRS_STDLIB` if set, (3) workspace `stdlib/` when
-  present (dev; not XOR with env), (4) **embedded** stdlib inside the
-  `pyrs` binary (always; no companion directory needed). User code shadows
-  stdlib; once a package is found under one origin, children stay there
-  (no split packages). Cycles and missing modules/names are compile
-  errors that point at the offending file
-- **Stdlib (subset, frozen):** pure-PyRs `os.path` — `join(a, *parts)`
-  (POSIX), `dirname`, `basename`; `os.getcwd()` (C runtime); `math` —
-  constants `pi`/`e` and unary `sqrt`/`sin`/`cos`/`tan`/`log`/`log10`/
-  `exp`/`floor`/`ceil`/`fabs` (intrinsics / libm); `json.dumps` for
-  int/float/bool/str and homogeneous list/dict-of-str, plus typed
-  `json.loads_*` helpers (no dynamic `json.loads`). `import sys` remains
-  special-cased for `sys.argv`. **No new stdlib until the core language
-  is far enough for pure-PyRs libraries** (see the [roadmap](docs/ROADMAP.md));
-  interim modules may be rewritten pure later
-- **Entry point:** top-level statements run like a script; if there are
-  none, a zero-argument `main()` is called automatically
-
-Python semantics are preserved where it counts:
-
-- `7 / 2 == 3.5` — true division always yields float
-- `-7 // 2 == -4`, `-7 % 3 == 2` — floored division and modulo
-- `-2 ** 2 == -4`, `2 ** -1 == 0.5`, right-associative `2 ** 3 ** 2`
-- `1 < middle() < 10` evaluates `middle()` exactly once and
-  short-circuits, exactly like Python
-- `ZeroDivisionError`, `IndexError`, `ValueError`, `KeyError`, … trap
-  with exit 1 when uncaught (or transfer to an active `except`)
-- floats print with shortest round-trip representation
-  (`0.1 + 0.2` → `0.30000000000000004`, `1.0` → `1.0`); lists print as
-  `[1, 2, 3]` / `['a', 'b']`; tuples/dicts/sets print like CPython
-- iterating a list re-reads the live length, so appending inside the
-  loop behaves like CPython
-- variables use function-wide scoping; storage type is the join of all
-  assignments (and annotation); bare multi-assign may produce a union
-
-Known limits (v0.110.0): `int` is arbitrary precision (tagged small ±2⁶² /
-GC-managed heap limbs; no interning/`is` identity for equal
-values), `min`/`max`
-multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
-`1.0`, not the int `1`; pure `bool` args print as `0`/`1`); multi-arg and
-iterable form also accept homogeneous `str`, orderable tuples, orderable
-lists (lexicographic), and class instances that define `__lt__` or `__gt__`; multi-arg with
-monomorphic `key=` requires homogeneous positionals (mixed types → compile
-error; use the iterable form or a common type); iterable `min`/`max` without
-`key=` is for `list[int|float|bool|str|orderable tuple|orderable list|class with __lt__ or __gt__]`
-(empty without `default=` → ValueError like CPython); with monomorphic `key=`
-any `list[T]` is fine; iterable `default=` joins with element type
-(`default=None` → Optional); multi-arg rejects `default=`; bare `key=`
-builtins supported are `len` (containers and classes with `__len__`), `abs`,
-`int`/`float`/`bool`/`str` (other builtins still need a wrapper); `sorted(..., key=)`
-and `list.sort(key=)` materialize a GC-managed auxiliary keys list of
-length `n`; `sorted`/`list.sort` `reverse=` uses truthiness (bool/int/str/…);
-`min`/`max` reject `reverse=` as unexpected (CPython has no such
-kwarg),
-control-flow narrowing covers `is None` / `is not None` (and `not`,
-`and`/`or` body peels and **mid-expression** refine of
-`x is not None and x > 0` / `x is None or x < 0`) **and** `isinstance`
-peels (unions, Optional, and class base → subclass for field access)
-on locals, cells, and module Optionals (free reads, no `global` required)
-in `if`/`while` / match guards (not full SAT / open attribute narrowing);
-post-loop / post-if rebinds clear stale peels; multi-member peels keep a
-safe storage type for print/tags; bare-param inference is monomorphic only
-(conflicting uses still need annotations; multi-type `isinstance(x, (int,
-float))` and container `isinstance(x, list)` do not bare-infer); empty
-lists without append/insert default to `list[Any]` (append/insert still
-specialize); multi-class `isinstance` peels allow shared layout fields and
-runtime exclusive-field access (AttributeError when missing); limited
-`Any` only (no open setattr / bare-Any methods / full gradual typing);
-`and`-chain peels compose left-to-right;
-`is`/`is not` works
-with `None` and same-type identity (heap pointers, scalar slots, float
-bitcast — not CPython int interning); `x ** e` with a *dynamic* negative
-int exponent traps (a constant like `2 ** -1` works and gives float),
-mixed int↔float comparisons preserve the exact integer value,
-mixed-numeric list/tuple **literals** keep each element's own type as a
-union (`[1, 2.5, 1]` prints `[1, 2.5, 1]`, not `[1.0, 2.5, 1.0]`); a
-homogeneous literal still gets optimized single-type storage, and
-converting an already-typed `list[int]` into `list[float]` (or into a union)
-by assignment remains unsupported — only the literal's own elements are
-joined (mixed non-numeric literal elements still error unless annotated
-as a union), `nan in [nan]`
-is False (IEEE equality), str offsets, case transforms and `is*` methods
-follow Unicode 16.0.0 (no normalization or locale-sensitive casing),
-indexing a non-ASCII `str` is amortised rather than exactly O(1) (a memo
-serves sequential access, a lazily built sampled index serves scattered
-access), sets iterate in insertion order where CPython's order is unspecified
-and varies per run, GC is
-nonmoving mark–sweep with conservative native roots (so reclamation can be
-delayed by pointer-like stack values), files support text modes "r"/"w"/"a"
-only and still require `with` or explicit `close()` for deterministic resource
-cleanup; no multi-path split namespace packages, no `from sys import *`, a package
-importing itself by name, or treating modules as first-class values
-beyond attribute/call chains; `os.path` is POSIX only; `*args` /
-`**kwargs` on defs and `*`/`**` unpacking in calls are supported for
-homogeneous list/dict types; starred assignment `a, *rest = xs` and
-list displays `[*a, *b]` work for lists/tuples; `json` has no dynamic
-`loads`; f-string `{x=}`, grouping (`,`/`_`), and types `n`/`c` are
-unsupported; match/case includes class patterns (closed-world fields),
-or-patterns bind only the matching alt; duplicate names/keys rejected;
-generators
-support `yield` / `yield from` on list/tuple/str/generator (including
-inside `finally`; subgen `return` feeds yield-from; close cascades to
-yield-from subgens), `try`/`except`/`else`/`finally` (phase and try
-exit kind preserved across yield resume), `close()` (GeneratorExit +
-finally; ignore-GE → RuntimeError), `send(None|value)` (value must
-match yield type; non-None before first yield → TypeError; yield
-expression is `Optional[Y]`), and `throw(ExcType)` /
-`throw(ExcType("msg"))` (inject at yield; uncaught propagates);
-`for`/`send` treat exhaustion as Optional None rather than raising
-StopIteration; after close/exhaust/uncaught throw, further send is
-None and does not re-enter the body; `send`/`throw` are **not**
-forwarded through `yield from` (the subgenerator is only advanced with
-`None` — full PEP 380 send/throw delegation is unsupported);
-`except GeneratorExit`
-is supported; free captures use cells (late bind; load before assign
-→ NameError); nested defaults freeze at def time (escaped free-var
-defaults need literals); lambda params without defaults still need
-annotations or defaults for inference; homogeneous closures in
-containers need matching params/ret/capture-env shape; classes are the
-closed-world subset above (no multi-base / open attrs / full dynamism); GC
-does not run user finalizers or implicitly close abandoned generators (see
-[Garbage collection](docs/GC.md)).
-
-Errors come with source snippets:
-
+```toml
+[tool.pyrs]
+entry = "src/app/main.py"
+root = "src"
+opt-level = 2
 ```
-error[semantic]: type mismatch in argument 1 of 'f': expected int, found float
- --> bad.py:4:7
-  |
-4 | x = f(2.5)
-  |       ^^^
+
+`pyrs init` adds that table; project creation itself is `uv init`'s job. See
+[TOOLING.md](docs/TOOLING.md) for the manifest, build caching and interpreter
+resolution.
+
+## The language
+
+The [**PyRs Guide**](docs/GUIDE.md) is the reference: the full language, every
+difference from CPython, runtime errors, diagnostics and performance notes.
+In outline, the subset covers:
+
+- **Types** — `int` (arbitrary precision), `float`, `bool`, `str` (Unicode
+  16.0.0), `None`, unions and `Optional`, `list`, `tuple`, `dict`, `set`,
+  files, closures, generators, class instances
+- **Statements** — `if`/`while`/`for`/`match`, `try` with the CPython
+  exception hierarchy, `with`, `del`, `assert`, `global` and `nonlocal`,
+  unpacking and augmented assignment
+- **Expressions** — arithmetic including `**`, chained comparisons, `in`,
+  walrus, `is`, bitwise operators, conditional expressions, comprehensions
+  (list/dict/set), generator expressions, lambdas, f-strings with the format
+  mini-language, `.format()` and `%`
+- **Functions** — annotations optional and inferred where unambiguous,
+  defaults, keyword arguments, `*args`/`**kwargs`, closures, `nonlocal`,
+  generators with `send`/`throw`/`close`
+- **Classes** — closed-world with virtual methods, inheritance, properties,
+  static and class methods, context managers, iterator and comparison
+  protocols, user-defined exceptions
+- **Modules** — `import` and `from` in their usual forms, regular and PEP 420
+  namespace packages, relative imports, cycles reported at compile time
+- **Standard library** — a deliberately small pure-PyRs core: `os.path`,
+  `math`, a typed `json` subset, and `sys.argv`
+
+## What it does not do
+
+Rejected at compile time, with a diagnostic naming the feature:
+
+- **Dynamism** — `eval`/`exec`, monkey-patching, metaclasses, `__slots__`,
+  `__new__`, open `__dict__`, class decorators, first-class class values
+- **Type system** — multiple inheritance, heterogeneous containers without a
+  union annotation, `Any` method dispatch, generics
+- **Library surface** — `bytes`/`bytearray`/`memoryview`, encodings other
+  than UTF-8, most of the standard library, all of PyPI
+- **Syntax corners** — `raise X from Y`, `f"{x=}"`, two-arg `super()`,
+  stacked decorators, `async`/`await`
+
+Known behavioural divergences, each documented with its reason in the
+[guide](docs/GUIDE.md#9-differences-from-cpython):
+
+- Sets iterate in insertion order; CPython's order is unspecified and varies
+  between runs, so there is no single order to match — use `sorted()`
+- `e.args` is a list, not a tuple, because tuples here are fixed-arity
+- No `is` interning for equal integers, and `nan in [nan]` is `False`
+- Indexing a non-ASCII string is amortised rather than exactly O(1)
+
+## Running Python that PyRs cannot compile
+
+Compatibility mode runs a whole program under CPython instead, including
+installed packages. It is **explicit** — declared in the manifest or passed on
+the command line — and never an automatic fallback, so a native binary can
+never silently become an interpreted one:
+
+```console
+pyrs run --compat -i prog.py
 ```
+
+Separately, the experimental [CPython bridge](docs/INTEROPERABILITY.md)
+compiles numerical functions into importable native extensions, and can read
+NumPy float64 buffers without copying — the first step toward mixed
+Python/native execution.
 
 ## Architecture
 
-Cargo workspace with a strict, unidirectional data flow
-(see [SPECIFICATIONS.md](docs/SPECIFICATIONS.md)):
+A Cargo workspace with strictly unidirectional data flow (see
+[SPECIFICATIONS.md](docs/SPECIFICATIONS.md)):
 
 ```
 source ─→ lexer ─→ parser ─→ semantic ─→ ir ─→ codegen ─→ executable
@@ -632,18 +167,18 @@ source ─→ lexer ─→ parser ─→ semantic ─→ ir ─→ codegen ─�
           DEDENT   descent
 ```
 
-- **`common`** — spans and diagnostics shared by every phase
-- **`lexer`** — `logos`-based scanner with an indent-stack state machine for
-  Python's semantic whitespace and implicit line joining
-- **`parser`** — hand-written recursive descent, precedence-layered
-  expressions
-- **`semantic`** — name resolution, type checking, implicit numeric
-  promotion, return-path analysis; lowers AST to IR
-- **`ir`** — fully typed tree; the contract handed to the backend
-- **`codegen`** — emits LLVM IR text; a thin C++ shim (built via CMake)
-  parses, verifies, optimizes and emits object code; a tiny C runtime
-  provides Python-faithful operations, runtime traps, and nonmoving GC
-- **`cli`** — the driver
+| Crate | Responsibility |
+|---|---|
+| `common` | Spans and diagnostics shared by every phase |
+| `lexer` | `logos` scanner with an indent stack for semantic whitespace |
+| `parser` | Hand-written recursive descent, precedence-layered |
+| `semantic` | Name resolution, type checking, numeric promotion, lowering to IR |
+| `ir` | Fully typed tree — the contract handed to the backend |
+| `codegen` | LLVM IR text; a C++ shim verifies, optimizes and emits objects |
+| `cli` | Driver, module loading, build cache, project manifest |
+
+The C runtime provides Python-faithful operations, runtime traps and a
+nonmoving mark–sweep [collector](docs/GC.md).
 
 ## Benchmarks
 
@@ -664,44 +199,41 @@ is byte-identical to `python3`'s, then reports best-of-3 wall times:
 
 (Linux, LLVM 22, CPython 3.14; run `./benchmarks/run.sh` to reproduce.)
 
-v0.3 inlined list element access into the generated IR (bounds check +
-direct load/store, so LLVM keeps hot values in registers) and interned
-single-character strings (indexing/iterating a str allocates nothing) —
-that took sort from 13× to 45×, nbody from 59× to 164×, and strings
-from 3× to 6×.
-
-## Building
-
-Requires Rust (edition 2024), LLVM (`llvm-config` on PATH), CMake, and a C
-compiler.
+## Development
 
 ```console
-cargo build --release
-cargo test
+make doctor    # check the toolchain
+make ci        # the full local gate
 ```
 
-### Continuous integration
-
-GitHub Actions (see `.github/workflows/`):
-
-| Workflow | When | What |
-|----------|------|------|
-| **CI** | push/PR to `main` | `fmt`, clippy, tests, example parity, opt-level smoke (Ubuntu, LLVM 18, CPython 3.14) |
-| **Benchmarks** | weekly / manual / bench-related pushes | `benchmarks/run.sh` (artifact log) |
-| **Release** | tags `v*.*.*` | Linux `x86_64` tarball + checksum + GitHub Release |
-| **Docs & hygiene** | docs/CI path changes | required files + workflow YAML shape |
-
-Local gate (same spirit as CI): `make doctor && make ci`, which runs
-format, lints, tests, `make hygiene`, byte-exact example parity and the
-compatibility probes.
+`make ci` runs format, clippy with `-D warnings`, the workspace tests,
+`make hygiene`, byte-exact example parity and the compatibility probes.
 
 | Target | What it checks |
-|--------|----------------|
-| `make examples` | Example parity against `python3` comparing **stdout bytes, stderr bytes and exit status** of the compiled program. Building and running are separate steps so C toolchain warnings on `pyrs run`'s stderr are never mistaken for program output; build output is shown only when the build fails. (`make examples-all-opts` for O0/O2/O3) |
-| `make hygiene` | Version agreement across the 7 crates, `Cargo.lock`, README, SPECIFICATIONS and `pyrs --version`; every relative documentation link resolves; and the gates' own failure paths |
-| `make asan` / `make ubsan` | The extension boundary suite with the C adapter, runtime and collector instrumented. The LLVM-generated kernel object is not instrumented, so this is adapter/runtime coverage |
+|---|---|
+| `make examples` | Example parity against `python3`, comparing **stdout bytes, stderr bytes and exit status**. Building and running are separate steps so toolchain warnings are never mistaken for program output. (`make examples-all-opts` for O0/O2/O3) |
+| `make hygiene` | Version agreement across the 7 crates, `Cargo.lock` and the docs; the Unicode tables' generating interpreter; every relative documentation link; and the gates' own failure paths |
+| `make asan` / `make ubsan` | The extension boundary suite with the C adapter, runtime and collector instrumented |
 | `make compatibility` | Native and CPython probes at O0/O2/O3 under GC stress |
 
 Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
+
+CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
+benchmarks and a tagged release workflow.
+
 Release tags: `git tag v0.110.0 && git push origin v0.110.0`.
+
+## Documentation
+
+| Document | What it is for |
+|---|---|
+| [GUIDE.md](docs/GUIDE.md) | The reference: language, CLI, diagnostics, differences from CPython |
+| [TOOLING.md](docs/TOOLING.md) | Projects, the `[tool.pyrs]` manifest, build caching, uv |
+| [ROADMAP.md](docs/ROADMAP.md) | Open gaps, workstreams and the 1.0 release gates |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in every release |
+| [SPECIFICATIONS.md](docs/SPECIFICATIONS.md) | Architecture and phase contracts |
+| [PRIMITIVES.md](docs/PRIMITIVES.md) | The runtime primitive inventory |
+| [GC.md](docs/GC.md) | The collector's design and invariants |
+| [EXTENDING.md](docs/EXTENDING.md) | Adding language features to the compiler |
+| [INTEROPERABILITY.md](docs/INTEROPERABILITY.md) | The experimental CPython bridge |

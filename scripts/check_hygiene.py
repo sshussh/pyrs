@@ -41,8 +41,10 @@ CRATES: dict[str, str] = {
 # Each regex must expose the version in group 1. The label is what a failure
 # report names, so it has to be readable on its own.
 VERSION_SITES: tuple[tuple[str, str, str], ...] = (
-    ("README.md", "language heading", r"^## The language \(v([0-9]+\.[0-9]+\.[0-9]+)\)"),
-    ("README.md", "known-limits line", r"^Known limits \(v([0-9]+\.[0-9]+\.[0-9]+)\)"),
+    # The README used to carry the version in three places, two of them inside
+    # a chronological feature list that has since moved to the changelog. One
+    # explicit line is enough to catch drift and does not invite the list back.
+    ("README.md", "milestone line", r"^Current milestone: \*\*v([0-9]+\.[0-9]+\.[0-9]+)\*\*"),
     ("README.md", "release tag example", r"^Release tags: `git tag v([0-9]+\.[0-9]+\.[0-9]+)"),
     (
         "docs/SPECIFICATIONS.md",
@@ -140,25 +142,61 @@ def check_versions(root: Path, binary: str | None) -> list[str]:
     return problems
 
 
+def heading_slugs(text: str) -> set[str]:
+    """GitHub's heading anchors: lowercased, markup and punctuation dropped,
+    spaces to hyphens."""
+    slugs = set()
+    for match in re.finditer(r"^#{1,6}\s+(.*)$", text, re.M):
+        title = match.group(1).strip()
+        title = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", title)  # links
+        title = re.sub(r"[`*_]", "", title)  # inline markup
+        title = re.sub(r"[^\w\s-]", "", title)  # punctuation
+        slugs.add(re.sub(r"\s", "-", title.lower()))
+    return slugs
+
+
 def check_links(root: Path) -> list[str]:
+    """Every relative link resolves, and every `#anchor` names a real heading.
+
+    Anchors were unchecked until the documentation overhaul, which is how a
+    table of contents came to list sections that had been renamed and omit
+    three that existed.
+    """
     problems: list[str] = []
     checked = 0
-    for md in sorted(root.rglob("*.md")):
-        if "target" in md.parts or ".git" in md.parts:
-            continue
+    anchors = 0
+    slugs: dict[Path, set[str]] = {}
+    docs = [
+        md
+        for md in sorted(root.rglob("*.md"))
+        if "target" not in md.parts and ".git" not in md.parts
+    ]
+    for md in docs:
+        slugs[md.resolve()] = heading_slugs(md.read_text())
+
+    for md in docs:
         rel = md.relative_to(root)
         for raw in LINK.findall(strip_code(md.read_text())):
             target = raw.strip()
-            if target.startswith(("http://", "https://", "mailto:", "#")):
+            if target.startswith(("http://", "https://", "mailto:")):
                 continue
             path_part = urllib.parse.unquote(target.split("#", 1)[0])
-            if not path_part:
-                continue
-            checked += 1
-            if not (md.parent / path_part).resolve().exists():
-                problems.append(f"{rel}: broken link -> {target}")
+            fragment = urllib.parse.unquote(target.split("#", 1)[1]) if "#" in target else ""
+            if path_part:
+                checked += 1
+                resolved = (md.parent / path_part).resolve()
+                if not resolved.exists():
+                    problems.append(f"{rel}: broken link -> {target}")
+                    continue
+            else:
+                resolved = md.resolve()
+            if fragment and resolved.suffix == ".md" and resolved in slugs:
+                anchors += 1
+                if fragment not in slugs[resolved]:
+                    problems.append(f"{rel}: link to a heading that does not exist -> {target}")
     if not problems:
         print(f"  all {checked} relative documentation links resolve")
+        print(f"  all {anchors} document anchors name a real heading")
     return problems
 
 

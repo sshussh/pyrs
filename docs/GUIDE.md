@@ -15,13 +15,22 @@ machine code through LLVM. There is no interpreter and no VM at runtime —
 1. [Installation](#1-installation)
 2. [Quick start](#2-quick-start)
 3. [The command line](#3-the-command-line)
-4. [The Makefile](#4-the-makefile)
-5. [Language reference](#5-language-reference)
+4. [Projects and the build cache](#4-projects-and-the-build-cache)
+   - [The manifest](#the-manifest)
+   - [Discovery](#discovery)
+   - [`root`, and `src/` layouts](#root-and-src-layouts)
+   - [Compatibility mode](#compatibility-mode)
+   - [The build cache](#the-build-cache)
+   - [Which interpreter](#which-interpreter)
+5. [The Makefile](#5-the-makefile)
+6. [Language reference](#6-language-reference)
    - [Program structure](#program-structure)
    - [Types](#types)
    - [Variables and assignment](#variables-and-assignment)
    - [Operators](#operators)
    - [Strings](#strings)
+   - [`.format()` and `%` formatting](#format-and--formatting)
+   - [Conditional expressions](#conditional-expressions)
    - [f-strings](#f-strings)
    - [Lists](#lists)
    - [Control flow](#control-flow)
@@ -32,11 +41,12 @@ machine code through LLVM. There is no interpreter and no VM at runtime —
    - [Files](#files)
    - [Standard input and arguments](#standard-input-and-arguments)
    - [Modules and packages](#modules-and-packages)
-6. [Runtime errors](#6-runtime-errors)
-7. [Compiler diagnostics](#7-compiler-diagnostics)
-8. [Differences from CPython](#8-differences-from-cpython)
-9. [Performance](#9-performance)
-10. [Under the hood](#10-under-the-hood)
+   - [Standard library (subset)](#standard-library-subset)
+7. [Runtime errors](#7-runtime-errors)
+8. [Compiler diagnostics](#8-compiler-diagnostics)
+9. [Differences from CPython](#9-differences-from-cpython)
+10. [Performance](#10-performance)
+11. [Under the hood](#11-under-the-hood)
 
 ---
 
@@ -192,7 +202,123 @@ $ pyrs parse -i prog.py -o ast.txt # AST to a file
 
 Both print to stdout unless `-o` is given.
 
-## 4. The Makefile
+## 4. Projects and the build cache
+
+A single file needs no project: `pyrs run -i prog.py` works with no
+manifest, no virtual environment and no uv. A *project* adds a place to
+record what would otherwise be retyped on every invocation.
+
+### The manifest
+
+Configuration lives in `pyproject.toml` under `[tool.pyrs]` — the file the
+rest of the Python toolchain already reads. Every key is optional:
+
+```toml
+[tool.pyrs]
+entry = "src/app/main.py"    # module run as __main__
+root = "src"                 # import root; defaults to the manifest's directory
+opt-level = 2                # default -O
+execution = "native"         # or "compat"
+python = ".venv/bin/python"  # interpreter for compat and extensions
+
+[tool.pyrs.extension]        # defaults for build-extension
+module = "kernels_native"
+source = "src/app/kernels.py"
+```
+
+Unknown keys are rejected rather than ignored, so a typo is reported instead
+of silently doing nothing.
+
+`pyrs init [path]` writes that table, creating a minimal `pyproject.toml` if
+there is none. There is no `pyrs new`: project *creation* is `uv init`'s job,
+and PyRs adds one table to what it produced.
+
+```console
+$ uv init myapp && cd myapp
+$ pyrs init --entry src/myapp/main.py .
+$ pyrs run
+```
+
+### Discovery
+
+With no `-i`, `-c` or `-m`, PyRs walks up from the working directory to the
+nearest `pyproject.toml` containing `[tool.pyrs]` and runs its `entry`. A
+`pyproject.toml` without that table belongs to some other Python project and
+is skipped; one that does not parse is reported rather than ignored.
+
+An explicit `-i`, `-c` or `-m` bypasses discovery entirely, and command-line
+flags override the manifest.
+
+### `root`, and `src/` layouts
+
+The import resolver roots at the entry script's own directory, so a package
+that is a *sibling* of the entry point is not importable by default:
+
+```
+myapp/
+  pyproject.toml      root = "src"
+  src/
+    pkg/__init__.py
+    app/main.py       import pkg   ← needs root = "src"
+```
+
+Declaring `root` adds that directory to the search path, which is what makes
+the `src/` layout `uv init` scaffolds work.
+
+### Compatibility mode
+
+`execution = "compat"` runs the whole program under CPython instead of
+compiling it. It is **declared, never inferred** — PyRs will not select it
+from a dependency list or fall back to it after a failed compile, so a native
+binary cannot silently become an interpreted one.
+
+`--compat` enables it for one run; `--no-compat` overrides a manifest that
+asks for it, which is how you check whether a program has become natively
+compilable without editing the file.
+
+### The build cache
+
+Compiled C runtime objects and whole programs are cached, so an unchanged
+program recompiles nothing:
+
+| | cold | cached |
+|---|---:|---:|
+| unchanged program | 2610 ms | 11 ms |
+| new program | 2610 ms | 84 ms |
+
+The cache lives in `$XDG_CACHE_HOME/pyrs` (override with `PYRS_CACHE_DIR`),
+not in the project: the runtime objects depend only on the compiler and PyRs's
+embedded sources, so every project on the machine shares them.
+
+Keys cover everything that can change the output — the compiler's own
+fingerprint, the C toolchain, the optimization level, the target, and the
+content of every module in the import graph — and entries are checksum
+verified before reuse. `--no-cache` on `run` and `compile` reuses and
+publishes nothing.
+
+Two limits are worth knowing: `CC` is honoured but `CFLAGS` is not, and a
+compiler wrapper that changes behaviour without changing its identity or its
+preprocessed output will not invalidate the key. Both need `--no-cache` or a
+deleted cache directory.
+
+### Which interpreter
+
+`--compat` and `build-extension` need a CPython, and `build-extension` needs
+one with development headers. Resolution order, most specific first:
+
+1. `--python`
+2. `[tool.pyrs] python`
+3. the uv **project** environment, when uv is installed and the project has
+   one
+4. `PYRS_PYTHON`
+5. `python3` on `PATH`
+
+uv is preferred because its interpreters always ship headers, and never
+required. `pyrs check` reports which one was chosen and warns when its
+version differs from the CPython PyRs was built against — see
+[TOOLING.md](TOOLING.md) for why that matters.
+
+## 5. The Makefile
 
 Day-to-day work is wrapped in `make` targets; `make help` lists them all.
 The interesting variables are `FILE` (source file, default `main.py`),
@@ -207,7 +333,7 @@ $ make bench RUNS=5                 # the benchmark suite
 $ make ci                           # format check + clippy + tests + parity
 ```
 
-## 5. Language reference
+## 6. Language reference
 
 PyRs compiles a statically-typed subset of Python. Valid PyRs programs
 are valid Python programs with the same output — the reverse is not true,
@@ -1409,7 +1535,7 @@ local to that function and not visible at module scope. Module top-level
 and nested `if`/`for` blocks may also import; nested function bodies use
 function-local import scopes.
 
-## 6. Runtime errors
+## 7. Runtime errors
 
 Uncaught runtime errors print the same message CPython would, then exit
 with code 1. Inside `try`/`except`, the same traps transfer to a matching
@@ -1517,7 +1643,7 @@ $ echo $?
 1
 ```
 
-## 7. Compiler diagnostics
+## 8. Compiler diagnostics
 
 Every phase reports errors against your source with a caret:
 
@@ -1538,7 +1664,7 @@ that name the feature: `two-arg super() is not supported yet`,
 Compilation stops at the
 first error.
 
-## 8. Differences from CPython
+## 9. Differences from CPython
 
 Everything PyRs *does* support behaves like Python — these are the known,
 deliberate exceptions:
@@ -1609,7 +1735,7 @@ deliberate exceptions:
     attribute or full SAT-style narrowing. Multi-member peels keep a safe
     storage type for print/tags.
 
-Container notes (v0.20.1):
+Container notes:
 
 - **tuple:** literals, index (const OOB is a compile error; dynamic OOB
   traps), `len`, unpack, `==`/`!=`, `count(x)` / `index(x[, start[, end]])` (same
@@ -1688,7 +1814,7 @@ dict/set (tuples have `count`/`index`). Generator exhaustion is **Optional None*
 with optional `*rest`, mapping with str keys and optional `**rest`, `as`
 patterns, guards, **class patterns** with positional/keyword fields).
 
-## 9. Performance
+## 10. Performance
 
 Measured by `make bench` (best of 3, output byte-verified against
 python3 before timing — Linux, LLVM 22, CPython 3.14):
@@ -1715,7 +1841,7 @@ What makes code fast in PyRs:
 - `-O2` is the default; `-O3` occasionally helps hot float code; `-O0`
   compiles fastest for debugging.
 
-## 10. Under the hood
+## 11. Under the hood
 
 ```
 source ─→ lexer ─→ parser ─→ semantic ─→ ir ─→ codegen ─→ cc link ─→ binary

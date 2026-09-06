@@ -503,7 +503,7 @@ These are product constraints that affect design choices:
 | Typing           | Multi-assign join + bare-param body infer + isinstance peels + subclass coercion + limited `Any` | Fuller optional typing + more dynamism                                 |
 | Builtins / kit   | `isinstance` (incl. on `Any`), `any`/`all`, `enumerate`/`zip`/`reversed`, set/dict kit | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
-| Language surface | Subset (see README v0.20.1); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
+| Language surface | Subset (see [the guide](GUIDE.md)); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
 | Product version  | `0.110.0` (and later `0.111.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): full

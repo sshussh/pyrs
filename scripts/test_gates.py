@@ -195,9 +195,7 @@ class HygieneGateTests(unittest.TestCase):
         write(
             root / "README.md",
             f"""\
-            ## The language (v{version})
-
-            Known limits (v{version}): things
+            Current milestone: **v{version}**.
 
             Release tags: `git tag v{version} && git push origin v{version}`.
             """,
@@ -290,10 +288,25 @@ class HygieneGateTests(unittest.TestCase):
     def test_readme_label_drift_is_caught(self) -> None:
         root = self.make_repo()
         text = (root / "README.md").read_text()
-        write(root / "README.md", text.replace("## The language (v9.9.9)", "## The language (v9.9.7)"))
+        write(
+            root / "README.md",
+            text.replace("Current milestone: **v9.9.9**", "Current milestone: **v9.9.7**"),
+        )
         done = self.run_gate(root, "versions")
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("README.md", done.stdout)
+
+    def test_dead_document_anchor_is_caught(self) -> None:
+        # A table of contents that points at renamed sections is the exact
+        # rot this check exists for.
+        root = self.make_repo()
+        write(
+            root / "docs/GUIDE.md",
+            "# Guide\n\n[jump](#a-real-heading)\n[broken](#not-a-heading)\n\n## A real heading\n",
+        )
+        done = self.run_gate(root, "links")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("not-a-heading", done.stdout)
 
     def test_lockfile_drift_is_caught(self) -> None:
         root = self.make_repo()

@@ -758,3 +758,74 @@ execution. Reaching 0.86.0 does not establish 1.0 readiness; see the
 - CI wiring for the compatibility probes is deferred: the required
   `scientific-compatibility` job would have made every run depend on installing
   NumPy/pandas from PyPI. `make ci` runs the probes locally in the meantime.
+
+## Feature history before 0.86
+
+PyRs had no changelog until 0.86. These records lived in the README's
+language section, which had accreted one paragraph per milestone until
+it was 77% of the file. They are kept here so the README can say what
+PyRs *does* rather than when each piece arrived; the current behaviour
+of every feature below is documented in [the guide](docs/GUIDE.md).
+
+- **Also (v0.23+):** `@staticmethod` / `@classmethod` / read-only `@property`, bound methods as values, `__iter__`/`__next__` for-loops, `__len__`/`__bool__`, class `with` context managers, single free-function decorators, match class patterns.
+- **v0.25 protocol completion:** `__exit__` suppress (truthy return swallows the body exception); exception path passes `__exit__(None, exc, None)` (type and traceback remain `None` — no exception type objects / traceback objects yet); builtin `next(it)` / `next(it, default)` for user iterators and generators; user-class `__contains__` for `in` / `not in`.
+- **v0.26:** `sorted(xs, key=f)`, `min(xs, key=f)`, `max(xs, key=f)` with a monomorphic `key=` callable (`T →` sortable `int|float|bool|str`); desugared in semantic (no C comparator).
+- **v0.27:** `list.sort(key=f)` in-place with the same monomorphic `key=` surface (shared desugar with `sorted`; `reverse=` still residual).
+- **v0.28:** `sorted(..., reverse=bool)` and `list.sort(reverse=bool)` (stable reverse-sort-reverse; works with `key=`; `reverse=` must be `bool`).
+- **v0.29:** multi-arg `min(a, b, c, …)` / `max(…)` (numeric fold with `bool`→`int`→`float` unify) and multi-arg with monomorphic `key=` (`min(a, b[, c…], key=f)`); positionals must share one type when `key=` is used.
+- **v0.30:** `min`/`max` iterable `default=` (`min(xs, default=d)` / `min(xs, key=f, default=d)`); empty → default (result type is `join(elem, default)`); multi-arg form rejects `default=` like CPython.
+- **v0.31:** bare builtins as monomorphic `key=` — `len`, `abs`, and casts `int`/`float`/`bool`/`str` on `sorted` / `list.sort` / `min` / `max` (IR ops, not first-class values); other builtins still need a wrapper.
+- **v0.32:** lexicographic `min`/`max` for homogeneous `str` (multi-arg and `list[str]` without `key=`); numeric multi-arg/list path unchanged.
+- **v0.33:** `sorted` / `list.sort` `reverse=` uses CPython truthiness (`reverse=1` / runtime int, not only `bool`); const-folds 0/1/True/False.
+- **v0.34:** lexicographic tuple ordering (`<`/`<=`/`>`/`>=`), multi-arg and list `min`/`max` over orderable tuples, and `sorted`/`list.sort` for `list[tuple[…]]` (elements: int|float|bool|str or nested orderable tuples).
+- **v0.35:** lexicographic list ordering (`[1,2] < [1,3]`), multi-arg and list `min`/`max` over orderable lists, and `sorted`/`list.sort` for nested `list[list[…]]` of orderable elements.
+- **v0.36:** bare `key=len` on class instances that define `__len__` → `int` (`sorted` / `list.sort` / `min` / `max`).
+- **v0.37:** `in` / `not in` for nested lists (`[1, 2] in [[1, 2], [3]]`), using the same recursive equality as `==` / `list.index` / `list.remove`.
+- **v0.38:** `list.count(x)` with the same recursive equality (including nested lists).
+- **v0.39:** `list.reverse()` in-place (statement only; `reversed(xs)` / `xs[::-1]` still allocate a copy).
+- **v0.40:** `sum(xs, start)` / `sum(xs, start=s)` — numeric start (default 0 / 0.0); result type is `elem ⊔ start`.
+- **v0.41:** `del xs[i]` for lists (negative indices; OOB → same `IndexError` as list assignment).
+- **v0.42:** class `==` / `!=` — `__eq__` when defined (virtual), else pointer identity.
+- **v0.43:** list slice assignment `xs[lo:hi:step] = ys` and `del xs[lo:hi]` (same-elem list RHS; extended slices require matching length).
+- **v0.44:** set `==` / `!=`, subset operators `<` / `<=` / `>` / `>=`, and `issubset` / `issuperset` / `isdisjoint`.
+- **v0.45:** `round(x)` / `round(x, ndigits)` — ties to even; one-arg yields `int`; two-arg keeps `int` or `float`.
+- **v0.46:** `ord(s)` / `chr(n)` — Unicode code point of a one-character string, and the inverse (`chr` accepts `0 ..= 0x10FFFF`; `bool` → `int`). String `len`/index agree with them since v0.90.
+- **v0.47:** integer literals `0x` / `0b` / `0o` (any case, PEP 515 underscores) convert to the same `int` as decimal; invalid prefixes are compile errors.
+- **v0.48:** `print(..., sep=..., end=...)` — `sep`/`end` are `str` or `None` (`None` restores the defaults `" "` / `"\\n"`).
+- **v0.49:** `hex(n)` / `bin(n)` / `oct(n)` — lowercase `0x` / `0b` / `0o` strings (`hex(-10)` is `'-0xa'`); `bool` → `int` like `chr`.
+- **v0.50:** `dict.setdefault(k[, default])` — insert on miss and return the stored value; bare form requires a value type that includes `None`.
+- **v0.51:** `divmod(a, b)` — `(a // b, a % b)` for int/bool/float (operands evaluated once; mixed numeric promotes like `//`).
+- **v0.52:** `print(..., flush=...)` — CPython truthiness (`True`/`1` flush stdout after writing; `False`/`0`/`None` no-op); `file=` still residual.
+- **v0.53:** `dict.popitem()` — LIFO last-inserted `(k, v)` pair; empty dict raises `KeyError: 'popitem(): dictionary is empty'`.
+- **v0.54:** `str.removeprefix` / `str.removesuffix` — drop an exact prefix or suffix when present (empty affix is a no-op).
+- **v0.55:** `str.partition` / `str.rpartition` — first/last split into `(head, sep, tail)`; empty separator is `ValueError`.
+- **v0.56:** `pow(base, exp)` is `**`; `pow(base, exp, mod)` is modular exponentiation (ints; negative exp is modular inverse).
+- **v0.57:** `str.rsplit` and optional `maxsplit` on `split`/`rsplit` (`None` sep is whitespace; `maxsplit < 0` is unlimited).
+- **v0.58:** `int(s[, base])` and `float(s)` parse strings (CPython rules; ASCII whitespace; `int` bases 0 and 2..=36; `float` accepts `inf`/`nan`).
+- **v0.59:** `str.index` and optional `start`/`end` on `find`/`index`/`rfind`/ `rindex` (CPython slice bounds; `None` allowed; miss is `-1` or ValueError).
+- **v0.60:** `str.replace(old, new[, count])` — `count < 0` is unlimited; empty `old` inserts `new` between characters (capped by `count`).
+- **v0.61:** `str.splitlines([keepends])` — CPython line boundaries (`\\n`/`\\r`/`\\r\\n`/`\\v`/`\\f`/C0 seps, UTF-8 U+0085/U+2028/U+2029); truthy `keepends` keeps the break; trailing break does not add `''`.
+- **v0.62:** `str.count(sub[, start[, end]])` — same slice bounds as find; empty needle is `len(slice)+1`; start past `len` is 0.
+- **v0.63:** `str.startswith`/`endswith` accept a tuple of strs and optional `start`/`end` (same slice bounds as find).
+- **v0.64:** `str.capitalize` / `title` / `swapcase` (Unicode-aware since v0.91; title words break on cased characters and use the titlecase mapping, so `'` starts a new word like CPython).
+- **v0.65:** `str.zfill` / `center` / `ljust` / `rjust` — pad to width (`zfill` keeps a leading `+`/`-`; fillchar is one character, counted in code points since v0.90; extra center pad matches CPython 3.14).
+- **v0.66:** `str.isalnum` / `istitle` / `isascii` — ASCII predicates (empty `isalnum`/`istitle` are False; empty `isascii` is True).
+- **v0.67:** `str.expandtabs([tabsize])` — tab stops (default 8); `\\n`/`\\r` reset the column; `tabsize <= 0` deletes tabs.
+- **v0.68:** `str.strip` / `lstrip` / `rstrip` accept optional `chars` (`None` or omitted is Unicode whitespace since v0.91; empty `chars` is a no-op).
+- **v0.69:** `str.isdecimal` / `isnumeric` / `isidentifier` / `isprintable` (Unicode 16.0.0 since v0.91: `"²"` is a digit but not a decimal, `café` and `π` are identifiers, empty is printable).
+- **v0.70:** `tuple.count(x)` / `tuple.index(x)` — same tag+equality as `in` (homogeneous coerces; miss is `ValueError: tuple.index(x): x not in tuple`).
+- **v0.71:** `list.index` / `tuple.index` accept optional `start`/`end` (CPython slice bounds; `None` is a type error; miss is the same ValueError).
+- **v0.72:** `str.casefold()` — full Unicode case folding since v0.91, so `"ß".casefold()` is `"ss"` and matches `"SS".casefold()`.
+- **v0.73:** `str.maketrans` / `str.translate` — 2-arg maps strings of equal character length; 3-arg also deletes; `translate` accepts `dict[int, int]` or `dict[int, int | None]` (code point ordinals since v0.90, as `ord` produces; replacements via `chr`).
+- **v0.74:** `set.copy()` — shallow copy (independent of later add/remove).
+- **v0.75:** `set.pop()` — remove and return an element (last-inserted); empty is `KeyError: 'pop from an empty set'`.
+- **v0.76:** `set.intersection_update` / `difference_update` / `symmetric_difference_update` and `&=` / `-=` / `^=` (in-place, same element type; aliases see the mutation).
+- **v0.77:** `dict.fromkeys(iterable[, value])` — keys from `list`/`set` of int or str, or a `str` (chars); omitted value is `None`.
+- **v0.78:** class `<` / `<=` / `>` / `>=` — `__lt__` / `__le__` / `__gt__` / `__ge__` when defined on the left class (virtual, including inherited); no identity fallback.
+- **v0.79:** `sorted` / `list.sort` / `min` / `max` of class instances that define `__lt__` (virtual, including inherited; CPython uses `<` only); empty iterable `min`/`max` matches the usual ValueError / `default=`.
+- **v0.80:** reflected class ordering — `a < b` tries `b.__gt__(a)` when the left type has no `__lt__` (and the other swap pairs); subclass-first when the right type is a proper subclass and defines the reflected slot. No `NotImplemented` fallthrough. `sorted` / `min` / `max` accept `__gt__` as well as `__lt__`.
+- **v0.81:** reflected class `==` / `!=` — `1 == P()` calls `P.__eq__(1)` when the left type has no `__eq__` and the left type is assignable to `other` (subclass-first when the right type is a proper subclass). Identity remains only when neither side provides a usable `__eq__`.
+- **v0.82:** class `__getitem__` / `__setitem__` / `__delitem__` — `obj[k]`, `obj[k] = v`, `del obj[k]`, and `obj[k] += v` (virtual, including inherited). Slice syntax on a class is still residual.
+- **v0.83:** class `!=` uses `__ne__` when present (virtual, inherited, reflected, subclass-first); otherwise it still inverts that receiver's `__eq__`. Comparison and class-membership operands are evaluated once in source order (needle before container).
+- **v0.84:** user-iterator `for` / comprehensions treat `StopIteration` from `__next__` as the loop terminator only; body and target-binding exceptions propagate. List/set/dict comprehensions accept the same iterables as `for` (range, list, str, tuple, dict keys, set, file, generator, class `__iter__`).
+- **v0.85:** `list[C]` `==` / `!=` / `in` / `index` / `count` / `remove` and tuple `==` / `!=` use class `__eq__` (virtual, inherited, identity fallback). List `!=` negates element `==`, not `__ne__`. Homogeneous `tuple[C, …]` `in` / `index` / `count` use the same protocol; mixed-tuple membership stays slot identity.
