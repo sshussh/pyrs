@@ -162,6 +162,29 @@ def check_links(root: Path) -> list[str]:
     return problems
 
 
+def check_unicode_tables(root: Path) -> list[str]:
+    """The committed Unicode tables must match the interpreter that generated
+    them, so a regeneration on a different CPython cannot land unnoticed."""
+    header = root / "codegen" / "runtime" / "unicode_data.h"
+    if not header.exists():
+        return ["codegen/runtime/unicode_data.h is missing; run scripts/gen_unicode_tables.py"]
+    text = header.read_text()
+    stamped = re.search(r'#define PYRS_UNIDATA_VERSION "([^"]+)"', text)
+    if not stamped:
+        return ["unicode_data.h has no PYRS_UNIDATA_VERSION stamp"]
+    import unicodedata
+
+    running = unicodedata.unidata_version
+    if stamped.group(1) != running:
+        return [
+            f"unicode_data.h was generated for Unicode {stamped.group(1)} but this "
+            f"CPython provides {running}; regenerate with "
+            f"scripts/gen_unicode_tables.py or use a matching interpreter"
+        ]
+    print(f"  Unicode tables generated for {stamped.group(1)}, matching this CPython")
+    return []
+
+
 def check_historical_untouched(root: Path) -> list[str]:
     """Milestone records should not be rewritten to the current version."""
     missing = [p for p in HISTORICAL if not (root / p).exists()]
@@ -190,6 +213,7 @@ def main() -> int:
         print("version agreement:")
         problems += check_versions(root, binary)
         problems += check_historical_untouched(root)
+        problems += check_unicode_tables(root)
     if args.only in (None, "links"):
         print("documentation links:")
         problems += check_links(root)

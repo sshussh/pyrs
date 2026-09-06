@@ -8394,7 +8394,11 @@ print(add3(*[1, 2, 3]))
 fn while_local_optional_reassign_none_terminates() {
     // Regression: refined `is not None` must not constant-fold the loop cond
     // after a prior concrete assign (would infinite-loop on `x = None`).
-    // Timeout so a hang fails CI quickly instead of blocking the suite.
+    // Timeout so a hang fails CI quickly instead of blocking the suite. The
+    // budget has to cover a full `pyrs compile` (~2.4s serial, dominated by
+    // building the C runtime) under a saturated parallel test run, so it is
+    // sized for hang detection, not as a compile-time budget; the other
+    // timeout tests here already use 15s.
     let src = "\
 def f() -> int:
     x: int | None = 3
@@ -8408,7 +8412,7 @@ def f() -> int:
     return s
 print(f())
 ";
-    let out = run_program_timeout("while_local_opt", src, Duration::from_secs(5));
+    let out = run_program_timeout("while_local_opt", src, Duration::from_secs(30));
     let py = Command::new("python3")
         .arg("-c")
         .arg(src)

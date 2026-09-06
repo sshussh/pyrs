@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import unicodedata
 import unittest
 from pathlib import Path
 
@@ -210,7 +211,30 @@ class HygieneGateTests(unittest.TestCase):
         )
         write(root / "CHANGELOG.md", "# Changelog\n")
         write(root / "docs/superpowers/plans/keep.md", "# history\n")
+        write(
+            root / "codegen/runtime/unicode_data.h",
+            f'#define PYRS_UNIDATA_VERSION "{unicodedata.unidata_version}"\n',
+        )
         return root
+
+    def test_unicode_table_version_must_match_the_interpreter(self) -> None:
+        # The tables are generated from whatever CPython ran the generator, so
+        # a regeneration on a different interpreter must not land unnoticed.
+        root = self.make_repo()
+        write(
+            root / "codegen/runtime/unicode_data.h",
+            '#define PYRS_UNIDATA_VERSION "1.0.0"\n',
+        )
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("generated for Unicode 1.0.0", done.stdout)
+
+    def test_missing_unicode_tables_are_caught(self) -> None:
+        root = self.make_repo()
+        (root / "codegen/runtime/unicode_data.h").unlink()
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("gen_unicode_tables.py", done.stdout)
 
     def test_consistent_repo_passes(self) -> None:
         done = self.run_gate(self.make_repo(), "versions")

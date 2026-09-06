@@ -434,8 +434,8 @@ range gives `""`, and negative steps walk backwards — `s[::-1]` reverses,
 `s[8:2:-2]` == `"rwo"` for `"hello world"`. A zero step raises
 `ValueError`.
 
-String methods (offsets are code points; case and `is*` rules are still
-ASCII-only — see the note after this section):
+String methods (offsets, case and character classes are all Unicode — see
+the note after this section):
 
 ```python
 "  hi  ".strip()          # also lstrip / rstrip; .strip("x") / None ok
@@ -484,23 +484,33 @@ widths all count **Unicode code points**, as CPython does: `len("é")` is
 `1`, `len("🐍")` is `1`, and `"héllo".find("l")` is `2`. `ord` / `chr`
 round-trip with them.
 
-Two divergences to know about:
+Case transforms (`upper`, `lower`, `title`, `capitalize`, `swapcase`,
+`casefold`) and the character classes (`isalpha`, `isdigit`, `isdecimal`,
+`isnumeric`, `isalnum`, `isspace`, `isupper`, `islower`, `istitle`,
+`isprintable`, `isidentifier`) follow **Unicode 16.0.0**, including mappings
+that change length: `"ß".upper()` is `"SS"` and `"ﬁ".upper()` is `"FI"`.
+Whitespace-driven `strip()` / `split()` and `splitlines()` use the Unicode
+whitespace and line-boundary sets. The tables are generated from the
+installed CPython by `scripts/gen_unicode_tables.py`.
 
-- **Case and character-class methods are still ASCII-only.** `upper`,
-  `lower`, `title`, `capitalize`, `swapcase`, `casefold` and every `is*`
-  predicate ignore non-ASCII characters, so `"ß".upper()` is `"ß"` (CPython
-  gives `"SS"`), `"naïve".upper()` is `"NAïVE"`, and `"é".isalpha()` is
-  `False`. Whitespace-driven `strip()` / `split()` and `splitlines()` use
-  the ASCII whitespace and line-terminator sets. Unicode data tables are the
-  next milestone.
+Divergences to know about:
+
+- **No normalization or grapheme clusters.** `len` counts code points, as
+  CPython does, so `"e"` followed by a combining acute is `2`, not `1`.
+- **Casing is not locale-sensitive.** `"İ".lower()` matches CPython's
+  default two-code-point result, not the Turkish-locale one.
 - **Indexing a non-ASCII string is O(n), not O(1).** Strings are stored as
   UTF-8, so `s[i]` scans. Sequential access — `for c in s`, or
   `for i in range(len(s))` — is amortised O(1) per step, so ordinary loops
   stay linear; random access into a large non-ASCII string does not. ASCII
   strings are O(1) throughout.
+- **No `bytes` / `bytearray` / `.encode()`, and no codec but UTF-8.**
+  Lone-surrogate behavior is unspecified: `chr(0xD800)` produces bytes that
+  the CPython extension bridge rejects.
 
 The lexer does not yet accept `\xNN` or `\uXXXX` escapes in string
-literals; use `chr(n)` for a non-literal character.
+literals; use `chr(n)` for a non-literal character. An f-string replacement
+field cannot contain nested quotes.
 
 ### f-strings
 

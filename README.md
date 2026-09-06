@@ -76,10 +76,10 @@ Build your own module with `pyrs build-extension -i kernels.py --module kernels_
 --python .venv/bin/python`; import `kernels_native` from that same environment.
 Only the exported kernels run natively; Python and package code keep using CPython.
 
-## The language (v0.90.0)
+## The language (v0.91.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.91.0**, not 1.0) until it is ready for
+milestone after this one is **0.92.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -213,8 +213,9 @@ A statically-typed Python subset:
   empty needle is `len(slice)+1`; start past `len` is 0.
   **v0.63:** `str.startswith`/`endswith` accept a tuple of strs and optional
   `start`/`end` (same slice bounds as find).
-  **v0.64:** `str.capitalize` / `title` / `swapcase` — ASCII case transforms
-  (title words are letter runs; `'` starts a new word like CPython).
+  **v0.64:** `str.capitalize` / `title` / `swapcase` (Unicode-aware since
+  v0.91; title words break on cased characters and use the titlecase
+  mapping, so `'` starts a new word like CPython).
   **v0.65:** `str.zfill` / `center` / `ljust` / `rjust` — pad to width
   (`zfill` keeps a leading `+`/`-`; fillchar is one character, counted in
   code points since v0.90; extra center pad matches CPython 3.14).
@@ -223,16 +224,17 @@ A statically-typed Python subset:
   **v0.67:** `str.expandtabs([tabsize])` — tab stops (default 8);
   `\\n`/`\\r` reset the column; `tabsize <= 0` deletes tabs.
   **v0.68:** `str.strip` / `lstrip` / `rstrip` accept optional `chars`
-  (`None` or omitted is ASCII whitespace; empty `chars` is a no-op).
+  (`None` or omitted is Unicode whitespace since v0.91; empty `chars` is a
+  no-op).
   **v0.69:** `str.isdecimal` / `isnumeric` / `isidentifier` / `isprintable`
-  (ASCII: decimal/numeric match `isdigit`; identifiers are
-  `[A-Za-z_][A-Za-z0-9_]*`; printable is `0x20..=0x7E`, empty is True).
+  (Unicode 16.0.0 since v0.91: `"²"` is a digit but not a decimal, `café`
+  and `π` are identifiers, empty is printable).
   **v0.70:** `tuple.count(x)` / `tuple.index(x)` — same tag+equality as `in`
   (homogeneous coerces; miss is `ValueError: tuple.index(x): x not in tuple`).
   **v0.71:** `list.index` / `tuple.index` accept optional `start`/`end`
   (CPython slice bounds; `None` is a type error; miss is the same ValueError).
-  **v0.72:** `str.casefold()` — ASCII case-fold (same as `lower`; Unicode
-  folds like `ß` → `ss` remain residual).
+  **v0.72:** `str.casefold()` — full Unicode case folding since v0.91, so
+  `"ß".casefold()` is `"ss"` and matches `"SS".casefold()`.
   **v0.73:** `str.maketrans` / `str.translate` — 2-arg maps strings of
   equal character length; 3-arg also deletes; `translate` accepts
   `dict[int, int]` or `dict[int, int | None]` (code point ordinals since
@@ -472,7 +474,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.90.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.91.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -518,8 +520,8 @@ converting an already-typed `list[int]` into `list[float]` (or into a union)
 by assignment remains unsupported — only the literal's own elements are
 joined (mixed non-numeric literal elements still error unless annotated
 as a union), `nan in [nan]`
-is False (IEEE equality), str offsets are Unicode code points but case
-and `is*` methods still use ASCII rules,
+is False (IEEE equality), str offsets, case transforms and `is*` methods
+follow Unicode 16.0.0 (no normalization or locale-sensitive casing),
 indexing a non-ASCII `str` is O(n) rather than CPython's O(1) (sequential
 access is amortised O(1)), GC is
 nonmoving mark–sweep with conservative native roots (so reclamation can be
@@ -652,4 +654,4 @@ compatibility probes.
 
 Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
-Release tags: `git tag v0.90.0 && git push origin v0.90.0`.
+Release tags: `git tag v0.91.0 && git push origin v0.91.0`.

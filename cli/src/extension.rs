@@ -117,6 +117,8 @@ print('\0'.join([sysconfig.get_path('include'), sysconfig.get_path('platinclude'
     fs::write(dir.join("runtime.c"), codegen::RUNTIME_C).map_err(|e| e.to_string())?;
     fs::write(dir.join("gc.c"), codegen::GC_C).map_err(|e| e.to_string())?;
     fs::write(dir.join("gc.h"), codegen::GC_H).map_err(|e| e.to_string())?;
+    fs::write(dir.join("unicode_data.c"), codegen::UNICODE_DATA_C).map_err(|e| e.to_string())?;
+    fs::write(dir.join("unicode_data.h"), codegen::UNICODE_DATA_H).map_err(|e| e.to_string())?;
     fs::write(dir.join("bridge.c"), wrapper(&cmd.module, &exports)).map_err(|e| e.to_string())?;
     fs::write(
         dir.join("exports.map"),
@@ -152,6 +154,7 @@ print('\0'.join([sysconfig.get_path('include'), sysconfig.get_path('platinclude'
         .arg(&object)
         .arg(dir.join("bridge.c"))
         .arg(dir.join("gc.c"))
+        .arg(dir.join("unicode_data.c"))
         .arg(format!(
             "-Wl,--version-script={}",
             dir.join("exports.map").display()
