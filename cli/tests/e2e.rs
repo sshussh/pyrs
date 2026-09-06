@@ -11095,19 +11095,18 @@ class C:
 
 #[test]
 fn class_body_attr_default_rejected() {
+    // A literal class attribute is a class constant now; what stays rejected
+    // is a computed one, which would need real class-level storage.
     let (_, stderr) = run_program_expect_fail(
         "class_attr_def",
         "\
 class C:
-    x: int = 5
+    x: int = 5 + 1
     def __init__(self):
         pass
 ",
     );
-    assert!(
-        stderr.contains("class body attributes are not supported yet"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("must be a literal"), "stderr: {stderr}");
 }
 
 #[test]

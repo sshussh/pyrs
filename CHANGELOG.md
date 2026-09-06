@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.106.0 — Class-body constants
+
+Any assignment in a class body was rejected, so a class could not carry a
+constant at all: enum-like values, limits, `PI`. The stated reason was that a
+class attribute with a default would leave zeroed instance storage — true of an
+instance *field* default, but not of a class constant, which is not an
+instance field.
+
+- `class C: LIMIT = 10` declares a constant, read as `C.LIMIT` and `self.LIMIT`
+  (and inherited by subclasses, which may override it). Int, float, str, bool
+  and negated numbers, with or without an annotation.
+- An instance field of the same name shadows the constant, as in CPython.
+- The value must be a **literal**: constants are substituted where they are
+  read rather than stored, which is exact for something immutable and needs no
+  storage or initialisation ordering. A computed value is rejected with that
+  reason and a pointer to `__init__`.
+- Assigning to a constant is rejected for the same reason — there is nothing to
+  assign to. Previously `C.N = 2` reported `name 'C' is not defined`, which
+  sent the reader after a missing binding.
+- An unknown attribute on a class name now names the class, instead of
+  reporting the class itself as undefined.
+
 ## 0.105.0 — n-ary `zip` and `enumerate(start)`
 
 `zip` accepted exactly two arguments and `enumerate` only a keyword `start=`,

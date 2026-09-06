@@ -90,6 +90,54 @@ thread_local! {
     static EXC_ENV: RefCell<ExcEnv> = RefCell::new(ExcEnv::default());
 }
 
+thread_local! {
+    /// Class-body constants: `(module, Class, NAME)` -> literal value.
+    ///
+    /// Only literals are accepted, and the value is substituted at every use
+    /// rather than stored. That is exact for an immutable constant, needs no
+    /// storage and no initialisation ordering, and is why assigning to one is
+    /// rejected: there is nothing to assign to.
+    static CLASS_CONSTS: RefCell<HashMap<(String, String, String), ir::Expr>> =
+        RefCell::new(HashMap::new());
+}
+
+fn set_class_const(module: &str, class: &str, name: &str, value: ir::Expr) {
+    CLASS_CONSTS.with(|m| {
+        m.borrow_mut().insert(
+            (module.to_string(), class.to_string(), name.to_string()),
+            value,
+        )
+    });
+}
+
+/// A class constant, searching the class and then its bases.
+fn class_const(class_id: ir::ClassId, name: &str) -> Option<ir::Expr> {
+    let mut cur = Some(class_id);
+    while let Some(id) = cur {
+        let info = class_info(id)?;
+        let module = with_class_env(|e| e.module_of.get(&id).cloned())?;
+        // `info.name` may be qualified (`mod.Class`); constants are keyed by
+        // the bare name the class body declared.
+        let bare = info
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&info.name)
+            .to_string();
+        if let Some(v) =
+            CLASS_CONSTS.with(|m| m.borrow().get(&(module, bare, name.to_string())).cloned())
+        {
+            return Some(v);
+        }
+        cur = info.parent;
+    }
+    Option::None
+}
+
+fn clear_class_consts() {
+    CLASS_CONSTS.with(|m| m.borrow_mut().clear());
+}
+
 fn clear_exc_env() {
     EXC_ENV.with(|e| *e.borrow_mut() = ExcEnv::default());
 }
@@ -2118,6 +2166,8 @@ struct ClassAst<'a> {
     methods: Vec<ClassMethodAst<'a>>,
     /// Class-body annotated attrs: name → type annotation.
     class_attrs: Vec<(String, ast::TypeName, Span)>,
+    /// Class-body constants, in declaration order: `NAME = <literal>`.
+    class_consts: Vec<(String, &'a ast::Expr)>,
     span: Span,
 }
 
@@ -2147,6 +2197,7 @@ fn collect_class_asts<'a>(modules: &'a [ModuleInput<'a>]) -> SResult<Vec<ClassAs
                 }
                 let mut methods = Vec::new();
                 let class_attrs = Vec::new();
+                let mut class_consts: Vec<(String, &ast::Expr)> = Vec::new();
                 let mut seen_methods = HashSet::new();
                 for b in &c.body {
                     match &b.kind {
@@ -2169,16 +2220,50 @@ fn collect_class_asts<'a>(modules: &'a [ModuleInput<'a>]) -> SResult<Vec<ClassAs
                             methods.push(ClassMethodAst { def: f });
                         }
                         ast::StmtKind::Pass => {}
-                        ast::StmtKind::Assign { .. } => {
-                            // Class-body attributes with defaults would leave zeroed
-                            // storage (untagged int 0 → SEGV). Reject until defaults
-                            // are applied at NewObject. Fields belong in __init__.
-                            return Err(err(
-                                "class body attributes are not supported yet \
-                                 (assign fields in __init__ with self.x = …)",
-                                b.span,
-                            )
-                            .with_file(i));
+                        ast::StmtKind::Assign {
+                            targets,
+                            value,
+                            annotation,
+                        } => {
+                            // A class constant. Only a literal: it is
+                            // substituted at every use rather than stored, so
+                            // there is no initialisation to order and nothing
+                            // that could be mutated. Instance fields still
+                            // belong in __init__, where they get real storage.
+                            let [ast::AssignTarget::Name { name, .. }] = &targets[..] else {
+                                return Err(err(
+                                    "only a plain name can be assigned in a class body",
+                                    b.span,
+                                )
+                                .with_file(i));
+                            };
+                            let Some(ty) = class_const_literal_ty(value) else {
+                                return Err(err(
+                                    format!(
+                                        "class attribute '{name}' must be a literal \
+                                         (int, float, bool or str): it is substituted \
+                                         where it is used, not stored. Assign a computed \
+                                         value in __init__ instead"
+                                    ),
+                                    value.span,
+                                )
+                                .with_file(i));
+                            };
+                            if let Some(ann) = annotation {
+                                let want = resolve_type_checked(*ann, b.span)
+                                    .map_err(|e| e.with_file(i))?;
+                                if want != ty {
+                                    return Err(err(
+                                        format!(
+                                            "class attribute '{name}' is annotated {want} \
+                                             but its value is {ty}"
+                                        ),
+                                        b.span,
+                                    )
+                                    .with_file(i));
+                                }
+                            }
+                            class_consts.push((name.clone(), value));
                         }
                         ast::StmtKind::ExprStmt(e) if matches!(e.kind, ast::ExprKind::Str(_)) => {}
                         _ => {
@@ -2197,6 +2282,7 @@ fn collect_class_asts<'a>(modules: &'a [ModuleInput<'a>]) -> SResult<Vec<ClassAs
                     bases: c.bases.clone(),
                     methods,
                     class_attrs,
+                    class_consts,
                     span: c.span,
                 });
             }
@@ -2664,6 +2750,73 @@ fn builtin_exc_base(name: &str) -> Option<ir::ExcType> {
         return Option::None;
     }
     Some(ty)
+}
+
+/// The type of a class-body constant's value, or `None` if it is not a
+/// literal. A leading `-` or `+` on a number counts: `LIMIT = -1` is a
+/// literal to a reader, whatever the AST shape.
+fn class_const_literal_ty(e: &ast::Expr) -> Option<ir::Ty> {
+    match &e.kind {
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Neg,
+            operand,
+        } => match class_const_literal_ty(operand)? {
+            t @ (ir::Ty::Int | ir::Ty::Float) => Some(t),
+            _ => Option::None,
+        },
+        _ => literal_expr_ty(e),
+    }
+}
+
+/// Record each class's literal constants, so a `C.NAME` read can be replaced
+/// by the value. Runs after class ids exist and before any body is lowered.
+fn register_class_consts(classes: &[ClassAst<'_>]) -> SResult<()> {
+    for c in classes {
+        for (name, value) in &c.class_consts {
+            let lit = match &value.kind {
+                ast::ExprKind::Int(v) => int_const(*v),
+                ast::ExprKind::IntDigits(d) => ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::ConstIntDigits(d.clone()),
+                },
+                ast::ExprKind::Float(v) => ir::Expr {
+                    ty: ir::Ty::Float,
+                    kind: ir::ExprKind::ConstFloat(*v),
+                },
+                ast::ExprKind::Bool(v) => ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::ConstBool(*v),
+                },
+                ast::ExprKind::Str(v) => const_str_expr(v),
+                ast::ExprKind::Unary {
+                    op: ast::UnaryOp::Neg,
+                    operand,
+                } => match &operand.kind {
+                    ast::ExprKind::Int(v) => int_const(-*v),
+                    ast::ExprKind::Float(v) => ir::Expr {
+                        ty: ir::Ty::Float,
+                        kind: ir::ExprKind::ConstFloat(-*v),
+                    },
+                    _ => {
+                        return Err(err(
+                            format!("class attribute '{name}' must be a literal"),
+                            value.span,
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(err(
+                        format!("class attribute '{name}' must be a literal"),
+                        value.span,
+                    ));
+                }
+            };
+            // Keyed by the same module string `module_of` records, so the
+            // lookup in `class_const` matches.
+            set_class_const(&c.module, &c.name, name, lit);
+        }
+    }
+    Ok(())
 }
 
 /// Pass A: assign ClassIds only (no base resolution yet).
@@ -5688,6 +5841,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     assert!(!modules.is_empty(), "a program needs at least one module");
     clear_closure_defaults();
     clear_class_env();
+    clear_class_consts();
     clear_synth_param_tys();
     SYNTH_YIELD_TYS.with(|m| m.borrow_mut().clear());
     // Before regular class collection: an exception class must not acquire a
@@ -5698,6 +5852,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     // pass 0: class ids → import aliases for bases/annotations → bases → layouts
     let mut class_asts = collect_class_asts(modules)?;
     register_class_ids(&class_asts)?;
+    register_class_consts(&class_asts)?;
     inject_class_import_aliases(modules);
     resolve_class_bases(&class_asts)?;
     // Needs resolved bases: whether a class should get a default `__ne__`
@@ -13717,6 +13872,38 @@ fn lower_assign_ir(
             attr,
             attr_span,
         } => {
+            // A class constant is substituted where it is read, so there is
+            // no storage to assign to. Checked before lowering the base,
+            // which for a bare class name would fail as an undefined name.
+            let const_owner = match &base.kind {
+                ast::ExprKind::Name(cls) if !ctx.locals.contains_key(cls) => lookup_class(cls),
+                _ => ctx
+                    .locals
+                    .get(match &base.kind {
+                        ast::ExprKind::Name(n) => n.as_str(),
+                        _ => "",
+                    })
+                    .and_then(|t| match t {
+                        ir::Ty::Class(id) => Some(*id),
+                        _ => Option::None,
+                    }),
+            };
+            if let Some(id) = const_owner
+                && class_const(id, attr).is_some()
+                // An instance field of the same name shadows the constant, as
+                // in CPython, and assigning to *that* is fine. Only a name
+                // with no field behind it has nothing to assign to.
+                && field_index(id, attr).is_none()
+            {
+                return Err(err(
+                    format!(
+                        "'{attr}' is a class constant and cannot be assigned: it is \
+                         substituted where it is used, not stored. Use an instance \
+                         field assigned in __init__ if it needs to change"
+                    ),
+                    *attr_span,
+                ));
+            }
             // An annotation here declared the field's type during class
             // collection; the value is coerced to that type below, so a
             // disagreeing annotation is reported as a value mismatch.
@@ -16991,6 +17178,28 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     ));
                 }
             }
+            // `ClassName.CONST` — a class-body constant, substituted here.
+            // Checked before the module path, since a bare name that is a
+            // class is not a module.
+            if let ast::ExprKind::Name(cls) = &base.kind
+                && !ctx.locals.contains_key(cls)
+                && let Some(id) = lookup_class(cls)
+            {
+                if let Some(v) = class_const(id, attr) {
+                    return Ok(v);
+                }
+                // A class name with no such constant: say that, rather than
+                // falling through to "name 'C' is not defined", which sends
+                // the reader looking for a missing binding.
+                return Err(err(
+                    format!(
+                        "class '{cls}' has no attribute '{attr}'; class-body \
+                         constants must be literals, and methods are accessed \
+                         on an instance"
+                    ),
+                    *attr_span,
+                ));
+            }
             // `module.global` / `pkg.mod.global` from an imported module path.
             // Last-binding wins: value/function re-exports are checked before
             // treating `attr` as a submodule (same as `from pkg import attr`).
@@ -17204,6 +17413,11 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                             virtual_dispatch,
                         },
                     });
+                }
+                // Not an instance field or method: a class constant, which
+                // an instance reads through its class, as in CPython.
+                if let Some(v) = class_const(id, attr) {
+                    return Ok(v);
                 }
                 return Err(err(
                     format!(
