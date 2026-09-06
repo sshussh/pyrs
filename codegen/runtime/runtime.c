@@ -95,11 +95,30 @@ void pyrs_print_class_instance(void *obj) {
     fputs("<object>", stdout);
 }
 
-/* layout shared with codegen: leading i64 length, then bytes (+ NUL) */
+/* Layout shared with codegen: two i64 header words, then UTF-8 bytes (+ NUL).
+ *
+ * `cplen` is first because codegen's emit_len blindly loads the first i64 for
+ * every sized object (str/list/tuple/dict/set), and `len(s)` must be the
+ * Python answer: a count of code points.  `len` stays the UTF-8 byte count, so
+ * every byte-oriented operation in this file -- memcmp, memcpy, fwrite, the
+ * substring searches -- keeps using `->len` and needs no change.
+ *
+ * Invariant: cplen <= len, and cplen == len exactly when the string is ASCII.
+ * str_alloc leaves cplen == -1; every producer must finish with one of
+ * str_done_ascii / str_done_scan / str_done_cplen, so a missed site reports a
+ * negative length loudly instead of silently miscounting. */
 typedef struct {
+    long long cplen;
     long long len;
     char data[];
 } PyrsStr;
+
+/* Every code point is one byte exactly when the string is ASCII. */
+#define STR_IS_ASCII(s) ((s)->cplen == (s)->len)
+
+/* Defined with the string section below; the exception helpers above it need
+ * to build PyrsStr values too. */
+static PyrsStr *str_from_utf8(const char *buf, long long len);
 
 /* GC-managed first-class exception instance bound by `except E as e`. */
 typedef struct {
@@ -394,10 +413,7 @@ int pyrs_exc_type(void) {
 PyrsStr *pyrs_exc_message(void) {
     const char *body = exc_msg_body(g_exc_msg);
     size_t n = strlen(body);
-    PyrsStr *s = pyrs_gc_alloc(sizeof(long long) + n + 1, PYRS_GC_STRING);
-    s->len = (long long)n;
-    memcpy(s->data, body, n + 1);
-    return s;
+    return str_from_utf8(body, (long long)n);
 }
 
 /* Build a first-class exception object from the active pending exception. */
@@ -418,11 +434,7 @@ void pyrs_print_exc(PyrsExc *e) {
 
 PyrsStr *pyrs_str_from_exc(PyrsExc *e) {
     if (e == NULL || e->msg == NULL) {
-        PyrsStr *s =
-            pyrs_gc_alloc(sizeof(long long) + 1, PYRS_GC_STRING);
-        s->len = 0;
-        s->data[0] = '\0';
-        return s;
+        return str_from_utf8("", 0);
     }
     return e->msg;
 }
@@ -449,10 +461,7 @@ PyrsStr *pyrs_repr_from_exc(PyrsExc *e) {
         snprintf(buf, sizeof buf, "%s('%s')", name, body);
     }
     size_t n = strlen(buf);
-    PyrsStr *s = pyrs_gc_alloc(sizeof(long long) + n + 1, PYRS_GC_STRING);
-    s->len = (long long)n;
-    memcpy(s->data, buf, n + 1);
-    return s;
+    return str_from_utf8(buf, (long long)n);
 }
 
 /* isinstance(exc, filter_tag) with hierarchy. */
@@ -514,12 +523,120 @@ static void check_ref(const void *p) {
     }
 }
 
+/* defined with the rest of the Unicode helpers further down */
+static int utf8_next(const PyrsStr *s, long long i, unsigned int *cp);
+
+/* Allocate room for `len` UTF-8 bytes.  The code point count is deliberately
+ * left invalid: the caller knows whether the bytes it is about to write are
+ * ASCII (str_done_ascii), need a scan (str_done_scan), or have a count it
+ * already computed arithmetically (str_done_cplen). */
 static PyrsStr *str_alloc(long long len) {
-    PyrsStr *s = pyrs_gc_alloc(sizeof(long long) + (size_t)len + 1,
+    PyrsStr *s = pyrs_gc_alloc(2 * sizeof(long long) + (size_t)len + 1,
                               PYRS_GC_STRING);
+    s->cplen = -1;
     s->len = len;
     s->data[len] = '\0';
     return s;
+}
+
+/* The bytes are known to be ASCII, so each one is its own code point. */
+static PyrsStr *str_done_ascii(PyrsStr *s) {
+    s->cplen = s->len;
+    return s;
+}
+
+/* The caller computed the count itself (slicing, concatenation of strings
+ * whose counts are already known, and similar arithmetic cases). */
+static PyrsStr *str_done_cplen(PyrsStr *s, long long cplen) {
+    s->cplen = cplen;
+    return s;
+}
+
+/* Count the code points in bytes of unknown provenance. */
+static PyrsStr *str_done_scan(PyrsStr *s) {
+    long long n = 0;
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        n++;
+    }
+    s->cplen = n;
+    return s;
+}
+
+/* Allocate and copy `len` bytes of UTF-8 from an external buffer (file reads,
+ * input(), anything crossing into the runtime). */
+static PyrsStr *str_from_utf8(const char *buf, long long len) {
+    PyrsStr *s = str_alloc(len);
+    if (len > 0) {
+        memcpy(s->data, buf, (size_t)len);
+    }
+    return str_done_scan(s);
+}
+
+/* Sequential access -- `for c in s`, or an explicit `for i in range(len(s))`
+ * index loop -- would be quadratic on non-ASCII text if every lookup rescanned
+ * from the start.  One memo entry makes a forward walk amortised O(1) without
+ * growing PyrsStr.  It keys on the object address, so pyrs_str_cache_invalidate
+ * clears it whenever the collector runs and an address could be reused. */
+static _Thread_local const PyrsStr *cp_memo_str;
+static _Thread_local long long cp_memo_cp;
+static _Thread_local long long cp_memo_byte;
+
+void pyrs_str_cache_invalidate(void) {
+    cp_memo_str = NULL;
+    cp_memo_cp = 0;
+    cp_memo_byte = 0;
+}
+
+/* Byte offset of code point `i` (0 <= i <= s->cplen). */
+static long long str_byte_of_cp(const PyrsStr *s, long long i) {
+    if (STR_IS_ASCII(s)) {
+        return i;
+    }
+    long long b = 0;
+    long long at = 0;
+    if (cp_memo_str == s && cp_memo_cp <= i) {
+        b = cp_memo_byte;
+        at = cp_memo_cp;
+    }
+    while (at < i && b < s->len) {
+        unsigned int cp;
+        b += utf8_next(s, b, &cp);
+        at++;
+    }
+    cp_memo_str = s;
+    cp_memo_cp = at;
+    cp_memo_byte = b;
+    return b;
+}
+
+/* Code point index of byte offset `b`; `b` must be on a boundary. */
+static long long str_cp_of_byte(const PyrsStr *s, long long b) {
+    if (STR_IS_ASCII(s)) {
+        return b;
+    }
+    long long i = 0, at = 0;
+    while (at < b && at < s->len) {
+        unsigned int cp;
+        at += utf8_next(s, at, &cp);
+        i++;
+    }
+    return i;
+}
+
+/* Code points in the byte range [from, to). */
+static long long str_cp_between(const PyrsStr *s, long long from, long long to) {
+    if (STR_IS_ASCII(s)) {
+        return to - from;
+    }
+    long long n = 0;
+    for (long long b = from; b < to;) {
+        unsigned int cp;
+        b += utf8_next(s, b, &cp);
+        n++;
+    }
+    return n;
 }
 
 /* ---- printing ---- */
@@ -2242,7 +2359,7 @@ PyrsStr *pyrs_str_from_int(long long v) {
     PyrsStr *r = str_alloc(n);
     memcpy(r->data, s, (size_t)n);
     free(s);
-    return r;
+    return str_done_ascii(r);
 }
 
 
@@ -2276,22 +2393,25 @@ static void print_str_repr(const PyrsStr *s) {
     }
     char quote = (has_single && !has_double) ? '"' : '\'';
     fputc(quote, stdout);
-    for (long long i = 0; i < s->len; i++) {
-        unsigned char c = (unsigned char)s->data[i];
-        if (c == (unsigned char)quote || c == '\\') {
+    /* Same rule as pyrs_str_repr: escape by Unicode printability. */
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        int adv = utf8_next(s, i, &cp);
+        if (cp == (unsigned int)quote || cp == '\\') {
             fputc('\\', stdout);
-            fputc(c, stdout);
-        } else if (c == '\n') {
+            fputc((int)cp, stdout);
+        } else if (cp == '\n') {
             fputs("\\n", stdout);
-        } else if (c == '\r') {
+        } else if (cp == '\r') {
             fputs("\\r", stdout);
-        } else if (c == '\t') {
+        } else if (cp == '\t') {
             fputs("\\t", stdout);
-        } else if (c < 0x20 || c == 0x7f) {
-            printf("\\x%02x", c);
+        } else if (cp < 0x20 || cp == 0x7f) {
+            printf("\\x%02x", cp);
         } else {
-            fputc(c, stdout);
+            fwrite(s->data + i, 1, (size_t)adv, stdout);
         }
+        i += adv;
     }
     fputc(quote, stdout);
 }
@@ -2503,7 +2623,7 @@ PyrsStr *pyrs_str_concat(const PyrsStr *a, const PyrsStr *b) {
     PyrsStr *r = str_alloc(a->len + b->len);
     memcpy(r->data, a->data, (size_t)a->len);
     memcpy(r->data + a->len, b->data, (size_t)b->len);
-    return r;
+    return str_done_cplen(r, a->cplen + b->cplen);
 }
 
 PyrsStr *pyrs_str_repeat(const PyrsStr *s, long long n) {
@@ -2515,7 +2635,7 @@ PyrsStr *pyrs_str_repeat(const PyrsStr *s, long long n) {
     for (long long i = 0; i < n; i++) {
         memcpy(r->data + i * s->len, s->data, (size_t)s->len);
     }
-    return r;
+    return str_done_cplen(r, s->cplen * n);
 }
 
 /* lexicographic: -1 / 0 / 1 */
@@ -2533,15 +2653,19 @@ int pyrs_str_cmp(const PyrsStr *a, const PyrsStr *b) {
     return a->len > b->len ? 1 : -1;
 }
 
-/* single-character strings are interned: indexing/iterating a string
- * allocates nothing */
+/* Single-ASCII-character strings are interned, so indexing or iterating an
+ * ASCII string allocates nothing.  Only 0x00-0x7f can be interned this way:
+ * a byte >= 0x80 is a fragment of a UTF-8 sequence, never a string of its
+ * own, so non-ASCII code points go through str_from_cp instead. */
 static struct {
+    long long cplen;
     long long len;
     char data[2];
-} single_chars[256];
+} single_chars[128];
 
 static PyrsStr *single_char(unsigned char c) {
     if (single_chars[c].len == 0) {
+        single_chars[c].cplen = 1;
         single_chars[c].len = 1;
         single_chars[c].data[0] = (char)c;
         single_chars[c].data[1] = '\0';
@@ -2550,20 +2674,62 @@ static PyrsStr *single_char(unsigned char c) {
 }
 
 static struct {
+    long long cplen;
     long long len;
     char data[1];
-} empty_str_storage = {0, {'\0'}};
+} empty_str_storage = {0, 0, {'\0'}};
 #define EMPTY_STR ((PyrsStr *)&empty_str_storage)
+
+/* Encode one code point into `buf` (>= 4 bytes); returns the byte count. */
+static int utf8_encode(unsigned int cp, char *buf) {
+    if (cp < 0x80) {
+        buf[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        buf[0] = (char)(0xc0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3f));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        buf[0] = (char)(0xe0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        buf[2] = (char)(0x80 | (cp & 0x3f));
+        return 3;
+    }
+    buf[0] = (char)(0xf0 | (cp >> 18));
+    buf[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+    buf[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    buf[3] = (char)(0x80 | (cp & 0x3f));
+    return 4;
+}
+
+/* A one-code-point string, interning the ASCII case. */
+static PyrsStr *str_from_cp(unsigned int cp) {
+    if (cp < 0x80) {
+        return single_char((unsigned char)cp);
+    }
+    char buf[4];
+    int n = utf8_encode(cp, buf);
+    PyrsStr *r = str_alloc(n);
+    memcpy(r->data, buf, (size_t)n);
+    return str_done_cplen(r, 1);
+}
 
 PyrsStr *pyrs_str_index(const PyrsStr *s, long long i) {
     check_ref(s);
     if (i < 0) {
-        i += s->len;
+        i += s->cplen;
     }
-    if (i < 0 || i >= s->len) {
+    if (i < 0 || i >= s->cplen) {
         pyrs_die("IndexError: string index out of range");
     }
-    return single_char((unsigned char)s->data[i]);
+    if (STR_IS_ASCII(s)) {
+        return single_char((unsigned char)s->data[i]);
+    }
+    unsigned int cp;
+    utf8_next(s, str_byte_of_cp(s, i), &cp);
+    return str_from_cp(cp);
 }
 
 /* a substring copy, reusing the interned empty/single-char strings */
@@ -2576,7 +2742,7 @@ static PyrsStr *str_sub(const PyrsStr *s, long long off, long long n) {
     }
     PyrsStr *r = str_alloc(n);
     memcpy(r->data, s->data + off, (size_t)n);
-    return r;
+    return str_done_cplen(r, str_cp_between(s, off, off + n));
 }
 
 /* CPython PySlice_AdjustIndices: resolve one bound against len for the
@@ -2611,23 +2777,40 @@ PyrsStr *pyrs_str_slice(const PyrsStr *s, long long lo, long long hi, long long 
     if (step == 0) {
         pyrs_die("ValueError: slice step cannot be zero");
     }
-    long long start = resolve_slice_bound(lo, 1, s->len, step);
-    long long stop = resolve_slice_bound(hi, 0, s->len, step);
+    /* Bounds are code point indices, as in CPython. */
+    long long start = resolve_slice_bound(lo, 1, s->cplen, step);
+    long long stop = resolve_slice_bound(hi, 0, s->cplen, step);
     long long n = slice_count(start, stop, step);
-    if (step == 1) {
-        return str_sub(s, start, n);
-    }
     if (n <= 0) {
         return EMPTY_STR;
     }
-    if (n == 1) {
-        return single_char((unsigned char)s->data[start]);
+    if (step == 1) {
+        long long from = str_byte_of_cp(s, start);
+        long long to = str_byte_of_cp(s, start + n);
+        return str_sub(s, from, to - from);
     }
-    PyrsStr *r = str_alloc(n);
+    if (STR_IS_ASCII(s)) {
+        if (n == 1) {
+            return single_char((unsigned char)s->data[start]);
+        }
+        PyrsStr *r = str_alloc(n);
+        for (long long i = 0; i < n; i++) {
+            r->data[i] = s->data[start + i * step];
+        }
+        return str_done_ascii(r);
+    }
+    /* A strided slice of non-ASCII text: each selected code point can be a
+     * different width, so size the buffer at the worst case and trim. */
+    PyrsStr *r = str_alloc(n * 4);
+    long long w = 0;
     for (long long i = 0; i < n; i++) {
-        r->data[i] = s->data[start + i * step];
+        unsigned int cp;
+        utf8_next(s, str_byte_of_cp(s, start + i * step), &cp);
+        w += utf8_encode(cp, r->data + w);
     }
-    return r;
+    r->len = w;
+    r->data[w] = '\0';
+    return str_done_cplen(r, n);
 }
 
 /* ---- str methods (ASCII case/whitespace rules) ---- */
@@ -2639,7 +2822,7 @@ PyrsStr *pyrs_str_upper(const PyrsStr *s) {
         char c = s->data[i];
         r->data[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
     }
-    return r;
+    return str_done_cplen(r, s->cplen);
 }
 
 PyrsStr *pyrs_str_lower(const PyrsStr *s) {
@@ -2649,7 +2832,7 @@ PyrsStr *pyrs_str_lower(const PyrsStr *s) {
         char c = s->data[i];
         r->data[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
     }
-    return r;
+    return str_done_cplen(r, s->cplen);
 }
 
 /* ASCII: same as lower. Unicode folds (ß → ss) are residual. */
@@ -2673,13 +2856,13 @@ PyrsStr *pyrs_str_capitalize(const PyrsStr *s) {
     check_ref(s);
     PyrsStr *r = str_alloc(s->len);
     if (s->len == 0) {
-        return r;
+        return str_done_ascii(r);
     }
     r->data[0] = ascii_upper(s->data[0]);
     for (long long i = 1; i < s->len; i++) {
         r->data[i] = ascii_lower(s->data[i]);
     }
-    return r;
+    return str_done_cplen(r, s->cplen);
 }
 
 PyrsStr *pyrs_str_title(const PyrsStr *s) {
@@ -2696,7 +2879,7 @@ PyrsStr *pyrs_str_title(const PyrsStr *s) {
             prev_letter = 0;
         }
     }
-    return r;
+    return str_done_cplen(r, s->cplen);
 }
 
 PyrsStr *pyrs_str_swapcase(const PyrsStr *s) {
@@ -2712,20 +2895,20 @@ PyrsStr *pyrs_str_swapcase(const PyrsStr *s) {
             r->data[i] = c;
         }
     }
-    return r;
+    return str_done_cplen(r, s->cplen);
 }
 
 /* mode: 0=ljust (pad right), 1=rjust (pad left), 2=center */
 static PyrsStr *str_just(const PyrsStr *s, long long width, const PyrsStr *fill, int mode) {
     check_ref(s);
     check_ref(fill);
-    if (fill->len != 1) {
+    if (fill->cplen != 1) {
         pyrs_die("TypeError: The fill character must be exactly one character long");
     }
-    if (width <= s->len) {
+    if (width <= s->cplen) {
         return str_sub(s, 0, s->len);
     }
-    long long pad = width - s->len;
+    long long pad = width - s->cplen;
     long long left;
     if (mode == 0) {
         left = 0;
@@ -2733,19 +2916,24 @@ static PyrsStr *str_just(const PyrsStr *s, long long width, const PyrsStr *fill,
         left = pad;
     } else {
         /* CPython 3.14: extra pad on the left when len is even. */
-        left = (pad + 1 - (s->len & 1)) / 2;
+        left = (pad + 1 - (s->cplen & 1)) / 2;
     }
     long long right = pad - left;
-    PyrsStr *r = str_alloc(width);
-    char fc = fill->data[0];
+    /* The fill is one code point, which may be more than one byte. */
+    long long fw = fill->len;
+    PyrsStr *r = str_alloc(left * fw + s->len + right * fw);
+    long long o = 0;
     for (long long i = 0; i < left; i++) {
-        r->data[i] = fc;
+        memcpy(r->data + o, fill->data, (size_t)fw);
+        o += fw;
     }
-    memcpy(r->data + left, s->data, (size_t)s->len);
+    memcpy(r->data + o, s->data, (size_t)s->len);
+    o += s->len;
     for (long long i = 0; i < right; i++) {
-        r->data[left + s->len + i] = fc;
+        memcpy(r->data + o, fill->data, (size_t)fw);
+        o += fw;
     }
-    return r;
+    return str_done_cplen(r, width);
 }
 
 PyrsStr *pyrs_str_ljust(const PyrsStr *s, long long width, const PyrsStr *fill) {
@@ -2762,12 +2950,12 @@ PyrsStr *pyrs_str_center(const PyrsStr *s, long long width, const PyrsStr *fill)
 
 PyrsStr *pyrs_str_zfill(const PyrsStr *s, long long width) {
     check_ref(s);
-    if (width <= s->len) {
+    if (width <= s->cplen) {
         return str_sub(s, 0, s->len);
     }
-    long long nzero = width - s->len;
+    long long nzero = width - s->cplen;
     int sign = s->len > 0 && (s->data[0] == '+' || s->data[0] == '-');
-    PyrsStr *r = str_alloc(width);
+    PyrsStr *r = str_alloc(s->len + nzero);
     long long o = 0;
     if (sign) {
         r->data[o++] = s->data[0];
@@ -2776,16 +2964,21 @@ PyrsStr *pyrs_str_zfill(const PyrsStr *s, long long width) {
         r->data[o++] = '0';
     }
     memcpy(r->data + o, s->data + (sign ? 1 : 0), (size_t)(s->len - (sign ? 1 : 0)));
-    return r;
+    return str_done_cplen(r, width);
 }
 
 PyrsStr *pyrs_str_expandtabs(const PyrsStr *s, long long tabsize) {
     check_ref(s);
+    /* Columns are counted in code points, so the scan advances by whole UTF-8
+     * sequences; `n` accumulates output *bytes* and `cps` output code points. */
     long long n = 0;
+    long long cps = 0;
     long long col = 0;
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (c == '\t') {
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        int adv = utf8_next(s, i, &cp);
+        i += adv;
+        if (cp == '\t') {
             if (tabsize <= 0) {
                 continue;
             }
@@ -2797,13 +2990,15 @@ PyrsStr *pyrs_str_expandtabs(const PyrsStr *s, long long tabsize) {
                 pyrs_die("MemoryError: expandtabs result too large");
             }
             n += pad;
+            cps += pad;
             col += pad;
         } else {
-            if (n == LLONG_MAX) {
+            if (n > LLONG_MAX - adv) {
                 pyrs_die("MemoryError: expandtabs result too large");
             }
-            n++;
-            if (c == '\n' || c == '\r') {
+            n += adv;
+            cps++;
+            if (cp == '\n' || cp == '\r') {
                 col = 0;
             } else {
                 col++;
@@ -2813,9 +3008,11 @@ PyrsStr *pyrs_str_expandtabs(const PyrsStr *s, long long tabsize) {
     PyrsStr *r = str_alloc(n);
     long long o = 0;
     col = 0;
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (c == '\t') {
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        int adv = utf8_next(s, i, &cp);
+        if (cp == '\t') {
+            i += adv;
             if (tabsize <= 0) {
                 continue;
             }
@@ -2828,15 +3025,17 @@ PyrsStr *pyrs_str_expandtabs(const PyrsStr *s, long long tabsize) {
             }
             col += pad;
         } else {
-            r->data[o++] = c;
-            if (c == '\n' || c == '\r') {
+            memcpy(r->data + o, s->data + i, (size_t)adv);
+            o += adv;
+            i += adv;
+            if (cp == '\n' || cp == '\r') {
                 col = 0;
             } else {
                 col++;
             }
         }
     }
-    return r;
+    return str_done_cplen(r, cps);
 }
 
 static int is_py_space(char c) {
@@ -2882,24 +3081,73 @@ static void fill_byte_set(const PyrsStr *chars, unsigned char set[32]) {
     }
 }
 
+/* Byte offset of the code point ending at byte `e` (e > 0). */
+static long long utf8_prev(const PyrsStr *s, long long e) {
+    long long b = e - 1;
+    while (b > 0 && ((unsigned char)s->data[b] & 0xc0) == 0x80) {
+        b--;
+    }
+    return b;
+}
+
+/* Does `chars` contain this code point? */
+static int cp_in_str(const PyrsStr *chars, unsigned int cp) {
+    for (long long i = 0; i < chars->len;) {
+        unsigned int c;
+        i += utf8_next(chars, i, &c);
+        if (c == cp) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static PyrsStr *strip_chars_impl(const PyrsStr *s, const PyrsStr *chars, int left, int right) {
     check_ref(s);
     check_ref(chars);
     if (chars->len == 0 || s->len == 0) {
         return (PyrsStr *)s;
     }
-    unsigned char set[32];
-    fill_byte_set(chars, set);
     long long b = 0;
     long long e = s->len;
-    if (left) {
-        while (b < e && byte_in_set((unsigned char)s->data[b], set)) {
-            b++;
+    if (STR_IS_ASCII(s) && STR_IS_ASCII(chars)) {
+        /* Fast path: a 256-bit set over bytes, which for ASCII is exactly a
+         * set over code points. */
+        unsigned char set[32];
+        fill_byte_set(chars, set);
+        if (left) {
+            while (b < e && byte_in_set((unsigned char)s->data[b], set)) {
+                b++;
+            }
         }
-    }
-    if (right) {
-        while (e > b && byte_in_set((unsigned char)s->data[e - 1], set)) {
-            e--;
+        if (right) {
+            while (e > b && byte_in_set((unsigned char)s->data[e - 1], set)) {
+                e--;
+            }
+        }
+    } else {
+        /* Compare whole code points, so a multi-byte character is never
+         * stripped a byte at a time into an invalid sequence. */
+        if (left) {
+            while (b < e) {
+                unsigned int cp;
+                int adv = utf8_next(s, b, &cp);
+                if (!cp_in_str(chars, cp)) {
+                    break;
+                }
+                b += adv;
+            }
+        }
+        if (right) {
+            while (e > b) {
+                long long prev = utf8_prev(s, e);
+                unsigned int cp;
+                utf8_next(s, prev, &cp);
+                if (!cp_in_str(chars, cp)) {
+                    break;
+                }
+                e = prev;
+            }
         }
     }
     if (b == 0 && e == s->len) {
@@ -2938,7 +3186,7 @@ PyrsStr *pyrs_str_removeprefix(const PyrsStr *s, const PyrsStr *pre) {
         long long n = s->len - pre->len;
         PyrsStr *r = str_alloc(n);
         memcpy(r->data, s->data + pre->len, (size_t)n);
-        return r;
+        return str_done_cplen(r, s->cplen - pre->cplen);
     }
     return (PyrsStr *)s;
 }
@@ -2950,7 +3198,7 @@ PyrsStr *pyrs_str_removesuffix(const PyrsStr *s, const PyrsStr *suf) {
         long long n = s->len - suf->len;
         PyrsStr *r = str_alloc(n);
         memcpy(r->data, s->data, (size_t)n);
-        return r;
+        return str_done_cplen(r, s->cplen - suf->cplen);
     }
     return (PyrsStr *)s;
 }
@@ -2985,10 +3233,12 @@ static int str_affix_in_slice(const PyrsStr *s, const PyrsStr *aff, long long st
                               long long end, int from_end) {
     check_ref(s);
     check_ref(aff);
-    adjust_slice_bounds(s->len, &start, &end);
+    adjust_slice_bounds(s->cplen, &start, &end);
     if (start > end) {
         return 0;
     }
+    start = str_byte_of_cp(s, start);
+    end = str_byte_of_cp(s, end);
     if (aff->len == 0) {
         return 1;
     }
@@ -3015,27 +3265,30 @@ static long long str_find_bounds(const PyrsStr *s, const PyrsStr *t, long long s
                                  long long end, int from_right) {
     check_ref(s);
     check_ref(t);
-    adjust_slice_bounds(s->len, &start, &end);
+    adjust_slice_bounds(s->cplen, &start, &end);
     if (start > end) {
         return -1;
     }
     if (t->len == 0) {
+        /* already a code point index */
         return from_right ? end : start;
     }
-    if (t->len > end - start) {
+    long long bstart = str_byte_of_cp(s, start);
+    long long bend = str_byte_of_cp(s, end);
+    if (t->len > bend - bstart) {
         return -1;
     }
     if (from_right) {
-        for (long long i = end - t->len; i >= start; i--) {
+        for (long long i = bend - t->len; i >= bstart; i--) {
             if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
-                return i;
+                return str_cp_of_byte(s, i);
             }
         }
         return -1;
     }
-    for (long long i = start; i + t->len <= end; i++) {
+    for (long long i = bstart; i + t->len <= bend; i++) {
         if (memcmp(s->data + i, t->data, (size_t)t->len) == 0) {
-            return i;
+            return str_cp_of_byte(s, i);
         }
     }
     return -1;
@@ -3086,13 +3339,16 @@ long long pyrs_str_count_slice(const PyrsStr *s, const PyrsStr *t, long long sta
                                long long end) {
     check_ref(s);
     check_ref(t);
-    adjust_slice_bounds(s->len, &start, &end);
+    adjust_slice_bounds(s->cplen, &start, &end);
     if (start > end) {
         return 0;
     }
     if (t->len == 0) {
+        /* an empty needle matches between every code point, and at both ends */
         return end - start + 1;
     }
+    start = str_byte_of_cp(s, start);
+    end = str_byte_of_cp(s, end);
     if (t->len > end - start) {
         return 0;
     }
@@ -3125,7 +3381,7 @@ PyrsStr *pyrs_str_replace(const PyrsStr *s, const PyrsStr *old, const PyrsStr *n
     }
     /* Python: an empty old inserts new between every character (and at ends). */
     if (old->len == 0) {
-        long long max_ins = s->len + 1;
+        long long max_ins = s->cplen + 1;
         long long nins = (count < 0 || count >= max_ins) ? max_ins : count;
         if (nins == 0) {
             return str_sub(s, 0, s->len);
@@ -3134,18 +3390,23 @@ PyrsStr *pyrs_str_replace(const PyrsStr *s, const PyrsStr *old, const PyrsStr *n
         PyrsStr *r = str_alloc(n);
         char *p = r->data;
         long long inserted = 0;
-        for (long long i = 0; i < s->len; i++) {
+        for (long long i = 0; i < s->len;) {
+            unsigned int cp;
+            int adv = utf8_next(s, i, &cp);
             if (inserted < nins) {
                 memcpy(p, new_s->data, (size_t)new_s->len);
                 p += new_s->len;
                 inserted++;
             }
-            *p++ = s->data[i];
+            memcpy(p, s->data + i, (size_t)adv);
+            p += adv;
+            i += adv;
         }
         if (inserted < nins) {
             memcpy(p, new_s->data, (size_t)new_s->len);
+            inserted++;
         }
-        return r;
+        return str_done_cplen(r, s->cplen + inserted * new_s->cplen);
     }
     long long avail = pyrs_str_count(s, old);
     long long nrep = count < 0 ? avail : (count < avail ? count : avail);
@@ -3168,7 +3429,7 @@ PyrsStr *pyrs_str_replace(const PyrsStr *s, const PyrsStr *old, const PyrsStr *n
             *p++ = s->data[i++];
         }
     }
-    return r;
+    return str_done_cplen(r, s->cplen - nrep * old->cplen + nrep * new_s->cplen);
 }
 
 static void list_reverse_slots(PyrsList *l) {
@@ -3346,6 +3607,7 @@ PyrsStr *pyrs_str_join(const PyrsStr *sep, const PyrsList *parts) {
         return EMPTY_STR;
     }
     long long total = sep->len * (parts->len - 1);
+    long long cps = sep->cplen * (parts->len - 1);
     for (long long i = 0; i < parts->len; i++) {
         total += ((const PyrsStr *)parts->data[i])->len;
     }
@@ -3360,8 +3622,9 @@ PyrsStr *pyrs_str_join(const PyrsStr *sep, const PyrsList *parts) {
         check_ref(part);
         memcpy(p, part->data, (size_t)part->len);
         p += part->len;
+        cps += part->cplen;
     }
-    return r;
+    return str_done_cplen(r, cps);
 }
 
 /* naive substring search; empty needle matches (like Python) */
@@ -3388,7 +3651,7 @@ PyrsStr *pyrs_str_from_float(double v) {
     size_t n = strlen(buf);
     PyrsStr *r = str_alloc((long long)n);
     memcpy(r->data, buf, n);
-    return r;
+    return str_done_ascii(r);
 }
 
 /* forward decls for format helpers (int may promote to float formatting) */
@@ -3410,7 +3673,7 @@ PyrsStr *pyrs_str_format_float(double v, long long precision) {
     }
     PyrsStr *r = str_alloc((long long)n);
     snprintf(r->data, (size_t)n + 1, "%.*f", p, v);
-    return r;
+    return str_done_ascii(r);
 }
 
 PyrsStr *pyrs_str_from_bool(int v) {
@@ -3418,7 +3681,7 @@ PyrsStr *pyrs_str_from_bool(int v) {
     size_t n = strlen(text);
     PyrsStr *r = str_alloc((long long)n);
     memcpy(r->data, text, n);
-    return r;
+    return str_done_ascii(r);
 }
 
 /* ---- format mini-language (PEP 3101 subset) ----
@@ -3577,10 +3840,10 @@ static void parse_format_spec(const PyrsStr *spec, PyrsFormatSpec *out,
 /* Build a new string by padding `body` (no sign) with optional sign/prefix. */
 static PyrsStr *format_pad(const char *sign_str, const char *prefix,
                            const char *body, long long body_len,
-                           const PyrsFormatSpec *fs) {
+                           long long body_cplen, const PyrsFormatSpec *fs) {
     long long sign_len = (long long)strlen(sign_str);
     long long pref_len = (long long)strlen(prefix);
-    long long content = sign_len + pref_len + body_len;
+    long long content = sign_len + pref_len + body_cplen;
     long long width = fs->width < 0 ? content : fs->width;
     if (width < content) {
         width = content;
@@ -3592,7 +3855,9 @@ static PyrsStr *format_pad(const char *sign_str, const char *prefix,
     }
     char fill = fs->fill ? fs->fill : ' ';
 
-    PyrsStr *r = str_alloc(width);
+    /* Padding is one fill character per column; the body may be wider in
+     * bytes than in characters. */
+    PyrsStr *r = str_alloc(sign_len + pref_len + body_len + pad);
     char *p = r->data;
     long long left = 0, right = 0, mid = 0;
     if (align == '<') {
@@ -3630,7 +3895,7 @@ static PyrsStr *format_pad(const char *sign_str, const char *prefix,
         p += body_len;
         memset(p, fill, (size_t)right);
     }
-    return r;
+    return str_done_scan(r);
 }
 
 static void int_to_base(unsigned long long v, int base, int upper, char *out,
@@ -3766,7 +4031,7 @@ PyrsStr *pyrs_format_int(long long v, const PyrsStr *spec) {
     } else {
         sign = "";
     }
-    PyrsStr *out = format_pad(sign, prefix, body, body_len, &fs);
+    PyrsStr *out = format_pad(sign, prefix, body, body_len, body_len, &fs);
     free(body);
     return out;
 }
@@ -3887,7 +4152,7 @@ PyrsStr *pyrs_format_float(double v, const PyrsStr *spec) {
             fs.align = '>';
         }
         /* sign is already in raw for negatives; pad as a whole string */
-        return format_pad("", "", raw, (long long)strlen(raw), &fs);
+        return format_pad("", "", raw, (long long)strlen(raw), (long long)strlen(raw), &fs);
     }
 
     /* Empty type with precision → like 'g'. */
@@ -3919,7 +4184,7 @@ PyrsStr *pyrs_format_float(double v, const PyrsStr *spec) {
             fs.fill = ' ';
             fs.align = '>';
         }
-        return format_pad(sign, "", body, (long long)strlen(body), &fs);
+        return format_pad(sign, "", body, (long long)strlen(body), (long long)strlen(body), &fs);
     }
 
     char sign_ch = '\0';
@@ -3941,7 +4206,7 @@ PyrsStr *pyrs_format_float(double v, const PyrsStr *spec) {
     if (fs.align == '\0') {
         fs.align = '>';
     }
-    return format_pad(sign, "", body, (long long)strlen(body), &fs);
+    return format_pad(sign, "", body, (long long)strlen(body), (long long)strlen(body), &fs);
 }
 
 PyrsStr *pyrs_format_bool(int v, const PyrsStr *spec) {
@@ -3967,37 +4232,40 @@ PyrsStr *pyrs_str_repr(const PyrsStr *s) {
     }
     char quote = (has_single && !has_double) ? '"' : '\'';
 
-    /* worst case: every byte → \xHH (4 chars) + quotes */
-    long long cap = s->len * 4 + 2;
+    /* worst case: every code point → \UXXXXXXXX (10 chars) + quotes */
+    long long cap = s->cplen * 10 + 2;
     char *buf = xmalloc((size_t)cap + 1);
     long long n = 0;
     buf[n++] = quote;
-    for (long long i = 0; i < s->len; i++) {
-        unsigned char c = (unsigned char)s->data[i];
-        if (c == (unsigned char)quote || c == '\\') {
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        int adv = utf8_next(s, i, &cp);
+        if (cp == (unsigned int)quote || cp == '\\') {
             buf[n++] = '\\';
-            buf[n++] = (char)c;
-        } else if (c == '\n') {
+            buf[n++] = (char)cp;
+        } else if (cp == '\n') {
             buf[n++] = '\\';
             buf[n++] = 'n';
-        } else if (c == '\r') {
+        } else if (cp == '\r') {
             buf[n++] = '\\';
             buf[n++] = 'r';
-        } else if (c == '\t') {
+        } else if (cp == '\t') {
             buf[n++] = '\\';
             buf[n++] = 't';
-        } else if (c < 0x20 || c == 0x7f) {
-            n += sprintf(buf + n, "\\x%02x", c);
+        } else if (cp < 0x20 || cp == 0x7f) {
+            n += sprintf(buf + n, "\\x%02x", cp);
         } else {
-            buf[n++] = (char)c;
+            memcpy(buf + n, s->data + i, (size_t)adv);
+            n += adv;
         }
+        i += adv;
     }
     buf[n++] = quote;
     buf[n] = '\0';
     PyrsStr *r = str_alloc(n);
     memcpy(r->data, buf, (size_t)n);
     free(buf);
-    return r;
+    return str_done_scan(r);
 }
 
 /* Decode one UTF-8 codepoint starting at s->data[i]; returns number of bytes
@@ -4044,26 +4312,16 @@ static int utf8_next(const PyrsStr *s, long long i, unsigned int *cp) {
 
 long long pyrs_str_ord(const PyrsStr *s) {
     check_ref(s);
-    if (s->len == 0) {
-        pyrs_die("TypeError: ord() expected a character, but string of length 0 found");
-    }
-    long long i = 0;
-    long long nchars = 0;
-    unsigned int last = 0;
-    while (i < s->len) {
-        unsigned int cp = 0;
-        i += utf8_next(s, i, &cp);
-        nchars++;
-        last = cp;
-    }
-    if (nchars != 1) {
+    if (s->cplen != 1) {
         char buf[96];
         snprintf(buf, sizeof buf,
                  "TypeError: ord() expected a character, but string of length %lld found",
-                 nchars);
+                 s->cplen);
         pyrs_die(buf);
     }
-    return pyrs_int_from_i64((long long)last);
+    unsigned int cp = 0;
+    utf8_next(s, 0, &cp);
+    return pyrs_int_from_i64((long long)cp);
 }
 
 PyrsStr *pyrs_chr(long long n) {
@@ -4098,7 +4356,7 @@ PyrsStr *pyrs_chr(long long n) {
     }
     PyrsStr *r = str_alloc(nbytes);
     memcpy(r->data, buf, (size_t)nbytes);
-    return r;
+    return str_done_cplen(r, 1);
 }
 
 /* ascii(): like repr but non-ASCII codepoints escaped (\xHH / \uXXXX / \UXXXXXXXX).
@@ -4154,7 +4412,7 @@ PyrsStr *pyrs_str_ascii(const PyrsStr *s) {
     PyrsStr *r = str_alloc(n);
     memcpy(r->data, buf, (size_t)n);
     free(buf);
-    return r;
+    return str_done_ascii(r);
 }
 
 PyrsStr *pyrs_format_str(const PyrsStr *s, const PyrsStr *spec) {
@@ -4198,14 +4456,16 @@ PyrsStr *pyrs_format_str(const PyrsStr *s, const PyrsStr *spec) {
 
     const char *body = s->data;
     long long body_len = s->len;
-    if (fs.precision >= 0 && fs.precision < body_len) {
-        body_len = fs.precision;
+    long long body_cplen = s->cplen;
+    if (fs.precision >= 0 && fs.precision < body_cplen) {
+        body_cplen = fs.precision;
+        body_len = str_byte_of_cp(s, body_cplen);
     }
 
     if (fs.align == '\0') {
         fs.align = '<'; /* default for strings */
     }
-    return format_pad("", "", body, body_len, &fs);
+    return format_pad("", "", body, body_len, body_cplen, &fs);
 }
 
 /* ASCII: `0`..=`9`; empty is False. Shared by isdigit / isdecimal / isnumeric. */
@@ -4215,7 +4475,8 @@ static int pyrs_str_is_ascii_digits(const PyrsStr *s) {
         return 0;
     }
     for (long long i = 0; i < s->len; i++) {
-        if (s->data[i] < '0' || s->data[i] > '9') {
+        char c = s->data[i];
+        if (c < '0' || c > '9') {
             return 0;
         }
     }
@@ -4327,12 +4588,9 @@ int pyrs_str_istitle(const PyrsStr *s) {
 
 int pyrs_str_isascii(const PyrsStr *s) {
     check_ref(s);
-    for (long long i = 0; i < s->len; i++) {
-        if ((unsigned char)s->data[i] >= 128) {
-            return 0;
-        }
-    }
-    return 1;
+    /* The empty string is ASCII, and every code point is ASCII exactly when
+     * the byte and character counts agree. */
+    return STR_IS_ASCII(s);
 }
 
 int pyrs_str_isdecimal(const PyrsStr *s) {
@@ -4370,7 +4628,7 @@ int pyrs_str_isprintable(const PyrsStr *s) {
     check_ref(s);
     for (long long i = 0; i < s->len; i++) {
         unsigned char c = (unsigned char)s->data[i];
-        if (c < 0x20 || c > 0x7E) {
+        if (c < 0x20 || c > 0x7e) {
             return 0;
         }
     }
@@ -5020,7 +5278,7 @@ PyrsStr *pyrs_file_read(PyrsFile *f) {
     memcpy(r->data, buf, len);
     free(buf);
     pyrs_gc_root_pop(&file_root);
-    return r;
+    return str_done_scan(r);
 }
 
 /* one line, keeping the trailing newline; "" at EOF (like Python) */
@@ -5036,7 +5294,7 @@ PyrsStr *pyrs_file_readline(PyrsFile *f) {
     PyrsStr *r = str_alloc(n);
     memcpy(r->data, line, (size_t)n);
     free(line);
-    return r;
+    return str_done_scan(r);
 }
 
 PyrsList *pyrs_file_readlines(PyrsFile *f) {
@@ -5099,7 +5357,7 @@ static PyrsStr *str_from_cstr(const char *c) {
     }
     PyrsStr *r = str_alloc((long long)n);
     memcpy(r->data, c, n);
-    return r;
+    return str_done_scan(r);
 }
 
 /* sys.argv: built once so repeated accesses alias, like Python */
@@ -5140,7 +5398,7 @@ PyrsStr *pyrs_input(const PyrsStr *prompt) {
     PyrsStr *r = str_alloc(n);
     memcpy(r->data, line, (size_t)n);
     free(line);
-    return r;
+    return str_done_scan(r);
 }
 
 /* ---- integer power: see pyrs_int_pow / pyrs_ipow in bigint_impl.c ---- */
@@ -5217,7 +5475,7 @@ static PyrsStr *str_slice_copy(const PyrsStr *s, long long lo, long long hi) {
     long long n = hi - lo;
     PyrsStr *r = str_alloc(n);
     memcpy(r->data, s->data + lo, (size_t)n);
-    return r;
+    return str_done_cplen(r, str_cp_between(s, lo, hi));
 }
 
 static PyrsTuple *str_parts3(PyrsStr *a, PyrsStr *b, PyrsStr *c) {
@@ -5236,11 +5494,13 @@ PyrsTuple *pyrs_str_partition(const PyrsStr *s, const PyrsStr *sep) {
     }
     long long idx = pyrs_str_find(s, sep);
     if (idx < 0) {
-        PyrsStr *empty = str_alloc(0);
+        PyrsStr *empty = str_done_ascii(str_alloc(0));
         return str_parts3((PyrsStr *)s, empty, empty);
     }
-    return str_parts3(str_slice_copy(s, 0, idx), (PyrsStr *)sep,
-                      str_slice_copy(s, idx + sep->len, s->len));
+    /* find() reports a code point index; slicing here is by byte offset. */
+    long long b = str_byte_of_cp(s, idx);
+    return str_parts3(str_slice_copy(s, 0, b), (PyrsStr *)sep,
+                      str_slice_copy(s, b + sep->len, s->len));
 }
 
 PyrsTuple *pyrs_str_rpartition(const PyrsStr *s, const PyrsStr *sep) {
@@ -5251,11 +5511,13 @@ PyrsTuple *pyrs_str_rpartition(const PyrsStr *s, const PyrsStr *sep) {
     }
     long long idx = pyrs_str_rfind(s, sep);
     if (idx < 0) {
-        PyrsStr *empty = str_alloc(0);
+        PyrsStr *empty = str_done_ascii(str_alloc(0));
         return str_parts3(empty, empty, (PyrsStr *)s);
     }
-    return str_parts3(str_slice_copy(s, 0, idx), (PyrsStr *)sep,
-                      str_slice_copy(s, idx + sep->len, s->len));
+    /* find() reports a code point index; slicing here is by byte offset. */
+    long long b = str_byte_of_cp(s, idx);
+    return str_parts3(str_slice_copy(s, 0, b), (PyrsStr *)sep,
+                      str_slice_copy(s, b + sep->len, s->len));
 }
 
 long long pyrs_tuple_get(const PyrsTuple *t, long long i) {
@@ -5654,14 +5916,17 @@ int pyrs_dict_get_default(const PyrsDict *d, long long key, int key_tag, long lo
 PyrsDict *pyrs_str_maketrans(const PyrsStr *x, const PyrsStr *y) {
     check_ref(x);
     check_ref(y);
-    if (x->len != y->len) {
+    if (x->cplen != y->cplen) {
         pyrs_die("ValueError: the first two maketrans arguments must have equal length");
     }
     PyrsDict *d = pyrs_dict_new();
-    for (long long i = 0; i < x->len; i++) {
-        long long k = pyrs_int_from_i64((unsigned char)x->data[i]);
-        long long v = pyrs_int_from_i64((unsigned char)y->data[i]);
-        pyrs_dict_set(d, k, TAG_INT, v, TAG_INT);
+    long long xi = 0, yi = 0;
+    while (xi < x->len && yi < y->len) {
+        unsigned int kc = 0, vc = 0;
+        xi += utf8_next(x, xi, &kc);
+        yi += utf8_next(y, yi, &vc);
+        pyrs_dict_set(d, pyrs_int_from_i64((long long)kc), TAG_INT,
+                      pyrs_int_from_i64((long long)vc), TAG_INT);
     }
     return d;
 }
@@ -5670,20 +5935,25 @@ PyrsDict *pyrs_str_maketrans_delete(const PyrsStr *x, const PyrsStr *y, const Py
     check_ref(x);
     check_ref(y);
     check_ref(z);
-    if (x->len != y->len) {
+    if (x->cplen != y->cplen) {
         pyrs_die("ValueError: the first two maketrans arguments must have equal length");
     }
     PyrsDict *d = pyrs_dict_new();
-    for (long long i = 0; i < x->len; i++) {
-        long long k = pyrs_int_from_i64((unsigned char)x->data[i]);
-        long long v = pyrs_int_from_i64((unsigned char)y->data[i]);
-        PyrsUnionBox *box = pyrs_union_box_new(TAG_INT, v);
-        pyrs_dict_set(d, k, TAG_INT, (long long)(uintptr_t)box, TAG_UNION);
+    long long xi = 0, yi = 0;
+    while (xi < x->len && yi < y->len) {
+        unsigned int kc = 0, vc = 0;
+        xi += utf8_next(x, xi, &kc);
+        yi += utf8_next(y, yi, &vc);
+        PyrsUnionBox *box = pyrs_union_box_new(TAG_INT, pyrs_int_from_i64((long long)vc));
+        pyrs_dict_set(d, pyrs_int_from_i64((long long)kc), TAG_INT,
+                      (long long)(uintptr_t)box, TAG_UNION);
     }
-    for (long long i = 0; i < z->len; i++) {
-        long long k = pyrs_int_from_i64((unsigned char)z->data[i]);
+    for (long long i = 0; i < z->len;) {
+        unsigned int kc = 0;
+        i += utf8_next(z, i, &kc);
         PyrsUnionBox *box = pyrs_union_box_new(-1, 0);
-        pyrs_dict_set(d, k, TAG_INT, (long long)(uintptr_t)box, TAG_UNION);
+        pyrs_dict_set(d, pyrs_int_from_i64((long long)kc), TAG_INT,
+                      (long long)(uintptr_t)box, TAG_UNION);
     }
     return d;
 }
@@ -5732,14 +6002,19 @@ PyrsStr *pyrs_str_translate(const PyrsStr *s, const PyrsDict *table, int val_tag
     }
     char *buf = xmalloc((size_t)cap);
     long long n = 0;
-    for (long long i = 0; i < s->len; i++) {
-        long long key = pyrs_int_from_i64((unsigned char)s->data[i]);
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp = 0;
+        int adv = utf8_next(s, i, &cp);
+        long long at = i;
+        i += adv;
+        long long key = pyrs_int_from_i64((long long)cp);
         long long val;
         if (!pyrs_dict_get_default(table, key, TAG_INT, &val)) {
-            if (n + 1 > cap) {
+            if (n + adv > cap) {
                 pyrs_die("ValueError: translate result too large");
             }
-            buf[n++] = s->data[i];
+            memcpy(buf + n, s->data + at, (size_t)adv);
+            n += adv;
             continue;
         }
         if (val_tag == TAG_UNION) {
@@ -5765,7 +6040,7 @@ PyrsStr *pyrs_str_translate(const PyrsStr *s, const PyrsDict *table, int val_tag
         memcpy(r->data, buf, (size_t)n);
     }
     free(buf);
-    return r;
+    return str_done_scan(r);
 }
 
 /* returns 1 and writes *out if found; else 0 */
@@ -6436,9 +6711,13 @@ PyrsList *pyrs_list_copy(const PyrsList *src) {
 /* list(str) → list of 1-char PyrsStr. */
 PyrsList *pyrs_list_from_str(const PyrsStr *s) {
     check_ref(s);
-    PyrsList *r = pyrs_list_new(s->len);
-    for (long long i = 0; i < s->len; i++) {
-        pyrs_list_push(r, (long long)(uintptr_t)str_sub(s, i, 1));
+    PyrsList *r = pyrs_list_new(s->cplen);
+    /* One element per code point, walking whole UTF-8 sequences. */
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        int adv = utf8_next(s, i, &cp);
+        pyrs_list_push(r, (long long)(uintptr_t)str_sub(s, i, adv));
+        i += adv;
     }
     return r;
 }
@@ -6457,8 +6736,12 @@ PyrsSet *pyrs_set_from_list(const PyrsList *xs, int key_tag) {
 PyrsSet *pyrs_set_from_str(const PyrsStr *s) {
     check_ref(s);
     PyrsSet *r = pyrs_set_new();
-    for (long long i = 0; i < s->len; i++) {
-        pyrs_set_add(r, (long long)(uintptr_t)str_sub(s, i, 1), TAG_STR);
+    /* One member per code point, walking whole UTF-8 sequences. */
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        int adv = utf8_next(s, i, &cp);
+        pyrs_set_add(r, (long long)(uintptr_t)str_sub(s, i, adv), TAG_STR);
+        i += adv;
     }
     return r;
 }
@@ -6621,7 +6904,9 @@ static PyrsStr *json_parse_string(const char **p) {
         }
     }
     (*p)++; /* closing quote */
-    return r;
+    r->len = out - r->data;
+    r->data[r->len] = '\0';
+    return str_done_scan(r);
 }
 
 static long long json_parse_int(const char **p) {
@@ -7234,8 +7519,8 @@ void pyrs_gen_set_throw(PyrsGen *g, long long type, void *msg) {
         int t = (int)type;
         const char *m = NULL;
         if (msg != NULL) {
-            /* pyrs str: i64 len then bytes */
-            m = (const char *)msg + 8;
+            /* pyrs str: two i64 header words, then the bytes */
+            m = (const char *)msg + 2 * sizeof(long long);
         }
         pyrs_raise(t, m);
         return;
@@ -7443,10 +7728,7 @@ PyrsStr *pyrs_str_from_object(void *obj) {
         snprintf(buf, sizeof buf, "<object>");
     }
     size_t n = strlen(buf);
-    PyrsStr *s = pyrs_gc_alloc(sizeof(long long) + n + 1, PYRS_GC_STRING);
-    s->len = (long long)n;
-    memcpy(s->data, buf, n + 1);
-    return s;
+    return str_from_utf8(buf, (long long)n);
 }
 
 /* ---- collector object-model hooks ----

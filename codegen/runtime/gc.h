@@ -52,5 +52,8 @@ void pyrs_gc_trace_object(int kind, void *object, size_t size,
 void pyrs_gc_visit_owned_ranges(int kind, void *object, size_t size,
                                 PyrsGcRangeFn visit, void *context);
 void pyrs_gc_destroy_object(int kind, void *object, size_t size);
+/* Drop caches that key on the address of a heap object, since sweeping can
+ * free one and hand its address to a later allocation. */
+void pyrs_str_cache_invalidate(void);
 
 #endif

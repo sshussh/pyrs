@@ -76,10 +76,10 @@ Build your own module with `pyrs build-extension -i kernels.py --module kernels_
 --python .venv/bin/python`; import `kernels_native` from that same environment.
 Only the exported kernels run natively; Python and package code keep using CPython.
 
-## The language (v0.89.0)
+## The language (v0.90.0)
 
 Versioning is **MAJOR.MINOR.PATCH**. PyRs stays on **0.y.z** (next
-milestone after this one is **0.90.0**, not 1.0) until it is ready for
+milestone after this one is **0.91.0**, not 1.0) until it is ready for
 **real-world use**; only then **1.0.0**. Crate versions and
 `pyrs --version` match this label. See the [roadmap to 1.0](docs/ROADMAP.md)
 for remaining readiness work. PyRs now ships its first default heap
@@ -176,7 +176,7 @@ A statically-typed Python subset:
   `int`; two-arg keeps `int` or `float`.
   **v0.46:** `ord(s)` / `chr(n)` — Unicode code point of a one-character
   string, and the inverse (`chr` accepts `0 ..= 0x10FFFF`; `bool` → `int`).
-  String `len`/index stay byte-based.
+  String `len`/index agree with them since v0.90.
   **v0.47:** integer literals `0x` / `0b` / `0o` (any case, PEP 515
   underscores) convert to the same `int` as decimal; invalid prefixes
   are compile errors.
@@ -216,8 +216,8 @@ A statically-typed Python subset:
   **v0.64:** `str.capitalize` / `title` / `swapcase` — ASCII case transforms
   (title words are letter runs; `'` starts a new word like CPython).
   **v0.65:** `str.zfill` / `center` / `ljust` / `rjust` — pad to width
-  (`zfill` keeps a leading `+`/`-`; fillchar is one byte; extra center pad
-  matches CPython 3.14).
+  (`zfill` keeps a leading `+`/`-`; fillchar is one character, counted in
+  code points since v0.90; extra center pad matches CPython 3.14).
   **v0.66:** `str.isalnum` / `istitle` / `isascii` — ASCII predicates
   (empty `isalnum`/`istitle` are False; empty `isascii` is True).
   **v0.67:** `str.expandtabs([tabsize])` — tab stops (default 8);
@@ -233,9 +233,10 @@ A statically-typed Python subset:
   (CPython slice bounds; `None` is a type error; miss is the same ValueError).
   **v0.72:** `str.casefold()` — ASCII case-fold (same as `lower`; Unicode
   folds like `ß` → `ss` remain residual).
-  **v0.73:** `str.maketrans` / `str.translate` — 2-arg maps equal-length
-  byte strings; 3-arg also deletes; `translate` accepts `dict[int, int]` or
-  `dict[int, int | None]` (byte keys; replacements via `chr`).
+  **v0.73:** `str.maketrans` / `str.translate` — 2-arg maps strings of
+  equal character length; 3-arg also deletes; `translate` accepts
+  `dict[int, int]` or `dict[int, int | None]` (code point ordinals since
+  v0.90, as `ord` produces; replacements via `chr`).
   **v0.74:** `set.copy()` — shallow copy (independent of later add/remove).
   **v0.75:** `set.pop()` — remove and return an element (last-inserted);
   empty is `KeyError: 'pop from an empty set'`.
@@ -471,7 +472,7 @@ Python semantics are preserved where it counts:
 - variables use function-wide scoping; storage type is the join of all
   assignments (and annotation); bare multi-assign may produce a union
 
-Known limits (v0.89.0): `int` is arbitrary precision (tagged small ±2⁶² /
+Known limits (v0.90.0): `int` is arbitrary precision (tagged small ±2⁶² /
 GC-managed heap limbs; no interning/`is` identity for equal
 values), `min`/`max`
 multi-arg numeric form unifies to a common numeric type (`min(1, 1.5)` is
@@ -517,9 +518,10 @@ converting an already-typed `list[int]` into `list[float]` (or into a union)
 by assignment remains unsupported — only the literal's own elements are
 joined (mixed non-numeric literal elements still error unless annotated
 as a union), `nan in [nan]`
-is False (IEEE equality), str methods use ASCII case/whitespace rules,
-`len`/index/slice on `str` are byte-based (`len("é")` is 2) while `ord`/`chr`
-count Unicode characters, GC is
+is False (IEEE equality), str offsets are Unicode code points but case
+and `is*` methods still use ASCII rules,
+indexing a non-ASCII `str` is O(n) rather than CPython's O(1) (sequential
+access is amortised O(1)), GC is
 nonmoving mark–sweep with conservative native roots (so reclamation can be
 delayed by pointer-like stack values), files support text modes "r"/"w"/"a"
 only and still require `with` or explicit `close()` for deterministic resource
@@ -650,4 +652,4 @@ compatibility probes.
 
 Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
-Release tags: `git tag v0.89.0 && git push origin v0.89.0`.
+Release tags: `git tag v0.90.0 && git push origin v0.90.0`.

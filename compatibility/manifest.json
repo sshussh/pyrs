@@ -2,17 +2,104 @@
   "schema_version": 1,
   "kind": "synthetic regression probes; not representative workload coverage",
   "cases": [
-    {"id": "numerical-kernels", "file": "cases/numerical_kernels.py", "group": "core", "native": "pass"},
-    {"id": "exact-comparisons", "file": "cases/exact_comparisons.py", "group": "core", "native": "pass"},
-    {"id": "exception-bindings", "file": "cases/exception_bindings.py", "group": "core", "native": "pass"},
-    {"id": "text-file-effects", "file": "cases/file_effects.py", "group": "core", "native": "pass"},
-    {"id": "unicode-length-gap", "file": "cases/unicode_length.py", "group": "core", "native": "mismatch", "native_stdout": "8\n", "reason": "Native str length/index still operate on bytes."},
-    {"id": "mixed-numeric-list", "file": "cases/mixed_numeric_list.py", "group": "core", "native": "pass"},
-    {"id": "numpy-arrays", "file": "cases/numpy_arrays.py", "group": "science", "requires": ["numpy"], "native": "unsupported", "diagnostic": "expected an expression, found ','", "reason": "Multidimensional slice syntax is not parsed."},
-    {"id": "numpy-linalg", "file": "cases/numpy_linalg.py", "group": "science", "requires": ["numpy"], "native": "unsupported", "diagnostic": "expected ')' after method arguments, found '@'", "reason": "Matrix multiplication syntax is not parsed."},
-    {"id": "numpy-random", "file": "cases/numpy_random.py", "group": "science", "requires": ["numpy"], "native": "unsupported", "diagnostic": "No module named 'numpy'"},
-    {"id": "pandas-group-join", "file": "cases/pandas_group_join.py", "group": "science", "requires": ["pandas"], "native": "unsupported", "diagnostic": "expected ']' to close the subscript, found ','", "reason": "Tuple subscript syntax is not parsed."},
-    {"id": "pandas-csv-effects", "file": "cases/pandas_csv.py", "group": "science", "requires": ["pandas"], "native": "unsupported", "diagnostic": "No module named 'pandas'"},
-    {"id": "pandas-time-series", "file": "cases/pandas_time_series.py", "group": "science", "requires": ["pandas"], "native": "unsupported", "diagnostic": "No module named 'pandas'"}
+    {
+      "id": "numerical-kernels",
+      "file": "cases/numerical_kernels.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
+      "id": "exact-comparisons",
+      "file": "cases/exact_comparisons.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
+      "id": "exception-bindings",
+      "file": "cases/exception_bindings.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
+      "id": "text-file-effects",
+      "file": "cases/file_effects.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
+      "id": "unicode-text",
+      "file": "cases/unicode_text.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
+      "id": "mixed-numeric-list",
+      "file": "cases/mixed_numeric_list.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
+      "id": "numpy-arrays",
+      "file": "cases/numpy_arrays.py",
+      "group": "science",
+      "requires": [
+        "numpy"
+      ],
+      "native": "unsupported",
+      "diagnostic": "expected an expression, found ','",
+      "reason": "Multidimensional slice syntax is not parsed."
+    },
+    {
+      "id": "numpy-linalg",
+      "file": "cases/numpy_linalg.py",
+      "group": "science",
+      "requires": [
+        "numpy"
+      ],
+      "native": "unsupported",
+      "diagnostic": "expected ')' after method arguments, found '@'",
+      "reason": "Matrix multiplication syntax is not parsed."
+    },
+    {
+      "id": "numpy-random",
+      "file": "cases/numpy_random.py",
+      "group": "science",
+      "requires": [
+        "numpy"
+      ],
+      "native": "unsupported",
+      "diagnostic": "No module named 'numpy'"
+    },
+    {
+      "id": "pandas-group-join",
+      "file": "cases/pandas_group_join.py",
+      "group": "science",
+      "requires": [
+        "pandas"
+      ],
+      "native": "unsupported",
+      "diagnostic": "expected ']' to close the subscript, found ','",
+      "reason": "Tuple subscript syntax is not parsed."
+    },
+    {
+      "id": "pandas-csv-effects",
+      "file": "cases/pandas_csv.py",
+      "group": "science",
+      "requires": [
+        "pandas"
+      ],
+      "native": "unsupported",
+      "diagnostic": "No module named 'pandas'"
+    },
+    {
+      "id": "pandas-time-series",
+      "file": "cases/pandas_time_series.py",
+      "group": "science",
+      "requires": [
+        "pandas"
+      ],
+      "native": "unsupported",
+      "diagnostic": "No module named 'pandas'"
+    }
   ]
 }
