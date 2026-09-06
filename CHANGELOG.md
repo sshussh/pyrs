@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.95.0 — Generators as arguments to the eager builtins
+
+A generator function could only be consumed by a `for` loop or a
+comprehension. Every eager builtin rejected one, so `list(g())` — probably the
+most common thing anyone does with a generator — was a compile error, and the
+only way to get the values out was to write the loop by hand.
+
+- `list`, `set`, `sorted`, `sum`, `max`, `min` and `str.join` accept a
+  generator. These drain their argument anyway, so the generator is
+  materialized first and side effects, order and result are identical to
+  consuming it lazily.
+- `any` and `all` accept a generator and **short-circuit**, stopping as soon
+  as the answer is known. They cannot materialize first: a side-effecting or
+  infinite generator would behave differently from CPython. (Over a list they
+  still walk the whole sequence, where it is unobservable.)
+- `tuple(gen)` is still rejected, because tuples are fixed-arity here; the
+  existing diagnostic says so.
+- Fixed alongside: an unannotated generator hard-coded its yield type to
+  `int`, so `def g(): yield "a"` failed with a type mismatch at the yield and
+  a `str`, `float` or `bool` generator could not be written at all without a
+  return annotation. The yield type is now taken from the first `yield` of a
+  literal or an annotated parameter, searched through `if` / `for` / `while` /
+  `try` / `with` bodies, and the three signature-collection sites agree with
+  the lowering site — a mismatch there gave a call site a different element
+  type than the body produced.
+
 ## 0.94.0 — User-defined exception classes
 
 `class E(Exception)` had no spelling: the exception type in `raise` / `except`

@@ -3077,12 +3077,14 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
             };
             let is_generator = stmts_have_yield(&f.body);
             let yield_ty = if is_generator {
-                // Prefer annotated return type as the yield element when present;
-                // otherwise default to int (refined poorly; yield sites coerce).
+                // Prefer the annotated return type as the yield element;
+                // otherwise infer from the first yield. These must agree with
+                // lower_function, or a call site sees a different element type
+                // than the body produced.
                 let y = if ret != ir::Ty::None {
                     ret
                 } else {
-                    ir::Ty::Int
+                    first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
                 };
                 ret = ir::generator_of(y);
                 Some(y)
@@ -6309,14 +6311,14 @@ fn lower_function_inner(
     let is_gen = stmts_have_yield(&f.body);
     let mut gen_yield_ty: Option<ir::Ty> = None;
     if is_gen {
-        // Yield type: use annotation of returns if present as element, else
-        // scan for first yield value type after params are in scope — deferred
-        // to after body lower would be ideal; use Int as default and refine.
-        // Prefer declared ret as yield element when annotated non-None, else Int.
+        // Yield type: a non-None return annotation names it directly.
+        // Without one, take the first `yield` of a literal or an annotated
+        // parameter -- defaulting to Int made `def g(): yield "a"` a hard
+        // error, so an unannotated generator could only ever yield ints.
         let yty = match ctx.ret {
-            ir::Ty::None => ir::Ty::Int, // bare/default; refined if body uses other
+            ir::Ty::None => first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int),
             other if !matches!(other, ir::Ty::Generator { .. }) => other,
-            _ => ir::Ty::Int,
+            _ => first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int),
         };
         ctx.yield_ty = Some(yty);
         gen_yield_ty = Some(yty);
@@ -6669,6 +6671,59 @@ fn stmts_have_yield(stmts: &[ast::Stmt]) -> bool {
     stmts.iter().any(stmt_has_yield)
 }
 
+/// The type of the first `yield <expr>` in a body, for an unannotated
+/// generator. Only literals and annotated parameters are consulted: this runs
+/// before the body is lowered and before locals exist, so anything else stays
+/// unknown and the caller keeps its default.
+fn first_yield_ty(stmts: &[ast::Stmt], params: &[ast::Param]) -> Option<ir::Ty> {
+    fn from_expr(e: &ast::Expr, params: &[ast::Param]) -> Option<ir::Ty> {
+        match &e.kind {
+            ast::ExprKind::Yield(Some(v)) => literal_expr_ty(v).or_else(|| match &v.kind {
+                ast::ExprKind::Name(n) => params
+                    .iter()
+                    .find(|p| &p.name == n)
+                    .and_then(|p| p.ty.as_ref())
+                    .map(|t| resolve_type(*t)),
+                _ => Option::None,
+            }),
+            ast::ExprKind::Yield(Option::None) => Option::None,
+            _ => Option::None,
+        }
+    }
+    fn walk(stmts: &[ast::Stmt], params: &[ast::Param]) -> Option<ir::Ty> {
+        for st in stmts {
+            let found = match &st.kind {
+                ast::StmtKind::ExprStmt(e) | ast::StmtKind::Return(Some(e)) => from_expr(e, params),
+                ast::StmtKind::Assign { value, .. } => from_expr(value, params),
+                ast::StmtKind::If { branches, orelse } => branches
+                    .iter()
+                    .find_map(|(_, b)| walk(b, params))
+                    .or_else(|| walk(orelse, params)),
+                ast::StmtKind::While { body, orelse, .. }
+                | ast::StmtKind::For { body, orelse, .. } => {
+                    walk(body, params).or_else(|| walk(orelse, params))
+                }
+                ast::StmtKind::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finally,
+                } => walk(body, params)
+                    .or_else(|| handlers.iter().find_map(|h| walk(&h.body, params)))
+                    .or_else(|| walk(orelse, params))
+                    .or_else(|| walk(finally, params)),
+                ast::StmtKind::With { body, .. } => walk(body, params),
+                _ => Option::None,
+            };
+            if found.is_some() {
+                return found;
+            }
+        }
+        Option::None
+    }
+    walk(stmts, params)
+}
+
 fn stmt_has_yield(st: &ast::Stmt) -> bool {
     match &st.kind {
         ast::StmtKind::ExprStmt(e) => expr_has_yield(e),
@@ -6857,10 +6912,11 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     };
     let is_generator = stmts_have_yield(&f.body);
     let yield_ty = if is_generator {
+        // Must match lower_function's rule; see the note there.
         let y = if ret != ir::Ty::None {
             ret
         } else {
-            ir::Ty::Int
+            first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
         };
         ret = ir::generator_of(y);
         Some(y)
@@ -7280,10 +7336,11 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     };
     let is_generator = stmts_have_yield(&f.body);
     let yield_ty = if is_generator {
+        // Must match lower_function's rule; see the note there.
         let y = if ret != ir::Ty::None {
             ret
         } else {
-            ir::Ty::Int
+            first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
         };
         ret = ir::generator_of(y);
         Some(y)
@@ -11223,6 +11280,10 @@ fn lower_set_binary_op(
 /// `list(iterable)` — shallow copy for lists; chars for str; keys for dict;
 /// elements for set; fixed-arity homogeneous tuple → list.
 fn lower_list_ctor(arg: ir::Expr, span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    // A generator is drained into a list first; `list(gen)` then *is* that list.
+    if let ir::Ty::Generator { yield_ty } = arg.ty {
+        return drain_generator_to_list(arg, *yield_ty, ctx);
+    }
     match arg.ty {
         ir::Ty::List(elem) => Ok(ir::Expr {
             ty: ir::list_of(*elem),
@@ -11969,7 +12030,7 @@ fn lower_str_method(
                     method_span,
                 ));
             }
-            let parts = lower_expr(&args[0], ctx)?;
+            let parts = materialize_if_generator(lower_expr(&args[0], ctx)?, ctx)?;
             if parts.ty != ir::list_of(ir::Ty::Str) {
                 return Err(err(
                     format!("join() expects a list[str], found {}", parts.ty),
@@ -18135,6 +18196,72 @@ fn wrap_comp_ifs(ifs: &[ir::Expr], inner: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
     body
 }
 
+/// Materialize a generator into a `list[yield_ty]`, exactly as
+/// `[x for x in gen]` does — it reuses the same comprehension machinery.
+///
+/// This is what lets the eager builtins accept a generator. It is only sound
+/// for consumers that would drain the generator anyway (`list`, `set`,
+/// `tuple`, `sorted`, `sum`, `max`, `min`, `join`): for those the side
+/// effects, order and result are identical to consuming lazily. `any` and
+/// `all` short-circuit, so they must not come through here.
+fn drain_generator_to_list(
+    gen_expr: ir::Expr,
+    yield_ty: ir::Ty,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let list_ty = ir::list_of(yield_ty);
+    let mut setup = Vec::new();
+    let parts = lower_comp_generator(gen_expr, yield_ty, ctx, &mut setup)?;
+
+    let res_t = ctx.fresh_temp("gen.drain", list_ty);
+    let res_local = || ir::Expr {
+        ty: list_ty,
+        kind: ir::ExprKind::Local(res_t.clone()),
+    };
+    let mut stmts = setup;
+    stmts.push(ir::Stmt::Assign {
+        name: res_t.clone(),
+        value: ir::Expr {
+            ty: list_ty,
+            kind: ir::ExprKind::ListNew {
+                cap: Box::new(int_const(4)),
+            },
+        },
+    });
+    let level = CompLevel {
+        setup: Vec::new(),
+        cond: parts.cond,
+        step: parts.step,
+        bind: Vec::new(),
+        ifs: Vec::new(),
+        cap: parts.cap,
+        kind: parts.kind,
+    };
+    // The element is appended directly; there is no target to bind, because
+    // this drain has no user-written loop variable.
+    let append = ir::Stmt::ListAppend {
+        list: res_local(),
+        value: parts.element,
+    };
+    stmts.extend(wrap_comp_level(level, vec![append]));
+    Ok(ir::Expr {
+        ty: list_ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(res_local()),
+        },
+    })
+}
+
+/// If `value` is a generator, drain it to a list; otherwise pass it through.
+/// Used by the builtins that consume their whole argument.
+fn materialize_if_generator(value: ir::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    match value.ty {
+        ir::Ty::Generator { yield_ty } => drain_generator_to_list(value, *yield_ty, ctx),
+        _ => Ok(value),
+    }
+}
+
 /// `[elem for target in iter if cond ... for ...]` desugars to nested loops
 /// building a list inside an expression-level Block. Simple name targets live
 /// in hidden storage (Python 3: shadow, do not leak). Unpack targets bind real
@@ -20591,6 +20718,7 @@ fn lower_call(
                     ));
                 }
                 let arg = lower_expr(args[0], ctx)?;
+                let arg = materialize_if_generator(arg, ctx)?;
                 lower_set_ctor(arg, args[0].span)
             }
             "list" => {
@@ -20632,6 +20760,7 @@ fn lower_call(
                     ));
                 }
                 let arg = lower_expr(args[0], ctx)?;
+                let arg = materialize_if_generator(arg, ctx)?;
                 lower_tuple_ctor(arg, args[0].span)
             }
             "len" => {
@@ -21181,6 +21310,98 @@ fn lower_isinstance(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult
 }
 
 /// `any(xs)` / `all(xs)` — list first; also str/tuple/set. Empty any→False, all→True.
+/// `any(gen)` / `all(gen)` — a short-circuiting walk over a generator.
+///
+/// Unlike the list path this cannot drain first: `any` must stop at the first
+/// truthy element, so a side-effecting or infinite generator behaves as it
+/// does in CPython. (The list path does not short-circuit either, but over a
+/// list that is unobservable.)
+fn lower_any_all_generator(
+    is_any: bool,
+    gen_expr: ir::Expr,
+    yield_ty: ir::Ty,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let name = if is_any { "any" } else { "all" };
+    let gen_ty = gen_expr.ty;
+    let gen_t = ctx.fresh_temp(&format!("{name}.gen"), gen_ty);
+    let mut stmts = vec![ir::Stmt::Assign {
+        name: gen_t.clone(),
+        value: gen_expr,
+    }];
+    let (more_t, more_cond) = push_comp_more(ctx, &mut stmts);
+    let acc_t = ctx.fresh_temp(&format!("{name}.acc"), ir::Ty::Bool);
+    stmts.push(assign_const_bool(acc_t.clone(), !is_any));
+
+    let opt_ty = ir::optional_of(yield_ty);
+    let nxt_t = ctx.fresh_temp(&format!("{name}.next"), opt_ty);
+    let nxt_local = local_expr(nxt_t.clone(), opt_ty);
+    let advance = ir::Stmt::Assign {
+        name: nxt_t,
+        value: ir::Expr {
+            ty: opt_ty,
+            kind: ir::ExprKind::GeneratorNext {
+                generator: Box::new(local_expr(gen_t, gen_ty)),
+                send: Box::new(const_none()),
+            },
+        },
+    };
+    let exhausted = ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::IsNone {
+            value: Box::new(nxt_local.clone()),
+            not: false,
+        },
+    };
+    let element = ir::Expr {
+        ty: yield_ty,
+        kind: ir::ExprKind::FromUnion {
+            value: Box::new(nxt_local),
+        },
+    };
+    // `any` decides on a truthy element, `all` on a falsy one; either way the
+    // answer is `is_any` and the walk stops.
+    let truth = to_bool_default(element, span)?;
+    let decisive = if is_any {
+        truth
+    } else {
+        ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::Unary {
+                op: ir::UnOp::Not,
+                operand: Box::new(truth),
+            },
+        }
+    };
+    let decide = ir::Stmt::If {
+        branches: vec![(
+            decisive,
+            vec![
+                assign_const_bool(acc_t.clone(), is_any),
+                assign_const_bool(more_t.clone(), false),
+            ],
+        )],
+        orelse: vec![],
+    };
+    let step_body = ir::Stmt::If {
+        branches: vec![(exhausted, vec![assign_const_bool(more_t, false)])],
+        orelse: vec![decide],
+    };
+    stmts.push(ir::Stmt::While {
+        cond: more_cond,
+        body: vec![advance, step_body],
+        step: vec![],
+    });
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(acc_t, ir::Ty::Bool)),
+        },
+    })
+}
+
 fn lower_any_all(
     is_any: bool,
     args: &[&ast::Expr],
@@ -21195,11 +21416,14 @@ fn lower_any_all(
         ));
     }
     let seq = lower_expr(args[0], ctx)?;
+    if let ir::Ty::Generator { yield_ty } = seq.ty {
+        return lower_any_all_generator(is_any, seq, *yield_ty, span, ctx);
+    }
     match seq.ty {
         ir::Ty::List(_) | ir::Ty::Str | ir::Ty::Tuple(_) | ir::Ty::Set(_) => {}
         other => {
             return Err(err(
-                format!("{name}() expects a list, str, tuple, or set, found {other}"),
+                format!("{name}() expects a list, str, tuple, set, or generator, found {other}"),
                 args[0].span,
             ));
         }
@@ -22043,7 +22267,7 @@ fn lower_sorted_expr(
             span,
         ));
     }
-    let arg = lower_expr(args[0], ctx)?;
+    let arg = materialize_if_generator(lower_expr(args[0], ctx)?, ctx)?;
     let elem = match arg.ty {
         ir::Ty::List(e) => *e,
         other => {
@@ -22322,8 +22546,8 @@ fn lower_min_max_expr(
         return lower_min_max_multi_plain(func, args, span, ctx);
     }
 
-    // Iterable form (one list).
-    let arg = lower_expr(args[0], ctx)?;
+    // Iterable form (one list, or a generator drained into one).
+    let arg = materialize_if_generator(lower_expr(args[0], ctx)?, ctx)?;
     let elem = match arg.ty {
         ir::Ty::List(e) => *e,
         other => {
@@ -23134,7 +23358,7 @@ fn lower_sum_expr(
             kw.name_span,
         ));
     }
-    let list = lower_expr(args[0], ctx)?;
+    let list = materialize_if_generator(lower_expr(args[0], ctx)?, ctx)?;
     let elem = match list.ty {
         ir::Ty::List(e) => *e,
         other => {
