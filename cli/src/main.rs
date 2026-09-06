@@ -222,6 +222,11 @@ fn compile_module(
         let gc_header = workdir.join("gc.h");
         fs::write(&gc_header, codegen::GC_H)
             .map_err(|e| format!("failed to write collector header: {e}"))?;
+        let unicode = workdir.join("unicode_data.c");
+        fs::write(&unicode, codegen::UNICODE_DATA_C)
+            .map_err(|e| format!("failed to write Unicode tables: {e}"))?;
+        fs::write(workdir.join("unicode_data.h"), codegen::UNICODE_DATA_H)
+            .map_err(|e| format!("failed to write Unicode table header: {e}"))?;
 
         // Honor `CC` so CI clang is used instead of Ubuntu's gcc. gcc's
         // `-Wformat-truncation` on `runtime.c` otherwise leaks onto stderr
@@ -231,6 +236,7 @@ fn compile_module(
             .arg(&object)
             .arg(&runtime)
             .arg(&gc)
+            .arg(&unicode)
             .arg("-O2")
             .arg("-Wno-format-truncation")
             .arg("-lm")

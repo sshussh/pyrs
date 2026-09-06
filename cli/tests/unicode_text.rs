@@ -552,3 +552,193 @@ print("-".join(["a", "b"]), "a\tb".expandtabs(4))
 "#,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unicode case transforms and character classes
+//
+// Driven by the tables in codegen/runtime/unicode_data.c, generated from the
+// CPython oracle by scripts/gen_unicode_tables.py. Before 0.91 these were
+// ASCII-only: `"ß".upper()` was `"ß"`, `"naïve".upper()` was `"NAïVE"`, and
+// `"é".isalpha()` was False.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upper_and_lower_follow_unicode() {
+    matches_python(
+        "case-basic",
+        r#"
+print("naïve café".upper())
+print("ÉCOLE".lower())
+print("λx".upper(), "ΛX".lower())
+print("Ünïcödé".upper(), "ÜNÏCÖDÉ".lower())
+print("日本語".upper(), "日本語".lower())
+print("hello".upper(), "HELLO".lower())
+print("".upper(), "".lower())
+"#,
+    );
+}
+
+#[test]
+fn case_mapping_may_change_length() {
+    // U+00DF upper-cases to two characters, U+FB01 to two, U+0390 to three.
+    matches_python(
+        "case-expanding",
+        r#"
+for s in ["ß", "ﬁ", "ΐ", "ﬄ", "ǰ", "ẞ"]:
+    u = s.upper()
+    print(len(s), len(u), u)
+print("straße".upper(), len("straße".upper()))
+print("ßß".upper())
+"#,
+    );
+}
+
+#[test]
+fn casefold_folds_beyond_lowercasing() {
+    matches_python(
+        "casefold",
+        r#"
+print("ß".casefold(), "ss".casefold())
+print("ß".casefold() == "ss".casefold())
+print("ẞ".casefold(), "Σ".casefold(), "ς".casefold())
+print("ΣΊΣΥΦΟΣ".casefold())
+print("HELLO".casefold())
+"#,
+    );
+}
+
+#[test]
+fn title_and_capitalize_use_titlecase_and_word_boundaries() {
+    matches_python(
+        "case-title",
+        r#"
+print("héllo wörld".title())
+print("ǅungla".title(), "ǅungla".capitalize())
+print("ǆ".title(), "ǆ".upper(), "ǆ".lower())
+print("hello world".title(), "hello world".capitalize())
+print("a'b c-d".title())
+print("ÉCOLE normale".title(), "ÉCOLE normale".capitalize())
+print("".title(), "".capitalize())
+"#,
+    );
+}
+
+#[test]
+fn swapcase_follows_unicode_case() {
+    matches_python(
+        "case-swap",
+        r#"
+print("héllo WÖRLD".swapcase())
+print("λΛ".swapcase())
+print("ǅ".swapcase())
+print("123 日本".swapcase())
+"#,
+    );
+}
+
+#[test]
+fn dotted_and_dotless_i_match_cpython() {
+    matches_python(
+        "case-turkish",
+        r#"
+print(len("İ".lower()), "İ".lower() == "i")
+print("ı".upper(), "I".lower())
+print("İ".upper(), "ı".title())
+"#,
+    );
+}
+
+#[test]
+fn alpha_digit_and_numeric_classes_follow_unicode() {
+    matches_python(
+        "class-alpha",
+        r#"
+for s in ["é", "λ", "日", "abc", "a1", "1", "²", "½", "٣", "Ⅷ", "", " "]:
+    print(s, s.isalpha(), s.isdigit(), s.isdecimal(), s.isnumeric(), s.isalnum())
+"#,
+    );
+}
+
+#[test]
+fn space_and_printable_classes_follow_unicode() {
+    matches_python(
+        "class-space",
+        r#"
+nbsp = chr(0x00A0)
+enq = chr(0x2003)
+zwsp = chr(0x200B)
+for s in [" ", "\t", nbsp, enq, zwsp, "a", ""]:
+    print(s.isspace(), s.isprintable())
+print("a b".isprintable(), (chr(7)).isprintable())
+"#,
+    );
+}
+
+#[test]
+fn case_predicates_handle_titlecase_characters() {
+    matches_python(
+        "class-case",
+        r#"
+for s in ["é", "É", "ǅ", "Ǆ", "ǆ", "aB", "AB", "ab", "1", "", "É1"]:
+    print(s.isupper(), s.islower(), s.istitle())
+print("Hello World".istitle(), "Héllo Wörld".istitle(), "HELLO".istitle())
+print("ǅungla".istitle())
+"#,
+    );
+}
+
+#[test]
+fn isidentifier_accepts_unicode_identifiers() {
+    matches_python(
+        "class-ident",
+        r#"
+for s in ["café", "π", "_x", "x1", "2x", "a-b", "", "日本語", "ᵃ", "x" + chr(0x0301)]:
+    print(s.isidentifier())
+"#,
+    );
+}
+
+#[test]
+fn whitespace_stripping_and_splitting_follow_unicode() {
+    matches_python(
+        "space-strip",
+        r#"
+nbsp = chr(0x00A0)
+enq = chr(0x2003)
+s = enq + "a" + enq + "b" + enq
+print(s.strip())
+print(s.split())
+print(s.lstrip(), s.rstrip())
+print((nbsp + "x").strip())
+print(("a" + enq + "b").split())
+print(("a" + nbsp + "b").split(), len(("a" + nbsp + "b").split()))
+"#,
+    );
+}
+
+#[test]
+fn splitlines_uses_the_unicode_boundary_set() {
+    matches_python(
+        "space-lines",
+        r#"
+s = "a\nb" + chr(0x2028) + "c" + chr(0x0085) + "d"
+print(s.splitlines())
+print(s.splitlines(True))
+print("a\r\nb".splitlines())
+print(("a" + chr(0x0B) + "b").splitlines())
+"#,
+    );
+}
+
+#[test]
+fn repr_escapes_by_unicode_printability() {
+    matches_python(
+        "repr-printable",
+        r#"
+zwsp = chr(0x200B)
+for s in ["café", "λ", "🐍", zwsp, chr(7), chr(0x0085)]:
+    print(f"{s!r}")
+print([chr(0x200B), "café"])
+"#,
+    );
+}

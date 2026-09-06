@@ -25,6 +25,13 @@ pub const GC_C: &str = include_str!("../runtime/gc.c");
 /// Shared collector/runtime declarations written beside the embedded C files.
 pub const GC_H: &str = include_str!("../runtime/gc.h");
 
+/// Unicode 16.0.0 property and case tables, generated from the CPython oracle
+/// by `scripts/gen_unicode_tables.py`.
+pub const UNICODE_DATA_C: &str = include_str!("../runtime/unicode_data.c");
+
+/// Declarations and lookup inlines for [`UNICODE_DATA_C`].
+pub const UNICODE_DATA_H: &str = include_str!("../runtime/unicode_data.h");
+
 pub fn ping() -> String {
     String::from("pong")
 }

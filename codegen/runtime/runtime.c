@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "gc.h"
+#include "unicode_data.h"
 
 /* exception type tags — keep in sync with ir::ExcType. Matching uses
  * CPython-like subclass checks via pyrs_exc_matches (Exception base,
@@ -367,6 +368,21 @@ _Noreturn void pyrs_die(const char *msg) {
     die_uncaught(msg);
 }
 
+/* Same fallback policy as xmalloc, for buffers that grow. */
+static void *xrealloc(void *old, size_t n) {
+    void *p = realloc(old, n);
+    if (p == NULL) {
+        pyrs_gc_collect();
+        p = realloc(old, n);
+    }
+    if (p == NULL) {
+        fflush(stdout);
+        fputs("MemoryError: out of memory\n", stderr);
+        exit(1);
+    }
+    return p;
+}
+
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
     if (p == NULL) {
@@ -623,6 +639,15 @@ static long long str_cp_of_byte(const PyrsStr *s, long long b) {
         i++;
     }
     return i;
+}
+
+/* Byte offset of the code point ending at byte `e` (e > 0). */
+static long long utf8_prev(const PyrsStr *s, long long e) {
+    long long b = e - 1;
+    while (b > 0 && ((unsigned char)s->data[b] & 0xc0) == 0x80) {
+        b--;
+    }
+    return b;
 }
 
 /* Code points in the byte range [from, to). */
@@ -2406,8 +2431,14 @@ static void print_str_repr(const PyrsStr *s) {
             fputs("\\r", stdout);
         } else if (cp == '\t') {
             fputs("\\t", stdout);
-        } else if (cp < 0x20 || cp == 0x7f) {
-            printf("\\x%02x", cp);
+        } else if ((pyrs_u_flags(cp) & PYRS_U_PRINTABLE) == 0) {
+            if (cp < 0x100) {
+                printf("\\x%02x", cp);
+            } else if (cp < 0x10000) {
+                printf("\\u%04x", cp);
+            } else {
+                printf("\\U%08x", cp);
+            }
         } else {
             fwrite(s->data + i, 1, (size_t)adv, stdout);
         }
@@ -2813,89 +2844,148 @@ PyrsStr *pyrs_str_slice(const PyrsStr *s, long long lo, long long hi, long long 
     return str_done_cplen(r, n);
 }
 
-/* ---- str methods (ASCII case/whitespace rules) ---- */
+/* ---- str methods ---- */
+
+/* A growable UTF-8 buffer, because case mapping can change length: U+00DF
+ * upper-cases to "SS", and a mapping can be up to three code points. */
+typedef struct {
+    char *data;
+    long long len;
+    long long cap;
+    long long cplen;
+} StrBuf;
+
+static void sb_init(StrBuf *b, long long hint) {
+    b->cap = hint < 16 ? 16 : hint;
+    b->data = xmalloc((size_t)b->cap);
+    b->len = 0;
+    b->cplen = 0;
+}
+
+static void sb_reserve(StrBuf *b, long long extra) {
+    if (b->len + extra <= b->cap) {
+        return;
+    }
+    while (b->len + extra > b->cap) {
+        if (b->cap > LLONG_MAX / 2) {
+            pyrs_die("MemoryError: string result too large");
+        }
+        b->cap *= 2;
+    }
+    b->data = xrealloc(b->data, (size_t)b->cap);
+}
+
+static void sb_put_cp(StrBuf *b, unsigned int cp) {
+    sb_reserve(b, 4);
+    b->len += utf8_encode(cp, b->data + b->len);
+    b->cplen++;
+}
+
+/* Append the mapping of `cp` in `slot` (upper/lower/title/fold). */
+static void sb_put_mapped(StrBuf *b, unsigned int cp, int slot) {
+    uint32_t out[3];
+    int n = pyrs_u_map(cp, slot, out);
+    for (int i = 0; i < n; i++) {
+        sb_put_cp(b, out[i]);
+    }
+}
+
+static PyrsStr *sb_finish(StrBuf *b) {
+    PyrsStr *r = str_alloc(b->len);
+    if (b->len > 0) {
+        memcpy(r->data, b->data, (size_t)b->len);
+    }
+    free(b->data);
+    return str_done_cplen(r, b->cplen);
+}
+
+/* upper/lower/casefold are per-character maps with no context. */
+static PyrsStr *str_map_each(const PyrsStr *s, int slot) {
+    check_ref(s);
+    StrBuf b;
+    sb_init(&b, s->len + 8);
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        sb_put_mapped(&b, cp, slot);
+    }
+    return sb_finish(&b);
+}
 
 PyrsStr *pyrs_str_upper(const PyrsStr *s) {
-    check_ref(s);
-    PyrsStr *r = str_alloc(s->len);
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        r->data[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
-    }
-    return str_done_cplen(r, s->cplen);
+    return str_map_each(s, PYRS_U_UPPER_MAP);
 }
 
 PyrsStr *pyrs_str_lower(const PyrsStr *s) {
-    check_ref(s);
-    PyrsStr *r = str_alloc(s->len);
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        r->data[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-    }
-    return str_done_cplen(r, s->cplen);
+    return str_map_each(s, PYRS_U_LOWER_MAP);
 }
 
-/* ASCII: same as lower. Unicode folds (ß → ss) are residual. */
 PyrsStr *pyrs_str_casefold(const PyrsStr *s) {
-    return pyrs_str_lower(s);
+    return str_map_each(s, PYRS_U_FOLD_MAP);
 }
 
-static char ascii_upper(char c) {
-    return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
-}
-
-static char ascii_lower(char c) {
-    return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-}
-
-static int ascii_is_letter(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+/* CPython's "cased" test, used by title() and istitle() to decide where a
+ * word starts: a character is cased when it is upper, lower or titlecase. */
+static int cp_is_cased(unsigned int cp) {
+    return (pyrs_u_flags(cp) &
+            (PYRS_U_UPPER | PYRS_U_LOWER | PYRS_U_TITLECASED)) != 0;
 }
 
 PyrsStr *pyrs_str_capitalize(const PyrsStr *s) {
     check_ref(s);
-    PyrsStr *r = str_alloc(s->len);
-    if (s->len == 0) {
-        return str_done_ascii(r);
+    StrBuf b;
+    sb_init(&b, s->len + 8);
+    long long i = 0;
+    if (i < s->len) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        /* CPython title-cases the first character, then lower-cases the rest. */
+        sb_put_mapped(&b, cp, PYRS_U_TITLE_MAP);
     }
-    r->data[0] = ascii_upper(s->data[0]);
-    for (long long i = 1; i < s->len; i++) {
-        r->data[i] = ascii_lower(s->data[i]);
+    while (i < s->len) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        sb_put_mapped(&b, cp, PYRS_U_LOWER_MAP);
     }
-    return str_done_cplen(r, s->cplen);
+    return sb_finish(&b);
 }
 
 PyrsStr *pyrs_str_title(const PyrsStr *s) {
     check_ref(s);
-    PyrsStr *r = str_alloc(s->len);
-    int prev_letter = 0;
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (ascii_is_letter(c)) {
-            r->data[i] = prev_letter ? ascii_lower(c) : ascii_upper(c);
-            prev_letter = 1;
+    StrBuf b;
+    sb_init(&b, s->len + 8);
+    int prev_cased = 0;
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        if (cp_is_cased(cp)) {
+            sb_put_mapped(&b, cp, prev_cased ? PYRS_U_LOWER_MAP : PYRS_U_TITLE_MAP);
+            prev_cased = 1;
         } else {
-            r->data[i] = c;
-            prev_letter = 0;
+            sb_put_cp(&b, cp);
+            prev_cased = 0;
         }
     }
-    return str_done_cplen(r, s->cplen);
+    return sb_finish(&b);
 }
 
 PyrsStr *pyrs_str_swapcase(const PyrsStr *s) {
     check_ref(s);
-    PyrsStr *r = str_alloc(s->len);
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (c >= 'a' && c <= 'z') {
-            r->data[i] = (char)(c - 32);
-        } else if (c >= 'A' && c <= 'Z') {
-            r->data[i] = (char)(c + 32);
+    StrBuf b;
+    sb_init(&b, s->len + 8);
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        uint16_t f = pyrs_u_flags(cp);
+        if (f & PYRS_U_LOWER) {
+            sb_put_mapped(&b, cp, PYRS_U_UPPER_MAP);
+        } else if (f & PYRS_U_UPPER) {
+            sb_put_mapped(&b, cp, PYRS_U_LOWER_MAP);
         } else {
-            r->data[i] = c;
+            sb_put_cp(&b, cp);
         }
     }
-    return str_done_cplen(r, s->cplen);
+    return sb_finish(&b);
 }
 
 /* mode: 0=ljust (pad right), 1=rjust (pad left), 2=center */
@@ -3038,8 +3128,24 @@ PyrsStr *pyrs_str_expandtabs(const PyrsStr *s, long long tabsize) {
     return str_done_cplen(r, cps);
 }
 
-static int is_py_space(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+static int cp_is_space(unsigned int cp) {
+    return (pyrs_u_flags(cp) & PYRS_U_SPACE) != 0;
+}
+
+/* Bytes of whitespace starting at `i`, or 0 if the character there is not
+ * whitespace. */
+static int space_len_at(const PyrsStr *s, long long i) {
+    unsigned int cp;
+    int adv = utf8_next(s, i, &cp);
+    return cp_is_space(cp) ? adv : 0;
+}
+
+/* Bytes of whitespace ending at byte `e`, or 0. */
+static int space_len_before(const PyrsStr *s, long long e) {
+    long long b = utf8_prev(s, e);
+    unsigned int cp;
+    int adv = utf8_next(s, b, &cp);
+    return (adv == e - b && cp_is_space(cp)) ? adv : 0;
 }
 
 static PyrsStr *strip_impl(const PyrsStr *s, int left, int right) {
@@ -3047,13 +3153,15 @@ static PyrsStr *strip_impl(const PyrsStr *s, int left, int right) {
     long long b = 0;
     long long e = s->len;
     if (left) {
-        while (b < e && is_py_space(s->data[b])) {
-            b++;
+        int adv;
+        while (b < e && (adv = space_len_at(s, b)) > 0) {
+            b += adv;
         }
     }
     if (right) {
-        while (e > b && is_py_space(s->data[e - 1])) {
-            e--;
+        int adv;
+        while (e > b && (adv = space_len_before(s, e)) > 0) {
+            e -= adv;
         }
     }
     return str_sub(s, b, e - b);
@@ -3079,15 +3187,6 @@ static void fill_byte_set(const PyrsStr *chars, unsigned char set[32]) {
         unsigned char c = (unsigned char)chars->data[i];
         set[c >> 3] |= (unsigned char)(1u << (c & 7));
     }
-}
-
-/* Byte offset of the code point ending at byte `e` (e > 0). */
-static long long utf8_prev(const PyrsStr *s, long long e) {
-    long long b = e - 1;
-    while (b > 0 && ((unsigned char)s->data[b] & 0xc0) == 0x80) {
-        b--;
-    }
-    return b;
 }
 
 /* Does `chars` contain this code point? */
@@ -3447,8 +3546,9 @@ PyrsList *pyrs_str_split_ws(const PyrsStr *s, long long maxsplit) {
     long long i = 0;
     long long n = 0;
     while (i < s->len) {
-        while (i < s->len && is_py_space(s->data[i])) {
-            i++;
+        int adv;
+        while (i < s->len && (adv = space_len_at(s, i)) > 0) {
+            i += adv;
         }
         if (i >= s->len) {
             break;
@@ -3458,8 +3558,9 @@ PyrsList *pyrs_str_split_ws(const PyrsStr *s, long long maxsplit) {
             pyrs_list_push(r, (long long)str_sub(s, start, s->len - start));
             break;
         }
-        while (i < s->len && !is_py_space(s->data[i])) {
-            i++;
+        while (i < s->len && space_len_at(s, i) == 0) {
+            unsigned int cp;
+            i += utf8_next(s, i, &cp);
         }
         pyrs_list_push(r, (long long)str_sub(s, start, i - start));
         n++;
@@ -3473,8 +3574,9 @@ PyrsList *pyrs_str_rsplit_ws(const PyrsStr *s, long long maxsplit) {
     long long i = s->len;
     long long n = 0;
     while (i > 0) {
-        while (i > 0 && is_py_space(s->data[i - 1])) {
-            i--;
+        int adv;
+        while (i > 0 && (adv = space_len_before(s, i)) > 0) {
+            i -= adv;
         }
         if (i == 0) {
             break;
@@ -3484,8 +3586,8 @@ PyrsList *pyrs_str_rsplit_ws(const PyrsStr *s, long long maxsplit) {
             pyrs_list_push(r, (long long)str_sub(s, 0, end));
             break;
         }
-        while (i > 0 && !is_py_space(s->data[i - 1])) {
-            i--;
+        while (i > 0 && space_len_before(s, i) == 0) {
+            i = utf8_prev(s, i);
         }
         pyrs_list_push(r, (long long)str_sub(s, i, end - i));
         n++;
@@ -4252,8 +4354,15 @@ PyrsStr *pyrs_str_repr(const PyrsStr *s) {
         } else if (cp == '\t') {
             buf[n++] = '\\';
             buf[n++] = 't';
-        } else if (cp < 0x20 || cp == 0x7f) {
-            n += sprintf(buf + n, "\\x%02x", cp);
+        } else if ((pyrs_u_flags(cp) & PYRS_U_PRINTABLE) == 0) {
+            /* CPython escapes by Unicode printability, not by byte range. */
+            if (cp < 0x100) {
+                n += sprintf(buf + n, "\\x%02x", cp);
+            } else if (cp < 0x10000) {
+                n += sprintf(buf + n, "\\u%04x", cp);
+            } else {
+                n += sprintf(buf + n, "\\U%08x", cp);
+            }
         } else {
             memcpy(buf + n, s->data + i, (size_t)adv);
             n += adv;
@@ -4469,14 +4578,17 @@ PyrsStr *pyrs_format_str(const PyrsStr *s, const PyrsStr *spec) {
 }
 
 /* ASCII: `0`..=`9`; empty is False. Shared by isdigit / isdecimal / isnumeric. */
-static int pyrs_str_is_ascii_digits(const PyrsStr *s) {
+/* Every code point satisfies `mask`; an empty string is False, matching
+ * CPython for every predicate except isascii(). */
+static int str_all_flags(const PyrsStr *s, uint16_t mask) {
     check_ref(s);
     if (s->len == 0) {
         return 0;
     }
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (c < '0' || c > '9') {
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        if ((pyrs_u_flags(cp) & mask) == 0) {
             return 0;
         }
     }
@@ -4484,91 +4596,85 @@ static int pyrs_str_is_ascii_digits(const PyrsStr *s) {
 }
 
 int pyrs_str_isdigit(const PyrsStr *s) {
-    return pyrs_str_is_ascii_digits(s);
+    return str_all_flags(s, PYRS_U_DIGIT);
+}
+
+int pyrs_str_isdecimal(const PyrsStr *s) {
+    return str_all_flags(s, PYRS_U_DECIMAL);
+}
+
+int pyrs_str_isnumeric(const PyrsStr *s) {
+    return str_all_flags(s, PYRS_U_NUMERIC);
 }
 
 int pyrs_str_isalpha(const PyrsStr *s) {
-    check_ref(s);
-    if (s->len == 0) {
-        return 0;
-    }
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
-            return 0;
-        }
-    }
-    return 1;
+    return str_all_flags(s, PYRS_U_ALPHA);
 }
 
 int pyrs_str_isspace(const PyrsStr *s) {
-    check_ref(s);
-    if (s->len == 0) {
-        return 0;
-    }
-    for (long long i = 0; i < s->len; i++) {
-        if (!is_py_space(s->data[i])) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-/* ASCII: at least one cased letter; all cased letters upper (or lower). */
-int pyrs_str_isupper(const PyrsStr *s) {
-    check_ref(s);
-    int saw_cased = 0;
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (c >= 'a' && c <= 'z') {
-            return 0;
-        }
-        if (c >= 'A' && c <= 'Z') {
-            saw_cased = 1;
-        }
-    }
-    return saw_cased;
-}
-
-int pyrs_str_islower(const PyrsStr *s) {
-    check_ref(s);
-    int saw_cased = 0;
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        if (c >= 'A' && c <= 'Z') {
-            return 0;
-        }
-        if (c >= 'a' && c <= 'z') {
-            saw_cased = 1;
-        }
-    }
-    return saw_cased;
+    return str_all_flags(s, PYRS_U_SPACE);
 }
 
 int pyrs_str_isalnum(const PyrsStr *s) {
+    return str_all_flags(
+        s, PYRS_U_ALPHA | PYRS_U_DECIMAL | PYRS_U_DIGIT | PYRS_U_NUMERIC);
+}
+
+int pyrs_str_isprintable(const PyrsStr *s) {
     check_ref(s);
-    if (s->len == 0) {
-        return 0;
-    }
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        int letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-        int digit = c >= '0' && c <= '9';
-        if (!letter && !digit) {
+    /* CPython: the empty string is printable. */
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        if ((pyrs_u_flags(cp) & PYRS_U_PRINTABLE) == 0) {
             return 0;
         }
     }
     return 1;
+}
+
+/* CPython: all cased characters are of the wanted case, and there is at
+ * least one. Titlecase (Lt) is cased but is neither upper nor lower, so it
+ * disqualifies both -- "\u01c5".isupper() and .islower() are both False. */
+static int str_is_one_case(const PyrsStr *s, uint16_t want) {
+    check_ref(s);
+    uint16_t other = want == PYRS_U_UPPER ? PYRS_U_LOWER : PYRS_U_UPPER;
+    int saw = 0;
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        uint16_t f = pyrs_u_flags(cp);
+        int is_lt = (f & PYRS_U_TITLECASED) != 0 && (f & PYRS_U_UPPER) == 0;
+        if ((f & other) || is_lt) {
+            return 0;
+        }
+        if (f & want) {
+            saw = 1;
+        }
+    }
+    return saw;
+}
+
+int pyrs_str_isupper(const PyrsStr *s) {
+    return str_is_one_case(s, PYRS_U_UPPER);
+}
+
+int pyrs_str_islower(const PyrsStr *s) {
+    return str_is_one_case(s, PYRS_U_LOWER);
 }
 
 int pyrs_str_istitle(const PyrsStr *s) {
     check_ref(s);
     int saw_cased = 0;
     int prev_cased = 0;
-    for (long long i = 0; i < s->len; i++) {
-        char c = s->data[i];
-        int upper = c >= 'A' && c <= 'Z';
-        int lower = c >= 'a' && c <= 'z';
+    for (long long i = 0; i < s->len;) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        uint16_t f = pyrs_u_flags(cp);
+        /* A titlecased character here means "uppercase or titlecase", which
+         * is what CPython's istitle() treats as starting a word. */
+        int upper = (f & PYRS_U_TITLECASED) != 0;
+        int lower = (f & PYRS_U_LOWER) != 0 && !upper;
         if (upper || lower) {
             if (prev_cased) {
                 if (upper) {
@@ -4593,42 +4699,22 @@ int pyrs_str_isascii(const PyrsStr *s) {
     return STR_IS_ASCII(s);
 }
 
-int pyrs_str_isdecimal(const PyrsStr *s) {
-    return pyrs_str_is_ascii_digits(s);
-}
-
-int pyrs_str_isnumeric(const PyrsStr *s) {
-    return pyrs_str_is_ascii_digits(s);
-}
-
-/* ASCII identifier: `[A-Za-z_][A-Za-z0-9_]*`. Keywords are identifiers. */
+/* XID_Start (plus '_') then XID_Continue, as CPython defines it. Keywords
+ * are identifiers. */
 int pyrs_str_isidentifier(const PyrsStr *s) {
     check_ref(s);
     if (s->len == 0) {
         return 0;
     }
-    char first = s->data[0];
-    int start = (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_';
-    if (!start) {
+    long long i = 0;
+    unsigned int cp;
+    i += utf8_next(s, i, &cp);
+    if ((pyrs_u_flags(cp) & PYRS_U_XID_START) == 0) {
         return 0;
     }
-    for (long long i = 1; i < s->len; i++) {
-        char c = s->data[i];
-        int cont = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
-            || c == '_';
-        if (!cont) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-/* ASCII printable: empty is True; each byte in 0x20..=0x7E (space through `~`). */
-int pyrs_str_isprintable(const PyrsStr *s) {
-    check_ref(s);
-    for (long long i = 0; i < s->len; i++) {
-        unsigned char c = (unsigned char)s->data[i];
-        if (c < 0x20 || c > 0x7e) {
+    while (i < s->len) {
+        i += utf8_next(s, i, &cp);
+        if ((pyrs_u_flags(cp) & PYRS_U_XID_CONTINUE) == 0) {
             return 0;
         }
     }
