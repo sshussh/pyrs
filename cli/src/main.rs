@@ -10,8 +10,10 @@ use std::{
     process,
 };
 
+mod cache;
 mod cli;
 mod extension;
+mod hash;
 mod modules;
 
 fn main() {
@@ -48,7 +50,13 @@ fn run(args: cli::Cli) -> Result<i32, String> {
             Ok(0)
         }
         cli::Command::Compile(cmd) => {
-            compile(&cmd.input, &cmd.output, cmd.opt_level, cmd.emit_llvm)?;
+            compile(
+                &cmd.input,
+                &cmd.output,
+                cmd.opt_level,
+                cmd.emit_llvm,
+                !cmd.no_cache,
+            )?;
             Ok(0)
         }
         cli::Command::Run(cmd) => run_program(cmd),
@@ -118,25 +126,51 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
             OsString::from("-"),
         )
     };
-    let module = analyze(loaded)?;
-    let workdir = temp_workdir()?;
-    let exe = workdir.join("program");
-    let result = compile_module(&module, &exe, cmd.opt_level, false).and_then(|()| {
-        let mut process = process::Command::new(&exe);
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let key =
+        (!cmd.no_cache).then(|| cache::program_key(&program_sources(&loaded), cmd.opt_level, &cc));
+
+    // A hit skips analysis and code generation as well as the C compile:
+    // the program is unchanged, so there is nothing left to decide about it.
+    if let Some(key) = &key
+        && let Some(cached) = cache::program_lookup(key)
+    {
+        let mut process = process::Command::new(&cached);
         process.args(&cmd.args);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             process.arg0(&argv0);
         }
-        #[cfg(not(unix))]
-        let _ = argv0;
-        // Keep the parent alive to clean up the native executable afterwards.
-        process
+        return process
             .status()
             .map(exit_code)
-            .map_err(|e| format!("failed to run compiled program: {e}"))
-    });
+            .map_err(|e| format!("failed to run compiled program: {e}"));
+    }
+
+    let module = analyze(loaded)?;
+    let workdir = temp_workdir()?;
+    let exe = workdir.join("program");
+    let result =
+        compile_module(&module, &exe, cmd.opt_level, false, !cmd.no_cache).and_then(|()| {
+            if let Some(key) = &key {
+                cache::program_store(key, &exe);
+            }
+            let mut process = process::Command::new(&exe);
+            process.args(&cmd.args);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                process.arg0(&argv0);
+            }
+            #[cfg(not(unix))]
+            let _ = argv0;
+            // Keep the parent alive to clean up the native executable afterwards.
+            process
+                .status()
+                .map(exit_code)
+                .map_err(|e| format!("failed to run compiled program: {e}"))
+        });
     drop(workdir);
     result
 }
@@ -166,9 +200,32 @@ fn execute(command: &mut process::Command) -> Result<i32, io::Error> {
 }
 
 /// The full pipeline: source file(s) in, linked native executable out.
-fn compile(input: &Path, output: &Path, opt_level: u8, emit_llvm: bool) -> Result<(), String> {
-    let module = analyze(modules::load_program(input).map_err(|e| e.0)?)?;
-    compile_module(&module, output, opt_level, emit_llvm)
+fn compile(
+    input: &Path,
+    output: &Path,
+    opt_level: u8,
+    emit_llvm: bool,
+    use_cache: bool,
+) -> Result<(), String> {
+    let loaded = modules::load_program(input).map_err(|e| e.0)?;
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    // `--emit-llvm` asks for a side artifact the cache does not hold, so it
+    // always rebuilds rather than silently not producing the .ll file.
+    let key = (use_cache && !emit_llvm)
+        .then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc));
+    if let Some(key) = &key
+        && let Some(cached) = cache::program_lookup(key)
+    {
+        fs::copy(&cached, output)
+            .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
+        return Ok(());
+    }
+    let module = analyze(loaded)?;
+    compile_module(&module, output, opt_level, emit_llvm, use_cache)?;
+    if let Some(key) = &key {
+        cache::program_store(key, output);
+    }
+    Ok(())
 }
 
 fn analyze(loaded: Vec<modules::Loaded>) -> Result<ir::Module, String> {
@@ -195,6 +252,7 @@ fn compile_module(
     output: &Path,
     opt_level: u8,
     emit_llvm: bool,
+    use_cache: bool,
 ) -> Result<(), String> {
     let llvm_ir = codegen::emit_llvm_ir(module);
 
@@ -211,9 +269,10 @@ fn compile_module(
         codegen::compile_ir_to_object(&llvm_ir, &object, opt_level)
             .map_err(|e| format!("error[codegen]: {e}"))?;
 
-        // The C runtime and collector are compiled and linked in the same cc
-        // invocation.  They are embedded in the compiler binary so produced
-        // executables do not depend on a PyRs installation at run time.
+        // The C runtime and collector are embedded in the compiler binary so
+        // produced executables do not depend on a PyRs installation at run
+        // time. They are written out here both to compile and to key the
+        // cache on their preprocessed content.
         let runtime = workdir.join("runtime.c");
         fs::write(&runtime, codegen::RUNTIME_C)
             .map_err(|e| format!("failed to write runtime: {e}"))?;
@@ -232,11 +291,21 @@ fn compile_module(
         // `-Wformat-truncation` on `runtime.c` otherwise leaks onto stderr
         // and breaks GC-stat parsing plus `make examples` (which diffs 2>&1).
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-        let status = process::Command::new(&cc)
-            .arg(&object)
-            .arg(&runtime)
-            .arg(&gc)
-            .arg(&unicode)
+
+        let runtime_build = cache::runtime_objects(&cc, &workdir, &workdir, use_cache)?;
+        let mut link = process::Command::new(&cc);
+        link.arg(&object);
+        match &runtime_build {
+            cache::Runtime::Cached(o) | cache::Runtime::Separate(o) => {
+                link.args(&o.objects);
+            }
+            cache::Runtime::Inline => {
+                // One invocation, not three: these objects are discarded, so
+                // splitting the compile buys nothing and measurably costs.
+                link.arg(&runtime).arg(&gc).arg(&unicode);
+            }
+        }
+        let status = link
             .arg("-O2")
             .arg("-Wno-format-truncation")
             .arg("-lm")
@@ -251,6 +320,15 @@ fn compile_module(
     })();
     drop(workdir);
     result
+}
+
+/// The inputs a program's identity is built from: every module in the
+/// resolved import graph, which the resolver has already determined exactly.
+fn program_sources(loaded: &[modules::Loaded]) -> Vec<(String, String)> {
+    loaded
+        .iter()
+        .map(|m| (m.name.clone(), m.source.clone()))
+        .collect()
 }
 
 fn read_source(path: &Path) -> Result<String, String> {

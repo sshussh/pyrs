@@ -1,8 +1,48 @@
 # Changelog
 
-## Unreleased
+## 0.109.0 — Build caching
 
-Review follow-ups: the shortcomings recorded during the 0.90-0.108 series.
+A one-line program took **2.61 s** to build, of which **2.39 s** was
+`cc -O2 -c runtime.c`. That is 92% of the floor, and it was paid again on
+every invocation — including every `pyrs run` of a program that had not
+changed.
+
+- **Runtime objects** (`runtime.c`, `gc.c`, `unicode_data.c`) are compiled
+  once and reused. A new program now builds in **84 ms** instead of 2.6 s.
+- **Whole programs** are cached too, keyed on their inputs, so an unchanged
+  `pyrs run` skips analysis, code generation and linking entirely: **11 ms**.
+- `--no-cache` on `run` and `compile` reuses and publishes nothing.
+
+The cache lives in `$XDG_CACHE_HOME/pyrs` (or `PYRS_CACHE_DIR`), not in the
+project: the runtime objects depend only on the compiler and the embedded
+sources, so every project on the machine wants the same ones, and an explicit
+`pyrs run -i prog.py` with no project still hits.
+
+A stale entry is a wrong answer that looks like a right one, so the keys cover
+everything that can change the output bytes — the compiler's own fingerprint
+(computed at build time over every workspace source, since hashing the 5 MB
+executable per run would cost more than some hits save), the C toolchain's
+identity, the optimization level, the target, and the content of every module
+in the resolved import graph. Entries are checksum-verified before reuse and
+published by atomic rename.
+
+Two findings from testing, both of which would have made the cache quietly
+useless or wrong:
+
+- The runtime key is computed over **preprocessed** C, which is what makes a
+  changed system header visible. Preprocessed output embeds the source path in
+  its line markers, and the sources are written to a fresh temporary directory
+  each run — so the key never repeated and the runtime cache never hit. Fixed
+  by preprocessing with `-P`.
+- Computing a key called `cc --version` and `cc -dumpmachine` on every run,
+  including cache hits. The toolchain identity is now recorded under a cheap
+  stamp of the compiler binary and recomputed only when that binary changes.
+
+
+### Also in this release
+
+
+The shortcomings recorded during the 0.90-0.108 series, addressed:
 
 - **`KeyError` display vs storage.** `str(KeyError("k"))` was unquoted where
   CPython gives `'k'`, and the internal raise sites had the mirror-image bug:

@@ -14,8 +14,8 @@ exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.102.0** module-level containers, **0.103.0** annotated attributes and
 **0.104.0** `typing` imports with `Iterator[T]`, **0.105.0** n-ary `zip` with
 `enumerate(start)`, **0.106.0** class-body constants, **0.107.0** tuple
-dict/set keys and **0.108.0** `str()` / `repr()` of containers. The next
-milestone is **0.109.0**; reaching a particular minor version does not
+dict/set keys, **0.108.0** `str()` / `repr()` of containers and **0.109.0**
+build caching. The next milestone is **0.110.0**; reaching a particular minor version does not
 establish 1.0 readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
@@ -105,6 +105,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.109 on the same host:
+
+| Check | Result after 0.109 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1378 passed; none failed or ignored (18 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 66 pass / 0 known_gap; compat 22 pass |
+| `pyrs --version` | `PyRs 0.109.0` |
 
 After 0.108 on the same host:
 
@@ -401,6 +412,28 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.109.0: build caching
+
+A one-line program took 2.61 s to build, 2.39 s of it `cc -O2 -c runtime.c` --
+92% of the floor, paid again on every invocation. Two layers close it: the
+runtime objects are compiled once and reused (84 ms for a new program), and
+whole programs are keyed on their inputs so an unchanged `pyrs run` skips
+analysis, codegen and linking entirely (11 ms).
+
+The cache is global rather than per-project, because the runtime objects
+depend only on the compiler and the embedded sources: every project wants the
+same ones, and an explicit `pyrs run -i prog.py` with no project still hits.
+
+A stale entry is a wrong answer that looks like a right one, so keys cover
+everything that can change the output bytes and entries are checksum-verified
+before reuse rather than trusted. Two defects found while testing would each
+have made the cache quietly useless: the runtime key is computed over
+*preprocessed* C, whose line markers embed the per-run temporary path, so it
+never repeated until preprocessing moved to `-P`; and computing a key ran
+`cc --version` and `cc -dumpmachine` on every invocation, including hits,
+until the toolchain identity was recorded under a stamp of the compiler
+binary.
 
 ## 0.108.0: `str()` and `repr()` of containers
 
@@ -1241,8 +1274,11 @@ documentation and the relevant gates.
       long-running workloads. A moving collector is optional; correct bounded
       memory behavior is the requirement.
 - [x] Reproducible sanitizer runs for the adapter, runtime and collector.
-- [ ] Measured compile time and runtime; safely cache runtime objects keyed
-      on runtime content, compiler, target and options.
+- [x] Measured compile time and runtime; safely cache runtime objects keyed
+      on runtime content, compiler, target and options (0.109). Whole
+      programs are cached on the same terms, so an unchanged `pyrs run`
+      compiles nothing: 2.6 s to 11 ms, and 84 ms for a new program against a
+      warm runtime cache.
 - [ ] Declare the supported host/target matrix (initially Linux x86-64) and
       exercise each claimed platform in CI.
 - [ ] Reproducible release builds, checksums, install instructions,

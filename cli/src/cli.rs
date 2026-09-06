@@ -126,6 +126,10 @@ pub struct CompileCommand {
     /// Also write the generated LLVM IR next to the output (<output>.ll)
     #[arg(long)]
     pub emit_llvm: bool,
+
+    /// Recompile from scratch, reusing and publishing nothing
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 #[derive(Debug, Args)]
@@ -153,6 +157,10 @@ pub struct RunCommand {
     /// Optimization level (0-3)
     #[arg(short = 'O', long = "opt-level", default_value_t = 2, value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt_level: u8,
+
+    /// Recompile from scratch, reusing and publishing nothing
+    #[arg(long)]
+    pub no_cache: bool,
 
     /// Script and arguments, or just arguments with -i/-c/-m; '-' reads stdin
     #[arg(trailing_var_arg = true)]
