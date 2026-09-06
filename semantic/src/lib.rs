@@ -24460,11 +24460,13 @@ fn lower_enumerate_expr(
 /// result is a `list[tuple[...]]` with one component per argument.
 fn lower_zip_expr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     if args.is_empty() {
-        return Err(err(
-            "zip() with no arguments is always empty; this subset needs at \
-             least one iterable",
-            span,
-        ));
+        // CPython: `list(zip())` is `[]`. Nothing to iterate, so the result is
+        // an empty list of empty tuples -- the type the n-ary form would give.
+        let _ = span;
+        return Ok(ir::Expr {
+            ty: ir::list_of(ir::tuple_of(&[])),
+            kind: ir::ExprKind::ListLit(vec![]),
+        });
     }
     // Element type of each argument, with the argument materialized to a list.
     let mut lists: Vec<ir::Expr> = Vec::with_capacity(args.len());

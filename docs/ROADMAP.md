@@ -1011,6 +1011,8 @@ probes append to it.
 | `def f(x: "Base")` | accepted | accepted | **closed in 0.87** |
 | `str(KeyError("k"))` | `'k'` | `k` | open — see below |
 | `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | `(1, 2)`, `[1, 2]` | **closed in 0.108** |
+| `list(zip(infinite(), [1]))` | `[(0, 1)]` | does not terminate | open — see below |
+| `(x for x in range(bound()))` | `bound()` at creation | `bound()` at first iteration | open — see below |
 
 `KeyError.__str__` is CPython's `repr(args[0])`, so a str key displays quoted
 and an int key does not. Every *internal* raise site already formats
@@ -1029,6 +1031,23 @@ right; it was unreachable, because the print routines wrote straight to
 `stdout`. 0.108 routes them through a sink that `str()` can capture, so the
 two now agree by construction. `ascii()` of a container and a format spec on
 one remain rejected, both deliberately.
+
+Two divergences share one root cause: the eager builtins and generator
+expressions **materialize their inputs** instead of advancing them lazily.
+`zip` drains each argument into a list before pairing, so
+`list(zip(infinite_generator(), [1]))` never terminates where CPython returns
+one pair, and any finite generator's side effects all run up front. A
+generator expression is the mirror image: CPython evaluates the *outermost*
+iterable when the genexp is created — `(x for x in range(bound()))` calls
+`bound()` right there — while PyRs leaves it in the synthesized body and calls
+it on first iteration. Both were found by review on the 0.90-0.108 series and
+confirmed against CPython.
+
+Neither is a formatting detail that can be patched at the call site: closing
+them means an iteration protocol that can advance heterogeneous inputs in
+lockstep, which is the same machinery `itertools`-style laziness would need.
+That is a milestone of its own rather than a fix, and it is tracked in
+workstream C below.
 
 ## Product contract
 
@@ -1100,6 +1119,11 @@ documentation and the relevant gates.
 
 ### C. Python values, typing and protocols
 
+- [ ] **Lazy iteration protocol.** Advance iterables in lockstep instead of
+      materializing them: `zip` must stop at the shortest input rather than
+      draining each one first (today `zip(infinite(), [1])` hangs), and a
+      generator expression must evaluate its outermost iterable at creation
+      as CPython does. One protocol closes both.
 - [ ] Runtime operations for `Any` and mixed containers; call-site inference
       for unannotated functions and lambdas.
 - [ ] Dynamic-length heterogeneous tuples; general hash/equality protocol;

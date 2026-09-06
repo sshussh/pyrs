@@ -221,7 +221,18 @@ fn too_many_enumerate_arguments_are_rejected() {
 }
 
 #[test]
-fn zip_with_no_arguments_is_rejected() {
-    let err = rejects("zip-none", "print(list(zip()))\n");
-    assert!(err.contains("at least one iterable"), "{err}");
+fn zip_with_no_arguments_is_empty() {
+    // `list(zip())` is `[]` in CPython. This was rejected, which contradicted
+    // the "any number of iterables" contract for the one arity that needs no
+    // iteration at all.
+    matches_python(
+        "zip-none",
+        r#"
+print(list(zip()))
+print(len(list(zip())))
+for t in zip():
+    print("unreachable")
+print("done")
+"#,
+    );
 }

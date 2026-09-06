@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+Review fixes on the 0.90–0.108 series.
+
+- **A missing tuple key crashed instead of raising `KeyError`.** All four miss
+  paths (`d[k]`, `del d[k]`, `d.pop(k)`, `set.remove(k)`) formatted any
+  non-string key with an integer-only routine, so a tuple key was read as a
+  tagged bigint and died with `MemoryError`. They now share one renderer built
+  on the 0.108 output sink, which produces CPython's `repr(key)` for every key
+  type: a str quoted, an int bare, a tuple parenthesised.
+- **f-string replacement fields were unescaped twice.** The lexer decoded the
+  whole payload, including field source that the parser then re-lexes, so
+  `f"{'\\n'}"` collapsed to a newline instead of the two characters `\` and
+  `n`. Escapes are now decoded in the literal chunks only, for both the
+  single- and triple-quoted forms.
+- **`zip()` with no arguments** returned an error; CPython gives an empty
+  iterator, so `list(zip())` is now `[]`.
+- **Two stale compatibility expectations.** `pandas-group-join` still named
+  the tuple-subscript parser diagnostic that 0.107 retired. Sweeping every
+  `unsupported` case against the current compiler found a second one:
+  `numpy-linalg` expected a generic parse error where the dedicated
+  matrix-multiply diagnostic is now reported. Both now match reality, and the
+  sweep is clean.
+- **The hygiene gate** claimed to pin the Unicode tables to the interpreter
+  that generated them but compared only the UCD version, which two CPython
+  releases can share. It now also compares the `PYRS_UNIDATA_CPYTHON` stamp,
+  to the minor version — a patch bump does not change casing, and pinning it
+  would fail the gate on any other 3.14.x.
+
 ## 0.108.0 — `str()` and `repr()` of containers
 
 `print([1, 2])` wrote `[1, 2]`, but `str([1, 2])`, `f"{xs}"` and `"%s" % xs`
