@@ -519,6 +519,35 @@ Unicode name database the compiler does not carry.
 Replacement fields may contain string literals using either quote,
 including the one delimiting the f-string (`f"{d["k"]}"`), per PEP 701.
 
+### Conditional expressions
+
+```python
+label = "big" if n > 3 else "small"
+print(1 if flag else 2.5)          # 1 -- each branch keeps its own type
+print(1 // n if n else -1)         # the untaken branch never runs, so no trap
+print("a" if k == 1 else "b" if k == 2 else "c")   # right-associative
+```
+
+Only the selected branch is evaluated and the condition runs exactly once, so
+the guard idioms (`xs[0] if xs else default`) behave as in Python. `or` and
+`not` bind tighter than the conditional, and the condition itself is an
+`or_test` — `1 if 2 if 3 else 4 else 5` is a syntax error here as it is in
+CPython; parenthesise to nest.
+
+A bare conditional cannot be a comprehension's iterable or filter, because the
+trailing `if` there belongs to the comprehension. Parenthesise it:
+
+```python
+[x for x in ([1] if flag else [2])]      # ok
+[("even" if i % 2 == 0 else "odd") for i in range(4)]   # ok in the element
+```
+
+Branches of different types produce a union. Mixed *numeric* branches keep
+each branch's own type rather than promoting, which is what makes
+`1 if flag else 2.5` print `1`; the cost is that arithmetic and comparison on
+that result are unsupported, exactly as for `[1, 2.5]` elements. Give both
+branches one type (`1.0 if flag else 2.5`) or narrow with `isinstance` first.
+
 ### f-strings
 
 ```python

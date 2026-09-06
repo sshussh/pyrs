@@ -6,9 +6,9 @@ PyRs has a substantial native compiler and runtime, but it is still a
 statically typed Python subset. Versions **0.90.0** through **0.92.0** make
 strings Unicode: offsets are code points, case transforms and character
 classes follow Unicode 16.0.0, and string literals accept the full escape
-set. The next milestone is **0.93.0**; reaching a particular minor version
-does not establish 1.0 readiness, and no stable release or tag has been
-created.
+set. **0.93.0** adds conditional expressions. The next milestone is
+**0.94.0**; reaching a particular minor version does not establish 1.0
+readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -97,6 +97,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.93 on the same host:
+
+| Check | Result after 0.93 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1148 passed; none failed or ignored (18 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 21 pass / 0 known_gap; compat 7 pass |
+| `pyrs --version` | `PyRs 0.93.0` |
 
 After 0.92 on the same host:
 
@@ -217,6 +228,40 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.93.0: conditional expressions
+
+`a if c else b` was a parse error — not an exotic corner, but one of the most
+common expressions in Python, with no spelling at all before this milestone.
+
+The milestone contract is:
+
+- A conditional expression is accepted everywhere an expression is, and only
+  the selected branch is evaluated, so `1 // n if n else -1` and
+  `xs[0] if xs else "empty"` do not trap. The condition runs exactly once.
+- Precedence and associativity match Python: `or` and `not` bind tighter,
+  chains are right-associative, and the condition is an `or_test`, so
+  `1 if 2 if 3 else 4 else 5` is rejected as CPython rejects it.
+- A bare conditional is excluded from comprehension iterables and filters,
+  because the trailing `if` there belongs to the comprehension.
+- Mixed numeric branches keep each branch's own type (`1 if c else 2.5` is
+  `1`), extending the 0.89 rule; unrelated branch types become a union.
+
+Lowered to a temp assigned in the two arms of an `If`, wrapped in the `Block`
+node comprehensions already use to put statements inside an expression, so
+laziness comes for free: the branch not taken is never emitted into the same
+basic block. No new IR.
+
+Found while testing: four recursive AST walkers — free-variable capture,
+`yield` detection, lambda collection and the call graph — silently skipped the
+new node through their catch-all arms, so a name used only inside a
+conditional looked undefined in a closure. That class of bug is invisible to
+the type checker and is why the suite covers closures, generators and
+comprehensions rather than just values.
+
+Arithmetic and comparison on a mixed-numeric union remain unsupported, as they
+already were for list elements since 0.89. The diagnostic now explains the
+cause and suggests two remedies that were verified to work.
 
 ## 0.92.0: string literal escapes and PEP 701 f-strings
 

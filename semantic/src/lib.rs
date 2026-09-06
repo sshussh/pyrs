@@ -6547,6 +6547,9 @@ fn stmt_has_yield(st: &ast::Stmt) -> bool {
 fn expr_has_yield(e: &ast::Expr) -> bool {
     match &e.kind {
         ast::ExprKind::Yield(_) | ast::ExprKind::YieldFrom(_) => true,
+        ast::ExprKind::IfExp { test, body, orelse } => {
+            expr_has_yield(test) || expr_has_yield(body) || expr_has_yield(orelse)
+        }
         ast::ExprKind::Binary { left, right, .. } => expr_has_yield(left) || expr_has_yield(right),
         ast::ExprKind::Unary { operand, .. } => expr_has_yield(operand),
         ast::ExprKind::Call {
@@ -7597,6 +7600,11 @@ fn collect_cell_candidates_in_expr(e: &ast::Expr, out: &mut HashSet<String>) {
 
 fn walk_expr_for_lambdas(e: &ast::Expr, out: &mut HashSet<String>) {
     match &e.kind {
+        ast::ExprKind::IfExp { test, body, orelse } => {
+            walk_expr_for_lambdas(test, out);
+            walk_expr_for_lambdas(body, out);
+            walk_expr_for_lambdas(orelse, out);
+        }
         ast::ExprKind::Lambda { params, body } => {
             let mut used = HashSet::new();
             collect_used_names_in_expr(body, &mut used);
@@ -7980,6 +7988,11 @@ fn collect_called_func_names_in_stmt(st: &ast::Stmt, out: &mut HashSet<String>) 
 
 fn collect_called_func_names_in_expr(e: &ast::Expr, out: &mut HashSet<String>) {
     match &e.kind {
+        ast::ExprKind::IfExp { test, body, orelse } => {
+            collect_called_func_names_in_expr(test, out);
+            collect_called_func_names_in_expr(body, out);
+            collect_called_func_names_in_expr(orelse, out);
+        }
         ast::ExprKind::Call {
             func,
             args,
@@ -8228,6 +8241,11 @@ fn collect_used_names_in_expr(e: &ast::Expr, out: &mut HashSet<String>) {
     match &e.kind {
         ast::ExprKind::Name(n) => {
             out.insert(n.clone());
+        }
+        ast::ExprKind::IfExp { test, body, orelse } => {
+            collect_used_names_in_expr(test, out);
+            collect_used_names_in_expr(body, out);
+            collect_used_names_in_expr(orelse, out);
         }
         ast::ExprKind::Call {
             func,
@@ -15810,6 +15828,70 @@ fn coerce_numeric_into(value: ir::Expr, target: ir::Ty) -> SResult<ir::Expr> {
 }
 
 /// Lower an expression used as a condition; applies truthiness.
+/// `body if test else orelse`.
+///
+/// Lowered to a temp assigned in the two arms of an `If`, wrapped in the
+/// `Block` node comprehensions already use to put statements inside an
+/// expression. That keeps Python's laziness for free: the branch not taken
+/// is never emitted into the same basic block, so its side effects do not
+/// run and neither do its traps.
+///
+/// The result type uses `join_elem_types`, not the scalar-assignment
+/// `join_types`. CPython evaluates to one branch's *value*, so
+/// `1 if c else 2.5` is `1`, not `1.0` -- collapsing mixed numerics here
+/// would reintroduce exactly the defect 0.89 fixed for list literals.
+fn lower_if_exp(
+    test: &ast::Expr,
+    body: &ast::Expr,
+    orelse: &ast::Expr,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let cond = lower_condition(test, ctx)?;
+    let then_val = lower_expr(body, ctx)?;
+    let else_val = lower_expr(orelse, ctx)?;
+
+    // A conditional expression yields one value, so a union of the two branch
+    // types is exactly its type. `join_elem_types` gives the numeric pairs the
+    // same treatment list literals get (a union, so `1 if c else 2.5` stays
+    // `1`); anything else it declines becomes a plain union. That is more than
+    // a list literal infers, and deliberately so: there is no container
+    // storage here whose representation would have to be chosen.
+    let ty = match join_elem_types(then_val.ty, else_val.ty) {
+        Some(ty) => ty,
+        Option::None => ir::union_of(&[then_val.ty, else_val.ty]),
+    };
+
+    // A mixed-numeric join is a union, so each branch is boxed into it and
+    // keeps its own runtime type.
+    let (then_val, else_val) = if matches!(ty, ir::Ty::Union(_)) {
+        (to_union(then_val, ty), to_union(else_val, ty))
+    } else {
+        (then_val, else_val)
+    };
+
+    let name = ctx.fresh_temp("ifexp", ty);
+    let branch = ir::Stmt::If {
+        branches: vec![(
+            cond,
+            vec![ir::Stmt::Assign {
+                name: name.clone(),
+                value: then_val,
+            }],
+        )],
+        orelse: vec![ir::Stmt::Assign {
+            name: name.clone(),
+            value: else_val,
+        }],
+    };
+    Ok(ir::Expr {
+        ty,
+        kind: ir::ExprKind::Block {
+            stmts: vec![branch],
+            result: Box::new(local_expr(name, ty)),
+        },
+    })
+}
+
 fn lower_condition(cond: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     let lowered = lower_expr(cond, ctx)?;
     to_bool(lowered, cond.span, ctx)
@@ -15885,6 +15967,7 @@ fn const_none() -> ir::Expr {
 
 fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     match &expr.kind {
+        ast::ExprKind::IfExp { test, body, orelse } => lower_if_exp(test, body, orelse, ctx),
         ast::ExprKind::Int(v) => Ok(int_const(*v)),
         ast::ExprKind::IntDigits(s) => Ok(ir::Expr {
             ty: ir::Ty::Int,
@@ -23989,6 +24072,29 @@ fn promote_numeric(value: ir::Expr, span: Span, what: &str) -> SResult<ir::Expr>
             ty: ir::Ty::Int,
             kind: ir::ExprKind::BoolToInt(Box::new(value)),
         }),
+        // A mixed-numeric union comes from a value that keeps each element's
+        // or branch's own type -- `[1, 2.5]`, or `1 if c else 2.5`. That is
+        // what makes it print like CPython, and it is also why there is no
+        // single machine type to compute in. Both suggestions below are
+        // checked to work; `float(x)` on the union itself does not, and
+        // neither does annotating the target.
+        ir::Ty::Union(ms)
+            if ms
+                .iter()
+                .all(|m| matches!(m, ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool)) =>
+        {
+            Err(err(
+                format!(
+                    "{what} is not supported for values of type {}: a mixed \
+                     numeric value keeps each part's own type, so it has no \
+                     single numeric representation to compute in. Give the \
+                     parts one type (e.g. `1.0` instead of `1`), or narrow \
+                     with `isinstance` first",
+                    ir::Ty::Union(ms)
+                ),
+                span,
+            ))
+        }
         other => Err(err(
             format!("{what} is not supported for values of type {other}"),
             span,

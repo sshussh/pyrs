@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.93.0 — Conditional expressions
+
+`a if c else b` was a parse error. Unlike the other open gaps this one is not
+an exotic corner: it is one of the most common expressions in Python, and
+`x = "big" if n > 3 else "small"` had no spelling at all.
+
+- Conditional expressions are supported everywhere an expression is:
+  assignments, returns, call arguments and defaults, subscripts and slices,
+  container literals, f-strings, `while` and `assert` conditions, comprehension
+  elements, generators and closures.
+- Only the selected branch is evaluated, so the guard idioms work:
+  `1 // n if n else -1` does not divide by zero, and `xs[0] if xs else "empty"`
+  does not raise. The condition is evaluated exactly once.
+- Precedence and associativity match Python: `or`/`not` bind tighter
+  (`0 or 2 if False else 9` is `9`), chains are right-associative, and the
+  condition itself is an `or_test`, so CPython's rejection of
+  `1 if 2 if 3 else 4 else 5` is reproduced rather than silently nested.
+- A bare conditional is excluded from comprehension iterables and filters, as
+  in CPython: the trailing `if` in `[x for x in a if b]` belongs to the
+  comprehension. `[x for x in range(3) if 1 if True else 0]` is rejected with a
+  diagnostic pointing at the `else`.
+- Mixed numeric branches keep each branch's own type, so `1 if c else 2.5` is
+  `1`, not `1.0` — the same rule 0.89 established for `[1, 2.5]`. Unrelated
+  branch types (`1 if c else "s"`) become a union.
+- Arithmetic and comparison on a mixed-numeric union remain unsupported, as
+  they already were for list elements. That diagnostic now explains why and
+  suggests two fixes that were checked to work — give the parts one type, or
+  narrow with `isinstance`. `float(x)` on the union and annotating the target
+  do not work and are no longer implied.
+
 ## 0.92.0 — String literal escapes and PEP 701 f-strings
 
 Two gaps found while testing the Unicode milestones. Both were silent wrong

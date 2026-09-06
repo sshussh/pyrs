@@ -1448,6 +1448,18 @@ impl Parser {
     // ---- expressions (precedence climbing, lowest first) ----
 
     pub fn parse_expr(&mut self) -> PResult<Expr> {
+        self.parse_expr_inner(true)
+    }
+
+    /// Python's `expression_nocond`: everything but a bare conditional
+    /// expression. Comprehension iterables and conditions use this, because a
+    /// trailing `if` there belongs to the comprehension — CPython rejects
+    /// `[x for x in a if b else c]` for the same reason.
+    fn parse_expr_nocond(&mut self) -> PResult<Expr> {
+        self.parse_expr_inner(false)
+    }
+
+    fn parse_expr_inner(&mut self, allow_cond: bool) -> PResult<Expr> {
         // Assignment expression: `name := value` (walrus).
         if let Token::Ident(name) = self.peek().clone()
             && self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::ColonEqual)
@@ -1467,7 +1479,27 @@ impl Parser {
                 span,
             });
         }
-        self.parse_or()
+        let body = self.parse_or()?;
+        if !allow_cond || self.peek() != &Token::If {
+            return Ok(body);
+        }
+        self.advance(); // if
+        // The condition is an `or_test`, not a full expression: CPython
+        // rejects `1 if 2 if 3 else 4 else 5` rather than nesting.
+        let test = self.parse_or()?;
+        self.expect(Token::Else, "in a conditional expression")?;
+        // The else branch takes a full expression, which makes chained
+        // conditionals right-associative as in Python.
+        let orelse = self.parse_expr()?;
+        let span = body.span.to(orelse.span);
+        Ok(Expr {
+            kind: ExprKind::IfExp {
+                test: Box::new(test),
+                body: Box::new(body),
+                orelse: Box::new(orelse),
+            },
+            span,
+        })
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -2274,10 +2306,12 @@ impl Parser {
                         let target_expr = self.parse_target_tuple_or_expr()?;
                         let target = self.expr_to_target(target_expr)?;
                         self.expect(Token::In, "after the comprehension target")?;
-                        let iter = self.parse_expr()?;
+                        // `_nocond`: a trailing `if` here starts a comprehension
+                        // filter, not a conditional expression.
+                        let iter = self.parse_expr_nocond()?;
                         let mut ifs = Vec::new();
                         while self.eat(&Token::If) {
-                            ifs.push(self.parse_expr()?);
+                            ifs.push(self.parse_expr_nocond()?);
                         }
                         generators.push(CompFor { target, iter, ifs });
                         if self.eat(&Token::For) {
@@ -2326,10 +2360,12 @@ impl Parser {
                             let target_expr = self.parse_target_tuple_or_expr()?;
                             let target = self.expr_to_target(target_expr)?;
                             self.expect(Token::In, "after the comprehension target")?;
-                            let iter = self.parse_expr()?;
+                            // `_nocond`: a trailing `if` here starts a comprehension
+                            // filter, not a conditional expression.
+                            let iter = self.parse_expr_nocond()?;
                             let mut ifs = Vec::new();
                             while self.eat(&Token::If) {
-                                ifs.push(self.parse_expr()?);
+                                ifs.push(self.parse_expr_nocond()?);
                             }
                             generators.push(CompFor { target, iter, ifs });
                             if self.eat(&Token::For) {
@@ -2370,10 +2406,12 @@ impl Parser {
                         let target_expr = self.parse_target_tuple_or_expr()?;
                         let target = self.expr_to_target(target_expr)?;
                         self.expect(Token::In, "after the comprehension target")?;
-                        let iter = self.parse_expr()?;
+                        // `_nocond`: a trailing `if` here starts a comprehension
+                        // filter, not a conditional expression.
+                        let iter = self.parse_expr_nocond()?;
                         let mut ifs = Vec::new();
                         while self.eat(&Token::If) {
-                            ifs.push(self.parse_expr()?);
+                            ifs.push(self.parse_expr_nocond()?);
                         }
                         generators.push(CompFor { target, iter, ifs });
                         if self.eat(&Token::For) {
@@ -3354,6 +3392,11 @@ fn rebase_spans(expr: &mut Expr, span: Span) {
             }
         }
         ExprKind::NamedExpr { value, .. } => rebase_spans(value, span),
+        ExprKind::IfExp { test, body, orelse } => {
+            rebase_spans(test, span);
+            rebase_spans(body, span);
+            rebase_spans(orelse, span);
+        }
         ExprKind::DictComp {
             key,
             value,
