@@ -867,6 +867,12 @@ def clamp(x: float, lo: float, hi: float) -> float:
   covering return paths.
 - Recursion and mutual recursion work; functions may be called before
   their definition in the file.
+- A generator is annotated `Iterator[T]` or `Generator[T, None, None]`, in
+  parameters and return types, so it can be passed to a function:
+  `def evens(src: Iterator[int]) -> Iterator[int]`. `Iterable[T]` and
+  `Sequence[T]` are rejected — they cover a list too, and the two are distinct
+  types here. `from typing import ...` and `collections.abc` are
+  annotation-only imports: they load nothing and bind nothing at run time.
 - Generator expressions `(x * 2 for x in xs if x)` are lazy and can drop
   their parentheses as a call's sole argument (`sum(x for x in xs)`). The
   loop variable does not leak; the outermost iterable is evaluated when the

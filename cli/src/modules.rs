@@ -620,7 +620,11 @@ fn collect_deps_in_stmts(
                     // Only `from __future__ import ...` is a directive; plain
                     // `import __future__` is an ordinary module import and
                     // should still report that the module is unavailable.
-                    if m != "sys" && m != self_name && seen.insert(m.clone()) {
+                    if m != "sys"
+                        && !semantic::is_typing_module(m)
+                        && m != self_name
+                        && seen.insert(m.clone())
+                    {
                         deps.push((m.clone(), *span));
                     }
                     if track_bound {
@@ -639,6 +643,7 @@ fn collect_deps_in_stmts(
                 ..
             } => {
                 if m != "sys"
+                    && !semantic::is_typing_module(m)
                     && m != semantic::FUTURE_MODULE
                     && !m.is_empty()
                     && m != self_name

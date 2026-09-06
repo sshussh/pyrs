@@ -105,6 +105,12 @@
       "native": "pass"
     },
     {
+      "id": "typing-annotations",
+      "file": "cases/typing_annotations.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",

@@ -817,6 +817,42 @@ impl Parser {
                 self.expect(Token::RBracket, "to close 'Optional[...]'")?;
                 Ok(intern_type_union(&[inner, TypeName::None]))
             }
+            // `Iterator[T]` / `Generator[T, S, R]` — a generator of `T`.
+            // These are how Python annotates one, so the same source compiles
+            // under CPython; `Iterable[T]` is deliberately not accepted,
+            // because a list is iterable too and the two are not
+            // interchangeable here.
+            Token::Ident(name) if name == "Iterator" || name == "Generator" => {
+                let which = name.clone();
+                self.advance();
+                self.expect(Token::LBracket, "after 'Iterator' (e.g. 'Iterator[int]')")?;
+                let inner = self.parse_type_name("inside 'Iterator[...]'")?;
+                // `Generator[Y, S, R]`: only the yield type is modelled here,
+                // and send/return must be None.
+                while self.eat(&Token::Comma) {
+                    let extra = self.parse_type_name("inside 'Generator[...]'")?;
+                    if extra != TypeName::None {
+                        return Err(self.error(
+                            "Generator[...] send and return types must be None in this subset",
+                        ));
+                    }
+                }
+                self.expect(Token::RBracket, "to close the type argument list")?;
+                let _ = which;
+                Ok(TypeName::Iterator(Box::leak(Box::new(inner))))
+            }
+            // `Iterable[T]` / `Sequence[T]` cover both a list and a
+            // generator, which are different types here, so there is no one
+            // thing to resolve them to. Say which to pick rather than failing
+            // on the bracket.
+            Token::Ident(name) if name == "Iterable" || name == "Sequence" => {
+                let which = name.clone();
+                Err(self.error(format!(
+                    "{which}[...] is not supported: it covers both a list and a \
+                     generator, which are distinct types here. Use 'list[T]' or \
+                     'Iterator[T]'"
+                )))
+            }
             // Limited dynamic type (`Any`).
             Token::Ident(name) if name == "Any" => {
                 self.advance();
