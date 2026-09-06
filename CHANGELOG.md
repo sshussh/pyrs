@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.92.0 — String literal escapes and PEP 701 f-strings
+
+Two gaps found while testing the Unicode milestones. Both were silent wrong
+answers in the supported surface rather than missing features.
+
+- String literals decode `\xNN`, `\uXXXX`, `\UXXXXXXXX`, one-to-three-digit
+  octal (`\101`) and the control escapes `\a \b \f \v`. The lexer previously
+  recognised only `\n \t \r \0 \\ \' \"`, so `"\x00"` survived as the four
+  characters `\`, `x`, `0`, `0` and `len` reported `4`. Unknown escapes still
+  survive verbatim, as in CPython.
+- Malformed escapes are rejected with a specific message —
+  `truncated \xXX escape`, `truncated \uXXXX escape`,
+  `illegal Unicode character U+11FFFF` — instead of being mangled.
+- Two forms CPython accepts are rejected deliberately, with a diagnostic
+  rather than a wrong answer: a lone surrogate (`"\ud800"`), which has no
+  UTF-8 form and so cannot be represented in a PyRs string, and `\N{NAME}`,
+  which needs the Unicode name database the compiler does not carry.
+  `chr(0xD800)` still produces the bytes at run time.
+- f-string replacement fields accept string literals in either quote,
+  including the quote delimiting the f-string: `f"{d["k"]}"` (PEP 701). The
+  f-string token was a regex that stopped at the first unescaped quote; it is
+  now a scanner tracking brace depth and nested literals. The parser's brace
+  scan and its `!` / `:` split skip nested literals too, so `f"{'}'}"` and
+  `f"{d[':']}"` are correct.
+- An unterminated single-quoted f-string now reports
+  `unterminated f-string literal` rather than `unexpected character`.
+
 ## 0.91.0 — Unicode case transforms and character classes
 
 0.90 made string offsets code points; this makes character *properties*

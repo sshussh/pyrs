@@ -3,11 +3,12 @@
 Status: implementation in progress. **Not a 1.0 release declaration.**
 
 PyRs has a substantial native compiler and runtime, but it is still a
-statically typed Python subset. Versions **0.90.0** and **0.91.0** make
-strings Unicode: offsets are code points, and case transforms and character
-classes follow Unicode 16.0.0. The next milestone is **0.92.0**; reaching a
-particular minor version does not establish 1.0 readiness, and no stable
-release or tag has been created.
+statically typed Python subset. Versions **0.90.0** through **0.92.0** make
+strings Unicode: offsets are code points, case transforms and character
+classes follow Unicode 16.0.0, and string literals accept the full escape
+set. The next milestone is **0.93.0**; reaching a particular minor version
+does not establish 1.0 readiness, and no stable release or tag has been
+created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -96,6 +97,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.92 on the same host:
+
+| Check | Result after 0.92 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1130 passed; none failed or ignored |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 18 pass / 0 known_gap; compat 6 pass |
+| `pyrs --version` | `PyRs 0.92.0` |
 
 After 0.91 on the same host:
 
@@ -206,6 +218,32 @@ fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
 
+## 0.92.0: string literal escapes and PEP 701 f-strings
+
+Two gaps found while testing the Unicode milestones, both silent wrong
+answers in the supported surface rather than missing features.
+
+The lexer recognised only `\n \t \r \0 \\ \' \"` and kept everything
+else verbatim, so `"\x00"` was the four characters `\`, `x`, `0`, `0` and
+`len` reported `4`. Adds `\xNN`, `\uXXXX`, `\UXXXXXXXX`, one-to-three-digit
+octal and the missing control escapes `\a \b \f \v`. Unknown escapes still
+survive verbatim, as in CPython. Malformed ones are rejected with a specific
+message (`truncated \xXX escape`, `illegal Unicode character U+11FFFF`)
+rather than mangled.
+
+Two forms CPython accepts are rejected deliberately, both with a diagnostic:
+a lone surrogate, which has no UTF-8 form and so cannot be represented in a
+UTF-8 string (`chr(0xD800)` still produces the bytes at run time, an
+inconsistency recorded above), and `\N{NAME}`, which needs the Unicode name
+database the compiler does not carry — keeping it verbatim would be wrong
+rather than merely incomplete, and CPython rejects a bare `\N` too.
+
+The f-string token was a regex that stopped at the first unescaped quote, so
+a replacement field could not hold a string literal: `f"{d["k"]}"` lexed as
+`f"{` followed by loose tokens. It is now a scanner tracking brace depth and
+nested literals, and the parser's brace scan and its `!`/`:` split skip
+nested literals too, so `f"{'}'}"` and `f"{d[':']}"` are correct.
+
 ## 0.91.0: Unicode case and character classes
 
 0.90 made every string *offset* a code point but deliberately left character
@@ -291,7 +329,7 @@ not cover them.
 | User iterator exception handling | Closed in 0.84: `StopIteration` is caught only around `__next__` | Keep generator `for` on Optional None unless that subset is deliberately changed |
 | Iterable coverage | Closed in 0.84 for `for` and list/set/dict comprehensions | `any` / `all` / `enumerate` / `zip` / `reversed` still use a narrower set |
 | Rich comparisons | Closed in 0.85 for `list[C]` `==`/`!=`/`in`/`index`/`count`/`remove`, tuple `==`/`!=`, and homogeneous `tuple[C, …]` `in`/`index`/`count`. Still: no `NotImplemented` fallback; slot choice uses static types; results are bool-coerced; mixed-tuple membership uses identity | Complete or explicitly bound the protocol contract before claiming general object compatibility |
-| Text | Closed in 0.90 for offsets and in 0.91 for character properties: `len`, index, slice, iteration, search, split/strip, padding and format widths, `list(str)`/`set(str)` and `ord`/`chr` count code points; case transforms, `casefold`, the `is*` predicates, whitespace, line boundaries and `repr` escaping follow Unicode 16.0.0 tables generated from the CPython oracle. Still open: indexing a non-ASCII string is O(n) with a sequential-access memo, not CPython's O(1); lone-surrogate and encoding-error behavior is unspecified (a lone surrogate reaches the CPython bridge and is rejected there); no normalization or grapheme clusters; no `bytes`/`bytearray`, `.encode()` or non-UTF-8 codecs. Separately, the lexer accepts no `\xNN`/`\uXXXX` escapes and no nested quotes inside an f-string replacement field | Specify lone-surrogate and encoding-error behavior; `bytes` and codecs as the corpus requires |
+| Text | Closed in 0.90 for offsets and in 0.91 for character properties: `len`, index, slice, iteration, search, split/strip, padding and format widths, `list(str)`/`set(str)` and `ord`/`chr` count code points; case transforms, `casefold`, the `is*` predicates, whitespace, line boundaries and `repr` escaping follow Unicode 16.0.0 tables generated from the CPython oracle. Still open: indexing a non-ASCII string is O(n) with a sequential-access memo, not CPython's O(1); lone-surrogate and encoding-error behavior is unspecified (a lone surrogate reaches the CPython bridge and is rejected there); no normalization or grapheme clusters; no `bytes`/`bytearray`, `.encode()` or non-UTF-8 codecs. Closed in 0.92: the lexer decodes `\xNN`/`\uXXXX`/`\UXXXXXXXX`/octal/control escapes, and f-string replacement fields accept nested quotes (PEP 701). A lone surrogate and `\N{NAME}` are rejected with a diagnostic rather than mis-decoded | Specify lone-surrogate and encoding-error behavior; `bytes` and codecs as the corpus requires |
 | Numeric and binding semantics | Closed in 0.86 for mixed int/float comparison and conditionally assigned locals. Closed in 0.89: mixed-numeric list/tuple **literals** keep each element's own type instead of promoting to one. Still open: converting an already-typed `list[int]` into `list[float]`/a union by assignment (only a literal's own elements are joined); dynamic negative integer powers trap; module globals, deletion and static use-before-assignment diagnostics | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
 | Generators and dynamism | `yield from` does not forward `send`/`throw`; generator exhaustion uses Optional None in several paths; `Any`, class attributes, inheritance, and class values remain restricted | Stabilize the intended subset and reject unsupported paths clearly; broader CPython dynamism is separate work |
 | Memory confidence | Conservative roots can retain garbage; abandoned generators do not run user finalizers; collection statistics exclude native/allocator overhead | Continue stress and exception-path tests and measure process memory on sustained workloads; see [GC.md](GC.md) |

@@ -2903,8 +2903,20 @@ fn parse_fstring(raw: &str, span: Span) -> PResult<Expr> {
                 }
                 let mut depth = 1;
                 let mut frag = String::new();
+                // A nested literal's contents are opaque: `f"{d['}']}"` must
+                // not close the field on the brace inside the string.
+                let mut quote: Option<char> = None;
                 loop {
                     match chars.next() {
+                        Some(ch) if quote == Some(ch) => {
+                            quote = None;
+                            frag.push(ch);
+                        }
+                        Some(ch) if quote.is_some() => frag.push(ch),
+                        Some(ch @ ('\'' | '"')) => {
+                            quote = Some(ch);
+                            frag.push(ch);
+                        }
                         Some('{') => {
                             depth += 1;
                             frag.push('{');
@@ -2965,7 +2977,26 @@ fn split_fstring_fragment(
     let mut depth = 0i32;
     let bytes = frag.as_bytes();
     let mut i = 0usize;
+    let mut quote: Option<u8> = None;
     while i < bytes.len() {
+        // Skip nested string literals wholesale, so `f"{d[':']}"` splits on
+        // neither the colon nor the quotes.
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            quote = Some(bytes[i]);
+            i += 1;
+            continue;
+        }
         match bytes[i] as char {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
