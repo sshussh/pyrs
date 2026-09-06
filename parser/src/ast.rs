@@ -32,6 +32,9 @@ pub enum TypeName {
     Class(&'static str),
     /// Limited dynamic type (`x: Any`). Resolved to `ir::Ty::Any`.
     Any,
+    /// `Iterator[T]` / `Generator[T, ...]` — a generator yielding `T`.
+    /// Spelled the way Python spells it so the annotation is valid there too.
+    Iterator(&'static TypeName),
 }
 
 impl std::fmt::Display for TypeName {
@@ -70,6 +73,7 @@ impl std::fmt::Display for TypeName {
             }
             TypeName::Class(name) => write!(f, "{name}"),
             TypeName::Any => write!(f, "Any"),
+            TypeName::Iterator(t) => write!(f, "Iterator[{t}]"),
         }
     }
 }

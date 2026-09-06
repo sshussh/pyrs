@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.104.0 — `typing` imports and `Iterator[T]` annotations
+
+Two gaps, one blocking the other.
+
+- `from typing import ...` and `import typing` (and `collections.abc`) failed
+  to **load**: `No module named 'typing'`. An ordinary typed Python file could
+  not be compiled at all, however simple its contents. These are now
+  annotation-only imports — they bind nothing at run time and run no module
+  body.
+- A generator could be created, iterated and passed to a builtin, but not to a
+  user function: there was no way to annotate a generator parameter, and a
+  `for` loop body says nothing about whether its subject is a list, a str or a
+  generator. `Iterator[T]` and `Generator[T, None, None]` now annotate one, in
+  parameters and return types, so a generator pipeline (`squares(evens(nums))`)
+  compiles — and the same source still runs under CPython.
+- A `-> Iterator[T]` return annotation names the generator type directly and is
+  no longer wrapped a second time; the older `-> T` spelling still names the
+  yield type.
+- `Iterable[T]` and `Sequence[T]` are rejected with the reason: they cover a
+  list as well as a generator, which are distinct types here, so there is
+  nothing to resolve them to. The message names `list[T]` and `Iterator[T]`.
+  `Generator[...]` with non-None send or return types, and
+  `from typing import *`, are rejected too.
+
+Found by running realistic programs against CPython: a generator-pipeline
+script was the only one of five that did not compile.
+
 ## 0.103.0 — Annotated attribute assignment
 
 `self.x: T = value` was rejected: the parser allowed an annotation only on a

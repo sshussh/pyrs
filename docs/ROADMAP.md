@@ -11,9 +11,10 @@ exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.96.0** generator expressions, **0.97.0** lambda parameter inference and
 **0.98.0** iterable coverage for the eager builtins, **0.99.0** bare `raise`
 **0.100.0** `str.format()` / `%` formatting, **0.101.0** tuple sort keys and
-**0.102.0** module-level containers and **0.103.0** annotated attributes. The
-next milestone is **0.104.0**; reaching a particular minor version does not
-establish 1.0 readiness, and no stable release or tag has been created.
+**0.102.0** module-level containers, **0.103.0** annotated attributes and
+**0.104.0** `typing` imports with `Iterator[T]`. The next milestone is
+**0.105.0**; reaching a particular minor version does not establish 1.0
+readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -102,6 +103,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.104 on the same host:
+
+| Check | Result after 0.104 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1281 passed; none failed or ignored (11 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 54 pass / 0 known_gap; compat 18 pass |
+| `pyrs --version` | `PyRs 0.104.0` |
 
 After 0.103 on the same host:
 
@@ -343,6 +355,32 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.104.0: `typing` imports and `Iterator[T]` annotations
+
+Two gaps, the first blocking any file that had the second.
+
+`from typing import ...` failed to *load* -- `No module named 'typing'` -- so
+an ordinary typed Python file could not be compiled however simple its
+contents. `typing` and `collections.abc` are now annotation-only modules: the
+loader skips them, the import binds nothing, and no module-init call is
+emitted for a module with no body.
+
+A generator could be created, iterated and passed to a builtin, but not to a
+user function. There was no spelling for a generator parameter, and inference
+cannot supply one -- a `for` loop body says nothing about whether its subject
+is a list, a str or a generator. `Iterator[T]` and `Generator[T, None, None]`
+now annotate one, which is how Python annotates it, so the same source still
+runs under CPython.
+
+`Iterable[T]` and `Sequence[T]` are rejected rather than mapped: they cover a
+list as well as a generator, and those are distinct types here, so there is no
+single thing to resolve them to. The diagnostic names both alternatives.
+
+A `-> Iterator[T]` return already *is* the generator type, so the four sites
+that build a generator's signature -- which have to agree, or a call site sees
+a different element type than the body produces -- now share one rule that
+unwraps it instead of wrapping it again.
 
 ## 0.103.0: annotated attribute assignment
 

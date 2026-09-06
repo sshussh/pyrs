@@ -419,6 +419,17 @@ pub const ENTRY_NAME: &str = "__main__";
 /// `__future__` is a compiler directive, not a loadable module.
 pub const FUTURE_MODULE: &str = "__future__";
 
+/// Modules that exist only to name types. They have no runtime content here,
+/// so importing one binds annotation names and loads nothing — which is what
+/// lets an ordinary typed Python file, `from typing import Optional` and all,
+/// compile at all.
+pub const TYPING_MODULES: [&str; 2] = ["typing", "collections.abc"];
+
+/// Is this an annotation-only module?
+pub fn is_typing_module(name: &str) -> bool {
+    TYPING_MODULES.contains(&name)
+}
+
 /// Feature names CPython's `__future__` accepts. Every one of these is either
 /// mandatory in Python 3 or, for `annotations`, already how PyRs behaves: names
 /// in annotations are resolved after the whole module is parsed, so the import
@@ -476,6 +487,7 @@ fn resolve_type(ty: ast::TypeName) -> ir::Ty {
         ast::TypeName::Str => ir::Ty::Str,
         ast::TypeName::File => ir::Ty::File,
         ast::TypeName::Any => ir::Ty::Any,
+        ast::TypeName::Iterator(t) => ir::generator_of(resolve_type(*t)),
         ast::TypeName::List(e) => ir::list_of(resolve_type(*e)),
         ast::TypeName::Tuple(elems) => {
             let ts: Vec<ir::Ty> = elems.iter().copied().map(resolve_type).collect();
@@ -3372,13 +3384,7 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                 // otherwise infer from the first yield. These must agree with
                 // lower_function, or a call site sees a different element type
                 // than the body produced.
-                let y = if let Some(t) = synth_yield_ty(&f.name) {
-                    t
-                } else if ret != ir::Ty::None {
-                    ret
-                } else {
-                    first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
-                };
+                let y = generator_yield_ty(&f.name, ret, &f.body, &f.params);
                 ret = ir::generator_of(y);
                 Some(y)
             } else {
@@ -5367,6 +5373,11 @@ fn collect_imports(
             }
             ast::StmtKind::Import { names } => {
                 for (m, alias, span) in names {
+                    // `import typing` binds nothing usable: annotations name
+                    // the types directly, and there is no runtime module.
+                    if is_typing_module(m) {
+                        continue;
+                    }
                     let local = import_bind_name(m, alias);
                     let binding = if m == "sys" {
                         ImportBinding::Sys
@@ -5389,6 +5400,19 @@ fn collect_imports(
             } => {
                 if m == FUTURE_MODULE {
                     check_future_import(names, *star, *span)?;
+                    continue;
+                }
+                // Annotation-only: the names are type spellings the parser
+                // already recognises, so the import binds nothing at run time.
+                if is_typing_module(m) {
+                    if *star {
+                        return Err(err(
+                            format!(
+                                "'from {m} import *' is not supported; import the names you use"
+                            ),
+                            *span,
+                        ));
+                    }
                     continue;
                 }
                 if m == "sys" {
@@ -6685,14 +6709,7 @@ fn lower_function_inner(
         // Without one, take the first `yield` of a literal or an annotated
         // parameter -- defaulting to Int made `def g(): yield "a"` a hard
         // error, so an unannotated generator could only ever yield ints.
-        let yty = match synth_yield_ty(&f.name) {
-            Some(t) => t,
-            Option::None => match ctx.ret {
-                ir::Ty::None => first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int),
-                other if !matches!(other, ir::Ty::Generator { .. }) => other,
-                _ => first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int),
-            },
-        };
+        let yty = generator_yield_ty(&f.name, ctx.ret, &f.body, &f.params);
         ctx.yield_ty = Some(yty);
         gen_yield_ty = Some(yty);
         // The *callable* appears to return Generator[Y]; resume IR uses i32.
@@ -7044,6 +7061,29 @@ fn stmts_have_yield(stmts: &[ast::Stmt]) -> bool {
     stmts.iter().any(stmt_has_yield)
 }
 
+/// The yield type of a generator function.
+///
+/// `-> Iterator[int]` already *is* the generator type, so it is unwrapped
+/// rather than wrapped again; a plain `-> int` names the yield type directly
+/// (the older spelling this subset accepted); with no annotation the first
+/// `yield` decides. The four places that build a generator's signature have to
+/// agree, or a call site sees a different element type than the body produces.
+fn generator_yield_ty(
+    name: &str,
+    ret: ir::Ty,
+    body: &[ast::Stmt],
+    params: &[ast::Param],
+) -> ir::Ty {
+    if let Some(t) = synth_yield_ty(name) {
+        return t;
+    }
+    match ret {
+        ir::Ty::Generator { yield_ty } => *yield_ty,
+        ir::Ty::None => first_yield_ty(body, params).unwrap_or(ir::Ty::Int),
+        other => other,
+    }
+}
+
 /// The type of the first `yield <expr>` in a body, for an unannotated
 /// generator. Only literals and annotated parameters are consulted: this runs
 /// before the body is lowered and before locals exist, so anything else stays
@@ -7285,14 +7325,7 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     };
     let is_generator = stmts_have_yield(&f.body);
     let yield_ty = if is_generator {
-        // Must match lower_function's rule; see the note there.
-        let y = if let Some(t) = synth_yield_ty(&f.name) {
-            t
-        } else if ret != ir::Ty::None {
-            ret
-        } else {
-            first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
-        };
+        let y = generator_yield_ty(&f.name, ret, &f.body, &f.params);
         ret = ir::generator_of(y);
         Some(y)
     } else {
@@ -7727,14 +7760,7 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     };
     let is_generator = stmts_have_yield(&f.body);
     let yield_ty = if is_generator {
-        // Must match lower_function's rule; see the note there.
-        let y = if let Some(t) = synth_yield_ty(&f.name) {
-            t
-        } else if ret != ir::Ty::None {
-            ret
-        } else {
-            first_yield_ty(&f.body, &f.params).unwrap_or(ir::Ty::Int)
-        };
+        let y = generator_yield_ty(&f.name, ret, &f.body, &f.params);
         ret = ir::generator_of(y);
         Some(y)
     } else {
@@ -9059,6 +9085,10 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
         ast::StmtKind::Pass => Ok(()),
         ast::StmtKind::Import { names } => {
             for (module, alias, _span) in names {
+                // Annotation-only modules have no body to run.
+                if is_typing_module(module) {
+                    continue;
+                }
                 // Module-level and function-level imports both run init once.
                 if module != "sys" {
                     out.extend(init_calls_for(module));
@@ -9091,6 +9121,10 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
             }
             if *star && !ctx.is_entry {
                 return Err(err("import * only allowed at module level", *span));
+            }
+            if is_typing_module(module) {
+                // Annotation-only: nothing to initialise and nothing to bind.
+                return Ok(());
             }
             // package / module body, then any submodules pulled in by name
             if !module.is_empty() && module != "sys" {
@@ -24886,6 +24920,10 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             span,
         )),
         ast::TypeName::None => Err(err("None is not a conversion", span)),
+        ast::TypeName::Iterator(_) => Err(err(
+            "Iterator[...] is an annotation, not a conversion",
+            span,
+        )),
         ast::TypeName::Union(_) => Err(err("union types are not a conversion", span)),
         ast::TypeName::Class(_) => Err(err(
             "class types are not a conversion (construct with ClassName(...))",
