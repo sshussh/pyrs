@@ -835,7 +835,15 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - Recursion and mutual recursion work; functions may be called before
   their definition in the file.
 - Generator functions use `yield` / `yield from` list, tuple, str
-  (chars), or another generator. Bare `return` ends the generator after
+  (chars), or another generator. A generator can be consumed by a `for`
+  loop, a comprehension, and the eager builtins `list`, `set`, `sorted`,
+  `sum`, `max`, `min`, `str.join`, `any` and `all`. `any` / `all`
+  short-circuit over a generator, so a side-effecting one runs only as far
+  as the answer needs; `tuple(gen)` is rejected because tuples are
+  fixed-arity here. Without a return annotation the yield type is inferred
+  from the first `yield` of a literal or an annotated parameter, so
+  `def g(): yield "a"` is a `str` generator; annotate the return type when
+  the first yield is something else. Bare `return` ends the generator after
   active `finally` blocks. `return <expr>` stores StopIteration.value
   (coerced to the generator's yield type) so `x = yield from g()` can
   receive it as `Y | None` (None after bare `return` / fall-off; the value

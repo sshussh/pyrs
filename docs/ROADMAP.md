@@ -6,10 +6,11 @@ PyRs has a substantial native compiler and runtime, but it is still a
 statically typed Python subset. Versions **0.90.0** through **0.92.0** make
 strings Unicode: offsets are code points, case transforms and character
 classes follow Unicode 16.0.0, and string literals accept the full escape
-set. **0.93.0** adds conditional expressions and **0.94.0** user-defined
-exception classes. The next milestone is **0.95.0**; reaching a particular
-minor version does not establish 1.0 readiness, and no stable release or tag
-has been created.
+set. **0.93.0** adds conditional expressions, **0.94.0** user-defined
+exception classes and **0.95.0** generators as arguments to the eager
+builtins. The next milestone is **0.96.0**; reaching a particular minor
+version does not establish 1.0 readiness, and no stable release or tag has
+been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -98,6 +99,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.95 on the same host:
+
+| Check | Result after 0.95 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1183 passed; none failed or ignored (14 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 27 pass / 0 known_gap; compat 9 pass |
+| `pyrs --version` | `PyRs 0.95.0` |
 
 After 0.94 on the same host:
 
@@ -240,6 +252,34 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.95.0: generators as arguments to the eager builtins
+
+A generator function could only be consumed by a `for` loop or a
+comprehension. Every eager builtin rejected one, so `list(g())` was a compile
+error and the values could only be extracted by writing the loop by hand.
+
+The milestone contract is:
+
+- `list`, `set`, `sorted`, `sum`, `max`, `min` and `str.join` accept a
+  generator, materializing it through the same comprehension machinery
+  `[x for x in gen]` already used. Sound precisely because these drain their
+  argument anyway: side effects, order and result are unchanged.
+- `any` and `all` accept a generator and short-circuit. They must not
+  materialize, or a side-effecting or infinite generator would diverge from
+  CPython — the tests print from inside the generator to pin how far it ran.
+- An unannotated generator infers its yield type from the first `yield`
+  instead of assuming `int`.
+
+That last item was a prerequisite, not a bonus: with the yield type hard-coded
+to `int`, `def g(): yield "a"` failed at the yield, so `",".join(g())` was
+unreachable no matter what `join` accepted. The fix has to be applied at four
+sites — the lowering site and three signature-collection sites — because a
+disagreement between them hands a call site a different element type than the
+body produces.
+
+`tuple(gen)` remains rejected: tuples are fixed-arity here, and the existing
+diagnostic already says so.
 
 ## 0.94.0: user-defined exception classes
 
