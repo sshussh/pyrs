@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.94.0 — User-defined exception classes
+
+`class E(Exception)` had no spelling: the exception type in `raise` / `except`
+was resolved by the *parser* against a hardcoded list of builtins. Unlike most
+open gaps there was no workaround — only falling back to a builtin type, which
+loses the distinction the program is making.
+
+- `class E(Exception): pass` and chains (`class B(A)`) are supported. A
+  subclass is caught by any ancestor and by `except Exception`; a base is not
+  caught by its subclass; unrelated user exceptions do not catch each other.
+- `raise E`, `raise E()` and `raise E("msg")` all work, for user classes and
+  builtins alike. These first two forms were previously rejected outright.
+- An uncaught exception with no message prints just the type name, as CPython
+  does: `raise ValueError()` reports `ValueError`, not `ValueError: `. The
+  bound `e` and its message are empty in that case rather than repeating the
+  type name.
+- Builtin exceptions are unaffected, including the `OSError` family, and a
+  tuple filter may mix user and builtin types.
+- Exception-name resolution moved from the parser to the semantic phase, which
+  is the only place that knows which classes exist. The parser no longer
+  validates exception names against a fixed list.
+- Deliberately rejected, each with a diagnostic that says why rather than a
+  generic one: methods or fields on an exception class (it carries a tag and a
+  name, with no instance layout); using an exception class as a value
+  (`x = E("m")`) — the name exists, the use does not; subclassing
+  `GeneratorExit`, which is BaseException-only in CPython so `except Exception`
+  would miss the subclass; and a base declared after its subclass, which
+  CPython rejects with NameError.
+
 ## 0.93.0 — Conditional expressions
 
 `a if c else b` was a parse error. Unlike the other open gaps this one is not

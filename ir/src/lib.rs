@@ -399,33 +399,46 @@ pub struct ClassInfo {
 /// by bare `except:` and by `except Exception:`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcType {
-    ValueError = 1,
-    KeyError = 2,
-    IndexError = 3,
-    ZeroDivisionError = 4,
-    TypeError = 5,
-    RuntimeError = 6,
+    ValueError,
+    KeyError,
+    IndexError,
+    ZeroDivisionError,
+    TypeError,
+    RuntimeError,
     /// Injected by `generator.close()` (CPython BaseException subclass only —
     /// not under Exception).
-    GeneratorExit = 7,
-    OverflowError = 8,
-    EOFError = 9,
-    FileNotFoundError = 10,
-    OSError = 11,
-    NameError = 12,
-    UnboundLocalError = 13,
+    GeneratorExit,
+    OverflowError,
+    EOFError,
+    FileNotFoundError,
+    OSError,
+    NameError,
+    UnboundLocalError,
     /// User-level catch; generator protocol still uses exhaustion as Optional.
-    StopIteration = 14,
+    StopIteration,
     /// Base of the Exception hierarchy (not GeneratorExit).
-    Exception = 15,
-    PermissionError = 16,
-    IsADirectoryError = 17,
-    AssertionError = 18,
+    Exception,
+    PermissionError,
+    IsADirectoryError,
+    AssertionError,
+    /// A user-defined `class E(Exception)`. The payload is the runtime tag
+    /// codegen assigns, always >= [`USER_EXC_BASE`], so it can never collide
+    /// with a builtin discriminant. The class *name* and its parent live in
+    /// tables codegen emits, because an `&'static str` cannot carry them.
+    User(u32),
 }
 
+/// First runtime tag handed to a user-defined exception class. Builtins own
+/// 1..=18 and 99 (`PYRS_EXC_OTHER`); starting well clear of those leaves room
+/// to add builtins without renumbering user classes.
+pub const USER_EXC_BASE: u32 = 1000;
+
 impl ExcType {
+    /// A static name for diagnostics. A user-defined class has no static
+    /// name; codegen carries the real one in its emitted name table.
     pub fn as_str(self) -> &'static str {
         match self {
+            ExcType::User(_) => "user-defined exception",
             ExcType::ValueError => "ValueError",
             ExcType::KeyError => "KeyError",
             ExcType::IndexError => "IndexError",
@@ -447,8 +460,40 @@ impl ExcType {
         }
     }
 
+    /// The runtime tag. Spelled out rather than cast from the discriminant:
+    /// once the enum carries a payload, `as i32` no longer applies, and an
+    /// exhaustive match makes the compiler catch a new builtin that forgets
+    /// its tag.
     pub fn tag(self) -> i32 {
-        self as i32
+        match self {
+            ExcType::ValueError => 1,
+            ExcType::KeyError => 2,
+            ExcType::IndexError => 3,
+            ExcType::ZeroDivisionError => 4,
+            ExcType::TypeError => 5,
+            ExcType::RuntimeError => 6,
+            ExcType::GeneratorExit => 7,
+            ExcType::OverflowError => 8,
+            ExcType::EOFError => 9,
+            ExcType::FileNotFoundError => 10,
+            ExcType::OSError => 11,
+            ExcType::NameError => 12,
+            ExcType::UnboundLocalError => 13,
+            ExcType::StopIteration => 14,
+            ExcType::Exception => 15,
+            ExcType::PermissionError => 16,
+            ExcType::IsADirectoryError => 17,
+            ExcType::AssertionError => 18,
+            ExcType::User(tag) => tag as i32,
+        }
+    }
+
+    /// The class id behind a user-defined exception, if this is one.
+    pub fn user_tag(self) -> Option<u32> {
+        match self {
+            ExcType::User(tag) => Some(tag),
+            _ => Option::None,
+        }
     }
 
     /// Whether a handler filtering on `self` catches a raised exception of
@@ -458,6 +503,9 @@ impl ExcType {
             return true;
         }
         match self {
+            // A user class's own chain is only known at runtime, where
+            // pyrs_exc_matches walks it; statically we know Exception catches
+            // every user class, and nothing else about them.
             ExcType::Exception => raised != ExcType::GeneratorExit,
             ExcType::OSError => matches!(
                 raised,
@@ -487,8 +535,23 @@ pub struct Module {
     pub globals: Vec<(String, Ty)>,
     /// User class layouts / method tables (indexed by [`ClassId`]).
     pub classes: Vec<ClassInfo>,
+    /// User-defined exception classes, in tag order from [`USER_EXC_BASE`].
+    /// Codegen emits these as runtime tables so `except` can walk the chain
+    /// and an uncaught one can print its real name.
+    pub exc_classes: Vec<ExcClass>,
     /// Name of the function that is the program entry point.
     pub entry: String,
+}
+
+/// A user-defined `class E(Exception)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExcClass {
+    pub name: String,
+    /// Runtime tag, >= [`USER_EXC_BASE`].
+    pub tag: u32,
+    /// Tag of the base class: another user exception, or a builtin (usually
+    /// [`ExcType::Exception`]). Walked at runtime for `except` matching.
+    pub parent_tag: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
