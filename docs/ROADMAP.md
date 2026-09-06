@@ -11,9 +11,9 @@ exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.96.0** generator expressions, **0.97.0** lambda parameter inference and
 **0.98.0** iterable coverage for the eager builtins, **0.99.0** bare `raise`
 **0.100.0** `str.format()` / `%` formatting, **0.101.0** tuple sort keys and
-**0.102.0** module-level containers. The next milestone is **0.103.0**;
-reaching a particular minor version does not establish 1.0 readiness, and no
-stable release or tag has been created.
+**0.102.0** module-level containers and **0.103.0** annotated attributes. The
+next milestone is **0.104.0**; reaching a particular minor version does not
+establish 1.0 readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -102,6 +102,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.103 on the same host:
+
+| Check | Result after 0.103 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1270 passed; none failed or ignored (9 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 51 pass / 0 known_gap; compat 17 pass |
+| `pyrs --version` | `PyRs 0.103.0` |
 
 After 0.102 on the same host:
 
@@ -332,6 +343,28 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.103.0: annotated attribute assignment
+
+`self.x: T = value` was rejected -- the parser allowed an annotation only on a
+bare name -- which made an attribute whose initial value has no inferable type
+unwritable. `self.xs = []` reported `'C' object has no attribute 'xs'` and
+`self.d = {}` could not infer a dict type, so an empty list or dict attribute
+could not be created at all.
+
+The milestone contract is:
+
+- `self.x: T = value` in `__init__` declares the field's type: scalars,
+  containers, nested containers and unions.
+- An unannotated attribute still infers from its value.
+- An annotation that disagrees with its value is a type error, as every other
+  annotation here is.
+
+Two places had to agree: the pass that collects a class's fields from
+`__init__` now prefers the annotation over inferring from the right-hand side,
+and the assignment lowering no longer rejects the annotation outright. The
+value is coerced to the declared field type, so a conflicting second
+annotation surfaces as a value mismatch rather than being ignored.
 
 ## 0.102.0: module-level containers are visible to functions
 

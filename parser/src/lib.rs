@@ -403,10 +403,14 @@ impl Parser {
         }
 
         if self.peek() == &Token::Colon {
-            // annotated assignment: `x: ty = value` (names only; not multi-assign)
-            let ExprKind::Name(_) = expr.kind else {
-                return Err(self.error("type annotations are only allowed on plain variable names"));
-            };
+            // annotated assignment: `x: ty = value` or `self.x: ty = value`
+            // (not multi-assign). A subscript target is legal Python but its
+            // annotation has no effect there, so it stays rejected.
+            if !matches!(expr.kind, ExprKind::Name(_) | ExprKind::Attribute { .. }) {
+                return Err(
+                    self.error("type annotations are only allowed on a variable or an attribute")
+                );
+            }
             self.advance();
             let annotation = self.parse_type_name("after ':' in annotated assignment")?;
             self.expect(

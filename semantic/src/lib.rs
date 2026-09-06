@@ -2494,15 +2494,29 @@ fn collect_self_fields(
     ) {
         for st in body {
             match &st.kind {
-                ast::StmtKind::Assign { targets, value, .. } => {
+                ast::StmtKind::Assign {
+                    targets,
+                    value,
+                    annotation,
+                    ..
+                } => {
                     for t in targets {
                         if let ast::AssignTarget::Attr { base, attr, .. } = t
                             && let ast::ExprKind::Name(n) = &base.kind
                             && n == self_name
-                            && let Some(ty) =
-                                type_field_rhs(value, self_name, param_tys, known_rets, fields)
                         {
-                            set_field(fields, attr, ty);
+                            // `self.xs: list[int] = []` -- the annotation is
+                            // the field's type. It is often the only way to
+                            // state one: an empty literal has no type to infer.
+                            let ty = match annotation {
+                                Some(ann) => resolve_type_checked(*ann, st.span).ok(),
+                                Option::None => {
+                                    type_field_rhs(value, self_name, param_tys, known_rets, fields)
+                                }
+                            };
+                            if let Some(ty) = ty {
+                                set_field(fields, attr, ty);
+                            }
                         }
                     }
                 }
@@ -13669,12 +13683,9 @@ fn lower_assign_ir(
             attr,
             attr_span,
         } => {
-            if ann_ty.is_some() {
-                return Err(err(
-                    "type annotations are only allowed on plain variable names",
-                    value_span,
-                ));
-            }
+            // An annotation here declared the field's type during class
+            // collection; the value is coerced to that type below, so a
+            // disagreeing annotation is reported as a value mismatch.
             let base_ir = lower_expr(base, ctx)?;
             let class_id = match base_ir.ty {
                 ir::Ty::Class(id) => id,
