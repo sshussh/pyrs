@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.100.0 — `str.format()` and `%` formatting
+
+Neither existed: `.format` was not in the str method table and `%` was
+rejected as an operator on str. A large amount of ordinary Python could not be
+compiled at all — f-strings covered new code, but rewriting an existing
+codebase by hand is not a workaround.
+
+- `"{} {}".format(a, b)`, `"{0} {1}"`, `"{name}"` and mixed positional and
+  keyword forms, with the full spec mini-language (`{:.2f}`, `{:>8}`,
+  `{:05d}`, fill and alignment) and the `!r` / `!s` / `!a` conversions.
+- `"%d-%s" % (a, b)` and the bare-value form `"%s" % x`, with `%d %i %s %r %a
+  %f %e %g %x %o %b`, the `-`, `+`, `0` and space flags, width, precision and
+  `%%`.
+- Both desugar into the `JoinedStr` parts f-strings already produce, so the
+  mini-language comes from the code that already implements it and nothing new
+  reaches the runtime.
+- Argument-count and field-name mistakes are compile errors, where CPython
+  raises `IndexError` / `KeyError` at run time: too few arguments, an
+  out-of-range index, an unknown keyword, and `%` with too few or too many.
+- The format string must be a literal, which is what makes the compile-time
+  desugaring possible. A runtime one is rejected with that reason and a
+  pointer to f-strings, rather than the previous generic "method not
+  supported" / "operator not supported".
+- A nested `{}` inside a format spec is rejected in `.format()`: it names an
+  argument there and an expression in an f-string, and quietly picking one
+  would be wrong.
+
 ## 0.99.0 — Bare `raise` (re-raise)
 
 `except E: log(); raise` is the standard way to observe an error without

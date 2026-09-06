@@ -519,6 +519,29 @@ Unicode name database the compiler does not carry.
 Replacement fields may contain string literals using either quote,
 including the one delimiting the f-string (`f"{d["k"]}"`), per PEP 701.
 
+### `.format()` and `%` formatting
+
+```python
+print("{} and {}".format(1, 2))       # auto-numbered
+print("{1}-{0}".format("a", "b"))     # indexed
+print("{n} is {v}".format(n="x", v=3))  # keyword
+print("{:.2f} {:>8}| {:05d}".format(3.14159, "hi", 42))
+print("%d-%s" % (3, "a"))
+print("%.2f %-5s| %05d" % (3.14159, "ab", 42))
+```
+
+Both accept the same mini-language f-strings do, plus `!r` / `!s` / `!a` for
+`.format()` and the printf flags (`-`, `+`, `0`, space), width, precision,
+`%d %i %s %r %a %f %e %g %x %o %b` and `%%` for `%`.
+
+The format string must be a **literal**: the fields are resolved at compile
+time, which is what lets both reuse the f-string machinery. A format string
+held in a variable is rejected — use an f-string, or inline the literal.
+Argument-count and field-name mistakes are compile errors here rather than
+`IndexError` / `KeyError` at run time. A nested `{}` inside a format spec
+(`"{:{}}"`) is rejected in `.format()`, because it names an argument there and
+an expression in an f-string.
+
 ### Conditional expressions
 
 ```python
