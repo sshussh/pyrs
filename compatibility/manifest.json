@@ -75,6 +75,12 @@
       "native": "pass"
     },
     {
+      "id": "reraise",
+      "file": "cases/reraise.py",
+      "group": "core",
+      "native": "pass"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",

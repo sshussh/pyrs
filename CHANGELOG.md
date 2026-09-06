@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.99.0 — Bare `raise` (re-raise)
+
+`except E: log(); raise` is the standard way to observe an error without
+swallowing it, and it had no workaround: raising a *new* exception loses the
+original type and message, which is the entire point of the idiom.
+
+- A bare `raise` inside an `except` handler re-raises what that handler
+  caught, preserving type and message — for builtin and user exception
+  classes, out of functions and generators, and through `finally`.
+- It picks the innermost enclosing handler, and survives other work in the
+  handler body, including a nested `try` that raises and handles its own
+  exception.
+- A bare `raise` with no active handler is a compile error rather than
+  CPython's runtime `RuntimeError: No active exception to re-raise` — the
+  compiler can see there is nothing to re-raise. This covers a bare `raise` in
+  a `try` body or a `finally` as well.
+
+The handler prologue calls `pyrs_exc_clear()` before running its body, so the
+pending exception is gone by the time the body executes. The exception object
+is now captured immediately before that clear, and a bare `raise` re-raises
+it through the existing `pyrs_raise_exc`.
+
+Found and left out of scope: `str(KeyError("k"))` is `k` here and `'k'` in
+CPython, whose `KeyError.__str__` is the repr of its argument. That is
+unrelated to re-raising and affects `raise KeyError` generally.
+
 ## 0.98.0 — The eager builtins accept any iterable
 
 `sorted`, `sum`, `max`, `min`, `set`, `list` and `str.join` took a list (and,

@@ -324,6 +324,8 @@ pub enum StmtKind {
         exc: ExcName,
         message: Expr,
     },
+    /// Bare `raise` — re-raise the exception the enclosing handler caught.
+    Reraise,
     /// `assert test` / `assert test, msg` — desugared in semantic to raise AssertionError.
     Assert {
         test: Expr,

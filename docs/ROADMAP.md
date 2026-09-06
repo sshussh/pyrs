@@ -9,9 +9,10 @@ classes follow Unicode 16.0.0, and string literals accept the full escape
 set. **0.93.0** adds conditional expressions, **0.94.0** user-defined
 exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.96.0** generator expressions, **0.97.0** lambda parameter inference and
-**0.98.0** iterable coverage for the eager builtins. The next milestone is
-**0.99.0**; reaching a particular minor version does not establish 1.0
-readiness, and no stable release or tag has been created.
+**0.98.0** iterable coverage for the eager builtins and **0.99.0** bare
+`raise`. The next milestone is **0.100.0**; reaching a particular minor
+version does not establish 1.0 readiness, and no stable release or tag has
+been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -100,6 +101,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.99 on the same host:
+
+| Check | Result after 0.99 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1231 passed; none failed or ignored (12 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 39 pass / 0 known_gap; compat 13 pass |
+| `pyrs --version` | `PyRs 0.99.0` |
 
 After 0.98 on the same host:
 
@@ -286,6 +298,31 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.99.0: bare `raise`
+
+`except E: log(); raise` is how a program observes an error without
+swallowing it, and it had no workaround here -- raising a new exception loses
+the original type and message, which is the whole point.
+
+The milestone contract is:
+
+- A bare `raise` in an `except` handler re-raises what that handler caught,
+  preserving type and message: builtin and user classes, out of functions and
+  generators, through `finally`, and picking the innermost handler.
+- With no active handler it is a compile error, where CPython raises
+  `RuntimeError` at run time.
+
+The mechanism is the interesting part. The handler prologue calls
+`pyrs_exc_clear()` before running its body -- so that a nested `try` inside
+the handler does not see a stale exception -- which means the pending
+exception is already gone by the time the body runs, and `pyrs_reraise()`
+would have found nothing. The exception object is captured immediately before
+that clear, kept on a stack in the emitter (handlers nest), and re-raised
+through the existing `pyrs_raise_exc`. Nothing new was needed in the runtime.
+
+A bare `raise` also had to be taught to the return-path and may-raise
+analyses, or a function ending in one is reported as falling off the end.
 
 ## 0.98.0: the eager builtins accept any iterable
 

@@ -932,6 +932,13 @@ impl Parser {
 
     fn parse_raise(&mut self) -> PResult<Stmt> {
         let start = self.expect(Token::Raise, "")?;
+        // Bare `raise` re-raises whatever the enclosing handler caught.
+        if matches!(self.peek(), Token::Newline | Token::EOF) {
+            return Ok(Stmt {
+                kind: StmtKind::Reraise,
+                span: start,
+            });
+        }
         let (exc, exc_span) = self.parse_exc_type("after 'raise'")?;
         // `raise E`, `raise E()` and `raise E("msg")` are all Python; the
         // first two carry an empty message.

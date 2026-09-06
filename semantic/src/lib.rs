@@ -6374,6 +6374,9 @@ struct FnCtx<'a> {
     pending_cell_inits: Vec<ir::Stmt>,
     /// Nesting depth of try/except/finally.
     try_depth: usize,
+    /// Nesting depth of `except` handler bodies, so a bare `raise` can be
+    /// rejected where there is nothing to re-raise.
+    handler_depth: usize,
     /// Function-local import bindings (CPython: import in function is local).
     local_imports: HashMap<String, ImportBinding>,
     /// Names that some nested function declares `nonlocal` (pre-scanned).
@@ -6559,6 +6562,7 @@ fn lower_function_inner(
         type_refinements: HashMap::new(),
         pending_cell_inits: Vec::new(),
         try_depth: 0,
+        handler_depth: 0,
         local_imports: HashMap::new(),
         sibling_nonlocal_names: HashSet::new(),
         cell_candidates: HashSet::new(),
@@ -8923,6 +8927,20 @@ fn lower_nested_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::S
 
 fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SResult<()> {
     match &stmt.kind {
+        ast::StmtKind::Reraise => {
+            // CPython raises `RuntimeError: No active exception to re-raise`;
+            // there is nothing to re-raise here either, and a compile error
+            // says so before the program runs.
+            if ctx.handler_depth == 0 {
+                return Err(err(
+                    "bare 'raise' is only valid inside an 'except' handler; \
+                     there is no active exception to re-raise here",
+                    stmt.span,
+                ));
+            }
+            out.push(ir::Stmt::Reraise);
+            Ok(())
+        }
         ast::StmtKind::FuncDef(f) => {
             if ctx.is_entry {
                 return Err(err(
@@ -9315,7 +9333,10 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 } else {
                     None
                 };
-                let body_h = lower_nested_block(&h.body, ctx)?;
+                ctx.handler_depth += 1;
+                let body_h = lower_nested_block(&h.body, ctx);
+                ctx.handler_depth -= 1;
+                let body_h = body_h?;
                 let filter = match &h.exc {
                     Some(ts) => Some(
                         ts.iter()
@@ -26609,7 +26630,10 @@ fn stmt_returns(stmt: &ir::Stmt) -> bool {
     match stmt {
         ir::Stmt::Return(_) => true,
         // Die / Raise exit the process or transfer; cannot fall through
-        ir::Stmt::Die(_) | ir::Stmt::Raise { .. } | ir::Stmt::RaiseExc { .. } => true,
+        ir::Stmt::Die(_)
+        | ir::Stmt::Raise { .. }
+        | ir::Stmt::RaiseExc { .. }
+        | ir::Stmt::Reraise => true,
         ir::Stmt::If { branches, orelse } => {
             !orelse.is_empty()
                 && branches.iter().all(|(_, body)| block_returns(body))
@@ -26655,7 +26679,10 @@ fn stmt_returns(stmt: &ir::Stmt) -> bool {
 /// Conservative: body may transfer via raise/die (so except handlers matter).
 fn block_may_raise(stmts: &[ir::Stmt]) -> bool {
     stmts.iter().any(|s| match s {
-        ir::Stmt::Raise { .. } | ir::Stmt::RaiseExc { .. } | ir::Stmt::Die(_) => true,
+        ir::Stmt::Raise { .. }
+        | ir::Stmt::RaiseExc { .. }
+        | ir::Stmt::Reraise
+        | ir::Stmt::Die(_) => true,
         ir::Stmt::If { branches, orelse } => {
             branches.iter().any(|(_, b)| block_may_raise(b)) || block_may_raise(orelse)
         }

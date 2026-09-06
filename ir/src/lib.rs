@@ -736,6 +736,10 @@ pub enum Stmt {
     RaiseExc {
         value: Expr,
     },
+    /// Bare `raise` inside an `except` handler: re-raise the exception that
+    /// handler caught, preserving its type and message. Only valid where a
+    /// handler is active, which the semantic phase checks.
+    Reraise,
     /// try / except / else / finally. See [`ExceptHandler`].
     /// `orelse` runs only on normal completion of `body` (not after a handled
     /// exception).
