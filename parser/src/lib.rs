@@ -935,17 +935,9 @@ impl Parser {
                         stmt.span,
                     ));
                 }
-                StmtKind::Assign { .. } => {
-                    // Semantic also rejects; fail early with the same policy:
-                    // fields belong in __init__, not class-body attributes.
-                    return Err(Diagnostic::new(
-                        Phase::Parse,
-                        "class body attributes are not supported yet \
-                         (assign fields in __init__ with self.x = …; methods, \
-                         pass, and docstrings only)",
-                        stmt.span,
-                    ));
-                }
+                // Class-body assignment: a class constant. Semantic decides
+                // what it accepts (a literal value); the parser just keeps it.
+                StmtKind::Assign { .. } => {}
                 StmtKind::ExprStmt(e) if matches!(e.kind, ExprKind::Str(_)) => {
                     // docstring
                 }

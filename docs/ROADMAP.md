@@ -12,10 +12,10 @@ exception classes, **0.95.0** generators as arguments to the eager builtins
 **0.98.0** iterable coverage for the eager builtins, **0.99.0** bare `raise`
 **0.100.0** `str.format()` / `%` formatting, **0.101.0** tuple sort keys and
 **0.102.0** module-level containers, **0.103.0** annotated attributes and
-**0.104.0** `typing` imports with `Iterator[T]` and **0.105.0** n-ary `zip`
-with `enumerate(start)`. The next milestone is **0.106.0**; reaching a
-particular minor version does not establish 1.0 readiness, and no stable
-release or tag has been created.
+**0.104.0** `typing` imports with `Iterator[T]`, **0.105.0** n-ary `zip` with
+`enumerate(start)` and **0.106.0** class-body constants. The next milestone is
+**0.107.0**; reaching a particular minor version does not establish 1.0
+readiness, and no stable release or tag has been created.
 
 This is the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
 delivery plan in 0.88, because the two documents had begun to contradict
@@ -104,6 +104,17 @@ After 0.86 on the same host:
 | `make compatibility` | native 12 pass / 6 known_gap; compat 6 pass |
 | `compatibility/test_extension.py` | 9 passed, 1 skipped (no NumPy/pandas in CPython 3.14) |
 | `pyrs --version` | `PyRs 0.86.0` |
+
+After 0.106 on the same host:
+
+| Check | Result after 0.106 |
+|-------|-------------------|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
+| `cargo test --workspace` | 1303 passed; none failed or ignored (12 new) |
+| `make examples` | All 13 example entry points matched CPython |
+| `make compatibility` | native 60 pass / 0 known_gap; compat 20 pass |
+| `pyrs --version` | `PyRs 0.106.0` |
 
 After 0.105 on the same host:
 
@@ -367,6 +378,34 @@ Acceptance requires differential tests for value equality, identity
 fallback, inheritance/virtual overrides, `!=` vs `__ne__`, membership,
 index bounds, remove, nested lists, tuple pairs, side effects, and
 exceptions, plus O0/O2/O3 and the full local gate.
+
+## 0.106.0: class-body constants
+
+Any assignment in a class body was rejected, so a class could not carry a
+constant: enum-like values, limits, `PI`. The recorded reason was that a class
+attribute with a default would leave zeroed instance storage -- true of an
+instance *field* default, and the reason to keep rejecting that, but a class
+constant is not an instance field and does not need the layout at all.
+
+The milestone contract is:
+
+- `class C: LIMIT = 10`, read as `C.LIMIT` and `self.LIMIT`, inherited and
+  overridable, for int / float / str / bool and negated numbers, annotated or
+  not.
+- An instance field of the same name shadows it, as in CPython.
+- The value must be a literal; a computed one is rejected with the reason.
+- Assigning to a constant is rejected -- unless an instance field of that name
+  exists, which is the shadowing case and is a real assignment.
+
+Constants are *substituted where they are read* rather than stored. That is
+exact for something immutable, and it removes the whole problem the original
+rejection was about: no storage, no initialisation ordering, nothing to zero.
+It is also what makes assignment meaningless, which the diagnostic says.
+
+Three diagnostics were wrong before and are worth noting, because each sent
+the reader somewhere unhelpful: `C.N = 2` reported `name 'C' is not defined`,
+`self.N = 2` reported that the object had no such attribute, and `C.M` for an
+unknown `M` also reported `C` as undefined.
 
 ## 0.105.0: n-ary `zip` and `enumerate(start)`
 
