@@ -2607,6 +2607,23 @@ PyrsUnionBox *pyrs_union_box_new(int print_tag, long long payload) {
     return box;
 }
 
+/* repr(e) -- `Type('body')`, or `Type()` when the body is empty. Shares
+ * exc_type_name and the message body with pyrs_repr_from_exc; this variant
+ * writes through the sink so a container element needs no allocation. */
+static void print_exc_repr(PyrsExc *e) {
+    out_puts(e ? exc_type_name(e->type_tag) : "Exception");
+    /* e->msg on the object is the body already; exc_msg_body is for the
+     * global "Type: body" buffer. */
+    const char *body = (e && e->msg && e->msg->len > 0) ? e->msg->data : "";
+    if (body[0] == '\0') {
+        out_puts("()");
+        return;
+    }
+    out_puts("('");
+    out_puts(body);
+    out_puts("')");
+}
+
 static void print_slot(long long slot, int tag) {
     switch (tag) {
     case TAG_INT:
@@ -2653,7 +2670,9 @@ static void print_slot(long long slot, int tag) {
         out_puts("<generator>");
         break;
     case TAG_EXC:
-        pyrs_print_exc((PyrsExc *)(uintptr_t)slot);
+        /* An element renders as repr, like every other slot: CPython prints
+         * [ValueError('x')], not [x]. Only a top-level print uses str. */
+        print_exc_repr((PyrsExc *)(uintptr_t)slot);
         break;
     default:
         /* Class instance: 13 + 8*class_id — print via type_id on the object. */
@@ -3086,15 +3105,72 @@ static PyrsStr *sb_finish(StrBuf *b) {
     return str_done_cplen(r, b->cplen);
 }
 
-/* upper/lower/casefold are per-character maps with no context. */
+#define PYRS_CP_CAPITAL_SIGMA 0x03A3u
+#define PYRS_CP_SMALL_SIGMA 0x03C3u
+#define PYRS_CP_FINAL_SIGMA 0x03C2u
+
+static int u_is_cased(unsigned int cp) {
+    return (pyrs_u_flags(cp) & PYRS_U_CASED) != 0;
+}
+
+static int u_is_case_ignorable(unsigned int cp) {
+    return (pyrs_u_flags(cp) & PYRS_U_CASE_IGNORABLE) != 0;
+}
+
+/* Is any cased character reachable from byte `i`, looking through
+ * case-ignorables? The forward half of the Final_Sigma condition. */
+static int cased_follows(const PyrsStr *s, long long i) {
+    while (i < s->len) {
+        unsigned int cp;
+        i += utf8_next(s, i, &cp);
+        if (u_is_case_ignorable(cp)) {
+            continue;
+        }
+        return u_is_cased(cp);
+    }
+    return 0;
+}
+
+/* Lowercasing is *not* a pure per-character map: U+03A3 becomes the final
+ * form when it ends a word, so CPython gives "ΟΣ".lower() == "ος" and
+ * "ΟΣΤΙ".lower() == "οστι". Tables generated from single-character calls
+ * cannot express that, since the answer depends on the neighbours.
+ *
+ * Unicode's Final_Sigma: preceded by a cased character (skipping
+ * case-ignorables) and not followed by one. `prev_cased` carries the
+ * backward half along the forward walk the callers already do; `next_i` is
+ * the byte after the sigma.
+ *
+ * Returns 1 when the mapping was context-dependent and has been emitted. */
+static int sb_put_lower_ctx(StrBuf *b, const PyrsStr *s, unsigned int cp,
+                            long long next_i, int prev_cased) {
+    if (cp != PYRS_CP_CAPITAL_SIGMA) {
+        return 0;
+    }
+    sb_put_cp(b, (prev_cased && !cased_follows(s, next_i)) ? PYRS_CP_FINAL_SIGMA
+                                                           : PYRS_CP_SMALL_SIGMA);
+    return 1;
+}
+
+/* Track the backward half of Final_Sigma: the last non-case-ignorable
+ * character decides, so an ignorable leaves the state alone. */
+static int next_prev_cased(unsigned int cp, int prev_cased) {
+    return u_is_case_ignorable(cp) ? prev_cased : u_is_cased(cp);
+}
+
+/* upper/casefold are per-character maps; lower needs the sigma context. */
 static PyrsStr *str_map_each(const PyrsStr *s, int slot) {
     check_ref(s);
     StrBuf b;
     sb_init(&b, s->len + 8);
+    int prev_cased = 0;
     for (long long i = 0; i < s->len;) {
         unsigned int cp;
         i += utf8_next(s, i, &cp);
-        sb_put_mapped(&b, cp, slot);
+        if (slot != PYRS_U_LOWER_MAP || !sb_put_lower_ctx(&b, s, cp, i, prev_cased)) {
+            sb_put_mapped(&b, cp, slot);
+        }
+        prev_cased = next_prev_cased(cp, prev_cased);
     }
     return sb_finish(&b);
 }
@@ -3123,16 +3199,23 @@ PyrsStr *pyrs_str_capitalize(const PyrsStr *s) {
     StrBuf b;
     sb_init(&b, s->len + 8);
     long long i = 0;
+    int prev_cased = 0;
     if (i < s->len) {
         unsigned int cp;
         i += utf8_next(s, i, &cp);
         /* CPython title-cases the first character, then lower-cases the rest. */
         sb_put_mapped(&b, cp, PYRS_U_TITLE_MAP);
+        /* Seed from the character itself, not from "there was one": a leading
+         * space leaves the next sigma medial. */
+        prev_cased = next_prev_cased(cp, 0);
     }
     while (i < s->len) {
         unsigned int cp;
         i += utf8_next(s, i, &cp);
-        sb_put_mapped(&b, cp, PYRS_U_LOWER_MAP);
+        if (!sb_put_lower_ctx(&b, s, cp, i, prev_cased)) {
+            sb_put_mapped(&b, cp, PYRS_U_LOWER_MAP);
+        }
+        prev_cased = next_prev_cased(cp, prev_cased);
     }
     return sb_finish(&b);
 }
@@ -3146,7 +3229,9 @@ PyrsStr *pyrs_str_title(const PyrsStr *s) {
         unsigned int cp;
         i += utf8_next(s, i, &cp);
         if (cp_is_cased(cp)) {
-            sb_put_mapped(&b, cp, prev_cased ? PYRS_U_LOWER_MAP : PYRS_U_TITLE_MAP);
+            if (!prev_cased || !sb_put_lower_ctx(&b, s, cp, i, prev_cased)) {
+                sb_put_mapped(&b, cp, prev_cased ? PYRS_U_LOWER_MAP : PYRS_U_TITLE_MAP);
+            }
             prev_cased = 1;
         } else {
             sb_put_cp(&b, cp);
@@ -3160,6 +3245,7 @@ PyrsStr *pyrs_str_swapcase(const PyrsStr *s) {
     check_ref(s);
     StrBuf b;
     sb_init(&b, s->len + 8);
+    int prev_cased = 0;
     for (long long i = 0; i < s->len;) {
         unsigned int cp;
         i += utf8_next(s, i, &cp);
@@ -3167,10 +3253,13 @@ PyrsStr *pyrs_str_swapcase(const PyrsStr *s) {
         if (f & PYRS_U_LOWER) {
             sb_put_mapped(&b, cp, PYRS_U_UPPER_MAP);
         } else if (f & PYRS_U_UPPER) {
-            sb_put_mapped(&b, cp, PYRS_U_LOWER_MAP);
+            if (!sb_put_lower_ctx(&b, s, cp, i, prev_cased)) {
+                sb_put_mapped(&b, cp, PYRS_U_LOWER_MAP);
+            }
         } else {
             sb_put_cp(&b, cp);
         }
+        prev_cased = next_prev_cased(cp, prev_cased);
     }
     return sb_finish(&b);
 }

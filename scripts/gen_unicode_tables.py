@@ -37,6 +37,16 @@ PRINTABLE = 1 << 8
 XID_START = 1 << 9
 XID_CONTINUE = 1 << 10
 LINEBREAK = 1 << 11
+CASED = 1 << 12
+CASE_IGNORABLE = 1 << 13
+
+# Word_Break MidLetter / MidNumLet / Single_Quote, which the Case_Ignorable
+# derivation includes and `unicodedata` does not expose. Small and stable.
+WORD_BREAK_MID = {
+    0x0027, 0x002E, 0x003A, 0x00B7, 0x0387, 0x055F, 0x05F4, 0x2018,
+    0x2019, 0x2024, 0x2027, 0xFE13, 0xFE52, 0xFE55, 0xFF07, 0xFF0E,
+    0xFF1A,
+}
 
 # CPython's str.splitlines boundaries.
 LINE_BREAKS = {
@@ -70,6 +80,18 @@ def props(cp, c):
         f |= XID_CONTINUE
     if cp in LINE_BREAKS:
         f |= LINEBREAK
+    # Cased = Lowercase + Uppercase + Lt. Python's islower()/isupper() are
+    # exactly Lowercase/Uppercase (category plus Other_*), so only Lt has to
+    # come from the category.
+    cat = unicodedata.category(c)
+    if c.islower() or c.isupper() or cat == "Lt":
+        f |= CASED
+    # Case_Ignorable = Mn + Me + Cf + Lm + Sk plus those Word_Break classes.
+    # Both properties exist for one rule: Final_Sigma, which decides whether
+    # a lowercased sigma is medial or final and cannot be answered per
+    # character -- the reason those mappings are not a pure table lookup.
+    if cat in ("Mn", "Me", "Cf", "Lm", "Sk") or cp in WORD_BREAK_MID:
+        f |= CASE_IGNORABLE
     return f
 
 
@@ -175,6 +197,8 @@ def main():
 #define PYRS_U_XID_START    (1u << 9)
 #define PYRS_U_XID_CONTINUE (1u << 10)
 #define PYRS_U_LINEBREAK    (1u << 11)
+#define PYRS_U_CASED        (1u << 12)
+#define PYRS_U_CASE_IGNORABLE (1u << 13)
 
 /* Case mapping slots, in record order. */
 #define PYRS_U_UPPER_MAP 0

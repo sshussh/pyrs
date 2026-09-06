@@ -23,6 +23,8 @@
 #define PYRS_U_XID_START    (1u << 9)
 #define PYRS_U_XID_CONTINUE (1u << 10)
 #define PYRS_U_LINEBREAK    (1u << 11)
+#define PYRS_U_CASED        (1u << 12)
+#define PYRS_U_CASE_IGNORABLE (1u << 13)
 
 /* Case mapping slots, in record order. */
 #define PYRS_U_UPPER_MAP 0
@@ -45,8 +47,8 @@ typedef struct {
 #define PYRS_U_BLOCK 128
 
 extern const uint16_t pyrs_u_stage1[8704];
-extern const uint16_t pyrs_u_stage2[37760];
-extern const PyrsURecord pyrs_u_records[303];
+extern const uint16_t pyrs_u_stage2[38144];
+extern const PyrsURecord pyrs_u_records[311];
 extern const uint32_t pyrs_u_ext[367];
 
 /* The record for one code point. */
