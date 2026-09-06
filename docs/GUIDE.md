@@ -720,7 +720,10 @@ float NaN sorts last on the primitive path (stable total order via runtime
 to `__gt__`). With monomorphic `key=f` (`T → K`, `K` in
 `int|float|bool|str` — same-module free function, imported free function,
 nested function, lambda, or bare `len` / `abs` / `int` / `float` / `bool` /
-`str`), any `list[T]` is accepted. A `key=` lambda needs no annotation: its
+`str`), any `list[T]` is accepted. The key may return a tuple or list of
+orderable values, compared lexicographically, which is how multi-criteria
+sorting is written: `sorted(items, key=lambda p: (-p[1], p[0]))`. A `key=`
+lambda needs no annotation: its
 parameter is the element type, so `sorted(ss, key=lambda s: len(s))` works
 even though the body says nothing about `s`. Keys keys
 are evaluated once into an auxiliary GC-managed `list[K]` of length `n`,

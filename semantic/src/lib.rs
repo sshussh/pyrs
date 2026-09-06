@@ -22512,12 +22512,14 @@ fn validate_sort_key_direct(
     let param_ty = sig.params[0].ty;
     ensure_key_arg_types(elem_ty, param_ty, span)?;
     let ret = sig.ret;
-    if !matches!(
-        ret,
-        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str
-    ) {
+    // Tuples of orderables sort lexicographically, which is what makes the
+    // multi-key idiom `key=lambda p: (-p[1], p[0])` work.
+    if !is_orderable_ty(ret) {
         return Err(err(
-            format!("key= return type must be sortable (int|float|bool|str), found {ret}"),
+            format!(
+                "key= return type must be sortable (int|float|bool|str, or a \
+                 tuple or list of those), found {ret}"
+            ),
             span,
         ));
     }
@@ -22550,12 +22552,12 @@ fn validate_sort_key_closure(
     }
     ensure_key_arg_types(elem_ty, params[0], span)?;
     let key_ty = *ret;
-    if !matches!(
-        key_ty,
-        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str
-    ) {
+    if !is_orderable_ty(key_ty) {
         return Err(err(
-            format!("key= return type must be sortable (int|float|bool|str), found {key_ty}"),
+            format!(
+                "key= return type must be sortable (int|float|bool|str, or a \
+                 tuple or list of those), found {key_ty}"
+            ),
             span,
         ));
     }
@@ -22671,6 +22673,23 @@ fn call_builtin_sort_key(
 }
 
 /// Compare two keys of the same sortable type with `<` (for min) or `>` (for max/sort).
+/// Compare two `key=` results. Scalars compare with a plain binary op; a
+/// tuple key needs the lexicographic lowering `(1, 2) < (1, 3)` already uses,
+/// because a raw `Binary` node on a tuple is not something codegen handles.
+fn key_value_cmp(
+    op: ast::BinOp,
+    left: ir::Expr,
+    right: ir::Expr,
+    key_ty: ir::Ty,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if matches!(key_ty, ir::Ty::Tuple(_)) {
+        return lower_tuple_binary(op, left, right, span, ctx);
+    }
+    Ok(key_cmp(comparison_ir_op(op), left, right))
+}
+
 fn key_cmp(op: ir::BinOp, left: ir::Expr, right: ir::Expr) -> ir::Expr {
     ir::Expr {
         ty: ir::Ty::Bool,
@@ -22869,11 +22888,14 @@ fn lower_list_sort_key_stmts(
             index: Box::new(j_m1.clone()),
         },
     };
-    let key_gt = key_cmp(
-        ir::BinOp::Gt,
+    let key_gt = key_value_cmp(
+        ast::BinOp::Gt,
         keys_jm1.clone(),
         local_expr(cur_k_t.clone(), key_ty),
-    );
+        key_ty,
+        key_ast.span,
+        ctx,
+    )?;
     let shift_cond = bool_and(j_gt0, key_gt);
     let list_jm1 = ir::Expr {
         ty: elem,
@@ -23363,7 +23385,7 @@ fn lower_min_max_multi_key(
     func: &str,
     args: &[&ast::Expr],
     key_ast: &ast::Expr,
-    _span: Span,
+    span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     debug_assert!(args.len() >= 2);
@@ -23404,9 +23426,9 @@ fn lower_min_max_multi_key(
     });
 
     let cmp_op = if func == "min" {
-        ir::BinOp::Lt
+        ast::BinOp::Lt
     } else {
-        ir::BinOp::Gt
+        ast::BinOp::Gt
     };
     for (i, val) in lowered.into_iter().enumerate().skip(1) {
         let x_t = ctx.fresh_temp("mm.x", elem);
@@ -23419,11 +23441,14 @@ fn lower_min_max_multi_key(
             name: k_t.clone(),
             value: call_sort_key(&key, local_expr(x_t.clone(), elem), args[i].span, ctx)?,
         });
-        let better = key_cmp(
+        let better = key_value_cmp(
             cmp_op,
             local_expr(k_t.clone(), key_ty),
             local_expr(best_k_t.clone(), key_ty),
-        );
+            key_ty,
+            span,
+            ctx,
+        )?;
         stmts.push(ir::Stmt::If {
             branches: vec![(
                 better,
@@ -23475,7 +23500,7 @@ fn lower_min_max_list_key(
     elem: ir::Ty,
     key_ast: &ast::Expr,
     default_ir: Option<ir::Expr>,
-    _arg_span: Span,
+    span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     let list_ty = arg.ty;
@@ -23556,15 +23581,18 @@ fn lower_min_max_list_key(
         },
     };
     let cmp_op = if func == "min" {
-        ir::BinOp::Lt
+        ast::BinOp::Lt
     } else {
-        ir::BinOp::Gt
+        ast::BinOp::Gt
     };
-    let better = key_cmp(
+    let better = key_value_cmp(
         cmp_op,
         local_expr(k_t.clone(), key_ty),
         local_expr(best_k_t.clone(), key_ty),
-    );
+        key_ty,
+        span,
+        ctx,
+    )?;
     let update = vec![
         ir::Stmt::Assign {
             name: best_t.clone(),

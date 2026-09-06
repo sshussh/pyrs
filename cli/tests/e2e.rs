@@ -3412,11 +3412,13 @@ ys = xs.sort(key=id)
     let (_, stderr) = run_program_expect_fail(
         "key_bad_ret",
         "\
-def bad(x: int) -> list[int]:
-    return [x]
+def bad(x: int) -> dict[str, int]:
+    return {\"k\": x}
 print(sorted([1, 2], key=bad))
 ",
     );
+    // A tuple or list key is orderable and now works (as in CPython); what
+    // is still rejected is a key type with no ordering at all.
     assert!(
         stderr.contains("key= return type must be sortable"),
         "stderr={stderr}"
