@@ -505,3 +505,218 @@ fn emit_llvm_still_writes_the_ir_on_a_repeat_build() {
         "--emit-llvm produced no IR on a cached build"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Management — inspecting, cleaning and pruning
+// ---------------------------------------------------------------------------
+
+/// Total bytes under a layer, so a size assertion does not have to trust the
+/// same walk the implementation uses.
+fn layer_bytes(cache: &Path, kind: &str) -> u64 {
+    fn walk(path: &Path) -> u64 {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if !meta.is_dir() {
+            return meta.len();
+        }
+        fs::read_dir(path)
+            .map(|d| d.flatten().map(|e| walk(&e.path())).sum())
+            .unwrap_or(0)
+    }
+    walk(&cache.join(kind))
+}
+
+#[test]
+fn cache_dir_reports_the_configured_directory() {
+    let (_dir, _src, cache) = sandbox("dir");
+    let out = stdout_of(&cache, &["cache", "dir"]);
+    assert_eq!(out.trim(), cache.to_string_lossy());
+}
+
+#[test]
+fn cache_info_counts_what_was_built() {
+    let (_dir, src, cache) = sandbox("info");
+    let prog = src.join("a.py");
+    write(&prog, "print(1)\n");
+    run_in(&cache, &["run", "-i", prog.to_str().unwrap()]);
+
+    let out = stdout_of(&cache, &["cache", "info"]);
+    assert!(out.contains("programs"), "{out}");
+    assert!(out.contains("runtime"), "{out}");
+    assert!(out.contains("total"), "{out}");
+    // One program, one set of runtime objects, both non-empty.
+    assert_eq!(entries(&cache, "programs"), 1, "{out}");
+    assert!(layer_bytes(&cache, "programs") > 0, "{out}");
+}
+
+#[test]
+fn cleaning_programs_leaves_the_runtime_objects_alone() {
+    let (_dir, src, cache) = sandbox("clean-programs");
+    let prog = src.join("a.py");
+    write(&prog, "print(1)\n");
+    run_in(&cache, &["run", "-i", prog.to_str().unwrap()]);
+    assert_eq!(entries(&cache, "programs"), 1);
+    let runtime_before = entries(&cache, "runtime");
+    assert!(runtime_before > 0);
+
+    let out = stdout_of(&cache, &["cache", "clean", "--programs"]);
+    assert!(out.starts_with("removed 1 entry"), "{out}");
+    assert_eq!(entries(&cache, "programs"), 0);
+    assert_eq!(
+        entries(&cache, "runtime"),
+        runtime_before,
+        "cleaning programs must not throw away the objects every build shares"
+    );
+}
+
+#[test]
+fn a_dry_run_removes_nothing() {
+    let (_dir, src, cache) = sandbox("dry-run");
+    let prog = src.join("a.py");
+    write(&prog, "print(1)\n");
+    run_in(&cache, &["run", "-i", prog.to_str().unwrap()]);
+    let before = entries(&cache, "programs");
+    assert!(before > 0);
+
+    let out = stdout_of(&cache, &["cache", "clean", "--dry-run"]);
+    assert!(out.starts_with("would have removed"), "{out}");
+    assert_eq!(entries(&cache, "programs"), before);
+    assert!(entries(&cache, "runtime") > 0);
+}
+
+#[test]
+fn a_cleaned_program_is_rebuilt_rather_than_lost() {
+    let (_dir, src, cache) = sandbox("clean-rebuild");
+    let prog = src.join("a.py");
+    write(&prog, "print(7)\n");
+    assert_eq!(
+        stdout_of(&cache, &["run", "-i", prog.to_str().unwrap()]),
+        "7\n"
+    );
+
+    stdout_of(&cache, &["cache", "clean"]);
+    assert_eq!(entries(&cache, "programs"), 0);
+    assert_eq!(entries(&cache, "runtime"), 0);
+
+    // The cache is an optimization; emptying it changes timing, never output.
+    assert_eq!(
+        stdout_of(&cache, &["run", "-i", prog.to_str().unwrap()]),
+        "7\n"
+    );
+    assert_eq!(entries(&cache, "programs"), 1);
+}
+
+#[test]
+fn pruning_by_size_evicts_the_least_recently_used_entry() {
+    let (_dir, src, cache) = sandbox("prune-lru");
+    let old = src.join("old.py");
+    let new = src.join("new.py");
+    write(&old, "print('old')\n");
+    write(&new, "print('new')\n");
+
+    run_in(&cache, &["run", "-i", old.to_str().unwrap()]);
+    // Distinct modification times: an LRU policy needs an order to read.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    run_in(&cache, &["run", "-i", new.to_str().unwrap()]);
+    // Reuse the older one, which stamps it as the most recently used.
+    assert_eq!(
+        stdout_of(&cache, &["run", "-i", old.to_str().unwrap()]),
+        "old\n"
+    );
+    assert_eq!(entries(&cache, "programs"), 2);
+
+    // A budget that fits one program but not two.
+    let budget = layer_bytes(&cache, "programs") * 3 / 4;
+    let out = stdout_of(
+        &cache,
+        &[
+            "cache",
+            "prune",
+            "--programs",
+            "--max-size",
+            &budget.to_string(),
+        ],
+    );
+    assert!(out.starts_with("pruned 1 entry"), "{out}");
+    assert_eq!(entries(&cache, "programs"), 1);
+    // The survivor is the one that was reused, not the one built last.
+    assert_eq!(
+        stdout_of(&cache, &["run", "-i", old.to_str().unwrap()]),
+        "old\n"
+    );
+}
+
+#[test]
+fn pruning_by_age_keeps_entries_that_are_young_enough() {
+    let (_dir, src, cache) = sandbox("prune-age");
+    let prog = src.join("a.py");
+    write(&prog, "print(1)\n");
+    run_in(&cache, &["run", "-i", prog.to_str().unwrap()]);
+    assert_eq!(entries(&cache, "programs"), 1);
+
+    let out = stdout_of(&cache, &["cache", "prune", "--older-than", "7d"]);
+    assert!(out.starts_with("pruned 0 entries"), "{out}");
+    assert_eq!(entries(&cache, "programs"), 1);
+
+    // Everything is older than nothing.
+    let out = stdout_of(&cache, &["cache", "prune", "--older-than", "0s"]);
+    assert!(out.starts_with("pruned"), "{out}");
+    assert_eq!(entries(&cache, "programs"), 0);
+}
+
+#[test]
+fn prune_without_a_budget_is_refused_rather_than_guessed() {
+    let (_dir, src, cache) = sandbox("prune-nobudget");
+    let prog = src.join("a.py");
+    write(&prog, "print(1)\n");
+    run_in(&cache, &["run", "-i", prog.to_str().unwrap()]);
+
+    let out = run_in(&cache, &["cache", "prune"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("nothing to prune by"), "{err}");
+    // Refusing must not have been a refusal *after* deleting something.
+    assert_eq!(entries(&cache, "programs"), 1);
+}
+
+#[test]
+fn an_unparseable_budget_is_reported_not_ignored() {
+    let (_dir, _src, cache) = sandbox("prune-badsize");
+    for (flag, value) in [("--max-size", "later"), ("--older-than", "soon")] {
+        let out = run_in(&cache, &["cache", "prune", flag, value]);
+        assert!(!out.status.success(), "{flag} {value} was accepted");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("invalid"), "{err}");
+    }
+}
+
+#[test]
+fn build_flags_are_part_of_the_key() {
+    let (_dir, src, cache) = sandbox("cflags");
+    let prog = src.join("a.py");
+    write(&prog, "print(1)\n");
+
+    run_in(&cache, &["run", "-i", prog.to_str().unwrap()]);
+    let baseline = entries(&cache, "programs");
+
+    // Honored *and* keyed: a flag that can change the emitted bytes must not
+    // silently reuse an entry built without it.
+    let out = Command::new(PYRS)
+        .args(["run", "-i", prog.to_str().unwrap()])
+        .env("PYRS_CACHE_DIR", &cache)
+        .env("PYRS_CFLAGS", "-DPYRS_CACHE_KEY_PROBE=1")
+        .output()
+        .expect("failed to spawn PyRs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+    assert_eq!(
+        entries(&cache, "programs"),
+        baseline + 1,
+        "PYRS_CFLAGS changed but the program entry was reused"
+    );
+}

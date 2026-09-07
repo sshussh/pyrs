@@ -26,6 +26,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::{Duration, SystemTime};
 
 use crate::hash::Sha256;
 
@@ -170,6 +171,23 @@ pub enum Runtime {
     Inline,
 }
 
+/// Extra flags for the C compile step (`PYRS_CFLAGS`) and the link step
+/// (`PYRS_LDFLAGS`), split on whitespace.
+///
+/// Deliberately *not* `CFLAGS`. That variable is a make convention, is
+/// routinely set machine-wide for unrelated builds, and `cc` does not read
+/// it on its own — silently adopting it would change PyRs's output because
+/// of a setting aimed at something else. A PyRs-specific name makes the
+/// opt-in explicit, and both are part of the cache key, so changing one
+/// invalidates rather than silently reuses.
+pub fn extra_flags(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
 /// Compile the runtime sources into separate objects under `out_dir`.
 fn compile_objects(cc: &str, src_dir: &Path, out_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut objects = Vec::new();
@@ -180,6 +198,7 @@ fn compile_objects(cc: &str, src_dir: &Path, out_dir: &Path) -> Result<Vec<PathB
             .arg(src_dir.join(name))
             .arg("-O2")
             .arg("-Wno-format-truncation")
+            .args(extra_flags("PYRS_CFLAGS"))
             .arg("-o")
             .arg(&object)
             .status()
@@ -241,6 +260,7 @@ pub fn runtime_objects(
     h.field(BUILD_FINGERPRINT.trim().as_bytes());
     h.field(toolchain_identity(cc).as_bytes());
     h.field(b"-O2 -Wno-format-truncation");
+    h.field(extra_flags("PYRS_CFLAGS").join(" ").as_bytes());
     h.field(&pp);
     let key = h.hex();
 
@@ -259,6 +279,7 @@ pub fn runtime_objects(
                 .zip(&expected)
                 .all(|(p, want)| file_digest(p).as_deref() == Some(*want));
         if intact {
+            touch(&entry);
             return Ok(Runtime::Cached(RuntimeObjects { objects }));
         }
         let _ = fs::remove_dir_all(&entry);
@@ -309,6 +330,8 @@ pub fn program_key(sources: &[(String, String)], opt_level: u8, cc: &str) -> Str
     h.field(toolchain_identity(cc).as_bytes());
     h.field(std::env::consts::ARCH.as_bytes());
     h.field(std::env::consts::OS.as_bytes());
+    h.field(extra_flags("PYRS_CFLAGS").join(" ").as_bytes());
+    h.field(extra_flags("PYRS_LDFLAGS").join(" ").as_bytes());
     for (name, source) in sources {
         h.field(name.as_bytes());
         h.field(source.as_bytes());
@@ -322,6 +345,7 @@ pub fn program_lookup(key: &str) -> Option<PathBuf> {
     let binary = entry.join("program");
     let recorded = fs::read_to_string(entry.join("checksum")).ok()?;
     if file_digest(&binary).as_deref() == Some(recorded.trim()) {
+        touch(&entry);
         return Some(binary);
     }
     let _ = fs::remove_dir_all(&entry);
@@ -345,4 +369,381 @@ pub fn program_store(key: &str, built: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(entry.join("program"))
+}
+
+// ---------------------------------------------------------------------------
+// Management
+// ---------------------------------------------------------------------------
+//
+// A cache with no way to inspect or bound it is a directory that only grows.
+// Measured on this machine before any of the below existed: 998 MB across
+// 3736 program entries, accumulated in about a day of test runs, with a
+// deleted directory as the only remedy. `uv cache dir/info/clean/prune` is
+// the shape this borrows.
+
+/// The cache layers, in the order `pyrs cache info` reports them.
+pub const LAYERS: [&str; 3] = ["programs", "runtime", "toolchain"];
+
+/// Default ceiling for the opportunistic prune, in bytes. Generous enough
+/// that an ordinary week of work never reaches it, small enough that an
+/// unattended machine does not lose a tenth of its disk to build artifacts.
+const DEFAULT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+
+/// How often the opportunistic prune is allowed to walk the cache.
+const GC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Resolution of the reuse clock. An entry's `used` stamp is rewritten at
+/// most this often, so a hot cache does not pay a write on every hit while
+/// still ordering entries finely enough for an age- or size-based policy.
+const TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// What one layer holds.
+pub struct LayerStats {
+    pub name: &'static str,
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+/// One cache entry, for pruning.
+struct Entry {
+    path: PathBuf,
+    used: SystemTime,
+    bytes: u64,
+}
+
+/// Recursive byte total, not following symlinks.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let Ok(read) = fs::read_dir(path) else {
+        return 0;
+    };
+    read.flatten().map(|e| dir_size(&e.path())).sum()
+}
+
+/// Whether a directory name is a half-published entry rather than a real one.
+fn is_staging(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with(".staging")
+}
+
+/// Record that `entry` was just reused, so pruning can distinguish the
+/// program you build every hour from the one you built once in March.
+///
+/// Rewritten only every [`TOUCH_INTERVAL`], and failure is ignored: a
+/// read-only cache should still be *read*.
+fn touch(entry: &Path) {
+    let stamp = entry.join("used");
+    if let Ok(meta) = fs::metadata(&stamp)
+        && let Ok(mtime) = meta.modified()
+        && mtime.elapsed().is_ok_and(|age| age < TOUCH_INTERVAL)
+    {
+        return;
+    }
+    let _ = fs::write(&stamp, b"");
+}
+
+/// When `entry` was last reused. Falls back to the directory's own
+/// modification time, which for an entry never reused since it was published
+/// is when it was built.
+fn last_used(entry: &Path) -> SystemTime {
+    let stamp = entry.join("used");
+    fs::metadata(&stamp)
+        .or_else(|_| fs::metadata(entry))
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Every real entry in `layer`, with its size and last reuse.
+fn entries_of(root: &Path, layer: &str) -> Vec<Entry> {
+    let Ok(read) = fs::read_dir(root.join(layer)) else {
+        return Vec::new();
+    };
+    read.flatten()
+        .filter(|e| !is_staging(&e.file_name()))
+        .map(|e| {
+            let path = e.path();
+            Entry {
+                used: last_used(&path),
+                bytes: dir_size(&path),
+                path,
+            }
+        })
+        .collect()
+}
+
+/// Per-layer entry counts and sizes.
+pub fn stats(root: &Path) -> Vec<LayerStats> {
+    LAYERS
+        .iter()
+        .map(|&name| {
+            let entries = entries_of(root, name);
+            LayerStats {
+                name,
+                entries: entries.len(),
+                bytes: entries.iter().map(|e| e.bytes).sum(),
+            }
+        })
+        .collect()
+}
+
+/// What a clean or prune did, so the caller can report it without
+/// re-walking the directory.
+pub struct Removed {
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+/// Remove every entry in `layers`. `dry_run` reports without deleting.
+pub fn clean(root: &Path, layers: &[&str], dry_run: bool) -> Removed {
+    let mut removed = Removed {
+        entries: 0,
+        bytes: 0,
+    };
+    for layer in layers {
+        for entry in entries_of(root, layer) {
+            if !dry_run && fs::remove_dir_all(&entry.path).is_err() {
+                continue;
+            }
+            removed.entries += 1;
+            removed.bytes += entry.bytes;
+        }
+    }
+    removed
+}
+
+/// What a prune is allowed to keep.
+#[derive(Default)]
+pub struct PruneOptions {
+    /// Drop entries not reused within this long.
+    pub older_than: Option<Duration>,
+    /// Drop least-recently-used entries until the total fits.
+    pub max_size: Option<u64>,
+    pub dry_run: bool,
+}
+
+/// Prune `layers` down to `opts`.
+///
+/// Age is applied first, then the size ceiling to whatever survived, so
+/// `--older-than 7d --max-size 500MB` means both rather than whichever runs
+/// last. Eviction is least-recently-used: the entry you rebuild every day
+/// should be the last one to go, not an arbitrary one.
+///
+/// `toolchain` is never pruned. Its entries are 64 bytes each and losing one
+/// costs two subprocesses on the next build for no space worth reclaiming.
+pub fn prune(root: &Path, layers: &[&str], opts: &PruneOptions) -> Removed {
+    let mut removed = Removed {
+        entries: 0,
+        bytes: 0,
+    };
+    let mut survivors: Vec<Entry> = Vec::new();
+
+    for layer in layers {
+        for entry in entries_of(root, layer) {
+            let expired = opts
+                .older_than
+                .is_some_and(|max| entry.used.elapsed().is_ok_and(|age| age > max));
+            if expired {
+                if opts.dry_run || fs::remove_dir_all(&entry.path).is_ok() {
+                    removed.entries += 1;
+                    removed.bytes += entry.bytes;
+                }
+            } else {
+                survivors.push(entry);
+            }
+        }
+    }
+
+    let Some(limit) = opts.max_size else {
+        return removed;
+    };
+    let mut total: u64 = survivors.iter().map(|e| e.bytes).sum();
+    if total <= limit {
+        return removed;
+    }
+    // Oldest first: the least-recently-used entry is the cheapest to lose.
+    survivors.sort_by_key(|e| e.used);
+    for entry in survivors {
+        if total <= limit {
+            break;
+        }
+        if !opts.dry_run && fs::remove_dir_all(&entry.path).is_err() {
+            continue;
+        }
+        total = total.saturating_sub(entry.bytes);
+        removed.entries += 1;
+        removed.bytes += entry.bytes;
+    }
+    removed
+}
+
+/// The ceiling the opportunistic prune enforces: `PYRS_CACHE_LIMIT`, or
+/// [`DEFAULT_LIMIT`]. `0` (or an unparseable value) disables it.
+fn configured_limit() -> Option<u64> {
+    match std::env::var("PYRS_CACHE_LIMIT") {
+        Ok(text) => parse_size(text.trim()).filter(|&n| n > 0),
+        Err(_) => Some(DEFAULT_LIMIT),
+    }
+}
+
+/// Keep the cache under its ceiling, at most once per [`GC_INTERVAL`].
+///
+/// Called after publishing a program, which is the only moment the cache
+/// grows. Silent and best-effort: a build that succeeded must not be
+/// reported as failed because housekeeping could not run.
+pub fn maintain() {
+    let Some(limit) = configured_limit() else {
+        return;
+    };
+    let Some(root) = root() else {
+        return;
+    };
+    let stamp = root.join("last-gc");
+    if let Ok(meta) = fs::metadata(&stamp)
+        && let Ok(mtime) = meta.modified()
+        && mtime.elapsed().is_ok_and(|age| age < GC_INTERVAL)
+    {
+        return;
+    }
+    // Stamp first: a prune that panics or is killed must not make every
+    // later build retry the same walk.
+    let _ = fs::write(&stamp, b"");
+    prune(
+        &root,
+        &["programs", "runtime"],
+        &PruneOptions {
+            max_size: Some(limit),
+            ..PruneOptions::default()
+        },
+    );
+}
+
+/// Parse `7d`, `24h`, `30m`, `90s`, or a bare number of seconds.
+pub fn parse_duration(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    let (digits, unit) = match text.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => text.split_at(i),
+        None => (text, "s"),
+    };
+    let n: u64 = digits.parse().ok()?;
+    let secs = match unit {
+        "s" | "" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        "w" => 7 * 24 * 60 * 60,
+        _ => return None,
+    };
+    n.checked_mul(secs).map(Duration::from_secs)
+}
+
+/// Parse `500MB`, `1GiB`, `2G`, or a bare number of bytes.
+///
+/// `MB` means 1024², not 1000², matching what `du -h` prints — a size that
+/// disagrees with the tool the user just checked the directory with would be
+/// worse than no unit suffix at all.
+pub fn parse_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (digits, unit) = match text.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => text.split_at(i),
+        None => (text, "B"),
+    };
+    let n: u64 = digits.parse().ok()?;
+    let scale: u64 = match unit.trim().to_ascii_uppercase().as_str() {
+        "B" | "" => 1,
+        "K" | "KB" | "KIB" => 1024,
+        "M" | "MB" | "MIB" => 1024 * 1024,
+        "G" | "GB" | "GIB" => 1024 * 1024 * 1024,
+        "T" | "TB" | "TIB" => 1024u64.pow(4),
+        _ => return None,
+    };
+    n.checked_mul(scale)
+}
+
+/// Human-readable byte count, matching `du -h`'s units.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_parse_in_the_units_people_type() {
+        assert_eq!(parse_duration("90"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("15m"), Some(Duration::from_secs(900)));
+        assert_eq!(parse_duration("2h"), Some(Duration::from_secs(7200)));
+        assert_eq!(parse_duration("7d"), Some(Duration::from_secs(604_800)));
+        assert_eq!(parse_duration("1w"), Some(Duration::from_secs(604_800)));
+        assert_eq!(parse_duration(" 7d "), Some(Duration::from_secs(604_800)));
+    }
+
+    #[test]
+    fn an_unrecognized_duration_is_rejected_rather_than_rounded() {
+        // Silently reading "7 years" as 7 seconds would delete the cache.
+        for text in ["", "7y", "d", "soon", "-1d", "7dd", "1.5h"] {
+            assert_eq!(parse_duration(text), None, "accepted {text:?}");
+        }
+    }
+
+    #[test]
+    fn sizes_parse_in_the_units_du_prints() {
+        assert_eq!(parse_size("512"), Some(512));
+        assert_eq!(parse_size("2K"), Some(2048));
+        assert_eq!(parse_size("1MB"), Some(1024 * 1024));
+        assert_eq!(parse_size("1MiB"), Some(1024 * 1024));
+        assert_eq!(parse_size("2GiB"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("1gb"), Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn an_unrecognized_size_is_rejected() {
+        for text in ["", "MB", "lots", "-5M", "1.5G", "5Z"] {
+            assert_eq!(parse_size(text), None, "accepted {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_size_that_would_overflow_is_rejected_rather_than_wrapped() {
+        // Wrapping would produce a small budget from a huge request, and
+        // then delete almost everything.
+        assert_eq!(parse_size("99999999999999999999"), None);
+        assert_eq!(parse_size(&format!("{}T", u64::MAX)), None);
+    }
+
+    #[test]
+    fn sizes_render_the_way_du_h_does() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1536), "1.5 KiB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn flags_split_the_way_a_shell_would_on_whitespace() {
+        // Safety: these tests share a process, so the variable is set and
+        // read without an intervening await point.
+        unsafe { std::env::set_var("PYRS_TEST_FLAGS", "  -DA=1   -O0 ") };
+        assert_eq!(extra_flags("PYRS_TEST_FLAGS"), vec!["-DA=1", "-O0"]);
+        unsafe { std::env::remove_var("PYRS_TEST_FLAGS") };
+        assert!(extra_flags("PYRS_TEST_FLAGS").is_empty());
+    }
 }

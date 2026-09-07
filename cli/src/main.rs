@@ -68,6 +68,7 @@ fn run(args: cli::Cli) -> Result<i32, String> {
             Ok(0)
         }
         cli::Command::Init(cmd) => init_project(cmd),
+        cli::Command::Cache(cmd) => manage_cache(cmd),
     }
 }
 
@@ -202,6 +203,7 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     let result = compile_module(&module, &exe, opt_level, false, !cmd.no_cache).and_then(|()| {
         if let Some(key) = &key {
             cache::program_store(key, &exe);
+            cache::maintain();
         }
         let mut process = process::Command::new(&exe);
         process.args(&cmd.args);
@@ -271,6 +273,7 @@ fn compile(
     compile_module(&module, output, opt_level, emit_llvm, use_cache)?;
     if let Some(key) = &key {
         cache::program_store(key, output);
+        cache::maintain();
     }
     Ok(())
 }
@@ -352,9 +355,13 @@ fn compile_module(
                 link.arg(&runtime).arg(&gc).arg(&unicode);
             }
         }
+        if matches!(runtime_build, cache::Runtime::Inline) {
+            link.args(cache::extra_flags("PYRS_CFLAGS"));
+        }
         let status = link
             .arg("-O2")
             .arg("-Wno-format-truncation")
+            .args(cache::extra_flags("PYRS_LDFLAGS"))
             .arg("-lm")
             .arg("-o")
             .arg(output)
@@ -431,6 +438,121 @@ fn check_program(cmd: cli::CheckCommand) -> Result<i32, String> {
     };
     analyze(loaded.map_err(|e| e.0)?)?;
     Ok(0)
+}
+
+/// `pyrs cache`: inspect, clean and prune the build cache.
+///
+/// The cache is otherwise a directory that only grows, with no way to see
+/// what is in it and no remedy short of deleting the whole thing — which
+/// also throws away the runtime objects that make every build on the machine
+/// fast, to reclaim space held by programs.
+fn manage_cache(cmd: cli::CacheCommand) -> Result<i32, String> {
+    let root = cache::root().ok_or_else(|| {
+        "no cache directory: set PYRS_CACHE_DIR, XDG_CACHE_HOME or HOME".to_string()
+    })?;
+
+    match cmd.action {
+        cli::CacheAction::Dir => println!("{}", root.display()),
+
+        cli::CacheAction::Info => {
+            println!("cache: {}", root.display());
+            let stats = cache::stats(&root);
+            let total: u64 = stats.iter().map(|s| s.bytes).sum();
+            for layer in &stats {
+                println!(
+                    "  {:<10} {:>6} entries  {:>10}",
+                    layer.name,
+                    layer.entries,
+                    cache::human_size(layer.bytes)
+                );
+            }
+            println!(
+                "  {:<10} {:>6}           {:>10}",
+                "total",
+                "",
+                cache::human_size(total)
+            );
+        }
+
+        cli::CacheAction::Clean(opts) => {
+            let layers = selected_layers(opts.programs, opts.runtime);
+            let removed = cache::clean(&root, &layers, opts.dry_run);
+            report_removed("removed", &removed, opts.dry_run);
+        }
+
+        cli::CacheAction::Prune(opts) => {
+            if opts.older_than.is_none() && opts.max_size.is_none() {
+                return Err(
+                    "nothing to prune by: pass --older-than, --max-size, or both \
+                     (use 'pyrs cache clean' to remove everything)"
+                        .to_string(),
+                );
+            }
+            let older_than = match &opts.older_than {
+                Some(text) => Some(cache::parse_duration(text).ok_or_else(|| {
+                    format!("invalid --older-than '{text}': expected a form like 7d, 24h or 30m")
+                })?),
+                None => None,
+            };
+            let max_size = match &opts.max_size {
+                Some(text) => Some(cache::parse_size(text).ok_or_else(|| {
+                    format!("invalid --max-size '{text}': expected a form like 500MB or 2GiB")
+                })?),
+                None => None,
+            };
+            let layers = selected_layers(opts.programs, opts.runtime);
+            let removed = cache::prune(
+                &root,
+                &layers,
+                &cache::PruneOptions {
+                    older_than,
+                    max_size,
+                    dry_run: opts.dry_run,
+                },
+            );
+            report_removed("pruned", &removed, opts.dry_run);
+        }
+    }
+    Ok(0)
+}
+
+/// Which layers a `--programs`/`--runtime` pair selects. Neither flag means
+/// both, which is what someone typing the bare command wants.
+///
+/// `toolchain` is never included: its entries are 64 bytes each and losing
+/// one costs two subprocesses on the next build for no space worth having.
+fn selected_layers(programs: bool, runtime: bool) -> Vec<&'static str> {
+    match (programs, runtime) {
+        (false, false) => vec!["programs", "runtime"],
+        _ => {
+            let mut layers = Vec::new();
+            if programs {
+                layers.push("programs");
+            }
+            if runtime {
+                layers.push("runtime");
+            }
+            layers
+        }
+    }
+}
+
+fn report_removed(verb: &str, removed: &cache::Removed, dry_run: bool) {
+    let what = format!(
+        "{} {} ({})",
+        removed.entries,
+        if removed.entries == 1 {
+            "entry"
+        } else {
+            "entries"
+        },
+        cache::human_size(removed.bytes)
+    );
+    if dry_run {
+        println!("would have {verb} {what}");
+    } else {
+        println!("{verb} {what}");
+    }
 }
 
 /// `pyrs init`: record a `[tool.pyrs]` table for this project.

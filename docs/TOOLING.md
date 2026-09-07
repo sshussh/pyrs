@@ -137,7 +137,47 @@ and the content of every module in the import graph — and entries are
 checksum-verified before reuse. A stale entry would be a wrong answer that
 looks like a right one, which is worse than a slow build.
 
-Two limits are accepted rather than papered over: `CC` is honored but
-`CFLAGS` is not, and a compiler wrapper that changes behavior without
-changing its identity or preprocessed output will not invalidate the key.
-Those cases need `--no-cache` or a deleted cache directory.
+`CC` is honored, and so are `PYRS_CFLAGS` and `PYRS_LDFLAGS` — both are
+part of the key, so changing one invalidates rather than silently reuses.
+They are deliberately *not* spelled `CFLAGS`: that is a make convention, is
+routinely set machine-wide for unrelated builds, and `cc` does not read it on
+its own, so adopting it would change PyRs's output because of a setting aimed
+at something else.
+
+One limit is accepted rather than papered over: a compiler wrapper that
+changes behavior without changing its identity or its preprocessed output
+will not invalidate the key. That case needs `--no-cache` or
+`pyrs cache clean`.
+
+### Managing it
+
+A cache with no way to inspect or bound it is a directory that only grows.
+
+```console
+pyrs cache dir                     # where it lives
+pyrs cache info                    # entries and bytes, per layer
+pyrs cache clean [--programs]      # empty it
+pyrs cache prune --max-size 2GiB   # or --older-than 7d
+```
+
+`--programs` and `--runtime` narrow any of them, and `--dry-run` reports what
+would go without removing it. The distinction matters: the runtime objects
+are a few hundred kilobytes shared by every build on the machine, while the
+programs are a few hundred kilobytes *each*, so reclaiming space almost
+always means `--programs`.
+
+Eviction is least-recently-used. Entries carry a `used` stamp refreshed when
+they are reused — at most hourly, so a warm cache pays no write per hit —
+which is what makes the program you rebuild every day the last one dropped
+rather than whichever the directory listing happened to yield first.
+
+`prune` applies age and then size, so `--older-than 7d --max-size 500MB`
+means both rather than whichever ran last. `toolchain` is never pruned: its
+entries are 64 bytes each and losing one costs two subprocesses on the next
+build.
+
+PyRs also prunes opportunistically, at most once a day, keeping the cache
+under `PYRS_CACHE_LIMIT` (default 2 GiB; `0` disables it). This is the one
+place the tool deletes something it was not asked to, and it is deliberate: a
+cache that reached 998 MB in a day of test runs during development is not one
+a user can be expected to police by hand.

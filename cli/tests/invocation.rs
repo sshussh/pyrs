@@ -265,3 +265,134 @@ fn compatibility_preserves_signal_termination() {
         .unwrap();
     assert_eq!(output.status.signal(), Some(15));
 }
+
+// ---------------------------------------------------------------------------
+// The subcommand boundary
+// ---------------------------------------------------------------------------
+//
+// `pyrs script.py` is accepted by inserting `run` in front of any first
+// argument that is not a subcommand. That convenience has a sharp edge: a
+// name the shim does not recognize silently becomes a *file path*, so a
+// mistyped or newly added subcommand fails with a message about a file the
+// user never named.
+
+#[test]
+fn every_subcommand_is_recognized_by_the_script_shim() {
+    // `--help` lists exactly the subcommands clap knows about, and the shim
+    // derives its list from the same parser — so each one must reach its own
+    // handler rather than being treated as a script to read.
+    let help = Command::new(PYRS).arg("--help").output().unwrap();
+    let text = String::from_utf8_lossy(&help.stdout);
+    let commands: Vec<&str> = text
+        .lines()
+        .skip_while(|l| !l.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|l| !l.trim().is_empty())
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| !w.starts_with('-'))
+        // clap's built-in `help` takes a command, not `--help`.
+        .filter(|w| *w != "help")
+        .collect();
+    assert!(
+        commands.len() >= 8,
+        "expected the subcommand list, got {commands:?}"
+    );
+
+    // `help` is clap's own and still must not become a filename.
+    let out = Command::new(PYRS).arg("help").output().unwrap();
+    let combined = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        combined.contains("Usage:"),
+        "'help' fell through: {combined}"
+    );
+
+    for command in commands {
+        let out = Command::new(PYRS)
+            .arg(command)
+            .arg("--help")
+            .output()
+            .unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !combined.contains("failed to read"),
+            "'{command}' fell through to the script shim: {combined}"
+        );
+        assert!(
+            combined.contains("Usage:"),
+            "'{command} --help' printed no usage: {combined}"
+        );
+    }
+}
+
+#[test]
+fn a_mistyped_subcommand_suggests_the_real_one() {
+    for (typo, meant) in [
+        ("comple", "compile"),
+        ("chek", "check"),
+        ("cache-", "cache"),
+        ("innit", "init"),
+    ] {
+        let out = Command::new(PYRS).arg(typo).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{typo}: {err}");
+        assert!(
+            err.contains(&format!("unrecognized subcommand '{typo}'")),
+            "{typo}: {err}"
+        );
+        assert!(err.contains(meant), "{typo} should suggest {meant}: {err}");
+        assert!(
+            !err.contains("failed to read"),
+            "{typo} was still treated as a file: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_script_is_never_mistaken_for_a_mistyped_subcommand() {
+    let dir = WorkDir::new();
+    // Named to be one edit from `check`, and a real file.
+    let script = dir.0.join("chec");
+    fs::write(&script, "print('ran')\n").unwrap();
+
+    let out = Command::new(PYRS)
+        .arg(&script)
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+
+    // Also by bare name, from the directory holding it.
+    let out = Command::new(PYRS)
+        .arg("chec")
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a file that exists must win over a spelling guess: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+}
+
+#[test]
+fn a_missing_script_is_reported_as_a_missing_file_not_a_typo() {
+    // Nothing near a subcommand: the honest error is still about the file.
+    let out = Command::new(PYRS)
+        .arg("nonexistent_program.py")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("nonexistent_program.py"), "{err}");
+    assert!(!err.contains("unrecognized subcommand"), "{err}");
+}

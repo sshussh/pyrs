@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.111.0 — Cache management, build flags, and a safe subcommand boundary
+
+The build cache had no way to inspect it, no way to clean it, and no bound.
+Measured on the development machine before this release: **998 MB across 3736
+program entries**, accumulated in about a day of test runs, with "delete the
+directory" as the only documented remedy — which also throws away the runtime
+objects that make every build on the machine fast, in order to reclaim space
+held by programs.
+
+- **`pyrs cache dir | info | clean | prune`**, after `uv cache`. `info`
+  reports entries and bytes per layer; `clean` empties them; `prune` takes
+  `--older-than 7d` and `--max-size 2GiB`, applied in that order so both
+  mean both. `--programs`/`--runtime` narrow any of them, and `--dry-run`
+  reports without deleting.
+- **Eviction is least-recently-used, not arbitrary.** Entries carry a `used`
+  stamp refreshed on reuse (at most hourly, so a hot cache pays no write per
+  hit), so the program rebuilt every day is the last one dropped rather than
+  whichever the directory listing happened to yield first.
+- **An opportunistic ceiling**, default 2 GiB, checked at most once a day and
+  disabled with `PYRS_CACHE_LIMIT=0`. A cache that reaches a gigabyte in a
+  day is not one a user can be expected to police by hand.
+- `toolchain` entries are never pruned: 64 bytes each, and losing one costs
+  two subprocesses on the next build.
+
+**`PYRS_CFLAGS` and `PYRS_LDFLAGS` are honored and keyed**, closing the
+limitation the previous release documented as accepted. Deliberately not
+`CFLAGS`: that is a make convention, is routinely set machine-wide for
+unrelated builds, and `cc` does not read it on its own, so adopting it would
+change PyRs's output because of a setting aimed at something else.
+
+**A mistyped subcommand is now an error, not a filename.** `pyrs script.py`
+works by inserting `run` before any first argument that is not a subcommand,
+and that list was a hand-maintained copy — so `pyrs comple -i x.py` reported
+`failed to read comple`, a message about a file the user never named, and any
+newly added subcommand would have done the same. The list is now derived from
+the parser itself, and a near-miss suggests the real name:
+
+```console
+$ pyrs comple -i prog.py
+error: unrecognized subcommand 'comple'
+
+  tip: a similar subcommand exists: 'compile'
+```
+
+A file that exists always wins over a spelling guess, so a script named
+`chec` still runs.
+
 ## 0.110.0 — Projects: `[tool.pyrs]`, `pyrs init`, and uv
 
 Configuration goes in **`pyproject.toml`** under `[tool.pyrs]`, the table

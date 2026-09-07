@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.110 |
+| Check | Result after 0.111 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1398 passed; none failed or ignored |
+| `cargo test --workspace` | 1419 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 66 pass / 0 known_gap; compat 22 pass |
-| `pyrs --version` | `PyRs 0.110.0` |
+| `pyrs --version` | `PyRs 0.111.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -344,6 +344,11 @@ documentation and the relevant gates.
       programs are cached on the same terms, so an unchanged `pyrs run`
       compiles nothing: 2.6 s to 11 ms, and 84 ms for a new program against a
       warm runtime cache.
+- [x] Bound and manage that cache (0.111): `pyrs cache dir/info/clean/prune`,
+      least-recently-used eviction against `--older-than` and `--max-size`,
+      and an opportunistic 2 GiB ceiling. Before this it grew without limit —
+      998 MB in a day of test runs, with a deleted directory as the only
+      remedy. `PYRS_CFLAGS`/`PYRS_LDFLAGS` are honored and keyed.
 - [ ] Declare the supported host/target matrix (initially Linux x86-64) and
       exercise each claimed platform in CI.
 - [ ] Reproducible release builds, checksums, install instructions,
