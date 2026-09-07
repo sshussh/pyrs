@@ -51,16 +51,7 @@ fn run(args: cli::Cli) -> Result<i32, String> {
             write_output(&format!("{module:#?}\n"), cmd.output.as_deref())?;
             Ok(0)
         }
-        cli::Command::Compile(cmd) => {
-            compile(
-                &cmd.input,
-                &cmd.output,
-                cmd.opt_level,
-                cmd.emit_llvm,
-                !cmd.no_cache,
-            )?;
-            Ok(0)
-        }
+        cli::Command::Compile(cmd) => compile_command(cmd),
         cli::Command::Run(cmd) => run_program(cmd),
         cli::Command::Check(cmd) => check_program(cmd),
         cli::Command::BuildExtension(cmd) => {
@@ -69,6 +60,14 @@ fn run(args: cli::Cli) -> Result<i32, String> {
         }
         cli::Command::Init(cmd) => init_project(cmd),
         cli::Command::Cache(cmd) => manage_cache(cmd),
+        cli::Command::Clean(cmd) => clean_project(cmd),
+        cli::Command::Doctor => doctor(),
+        cli::Command::Completions(cmd) => {
+            use clap::CommandFactory;
+            let mut command = cli::Cli::command();
+            clap_complete::generate(cmd.shell, &mut command, "pyrs", &mut std::io::stdout());
+            Ok(0)
+        }
     }
 }
 
@@ -248,15 +247,79 @@ fn execute(command: &mut process::Command) -> Result<i32, io::Error> {
     command.status().map(exit_code)
 }
 
+/// `pyrs compile` (and its `build` alias).
+///
+/// Project-aware in the same way `run` is: with no `-i` it builds the
+/// manifest's entry through the declared import root, and with no `-o` it
+/// writes `target/NAME` rather than `./a.out` in whatever directory the
+/// command happened to run from. `pyrs build` in a project should mean the
+/// same kind of thing `cargo build` does.
+fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
+    let project = if cmd.input.is_none() {
+        match std::env::current_dir() {
+            Ok(dir) => manifest::discover(&dir)?,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let m = match &project {
+        Some(path) => Some(manifest::load(path)?),
+        None => None,
+    };
+
+    let input = match (&cmd.input, m.as_ref().and_then(|m| m.entry_path())) {
+        (Some(i), _) => i.clone(),
+        (None, Some(entry)) => entry,
+        (None, None) => {
+            return Err(
+                "no input: pass -i, or run inside a project with [tool.pyrs] entry".to_string(),
+            );
+        }
+    };
+    let output = match (&cmd.output, m.as_ref().and_then(|m| m.default_output())) {
+        (Some(o), _) => o.clone(),
+        (None, Some(default)) => default,
+        (None, None) => PathBuf::from("a.out"),
+    };
+    let opt_level = cmd
+        .opt_level
+        .or_else(|| m.as_ref().and_then(|m| m.opt_level))
+        .unwrap_or(2);
+
+    compile(
+        &input,
+        &output,
+        m.as_ref().map(|m| m.root_path()),
+        opt_level,
+        cmd.emit_llvm,
+        !cmd.no_cache,
+    )?;
+    Ok(0)
+}
+
 /// The full pipeline: source file(s) in, linked native executable out.
 fn compile(
     input: &Path,
     output: &Path,
+    import_root: Option<PathBuf>,
     opt_level: u8,
     emit_llvm: bool,
     use_cache: bool,
 ) -> Result<(), String> {
-    let loaded = modules::load_program(input).map_err(|e| e.0)?;
+    let loaded = match &import_root {
+        Some(root) => modules::load_program_in_project(input, root),
+        None => modules::load_program(input),
+    }
+    .map_err(|e| e.0)?;
+    // A default output under `target/` may name a directory nothing created.
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     // `--emit-llvm` asks for a side artifact the cache does not hold, so it
     // always rebuilds rather than silently not producing the .ll file.
@@ -552,6 +615,154 @@ fn report_removed(verb: &str, removed: &cache::Removed, dry_run: bool) {
         println!("would have {verb} {what}");
     } else {
         println!("{verb} {what}");
+    }
+}
+
+/// `pyrs clean`: remove this project's build output directory.
+///
+/// Scoped to the project, not the machine. The global build cache is
+/// `pyrs cache clean` — conflating the two would mean that clearing one
+/// project's outputs slowed down every build on the system, which is
+/// exactly the confusion `cargo clean` avoids by owning only `target/`.
+fn clean_project(cmd: cli::CleanCommand) -> Result<i32, String> {
+    let project = match std::env::current_dir() {
+        Ok(dir) => manifest::discover(&dir)?,
+        Err(_) => None,
+    };
+    let Some(path) = project else {
+        return Err(
+            "not in a PyRs project: 'clean' removes the [tool.pyrs] target directory \
+             (for the shared build cache, use 'pyrs cache clean')"
+                .to_string(),
+        );
+    };
+    let target = manifest::load(&path)?.target_path();
+    if !target.exists() {
+        println!("nothing to clean: {} does not exist", target.display());
+        return Ok(0);
+    }
+    if cmd.dry_run {
+        println!("would remove {}", target.display());
+        return Ok(0);
+    }
+    fs::remove_dir_all(&target)
+        .map_err(|e| format!("failed to remove {}: {e}", target.display()))?;
+    println!("removed {}", target.display());
+    Ok(0)
+}
+
+/// `pyrs doctor`: what PyRs found, and whether it is enough to build.
+///
+/// The contributor-facing `make doctor` checks the machine can build the
+/// *compiler*. This answers the different question a user has — can this
+/// binary compile my program, and which interpreter will `--compat` use —
+/// and it answers it from the same resolution code the build actually runs,
+/// so the report cannot describe a different toolchain than the one used.
+fn doctor() -> Result<i32, String> {
+    let mut problems = 0;
+
+    println!("pyrs {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  target       {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    match process::Command::new(&cc).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let first = String::from_utf8_lossy(&out.stdout);
+            let first = first.lines().next().unwrap_or("").trim();
+            println!("  C compiler   {cc} ({first})");
+        }
+        _ => {
+            println!("  C compiler   {cc}: not found");
+            println!("               PyRs links every program with a C compiler; install one");
+            problems += 1;
+        }
+    }
+    for var in ["PYRS_CFLAGS", "PYRS_LDFLAGS"] {
+        let flags = cache::extra_flags(var);
+        if !flags.is_empty() {
+            println!("  {var:<12} {}", flags.join(" "));
+        }
+    }
+
+    let (python, source) = interpreter::resolve(None, None);
+    match interpreter::version_of(&python) {
+        Some(version) => {
+            let want = codegen::oracle_python_minor();
+            let matches = version.starts_with(want);
+            println!(
+                "  interpreter  {} ({}, Python {version}){}",
+                python.display(),
+                source.describe(),
+                if matches {
+                    String::new()
+                } else {
+                    format!("  [PyRs targets {want}]")
+                }
+            );
+            if !matches {
+                println!(
+                    "               --compat and the differential oracle use this \
+                     interpreter; a different minor version can disagree with PyRs"
+                );
+            }
+        }
+        None => {
+            println!("  interpreter  {}: not runnable", python.display());
+            println!("               only --compat and build-extension need one");
+        }
+    }
+
+    match cache::root() {
+        Some(root) => {
+            let total: u64 = cache::stats(&root).iter().map(|s| s.bytes).sum();
+            println!(
+                "  cache        {} ({})",
+                root.display(),
+                cache::human_size(total)
+            );
+        }
+        None => println!("  cache        none (set PYRS_CACHE_DIR, XDG_CACHE_HOME or HOME)"),
+    }
+
+    match std::env::current_dir().ok().map(|d| manifest::discover(&d)) {
+        Some(Ok(Some(path))) => {
+            println!("  project      {}", path.display());
+            match manifest::load(&path) {
+                Ok(m) => {
+                    println!(
+                        "               entry {}, root {}, target {}",
+                        m.entry
+                            .as_ref()
+                            .map(|e| e.display().to_string())
+                            .unwrap_or_else(|| "<none>".into()),
+                        m.root_path().display(),
+                        m.target_path().display()
+                    );
+                }
+                Err(e) => {
+                    println!("               {e}");
+                    problems += 1;
+                }
+            }
+        }
+        Some(Err(e)) => {
+            println!("  project      {e}");
+            problems += 1;
+        }
+        _ => println!("  project      none in this directory or its parents"),
+    }
+
+    if problems == 0 {
+        println!("\nno problems found");
+        Ok(0)
+    } else {
+        // A non-zero status so a setup script can act on this.
+        println!("\n{problems} problem(s) found");
+        Ok(1)
     }
 }
 

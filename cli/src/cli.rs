@@ -139,7 +139,8 @@ pub enum Command {
     /// Parse the input file and dump the AST
     Parse(ParseCommand),
 
-    /// Compile the input file to a native executable
+    /// Compile to a native executable (alias: build)
+    #[command(alias = "build")]
     Compile(CompileCommand),
 
     /// Compile the input file and run it immediately
@@ -156,6 +157,29 @@ pub enum Command {
 
     /// Inspect, clean and prune the build cache
     Cache(CacheCommand),
+
+    /// Remove this project's build output directory
+    Clean(CleanCommand),
+
+    /// Report the toolchain PyRs found, and whether it is usable
+    Doctor,
+
+    /// Print a shell completion script
+    Completions(CompletionsCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct CleanCommand {
+    /// Report what would be removed without removing it
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsCommand {
+    /// Shell to generate for
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(Debug, Args)]
@@ -251,17 +275,17 @@ pub struct ParseCommand {
 
 #[derive(Debug, Args)]
 pub struct CompileCommand {
-    /// Input file path
+    /// Input file path (default: the project's [tool.pyrs] entry)
     #[arg(short, long)]
-    pub input: path::PathBuf,
+    pub input: Option<path::PathBuf>,
 
-    /// Output executable path
-    #[arg(short, long, default_value = "a.out")]
-    pub output: path::PathBuf,
+    /// Output executable path (default: target/NAME in a project, else a.out)
+    #[arg(short, long)]
+    pub output: Option<path::PathBuf>,
 
-    /// Optimization level (0-3)
-    #[arg(short = 'O', long = "opt-level", default_value_t = 2, value_parser = clap::value_parser!(u8).range(0..=3))]
-    pub opt_level: u8,
+    /// Optimization level (0-3); defaults to the manifest, then 2
+    #[arg(short = 'O', long = "opt-level", value_parser = clap::value_parser!(u8).range(0..=3))]
+    pub opt_level: Option<u8>,
 
     /// Also write the generated LLVM IR next to the output (<output>.ll)
     #[arg(long)]

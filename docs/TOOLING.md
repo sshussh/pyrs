@@ -28,6 +28,8 @@ PyRs a foreign object in a Python repo.
 [tool.pyrs]
 entry = "src/app/main.py"   # module run as __main__
 root = "src"                # import root; defaults to the manifest's directory
+target = "target"           # build output directory; what `pyrs clean` removes
+target = "target"           # build output directory
 opt-level = 2               # default -O
 execution = "native"        # or "compat"
 python = ".venv/bin/python" # interpreter for compat and extensions
@@ -86,6 +88,103 @@ uv init myapp && cd myapp
 pyrs init --entry src/myapp/main.py .
 pyrs run
 ```
+
+## Building a project
+
+`pyrs build` (or `compile`, the same command) is project-aware in the same
+way `run` is. With no `-i` it builds the manifest's entry through the
+declared import root; with no `-o` it writes `target/NAME`, where `NAME` is
+the entry's stem — or its package directory when the entry is `main.py`, so
+`src/app/main.py` builds to `target/app` rather than every project building
+to `target/main`.
+
+```console
+pyrs build          # -> target/app
+pyrs clean          # removes target/
+```
+
+Outside a project the default is still `a.out`, and an explicit `-o` always
+wins.
+
+`pyrs clean` removes the project's target directory and nothing else. The
+machine-wide build cache is `pyrs cache clean`: conflating them would mean
+clearing one project's outputs slowed down every build on the system.
+
+## `pyrs doctor`
+
+`make doctor` checks that a machine can build the *compiler*. `pyrs doctor`
+answers the different question a user has — can this binary compile my
+program, and which interpreter will `--compat` use:
+
+```console
+$ pyrs doctor
+pyrs 0.112.0
+  target       x86_64-linux
+  C compiler   cc (cc (GCC) 16.2.1)
+  interpreter  python3 (python3 on PATH, Python 3.14)
+  cache        /home/you/.cache/pyrs (1.3 GiB)
+  project      /home/you/app/pyproject.toml
+               entry src/app/main.py, root /home/you/app/src, target /home/you/app/target
+
+no problems found
+```
+
+It reads the same resolution code the build runs, so it cannot describe a
+different toolchain than the one used, and it exits non-zero when it finds a
+problem.
+
+## Shell completions
+
+```console
+pyrs completions zsh > ~/.zfunc/_pyrs
+pyrs completions bash > /etc/bash_completion.d/pyrs
+```
+
+`bash`, `zsh`, `fish`, `elvish` and `powershell`.
+
+## Building a project
+
+`pyrs build` (an alias for `compile`) takes the entry, import root and
+optimization level from the manifest, the same way `pyrs run` does:
+
+```console
+pyrs build            # -> target/NAME
+pyrs build -O3
+pyrs clean            # remove target/
+```
+
+`NAME` is the entry module's stem, or its package directory when that stem is
+`main` — so `entry = "src/demo/main.py"` builds `target/demo` rather than
+`target/main`. An explicit `-o` always wins, and outside a project the
+default is still `a.out`.
+
+`pyrs clean` removes the target directory and nothing else. The shared build
+cache is `pyrs cache clean`; conflating the two would mean clearing one
+project's outputs slowed down every build on the machine.
+
+## Checking the toolchain
+
+```console
+pyrs doctor
+```
+
+Reports the C compiler, the resolved interpreter and whether its version
+matches the one PyRs targets, the cache directory and its size, and the
+project it would build — all resolved through the same code the build itself
+runs, so the report cannot describe a different toolchain than the one used.
+It exits non-zero when something is wrong, so a setup script can act on it.
+
+`make doctor` is the different, contributor-facing question: can this machine
+build the compiler.
+
+## Shell completions
+
+```console
+pyrs completions zsh > ~/.zfunc/_pyrs
+pyrs completions bash > /etc/bash_completion.d/pyrs
+```
+
+`bash`, `zsh`, `fish`, `elvish` and `powershell`.
 
 ## Interpreter resolution
 

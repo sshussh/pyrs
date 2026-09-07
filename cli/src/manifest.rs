@@ -42,6 +42,8 @@ pub struct Manifest {
     pub entry: Option<PathBuf>,
     /// Import root, relative to `dir`.
     pub root: Option<PathBuf>,
+    /// Build output directory, relative to `dir`.
+    pub target: Option<PathBuf>,
     pub opt_level: Option<u8>,
     pub execution: Execution,
     /// Interpreter for `--compat` and `build-extension`.
@@ -70,7 +72,41 @@ impl Manifest {
             None => self.dir.clone(),
         }
     }
+
+    /// Resolve `target`, defaulting to `target/` beside the manifest —
+    /// Cargo's name for the same thing, and the reason `pyrs clean` has
+    /// something definite to remove.
+    pub fn target_path(&self) -> PathBuf {
+        match &self.target {
+            Some(t) => self.dir.join(t),
+            None => self.dir.join(DEFAULT_TARGET),
+        }
+    }
+
+    /// Where `pyrs build` writes when no `-o` is given: the entry module's
+    /// stem inside the target directory, so a project builds to a stable,
+    /// predictable path instead of `./a.out` in whatever directory the
+    /// command happened to run from.
+    pub fn default_output(&self) -> Option<PathBuf> {
+        let entry = self.entry.as_ref()?;
+        let stem = entry.file_stem()?;
+        // `src/app/main.py` would otherwise build every project to
+        // `target/main`; the package directory is the meaningful name.
+        let name = if stem == "main" || stem == "__main__" {
+            entry
+                .parent()
+                .and_then(|p| p.file_name())
+                .filter(|n| *n != "src")
+                .unwrap_or(stem)
+        } else {
+            stem
+        };
+        Some(self.target_path().join(name))
+    }
 }
+
+/// Default build output directory, named after Cargo's.
+pub const DEFAULT_TARGET: &str = "target";
 
 /// Nearest ancestor directory (including `start`) whose `pyproject.toml`
 /// declares `[tool.pyrs]`.
@@ -140,6 +176,7 @@ pub fn load(path: &Path) -> Result<Manifest, String> {
         dir,
         entry: None,
         root: None,
+        target: None,
         opt_level: None,
         execution: Execution::Native,
         python: None,
@@ -152,6 +189,7 @@ pub fn load(path: &Path) -> Result<Manifest, String> {
         match key {
             "entry" => manifest.entry = Some(PathBuf::from(want_str(value, &where_, key)?)),
             "root" => manifest.root = Some(PathBuf::from(want_str(value, &where_, key)?)),
+            "target" => manifest.target = Some(PathBuf::from(want_str(value, &where_, key)?)),
             "python" => manifest.python = Some(PathBuf::from(want_str(value, &where_, key)?)),
             "opt-level" => {
                 let n = value
@@ -204,6 +242,7 @@ pub fn load(path: &Path) -> Result<Manifest, String> {
                     &[
                         "entry",
                         "root",
+                        "target",
                         "opt-level",
                         "execution",
                         "python",

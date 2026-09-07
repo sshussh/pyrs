@@ -40,7 +40,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.111.0**.
+Current milestone: **v0.112.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -67,9 +67,10 @@ binary, so compiled executables need no PyRs installation at run time.
 
 ```console
 pyrs run -i prog.py              # compile and run
-pyrs compile -i prog.py -o prog  # build a native executable
+pyrs build -i prog.py -o prog    # build a native executable
 pyrs check -i prog.py            # type-check without building
 pyrs prog.py arg1 arg2           # python-style invocation
+pyrs doctor                      # what PyRs found, and whether it is enough
 ```
 
 Builds are cached, so an unchanged `pyrs run` recompiles nothing:
@@ -89,9 +90,10 @@ root = "src"
 opt-level = 2
 ```
 
-`pyrs init` adds that table; project creation itself is `uv init`'s job. See
-[TOOLING.md](docs/TOOLING.md) for the manifest, build caching and interpreter
-resolution.
+Inside a project, `pyrs build` compiles the entry through the declared import
+root to `target/`, `pyrs clean` removes it, and `pyrs cache` inspects and
+prunes the machine-wide build cache. See [TOOLING.md](docs/TOOLING.md) for the
+manifest, project layout, build caching and interpreter resolution.
 
 ## The language
 
@@ -225,7 +227,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.111.0 && git push origin v0.111.0`.
+Release tags: `git tag v0.112.0 && git push origin v0.112.0`.
 
 ## Documentation
 

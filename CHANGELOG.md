@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.112.0 — `build`, `clean`, `doctor`, completions
+
+`pyrs compile` was not project-aware where `pyrs run` was, so the command
+that produces the artifact ignored the manifest the command that runs it
+obeys. It now takes the entry, import root and optimization level from
+`[tool.pyrs]`, and `build` is an alias — `pyrs build` in a project should
+mean what `cargo build` does.
+
+- **`target/`**, configurable as `[tool.pyrs] target`. With no `-o`, a
+  project builds to `target/NAME` instead of `./a.out` in whatever directory
+  the command ran from. `NAME` comes from the entry's stem, or its package
+  directory when that stem is `main` — so a `src/` layout builds to
+  `target/demo`, not `target/main`.
+- **`pyrs clean`** removes that directory and nothing else. The shared build
+  cache stays `pyrs cache clean`: conflating them would mean clearing one
+  project's outputs slowed down every build on the machine.
+- **`pyrs doctor`** reports the C compiler, the resolved interpreter and
+  whether its version matches the one PyRs targets, the cache and its size,
+  and the project it would build. It resolves all of it through the same code
+  the build runs, so the report cannot describe a different toolchain than
+  the one used, and it exits non-zero when something is actually wrong —
+  a report saying "no problems" about a project that cannot build would be
+  worse than no report.
+- **`pyrs completions bash|zsh|fish|elvish|powershell`.**
+
+Argument errors now name the argument. clap was built without
+`error-context`, so a mistyped flag produced `error: unexpected argument
+found` with nothing to act on:
+
+```console
+$ pyrs check --inpt x.py
+error: unexpected argument '--inpt' found
+
+  tip: a similar argument exists: '--input'
+```
+
+That covers nested subcommands too, so `pyrs cache prun` suggests `prune`.
+
+## 0.112.0 — `doctor`, `clean`, `build`, completions, and argument errors that name the argument
+
+- **`pyrs doctor`** answers the question a *user* has, where `make doctor`
+  answers a contributor's: can this binary compile my program, which
+  interpreter will `--compat` use, how big is the cache, and what project am
+  I in. It reads the same resolution code the build runs, so the report
+  cannot describe a different toolchain than the one used, and it exits
+  non-zero when it finds a problem — a report that says "no problems" about a
+  project that cannot build would be worse than no report.
+
+- **`pyrs build`** is `compile`, and both are now project-aware the way `run`
+  already was. With no `-i` they build the manifest's entry through the
+  declared import root; with no `-o` they write **`target/NAME`** instead of
+  `./a.out` in whatever directory the command ran from. The directory is
+  `[tool.pyrs] target`, defaulting to `target/` — Cargo's name for the same
+  thing. Outside a project the old `a.out` default is unchanged.
+
+- **`pyrs clean`** removes that directory, and only that directory. The
+  machine-wide build cache stays `pyrs cache clean`: conflating the two would
+  mean clearing one project's outputs slowed down every build on the system.
+
+- **`pyrs completions bash|zsh|fish|elvish|powershell`**.
+
+- **Argument errors name the argument.** `pyrs check --inpt x` reported
+  `error: unexpected argument found` — no name, no hint. It now reads:
+
+  ```console
+  error: unexpected argument '--inpt' found
+
+    tip: a similar argument exists: '--input'
+  ```
+
+  This comes from clap's `error-context` and `suggestions` features, which
+  also cover nested subcommands, so `pyrs cache prun` suggests `prune`.
+
+Two new dependencies, `clap_complete` and clap's `strsim`, both from the
+argument parser already in use.
+
 ## 0.111.0 — Cache management, build flags, and a safe subcommand boundary
 
 The build cache had no way to inspect it, no way to clean it, and no bound.
