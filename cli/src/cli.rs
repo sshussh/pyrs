@@ -246,9 +246,27 @@ pub struct InitCommand {
     /// Project directory (default: the current directory)
     pub path: Option<path::PathBuf>,
 
+    /// Project name (default: the directory's name)
+    #[arg(long)]
+    pub name: Option<String>,
+
     /// Entry module to record, relative to the project directory
     #[arg(long)]
     pub entry: Option<path::PathBuf>,
+
+    /// Scaffold a single main.py instead of a src/ package layout
+    #[arg(long)]
+    pub script: bool,
+
+    /// Version control to initialize (default: git, when available)
+    #[arg(long, value_name = "VCS", default_value = "git")]
+    pub vcs: Vcs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Vcs {
+    Git,
+    None,
 }
 
 #[derive(Debug, Args)]

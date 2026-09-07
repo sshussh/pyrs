@@ -40,7 +40,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.112.0**.
+Current milestone: **v0.113.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -90,6 +90,9 @@ root = "src"
 opt-level = 2
 ```
 
+`pyrs init myapp` scaffolds that, plus the `src/` layout, `.gitignore`,
+README, pinned `.python-version` and repository `cargo new` and `uv init` both
+produce — and adds only the table when a `pyproject.toml` already exists.
 Inside a project, `pyrs build` compiles the entry through the declared import
 root to `target/`, `pyrs clean` removes it, and `pyrs cache` inspects and
 prunes the machine-wide build cache. See [TOOLING.md](docs/TOOLING.md) for the
@@ -227,7 +230,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.112.0 && git push origin v0.112.0`.
+Release tags: `git tag v0.113.0 && git push origin v0.113.0`.
 
 ## Documentation
 

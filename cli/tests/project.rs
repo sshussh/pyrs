@@ -76,17 +76,96 @@ fn err(dir: &Path, cache: &Path, args: &[&str]) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn init_writes_a_manifest_and_a_runnable_entry() {
+fn init_scaffolds_the_layout_cargo_and_uv_both_produce() {
     let (_d, root, cache) = project("init-fresh");
     ok(&root, &cache, &["init", "."]);
 
     let manifest = fs::read_to_string(root.join("pyproject.toml")).unwrap();
     assert!(manifest.contains("[tool.pyrs]"), "{manifest}");
-    assert!(manifest.contains("entry = \"main.py\""), "{manifest}");
+    assert!(
+        manifest.contains("entry = \"src/proj/main.py\""),
+        "{manifest}"
+    );
+    // A src/ layout is only importable with a declared root, so init has to
+    // write the one that matches the layout it just scaffolded.
+    assert!(manifest.contains("root = \"src\""), "{manifest}");
     // The interpreter PyRs was built against, not uv's default: a mismatch
     // otherwise shows up only when something Unicode-shaped disagrees.
     assert!(manifest.contains("requires-python"), "{manifest}");
-    assert_eq!(ok(&root, &cache, &["run"]), "Hello from PyRs!\n");
+
+    for file in [
+        "src/proj/main.py",
+        "src/proj/__init__.py",
+        "README.md",
+        ".gitignore",
+        ".python-version",
+    ] {
+        assert!(root.join(file).is_file(), "missing {file}");
+    }
+    // `requires-python` states the floor; `.python-version` is what uv reads
+    // when it provisions the environment.
+    let pinned = fs::read_to_string(root.join(".python-version")).unwrap();
+    assert!(pinned.trim().starts_with("3."), "{pinned}");
+    // Build output must never be committed.
+    let ignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert!(ignore.contains("/target"), "{ignore}");
+
+    assert_eq!(ok(&root, &cache, &["run"]), "Hello from proj!\n");
+    ok(&root, &cache, &["build"]);
+    assert!(root.join("target/proj").is_file());
+}
+
+#[test]
+fn init_script_scaffolds_a_single_file_program() {
+    let (_d, root, cache) = project("init-script");
+    ok(&root, &cache, &["init", "--script", "."]);
+    let manifest = fs::read_to_string(root.join("pyproject.toml")).unwrap();
+    assert!(manifest.contains("entry = \"main.py\""), "{manifest}");
+    // No src/ layout means no import root to declare.
+    assert!(!manifest.contains("root ="), "{manifest}");
+    assert!(root.join("main.py").is_file());
+    assert!(!root.join("src").exists());
+    assert_eq!(ok(&root, &cache, &["run"]), "Hello from proj!\n");
+}
+
+#[test]
+fn init_names_the_package_after_the_project_not_the_directory_text() {
+    // A package directory has to be a Python identifier, so a hyphenated
+    // project name cannot be used verbatim -- the same mapping uv applies.
+    let (_d, root, cache) = project("init-name");
+    ok(&root, &cache, &["init", "--name", "my-app", "."]);
+    let manifest = fs::read_to_string(root.join("pyproject.toml")).unwrap();
+    assert!(manifest.contains("name = \"my-app\""), "{manifest}");
+    assert!(
+        manifest.contains("entry = \"src/my_app/main.py\""),
+        "{manifest}"
+    );
+    assert!(root.join("src/my_app/main.py").is_file());
+    assert_eq!(ok(&root, &cache, &["run"]), "Hello from my-app!\n");
+}
+
+#[test]
+fn init_leaves_an_existing_gitignore_alone_apart_from_the_target_line() {
+    let (_d, root, cache) = project("init-gitignore");
+    write(
+        &root.join(".gitignore"),
+        "secrets.env
+",
+    );
+    ok(&root, &cache, &["init", "."]);
+    let ignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert!(ignore.contains("secrets.env"), "clobbered: {ignore}");
+    assert!(ignore.contains("/target"), "{ignore}");
+
+    // Running it twice must not accumulate duplicate lines.
+    let manifest = root.join("pyproject.toml");
+    let text = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("[tool.pyrs]", "[tool.other]");
+    write(&manifest, &text);
+    ok(&root, &cache, &["init", "."]);
+    let again = fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert_eq!(again.matches("/target").count(), 1, "{again}");
 }
 
 #[test]
@@ -124,8 +203,81 @@ fn init_refuses_to_overwrite_an_existing_table() {
 fn init_preserves_an_existing_entry_file() {
     let (_d, root, cache) = project("init-keep-entry");
     write(&root.join("main.py"), "print(\"mine\")\n");
-    ok(&root, &cache, &["init", "."]);
+    ok(&root, &cache, &["init", "--script", "."]);
     assert_eq!(ok(&root, &cache, &["run"]), "mine\n");
+}
+
+#[test]
+fn init_starts_a_repository_and_can_be_told_not_to() {
+    // The test tree lives inside PyRs's own repository, and git's search
+    // walks upward -- so the "no repository here" case has to be arranged
+    // rather than assumed.
+    let (d, root, cache) = project("init-vcs");
+    let out = Command::new(PYRS)
+        .args(["init", "."])
+        .current_dir(&root)
+        .env("PYRS_CACHE_DIR", &cache)
+        .env("GIT_CEILING_DIRECTORIES", &d.0)
+        .output()
+        .expect("failed to spawn PyRs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        root.join(".git").is_dir(),
+        "cargo and uv both start a repository; a scaffold that does not \
+         leaves the user to make the first commit without a .gitignore"
+    );
+
+    let (_d2, plain, cache2) = project("init-vcs-none");
+    ok(&plain, &cache2, &["init", "--vcs", "none", "."]);
+    assert!(!plain.join(".git").exists());
+    assert!(plain.join("src").is_dir(), "the rest still gets scaffolded");
+}
+
+#[test]
+fn init_does_not_nest_a_repository_inside_one() {
+    // What cargo does, and the reason: a nested repository inside a checkout
+    // is almost never what was wanted, and is easy to create by accident.
+    let (_d, root, cache) = project("init-vcs-nested");
+    assert!(
+        Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(&root)
+            .output()
+            .is_ok_and(|o| o.status.success()),
+        "this test needs to run inside a checkout"
+    );
+    ok(&root, &cache, &["init", "."]);
+    assert!(!root.join(".git").exists());
+    assert!(root.join("src").is_dir());
+}
+
+#[test]
+fn init_adopts_an_existing_projects_layout_rather_than_adding_a_second_entry() {
+    // The likely history: `uv init` made this, and PyRs is being added to
+    // it. Scaffolding a parallel entry point beside the real one would be
+    // worse than useless.
+    let (_d, root, cache) = project("init-adopt");
+    write(
+        &root.join("pyproject.toml"),
+        "[project]\nname = \"proj\"\nversion = \"0.1.0\"\n",
+    );
+    write(&root.join("src/proj/main.py"), "print(\"theirs\")\n");
+    ok(&root, &cache, &["init", "."]);
+
+    let manifest = fs::read_to_string(root.join("pyproject.toml")).unwrap();
+    assert!(
+        manifest.contains("entry = \"src/proj/main.py\""),
+        "{manifest}"
+    );
+    assert!(manifest.contains("root = \"src\""), "{manifest}");
+    // Nothing else invented: no README, no .python-version, no repository.
+    assert!(!root.join("README.md").exists());
+    assert!(!root.join(".python-version").exists());
+    assert_eq!(ok(&root, &cache, &["run"]), "theirs\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +287,7 @@ fn init_preserves_an_existing_entry_file() {
 #[test]
 fn discovery_walks_up_to_the_nearest_manifest() {
     let (_d, root, cache) = project("discover-up");
-    ok(&root, &cache, &["init", "."]);
+    ok(&root, &cache, &["init", "--script", "."]);
     write(&root.join("main.py"), "print(\"found\")\n");
     let deep = root.join("a").join("b").join("c");
     fs::create_dir_all(&deep).unwrap();
@@ -172,7 +324,7 @@ fn an_explicit_input_bypasses_discovery() {
 #[test]
 fn the_manifest_supplies_the_optimization_level_and_the_flag_wins() {
     let (_d, root, cache) = project("opt-level");
-    ok(&root, &cache, &["init", "."]);
+    ok(&root, &cache, &["init", "--script", "."]);
     write(&root.join("main.py"), "print(\"opt\")\n");
     let manifest = root.join("pyproject.toml");
     let text = fs::read_to_string(&manifest)
@@ -206,13 +358,19 @@ fn a_declared_root_makes_a_src_layout_importable() {
     );
     ok(&root, &cache, &["init", "--entry", "src/app/main.py", "."]);
 
+    // An entry under src/ implies the root, so init records it rather than
+    // scaffolding a layout that does not resolve.
     let manifest = root.join("pyproject.toml");
-    let without_root = fs::read_to_string(&manifest).unwrap();
+    let with_root = fs::read_to_string(&manifest).unwrap();
+    assert!(with_root.contains("root = \"src\""), "{with_root}");
+    assert_eq!(ok(&root, &cache, &["run"]), "packaged\n");
+
+    // And the root is what makes it work: without it the sibling package is
+    // invisible, because the resolver otherwise roots at the entry's own
+    // directory.
+    write(&manifest, &with_root.replace("root = \"src\"\n", ""));
     let message = err(&root, &cache, &["run"]);
     assert!(message.contains("No module named 'pkg'"), "{message}");
-
-    write(&manifest, &format!("{without_root}root = \"src\"\n"));
-    assert_eq!(ok(&root, &cache, &["run"]), "packaged\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +388,7 @@ fn set_execution(root: &Path, mode: &str) {
 #[test]
 fn declared_compat_runs_a_program_native_compilation_rejects() {
     let (_d, root, cache) = project("compat-declared");
-    ok(&root, &cache, &["init", "."]);
+    ok(&root, &cache, &["init", "--script", "."]);
     // `sys.implementation` is not in PyRs's subset, so this program can only
     // run under CPython -- which makes the mode observable.
     write(
@@ -249,7 +407,7 @@ fn no_compat_overrides_a_manifest_that_asks_for_compat() {
     // Needed so a project can test whether its program has become natively
     // compilable without editing the file.
     let (_d, root, cache) = project("no-compat");
-    ok(&root, &cache, &["init", "."]);
+    ok(&root, &cache, &["init", "--script", "."]);
     write(
         &root.join("main.py"),
         "import sys\nprint(sys.implementation.name)\n",
@@ -267,7 +425,7 @@ fn compat_is_never_selected_by_dependencies() {
     // execution mode from a metadata table would be exactly the invisible
     // switch the product contract rules out.
     let (_d, root, cache) = project("no-inference");
-    ok(&root, &cache, &["init", "."]);
+    ok(&root, &cache, &["init", "--script", "."]);
     write(
         &root.join("main.py"),
         "import sys\nprint(sys.implementation.name)\n",
@@ -275,7 +433,7 @@ fn compat_is_never_selected_by_dependencies() {
     let manifest = root.join("pyproject.toml");
     let text = fs::read_to_string(&manifest)
         .unwrap()
-        .replace("[project]", "[project]\ndependencies = [\"requests\"]");
+        .replace("dependencies = []", "dependencies = [\"requests\"]");
     write(&manifest, &text);
 
     let message = err(&root, &cache, &["run"]);

@@ -766,11 +766,16 @@ fn doctor() -> Result<i32, String> {
     }
 }
 
-/// `pyrs init`: record a `[tool.pyrs]` table for this project.
+/// `pyrs init`: scaffold a PyRs project, or add the one table PyRs needs to
+/// a project that already exists.
 ///
-/// Project *creation* is `uv init`'s job — this only adds the one table PyRs
-/// needs, and writes a minimal `pyproject.toml` when there is not one yet so
-/// the command works without uv installed.
+/// There is still no `pyrs new`. The split is by *what is already there*,
+/// not by which command was typed: a directory with a `pyproject.toml`
+/// belongs to a project someone else created — `uv init`, most likely — and
+/// gets exactly one table added and nothing else touched. A directory
+/// without one gets the layout cargo and uv both scaffold, because a user
+/// starting from nothing should not have to assemble it by hand just because
+/// PyRs declined to own project creation.
 fn init_project(cmd: cli::InitCommand) -> Result<i32, String> {
     let dir = cmd.path.unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
@@ -783,46 +788,209 @@ fn init_project(cmd: cli::InitCommand) -> Result<i32, String> {
         ));
     }
 
-    let entry = cmd.entry.unwrap_or_else(|| PathBuf::from("main.py"));
+    let name = match &cmd.name {
+        Some(name) => name.clone(),
+        None => project_name(&dir),
+    };
+    let module = module_name(&name);
+    let scaffolding = existing.trim().is_empty();
+
+    // Where the program lives. `src/<module>/main.py` is uv's layout (and
+    // cargo's `src/`); `--script` is uv's older flat one, which is still the
+    // right shape for a single-file program.
+    let entry = match (&cmd.entry, cmd.script, scaffolding) {
+        (Some(entry), _, _) => entry.clone(),
+        (None, true, _) => PathBuf::from("main.py"),
+        (None, false, true) => PathBuf::from("src").join(&module).join("main.py"),
+        // An existing project: adopt whatever it already has rather than
+        // inventing a second entry point beside it.
+        (None, false, false) => discover_entry(&dir, &module),
+    };
+    let in_src = entry.starts_with("src");
+
     let mut text = existing.clone();
-    if text.trim().is_empty() {
-        let name = dir
-            .canonicalize()
-            .ok()
-            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "app".to_string());
-        let name: String = name
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '-' })
-            .collect();
-        // `requires-python` is pinned to the interpreter PyRs was built
-        // against: uv otherwise picks its own default, and a mismatch shows up
-        // only when something Unicode- or compat-shaped disagrees.
+    if scaffolding {
         text = format!(
-            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\nrequires-python = \">={}\"\n",
+            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\n\
+             description = \"Add your description here\"\nreadme = \"README.md\"\n\
+             requires-python = \">={}\"\ndependencies = []\n",
             codegen::oracle_python_minor()
         );
     } else if !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!(
-        "\n[tool.pyrs]\nentry = \"{}\"\nopt-level = 2\nexecution = \"native\"\n",
-        entry.display()
-    ));
+    text.push_str("\n[tool.pyrs]\n");
+    text.push_str(&format!("entry = \"{}\"\n", slashed(&entry)));
+    if in_src {
+        text.push_str("root = \"src\"\n");
+    }
+    text.push_str("opt-level = 2\nexecution = \"native\"\n");
     fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
 
-    let entry_path = dir.join(&entry);
-    if !entry_path.exists() {
-        if let Some(parent) = entry_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(
-            &entry_path,
-            "def main() -> None:\n    print(\"Hello from PyRs!\")\n\n\nmain()\n",
-        );
+    let mut wrote = vec![path.clone()];
+    if scaffolding {
+        // `requires-python` states the floor; `.python-version` is what uv
+        // actually reads when it provisions the environment, and PyRs's
+        // Unicode tables and differential oracle come from a specific
+        // CPython. Writing only the first would leave uv free to pick 3.12.
+        wrote.extend(write_new(
+            &dir.join(".python-version"),
+            &format!("{}\n", codegen::oracle_python_minor()),
+        ));
+        wrote.extend(write_new(
+            &dir.join("README.md"),
+            &format!("# {name}\n\nBuilt with [PyRs](https://github.com/sshussh/pyrs).\n\n```console\npyrs run\npyrs build\n```\n"),
+        ));
     }
-    println!("wrote [tool.pyrs] to {}", path.display());
+    // Even in an existing project, build output must not be committed.
+    wrote.extend(ensure_ignored(&dir)?);
+
+    if in_src {
+        wrote.extend(write_new(
+            &dir.join("src").join(&module).join("__init__.py"),
+            "",
+        ));
+    }
+    let entry_path = dir.join(&entry);
+    wrote.extend(write_new(
+        &entry_path,
+        &format!("def main() -> None:\n    print(\"Hello from {name}!\")\n\n\nmain()\n"),
+    ));
+
+    if cmd.vcs == cli::Vcs::Git && scaffolding {
+        init_git(&dir);
+    }
+
+    println!("initialized project `{name}` at {}", dir.display());
+    for file in &wrote {
+        println!("  {}", file.display());
+    }
     Ok(0)
+}
+
+/// Write `text` only when nothing is there. Every file `init` produces is a
+/// starting point, so overwriting one would destroy work to supply a
+/// template — and `init` on an existing project is a normal thing to do.
+fn write_new(path: &Path, text: &str) -> Option<PathBuf> {
+    if path.exists() {
+        return None;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(path, text).ok().map(|()| path.to_path_buf())
+}
+
+/// The entry an existing project already has, or the conventional one.
+fn discover_entry(dir: &Path, module: &str) -> PathBuf {
+    for candidate in [
+        PathBuf::from("src").join(module).join("main.py"),
+        PathBuf::from("src").join(module).join("__main__.py"),
+        PathBuf::from("main.py"),
+        PathBuf::from("__main__.py"),
+    ] {
+        if dir.join(&candidate).is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("main.py")
+}
+
+/// Project name from a directory, falling back when the directory has no
+/// usable name of its own (`.`, `/`, a name of only punctuation).
+fn project_name(dir: &Path) -> String {
+    let raw = dir
+        .canonicalize()
+        .ok()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('-').to_string();
+    if cleaned.is_empty() {
+        "app".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Import name for a project name. A package directory has to be a Python
+/// identifier, so `my-app` becomes `my_app` — the same mapping uv uses.
+fn module_name(name: &str) -> String {
+    let mut module: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    if module
+        .chars()
+        .next()
+        .is_none_or(|c| !(c.is_alphabetic() || c == '_'))
+    {
+        module.insert(0, '_');
+    }
+    module
+}
+
+/// Manifest paths are `/`-separated regardless of platform, so a project
+/// written on Windows still resolves on Linux.
+fn slashed(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Make sure the build output directory is ignored, without clobbering an
+/// existing `.gitignore`.
+fn ensure_ignored(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let path = dir.join(".gitignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|l| {
+        let l = l.trim();
+        l == "/target" || l == "target" || l == "target/" || l == "/target/"
+    }) {
+        return Ok(Vec::new());
+    }
+    let mut text = existing.clone();
+    if text.is_empty() {
+        text.push_str(
+            "# Python-generated files\n__pycache__/\n*.py[oc]\nbuild/\ndist/\nwheels/\n\
+             *.egg-info\n\n# Virtual environments\n.venv\n",
+        );
+    } else if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("\n# PyRs build output\n/target\n");
+    fs::write(&path, &text).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(vec![path])
+}
+
+/// `git init`, the way cargo and uv both do it.
+///
+/// Best-effort in every direction: no git on the machine, a directory
+/// already inside a repository, or a git that fails for its own reasons must
+/// none of them turn a successful scaffold into a failure.
+fn init_git(dir: &Path) {
+    let inside = process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(dir)
+        .output();
+    if matches!(&inside, Ok(out) if out.status.success()) {
+        return;
+    }
+    let _ = process::Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .current_dir(dir)
+        .status();
 }
 
 fn read_source(path: &Path) -> Result<String, String> {

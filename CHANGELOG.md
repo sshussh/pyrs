@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.113.0 — `pyrs init` scaffolds the layout cargo and uv both produce
+
+`pyrs init` wrote a flat `main.py` and one table. `cargo new` and `uv init`
+both produce a `src/` layout, a `.gitignore`, a README, a pinned interpreter
+and a repository — so a user starting from nothing had to assemble by hand
+what every neighbouring tool hands them.
+
+```console
+$ pyrs init myapp
+initialized project `myapp` at myapp
+  myapp/pyproject.toml
+  myapp/.python-version
+  myapp/README.md
+  myapp/.gitignore
+  myapp/src/myapp/__init__.py
+  myapp/src/myapp/main.py
+```
+
+- The **`src/` layout**, with `root = "src"` written alongside it — a src
+  layout is only importable with a declared root, so scaffolding one without
+  the other would produce a project that does not resolve.
+- **`.gitignore`** carrying `/target`, so the first commit cannot contain
+  build output. An existing `.gitignore` gets the one line appended and
+  nothing else touched, and running `init` twice does not duplicate it.
+- **`.python-version`** pinned to the CPython PyRs was built against.
+  `requires-python` states the floor, but `.python-version` is what uv
+  actually reads when it provisions the environment — writing only the first
+  left uv free to pick 3.12 against PyRs's 3.14.
+- **`git init`**, unless `--vcs none`, and never nested inside a repository
+  that already exists.
+- `--name` for a project name that is not the directory's. A package
+  directory has to be a Python identifier, so `my-app` produces
+  `src/my_app/`, the mapping uv uses.
+- `--script` keeps the flat single-file layout for a single-file program.
+
+**There is still no `pyrs new`,** and the split is by what is already there
+rather than by which command was typed. A directory that already has a
+`pyproject.toml` belongs to a project someone else created — `uv init`, most
+likely — and gets exactly one table added, its existing entry point adopted
+rather than a second one invented beside it, and nothing else written.
+
+`[tool.pyrs] target` was added in 0.112; `init` now records it in
+`.gitignore` as well.
+
 ## 0.112.0 — `build`, `clean`, `doctor`, completions
 
 `pyrs compile` was not project-aware where `pyrs run` was, so the command

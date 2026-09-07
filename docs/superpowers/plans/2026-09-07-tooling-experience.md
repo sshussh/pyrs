@@ -132,15 +132,70 @@ pinning the shim to every subcommand clap knows about.
 
 ## Milestone 0.112.0 — CLI ergonomics
 
-`pyrs doctor` (user-facing toolchain report), `pyrs clean` (project outputs),
-`pyrs completions <shell>`, and clap's `suggestions`/`error-context` features
-so an unknown flag names itself.
+**`pyrs doctor`** answers the question a *user* has, where `make doctor`
+answers a contributor's. It reads the same resolution code the build runs, so
+it cannot describe a different toolchain than the one used, and exits
+non-zero on a problem — a report that says "no problems" about a project that
+cannot build would be worse than no report.
+
+**`pyrs build`** is `compile`, and both become project-aware the way `run`
+already was: no `-i` builds the manifest entry through the declared import
+root, no `-o` writes `target/NAME` rather than `./a.out` in the current
+directory. The directory is `[tool.pyrs] target`, defaulting to `target/`.
+
+The naming needs care in one place. `pyrs clean` removes the *project's*
+output directory; the machine-wide cache stays `pyrs cache clean`. Conflating
+them would mean clearing one project's outputs slowed down every build on the
+system — the confusion `cargo clean` avoids by owning only `target/`.
+
+**`pyrs completions`** for five shells, and clap's `error-context` +
+`suggestions` features, which also fix nested subcommands for free.
+
+### Verification
+
+18 tests in `cli/tests/tooling.rs`: default and explicit outputs, a
+configurable target directory, the unchanged `a.out` default outside a
+project, clean against dry-run and against the shared cache, doctor's exit
+code on a broken manifest, completion output for every shell, and both flag
+and nested-subcommand typos.
 
 ## Milestone 0.113.0 — project scaffolding
 
-`pyrs init` currently writes a flat `main.py` and one table. Cargo and uv both
-scaffold a `src/` layout, a README, a `.gitignore`, a pinned interpreter and a
-git repository. Matching that is the milestone.
+`pyrs init` wrote a flat `main.py` and one table. `cargo new` and `uv init`
+both produce a `src/` layout, a `.gitignore`, a README, a pinned interpreter
+and a repository.
+
+**The split stays "no `pyrs new`", but by what is already there rather than
+by which command was typed.** A directory with a `pyproject.toml` belongs to
+a project someone else created and gets one table, its existing entry adopted
+rather than a second one invented beside it, and nothing else. A directory
+without one gets the full layout — a user starting from nothing should not
+have to assemble it by hand just because PyRs declined to own project
+creation.
+
+Three details that are not cosmetic:
+
+- `root = "src"` is written *with* the layout. A `src/` layout is only
+  importable with a declared root, so scaffolding one without the other
+  produces a project that does not resolve.
+- `.python-version`, not just `requires-python`. The latter states a floor;
+  the former is what uv reads when it provisions the environment, and PyRs's
+  Unicode tables and differential oracle come from a specific CPython.
+  Writing only `requires-python` left uv free to pick 3.12 against 3.14.
+- `/target` in `.gitignore`, so the first commit cannot contain build output.
+
+`--name my-app` produces `src/my_app/`: a package directory has to be a
+Python identifier, the same mapping uv applies.
+
+### Verification
+
+`cli/tests/project.rs` grows from 19 to 25. Six existing tests changed
+premise rather than breaking: they scaffolded a flat `main.py` and now pass
+`--script`, and `a_declared_root_makes_a_src_layout_importable` inverted —
+init now writes the root, so the test asserts that and then removes it to
+show the root is what makes the layout work. The git tests need
+`GIT_CEILING_DIRECTORIES`, because the test tree lives inside PyRs's own
+repository and git's search walks upward.
 
 ## Later, planned but not scheduled here
 

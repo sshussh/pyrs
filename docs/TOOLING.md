@@ -77,17 +77,56 @@ become natively compilable without editing the file.
 
 ## `pyrs init`
 
-There is no `pyrs new`. Project creation is `uv init`; `pyrs init` adds the
-one table PyRs needs to a `pyproject.toml` that already exists, and writes a
-minimal one when there is not (so it works without uv installed). It refuses
-to overwrite an existing `[tool.pyrs]` table, and leaves an existing entry
-file alone.
+There is no `pyrs new`. The split is by **what is already there**, not by
+which command was typed.
+
+**A directory that already has a `pyproject.toml`** belongs to a project
+someone else created — `uv init`, most likely. It gets exactly one table
+added, its existing entry point adopted rather than a second one invented
+beside it, and nothing else written:
 
 ```bash
 uv init myapp && cd myapp
-pyrs init --entry src/myapp/main.py .
+pyrs init
 pyrs run
 ```
+
+**A directory without one** gets the layout cargo and uv both scaffold,
+because a user starting from nothing should not have to assemble it by hand
+just because PyRs declined to own project creation:
+
+```console
+$ pyrs init myapp
+initialized project `myapp` at myapp
+  myapp/pyproject.toml
+  myapp/.python-version
+  myapp/README.md
+  myapp/.gitignore
+  myapp/src/myapp/__init__.py
+  myapp/src/myapp/main.py
+```
+
+`root = "src"` is written alongside the layout: a `src/` layout is only
+importable with a declared root, so scaffolding one without the other would
+produce a project that does not resolve. `.gitignore` carries `/target` so
+the first commit cannot contain build output; an existing one gets that line
+appended and nothing else touched.
+
+`.python-version` is pinned to the CPython PyRs was built against.
+`requires-python` states the floor, but `.python-version` is what uv reads
+when it provisions the environment — writing only the first left uv free to
+pick its own default.
+
+| Flag | Effect |
+|---|---|
+| `--name NAME` | Project name; defaults to the directory's. A package directory must be a Python identifier, so `my-app` produces `src/my_app/` |
+| `--entry PATH` | Entry module to record. An entry under `src/` implies `root = "src"` |
+| `--script` | A flat `main.py` instead of the `src/` layout, for a single-file program |
+| `--vcs git\|none` | `git init` unless told not to; never nested inside an existing repository |
+
+`init` refuses to overwrite an existing `[tool.pyrs]` table, and never
+overwrites a file that is already there — every file it produces is a
+starting point, and `init` on an existing project is a normal thing to do.
 
 ## Building a project
 
@@ -118,7 +157,7 @@ program, and which interpreter will `--compat` use:
 
 ```console
 $ pyrs doctor
-pyrs 0.112.0
+pyrs 0.113.0
   target       x86_64-linux
   C compiler   cc (cc (GCC) 16.2.1)
   interpreter  python3 (python3 on PATH, Python 3.14)
