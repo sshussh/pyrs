@@ -235,12 +235,56 @@ hostile source text, the position-less case, the unchanged human format, the
 phase surviving both) and twelve in `cli/tests/tooling.rs` (28 total),
 including one that asserts all three failing phases reach JSON.
 
+## Milestone 0.115.0 — `pyrs test`
+
+The one testing job that is unambiguously PyRs's, and the argument for it is
+worth stating precisely: pytest under CPython tests whether the *logic* is
+right, better than anything PyRs would build. It cannot test whether the
+**compiled** program agrees — which is the failure mode a subset compiler
+actually has.
+
+**The runner is a generated program, not a runtime feature.** PyRs is
+closed-world with no reflection, so nothing can enumerate test functions at
+run time. The driver parses the discovered modules, emits a `__main__` that
+calls each test inside a `try`, and compiles it like any other program. A
+unit test parses the generated source, which keeps it honest: a test run
+exercises the compiler on ordinary code rather than on a private back door.
+
+Three decisions the implementation forced:
+
+- **Results go to a file, not stdout.** The first design used sentinel lines
+  in stdout, which collide with whatever the test itself prints and have to
+  be stripped back out. A file has neither problem, and `open(..., "w")` with
+  immediate flushing means a run that crashes mid-suite leaves every result
+  up to the crash on disk. A short results file is reported as `N not run`
+  with a non-zero exit — reporting the survivors as the whole run would turn
+  a crash into a green build.
+- **Tests taking parameters are skipped, not rejected.** Fixtures are why a
+  test takes arguments; refusing a file pytest handles fine would make
+  `pyrs test` unusable beside it.
+- **No tests is exit 0.** Failing there would make the command unusable in CI
+  from day one.
+
+The subset does not have `sys.exit`, `SystemExit(int)` or exception
+constructors, and `type(e).__name__` is not available either — probed before
+designing, and the reason the exit status comes from the driver rather than
+from the generated program.
+
+### Verification
+
+14 tests in `cli/tests/test_runner.rs` and 7 in `testing.rs`, including one
+that runs the same test files under CPython to confirm the premise, and one
+that indexes past the end of a list mid-suite to confirm a crash is not
+reported as a pass.
+
 ## Later, planned but not scheduled here
 
 - Stable error codes and `pyrs explain`, especially valuable for a *subset*
   compiler where the common error is "this exists in Python but not here" and
   the useful answer is a paragraph.
-- `--debug` (`-g`) so compiled programs can be profiled or debugged at all.
-- `pyrs test`: compile `test_*.py` and run it natively. pytest under CPython
-  tests your logic; only a native runner catches PyRs-vs-CPython divergence
-  in your own code.
+- **Line-level debug info.** Corrected from the original plan: function
+  symbols are already emitted (`nm` shows `pyrs_fib`), so `perf` works today.
+  What is missing is DWARF line tables, which need debug metadata in the
+  emitted LLVM IR — a codegen milestone, not a `--debug` flag. Shipping the
+  flag as a `-g` pass-through would only add symbols for the C runtime while
+  implying user-code debugging.

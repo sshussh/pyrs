@@ -171,7 +171,26 @@ pub fn load_program_with_roots(root: &Path, roots: &[PathBuf]) -> Result<Vec<Loa
 pub fn load_inline(source: String, display: &str) -> Result<Vec<Loaded>, LoadError> {
     let cwd = std::env::current_dir()
         .map_err(|e| LoadError::plain(format!("failed to read working directory: {e}")))?;
-    let roots = import_fs_roots(cwd);
+    load_inline_with_roots(source, display, &import_fs_roots(cwd))
+}
+
+/// Inline source with an explicit search path.
+///
+/// `pyrs test` needs this: the program it runs is synthesized rather than
+/// read from disk, but it has to import the project's modules through the
+/// same roots a real entry point would.
+pub fn load_inline_with_roots(
+    source: String,
+    display: &str,
+    roots: &[PathBuf],
+) -> Result<Vec<Loaded>, LoadError> {
+    let mut roots = roots.to_vec();
+    if let Some(p) = env_stdlib_root() {
+        push_unique_root(&mut roots, p);
+    }
+    if let Some(p) = workspace_stdlib_root() {
+        push_unique_root(&mut roots, p);
+    }
     let parsed = parse_source(display.to_string(), source, ROOT_NAME, None, false, &roots)?;
     load_parsed(parsed, &roots)
 }

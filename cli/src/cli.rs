@@ -171,6 +171,32 @@ pub enum Command {
 
     /// Show the import graph the compiler resolved
     Tree(TreeCommand),
+
+    /// Compile and run the project's tests natively
+    Test(TestCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct TestCommand {
+    /// Only run tests whose name contains this
+    #[arg(value_name = "FILTER")]
+    pub filter: Option<String>,
+
+    /// Test file or directory to search (default: the project's roots)
+    #[arg(short, long)]
+    pub input: Option<path::PathBuf>,
+
+    /// Optimization level (0-3); defaults to the manifest, then 2
+    #[arg(short = 'O', long = "opt-level", value_parser = clap::value_parser!(u8).range(0..=3))]
+    pub opt_level: Option<u8>,
+
+    /// Recompile from scratch, reusing and publishing nothing
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// List the tests that would run, without running them
+    #[arg(long)]
+    pub list: bool,
 }
 
 #[derive(Debug, Args)]

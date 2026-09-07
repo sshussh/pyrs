@@ -157,7 +157,7 @@ program, and which interpreter will `--compat` use:
 
 ```console
 $ pyrs doctor
-pyrs 0.114.0
+pyrs 0.115.0
   target       x86_64-linux
   C compiler   cc (cc (GCC) 16.2.1)
   interpreter  python3 (python3 on PATH, Python 3.14)
@@ -224,6 +224,47 @@ pyrs completions bash > /etc/bash_completion.d/pyrs
 ```
 
 `bash`, `zsh`, `fish`, `elvish` and `powershell`.
+
+## `pyrs test`
+
+```console
+$ pyrs test
+running 3 tests
+test test_util::test_add ... ok
+test test_util::test_add_negative ... ok
+test test_util::test_broken ... FAILED
+
+failures:
+    test_util::test_broken
+        one plus one is not three
+
+test result: FAILED. 2 passed; 1 failed
+```
+
+pytest under CPython already tests whether your logic is right. What it
+cannot do is tell you whether the **compiled** program agrees with it, which
+is exactly the failure mode of a compiler for a Python subset. The test files
+stay ordinary Python, so both engines run them and the answers can be
+compared rather than trusted.
+
+Discovery follows pytest's conventions — `test_*.py` and `*_test.py`, under
+the declared import root and under `tests/` when it exists, in sorted order.
+A positional argument filters by test or module name, and `--list` shows what
+would run without running it.
+
+Tests taking parameters are **skipped, not rejected**: fixtures are why a
+test takes arguments, PyRs cannot supply them, and failing the whole run over
+a file pytest handles fine would make `pyrs test` unusable beside it. Any
+exception fails its test, not just `AssertionError`, and one failure does not
+stop the rest. A project with no tests exits 0.
+
+The runner is a *generated program*, not a runtime feature: PyRs is
+closed-world with no reflection, so the driver parses the modules it found,
+emits a `__main__` calling each test inside a `try`, and compiles that like
+any other program. Results go to a file rather than stdout, so a test's own
+printing stays exactly what was written; a run that crashes mid-suite leaves
+the results up to the crash on disk and is reported as `N not run`, never as
+a pass.
 
 ## Diagnostics for tools
 

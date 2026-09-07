@@ -18,6 +18,7 @@ mod hash;
 mod interpreter;
 mod manifest;
 mod modules;
+mod testing;
 
 use diagnostics::{Failure, Format};
 
@@ -65,6 +66,7 @@ fn run(args: cli::Cli) -> Result<i32, String> {
         cli::Command::Cache(cmd) => manage_cache(cmd),
         cli::Command::Clean(cmd) => clean_project(cmd),
         cli::Command::Tree(cmd) => show_tree(cmd),
+        cli::Command::Test(cmd) => run_tests(cmd),
         cli::Command::Doctor => doctor(),
         cli::Command::Completions(cmd) => {
             use clap::CommandFactory;
@@ -629,6 +631,171 @@ fn report_removed(verb: &str, removed: &cache::Removed, dry_run: bool) {
     } else {
         println!("{verb} {what}");
     }
+}
+
+/// `pyrs test`: compile the project's tests and run them natively.
+///
+/// pytest under CPython already tests whether your logic is right. What it
+/// cannot do is tell you whether the *compiled* program agrees with it,
+/// which is precisely the failure mode of a compiler for a Python subset.
+fn run_tests(cmd: cli::TestCommand) -> Result<i32, String> {
+    let project = match std::env::current_dir() {
+        Ok(dir) => manifest::discover(&dir)?,
+        Err(_) => None,
+    };
+    let m = match &project {
+        Some(path) => Some(manifest::load(path)?),
+        None => None,
+    };
+
+    // Where to look, and what those directories are roots *for*. A test
+    // module has to be importable to be runnable, so the search roots and
+    // the import roots are the same set by construction.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    match (&cmd.input, &m) {
+        (Some(input), _) if input.is_file() => {
+            roots.push(input.parent().unwrap_or(Path::new(".")).to_path_buf());
+        }
+        (Some(input), _) => roots.push(input.clone()),
+        (None, Some(m)) => {
+            roots.push(m.root_path());
+            // pytest's `tests/` sits outside a `src/` import root, so it is
+            // only importable if it is a root of its own.
+            let tests = m.dir.join("tests");
+            if tests.is_dir() {
+                roots.push(tests);
+            }
+        }
+        (None, None) => roots.push(PathBuf::from(".")),
+    }
+
+    let single_file = cmd.input.as_ref().filter(|i| i.is_file());
+    let mut discovered: Vec<(String, PathBuf)> = Vec::new();
+    match single_file {
+        Some(file) => {
+            let stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .ok_or_else(|| format!("{} has no module name", file.display()))?;
+            discovered.push((stem, file.clone()));
+        }
+        None => {
+            for root in &roots {
+                for found in testing::discover(root) {
+                    if !discovered.iter().any(|(name, _)| *name == found.0) {
+                        discovered.push(found);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut modules = Vec::new();
+    let mut total = 0usize;
+    for (name, path) in discovered {
+        let source = read_source(&path)?;
+        let ast = parser::parse(&source).map_err(|d| render_diag(&d, &path, &source))?;
+        let tests: Vec<String> = testing::collect_tests(&ast)
+            .into_iter()
+            .filter(|test| match &cmd.filter {
+                Some(needle) => test.contains(needle.as_str()) || name.contains(needle.as_str()),
+                None => true,
+            })
+            .collect();
+        if tests.is_empty() {
+            continue;
+        }
+        total += tests.len();
+        modules.push(testing::TestModule { name, tests });
+    }
+
+    if cmd.list {
+        for module in &modules {
+            for test in &module.tests {
+                println!("{}::{test}", module.name);
+            }
+        }
+        return Ok(0);
+    }
+
+    if total == 0 {
+        println!("no tests found");
+        // Not a failure: a project with no tests yet is a normal project,
+        // and failing here would make `pyrs test` unusable in CI from day
+        // one. `--filter` matching nothing is reported as such below.
+        if cmd.filter.is_some() {
+            println!("(no test matched the filter)");
+        }
+        return Ok(0);
+    }
+
+    let workdir = temp_workdir()?;
+    let results = workdir.join("results.tsv");
+    let source = testing::generate(&modules, &results);
+    let loaded =
+        modules::load_inline_with_roots(source, "<pyrs test>", &roots).map_err(|e| e.message)?;
+    let ir = analyze(loaded).map_err(|f| f.message)?;
+
+    let exe = workdir.join("harness");
+    let opt_level = cmd
+        .opt_level
+        .or_else(|| m.as_ref().and_then(|m| m.opt_level))
+        .unwrap_or(2);
+    compile_module(&ir, &exe, opt_level, false, !cmd.no_cache)?;
+
+    println!("running {total} test{}", if total == 1 { "" } else { "s" });
+    let status = process::Command::new(&exe)
+        .status()
+        .map_err(|e| format!("failed to run the test harness: {e}"))?;
+
+    let outcomes = testing::read_results(&results);
+    for outcome in &outcomes {
+        println!(
+            "test {} ... {}",
+            outcome.name,
+            if outcome.passed { "ok" } else { "FAILED" }
+        );
+    }
+
+    let failed: Vec<&testing::Outcome> = outcomes.iter().filter(|o| !o.passed).collect();
+    if !failed.is_empty() {
+        println!("\nfailures:");
+        for outcome in &failed {
+            println!("    {}", outcome.name);
+            if !outcome.message.is_empty() {
+                println!("        {}", outcome.message);
+            }
+        }
+    }
+
+    // A harness that died mid-suite recorded fewer results than there are
+    // tests. Reporting the survivors as the whole run would turn a crash
+    // into a pass.
+    let missing = total.saturating_sub(outcomes.len());
+    if missing > 0 {
+        println!(
+            "\nthe harness stopped after {} of {total} tests{}",
+            outcomes.len(),
+            match status.code() {
+                Some(code) => format!(" (exit status {code})"),
+                None => " (killed by a signal)".to_string(),
+            }
+        );
+    }
+
+    let passed = outcomes.len() - failed.len();
+    let ok = failed.is_empty() && missing == 0;
+    println!(
+        "\ntest result: {}. {passed} passed; {} failed{}",
+        if ok { "ok" } else { "FAILED" },
+        failed.len(),
+        if missing > 0 {
+            format!("; {missing} not run")
+        } else {
+            String::new()
+        }
+    );
+    Ok(if ok { 0 } else { 1 })
 }
 
 /// `pyrs tree`: the import graph, as the resolver actually resolved it.

@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.115.0 — `pyrs test`
+
+```console
+$ pyrs test
+running 3 tests
+test test_util::test_add ... ok
+test test_util::test_add_negative ... ok
+test test_util::test_broken ... FAILED
+
+failures:
+    test_util::test_broken
+        one plus one is not three
+
+test result: FAILED. 2 passed; 1 failed
+```
+
+**This is the one testing job that is unambiguously PyRs's.** pytest under
+CPython already tests whether your logic is right, and does it better than
+anything PyRs would build. What it cannot do is tell you whether the
+*compiled* program agrees with it — which is exactly the failure mode of a
+compiler for a Python subset. Running the same assertions through the
+compiler closes that gap and nothing else does. The test files stay ordinary
+Python, so both engines run them.
+
+- Discovery follows pytest's conventions (`test_*.py`, `*_test.py`), across
+  the declared import root and a `tests/` directory, in sorted order.
+- A positional argument filters by test *or* module name; `--list` shows what
+  would run.
+- Tests taking parameters are **skipped, not rejected**. Fixtures are why a
+  test takes arguments, PyRs cannot supply them, and failing the whole run
+  over a file pytest handles fine would make `pyrs test` unusable beside it.
+- Any exception fails its test, not just `AssertionError`, and a failure in
+  one test does not stop the others.
+- A project with no tests exits 0. Failing there would make the command
+  unusable in CI from day one.
+
+**The runner is a generated program, not a runtime feature.** PyRs is
+closed-world with no reflection, so there is no way to enumerate test
+functions at run time; the driver parses the modules it found, emits a
+`__main__` that calls each one inside a `try`, and compiles that like any
+other program. The generated source stays inside the documented subset — a
+test run exercises the compiler on ordinary code rather than on a private
+back door — and a unit test parses it to keep that true.
+
+Results are written to a file rather than stdout. A test's own printing then
+stays exactly what the user wrote, with no sentinel to collide with and
+nothing to strip back out. Writes flush immediately, so a run that crashes
+mid-suite leaves every result up to the crash on disk — and a short results
+file is reported as `N not run` with a non-zero exit rather than as a pass.
+
 ## 0.114.0 — Machine-readable diagnostics, and the import graph
 
 **`--message-format=json`** on `check`, `build` and `run`. An editor cannot

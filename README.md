@@ -40,7 +40,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.114.0**.
+Current milestone: **v0.115.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -70,6 +70,7 @@ pyrs run -i prog.py              # compile and run
 pyrs build -i prog.py -o prog    # build a native executable
 pyrs check -i prog.py            # type-check without building
 pyrs prog.py arg1 arg2           # python-style invocation
+pyrs test                        # compile and run the project's tests
 pyrs doctor                      # what PyRs found, and whether it is enough
 ```
 
@@ -230,7 +231,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.114.0 && git push origin v0.114.0`.
+Release tags: `git tag v0.115.0 && git push origin v0.115.0`.
 
 ## Documentation
 
