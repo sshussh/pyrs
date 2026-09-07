@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.117.0 — The cache ceiling is enforced by growth, not only by the clock
+
+A bug in 0.111, found by looking at the cache after a day of work on this
+tooling: **3.6 GiB against a 2 GiB ceiling.**
+
+The opportunistic prune ran at most once per day. That check had found the
+cache compliant at 06:02 with about 1 GiB; 46 minutes and ten thousand
+entries later it held 3.6 GiB, and the next check was not due for another 23
+hours. A time interval alone does not bound a cache — a test suite publishes
+thousands of entries in an hour, and the interval was chosen to keep the walk
+rare, not to keep the cache small.
+
+Growth is now tracked alongside the clock: once an eighth of the limit has
+been added since the last prune, the walk happens regardless of the time,
+which bounds the overshoot to roughly 12% by construction rather than by
+hoping builds are spread out. The daily check remains for a cache that grows
+slowly. `PYRS_CACHE_LIMIT=0` still disables both.
+
+A lost update to the growth counter between concurrent builders delays a
+prune and never corrupts one, so it needs no locking.
+
+Two tests: one that publishes eight programs against a small limit inside a
+single day — which the previous version fails — and one that confirms
+`PYRS_CACHE_LIMIT=0` prunes nothing.
+
 ## 0.116.0 — Closing the loop: a scaffolded test, build feedback, extension contracts
 
 **`pyrs init` now scaffolds a test**, so `pyrs init myapp && cd myapp &&

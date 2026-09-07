@@ -720,3 +720,65 @@ fn build_flags_are_part_of_the_key() {
         "PYRS_CFLAGS changed but the program entry was reused"
     );
 }
+
+#[test]
+fn the_ceiling_is_enforced_by_growth_not_only_by_the_clock() {
+    // The bug this pins: the first version checked once per day and nothing
+    // else, so the development cache reached 3.6 GiB against a 2 GiB limit
+    // in the 46 minutes after a check found it compliant. A test suite
+    // publishes thousands of entries in an hour; a time interval alone does
+    // not bound a cache.
+    let (_dir, src, cache) = sandbox("gc-growth");
+
+    // A limit small enough that a handful of programs must exceed it.
+    let limit = 400_000u64;
+    let build = |n: usize| {
+        let prog = src.join(format!("p{n}.py"));
+        write(&prog, &format!("print({n})\n"));
+        let out = Command::new(PYRS)
+            .args(["run", "-i", prog.to_str().unwrap()])
+            .env("PYRS_CACHE_DIR", &cache)
+            .env("PYRS_CACHE_LIMIT", limit.to_string())
+            .output()
+            .expect("failed to spawn PyRs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    for n in 0..8 {
+        build(n);
+    }
+
+    // Well inside a day, so only growth can have triggered the prune.
+    let held = layer_bytes(&cache, "programs");
+    assert!(
+        held <= limit + limit / 4,
+        "cache held {held} bytes against a {limit} limit; growth did not trigger a prune"
+    );
+    // Not emptied either: pruning to nothing would make the cache useless.
+    assert!(entries(&cache, "programs") > 0, "the cache was emptied");
+}
+
+#[test]
+fn a_disabled_limit_prunes_nothing() {
+    let (_dir, src, cache) = sandbox("gc-disabled");
+    for n in 0..4 {
+        let prog = src.join(format!("p{n}.py"));
+        write(&prog, &format!("print({n})\n"));
+        let out = Command::new(PYRS)
+            .args(["run", "-i", prog.to_str().unwrap()])
+            .env("PYRS_CACHE_DIR", &cache)
+            .env("PYRS_CACHE_LIMIT", "0")
+            .output()
+            .expect("failed to spawn PyRs");
+        assert!(out.status.success());
+    }
+    assert_eq!(
+        entries(&cache, "programs"),
+        4,
+        "PYRS_CACHE_LIMIT=0 must switch the opportunistic prune off"
+    );
+}

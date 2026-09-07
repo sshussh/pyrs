@@ -171,7 +171,7 @@ program, and which interpreter will `--compat` use:
 
 ```console
 $ pyrs doctor
-pyrs 0.116.0
+pyrs 0.117.0
   target       x86_64-linux
   C compiler   cc (cc (GCC) 16.2.1)
   interpreter  python3 (python3 on PATH, Python 3.14)
@@ -406,8 +406,14 @@ means both rather than whichever ran last. `toolchain` is never pruned: its
 entries are 64 bytes each and losing one costs two subprocesses on the next
 build.
 
-PyRs also prunes opportunistically, at most once a day, keeping the cache
-under `PYRS_CACHE_LIMIT` (default 2 GiB; `0` disables it). This is the one
-place the tool deletes something it was not asked to, and it is deliberate: a
-cache that reached 998 MB in a day of test runs during development is not one
-a user can be expected to police by hand.
+PyRs also prunes opportunistically, keeping the cache under
+`PYRS_CACHE_LIMIT` (default 2 GiB; `0` disables it). This is the one place
+the tool deletes something it was not asked to, and it is deliberate: a cache
+that reached 998 MB in a day of test runs during development is not one a
+user can be expected to police by hand.
+
+The prune triggers on **either** a day having passed **or** an eighth of the
+limit having been added since the last one. The growth trigger is not
+belt-and-braces: with only the daily check, the development cache reached
+3.6 GiB against a 2 GiB ceiling in the 46 minutes after a check found it
+compliant. A time interval keeps the walk rare; it does not bound a cache.

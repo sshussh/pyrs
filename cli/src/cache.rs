@@ -389,8 +389,14 @@ pub const LAYERS: [&str; 3] = ["programs", "runtime", "toolchain"];
 /// unattended machine does not lose a tenth of its disk to build artifacts.
 const DEFAULT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
-/// How often the opportunistic prune is allowed to walk the cache.
+/// How often the opportunistic prune is allowed to walk the cache when
+/// nothing much has been added.
 const GC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Prune early once this fraction of the limit has been added since the last
+/// one — an eighth, so the cache can exceed its ceiling by at most about
+/// 12% before the walk happens regardless of the clock.
+const GC_GROWTH_FRACTION: u64 = 8;
 
 /// Resolution of the reuse clock. An entry's `used` stamp is rewritten at
 /// most this often, so a hot cache does not pay a write on every hit while
@@ -589,28 +595,53 @@ fn configured_limit() -> Option<u64> {
     }
 }
 
-/// Keep the cache under its ceiling, at most once per [`GC_INTERVAL`].
+/// Keep the cache under its ceiling.
 ///
 /// Called after publishing a program, which is the only moment the cache
-/// grows. Silent and best-effort: a build that succeeded must not be
+/// grows, with the size of what was just published.
+///
+/// **A time interval alone does not bound a cache.** The first version of
+/// this checked once per [`GC_INTERVAL`] and nothing else, which let the
+/// development cache reach 3.6 GiB against a 2 GiB ceiling in the 46 minutes
+/// after a check found it compliant — a test suite publishes thousands of
+/// entries in an hour. So growth is tracked too: once
+/// [`GC_GROWTH_FRACTION`] of the limit has been added since the last prune,
+/// the walk happens regardless of the clock, which bounds the overshoot by
+/// construction rather than by hoping builds are spread out.
+///
+/// Silent and best-effort throughout: a build that succeeded must not be
 /// reported as failed because housekeeping could not run.
-pub fn maintain() {
+pub fn maintain(added: u64) {
     let Some(limit) = configured_limit() else {
         return;
     };
     let Some(root) = root() else {
         return;
     };
-    let stamp = root.join("last-gc");
-    if let Ok(meta) = fs::metadata(&stamp)
-        && let Ok(mtime) = meta.modified()
-        && mtime.elapsed().is_ok_and(|age| age < GC_INTERVAL)
-    {
+
+    let pending = root.join("gc-pending");
+    let grown = fs::read_to_string(&pending)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(added);
+
+    let overdue = fs::metadata(root.join("last-gc"))
+        .and_then(|m| m.modified())
+        .map_or(true, |mtime| {
+            mtime.elapsed().is_ok_and(|age| age >= GC_INTERVAL)
+        });
+    // A lost update between concurrent builders delays a prune, never
+    // corrupts one, so the counter needs no locking.
+    if !overdue && grown < limit / GC_GROWTH_FRACTION {
+        let _ = fs::write(&pending, grown.to_string());
         return;
     }
-    // Stamp first: a prune that panics or is killed must not make every
-    // later build retry the same walk.
-    let _ = fs::write(&stamp, b"");
+
+    // Stamp first: a prune that is killed must not make every later build
+    // retry the same walk.
+    let _ = fs::write(root.join("last-gc"), b"");
+    let _ = fs::write(&pending, "0");
     prune(
         &root,
         &["programs", "runtime"],

@@ -209,7 +209,7 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     let result = compile_module(&module, &exe, opt_level, false, !cmd.no_cache).and_then(|()| {
         if let Some(key) = &key {
             cache::program_store(key, &exe);
-            cache::maintain();
+            cache::maintain(fs::metadata(&exe).map(|m| m.len()).unwrap_or(0));
         }
         let mut process = process::Command::new(&exe);
         process.args(&cmd.args);
@@ -378,7 +378,7 @@ fn compile(
     compile_module(&module, output, opt_level, emit_llvm, use_cache)?;
     if let Some(key) = &key {
         cache::program_store(key, output);
-        cache::maintain();
+        cache::maintain(fs::metadata(output).map(|m| m.len()).unwrap_or(0));
     }
     Ok(Built::Compiled)
 }

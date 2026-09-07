@@ -317,6 +317,32 @@ it would narrow a working surface on a guess.
 for the build summary and `run`'s continued silence, and the fresh-project
 test in `cli/tests/project.rs` now runs `pyrs test` and expects it to pass.
 
+## Milestone 0.117.0 — the ceiling, actually enforced
+
+A bug in 0.111, found by looking at the cache after a day of building this
+tooling: **3.6 GiB against the 2 GiB ceiling**.
+
+The opportunistic prune ran at most once per [`GC_INTERVAL`]. That check
+found the cache compliant at 06:02 with about 1 GiB; 46 minutes and ten
+thousand entries later it held 3.6 GiB, with the next check 23 hours away.
+
+The mistake is worth naming precisely, because it is easy to repeat: the
+interval was chosen to keep the *walk* rare, and then used as though it kept
+the *cache* small. Those are different jobs. A rate limit on the check does
+not bound the thing being checked when the thing can grow arbitrarily fast
+between checks — and a test suite publishes thousands of entries in an hour.
+
+The fix tracks growth alongside the clock: once an eighth of the limit has
+been added since the last prune, the walk happens regardless of the time.
+That bounds the overshoot to roughly 12% by construction rather than by
+assuming builds are spread out. The daily check stays for a cache that grows
+slowly. A lost counter update between concurrent builders delays a prune and
+never corrupts one, so it needs no locking.
+
+The regression test publishes eight programs against a small limit inside a
+single day — which is exactly the case the previous version passed while
+being wrong, and which it now fails.
+
 ## Later, planned but not scheduled here
 
 - Stable error codes and `pyrs explain`, especially valuable for a *subset*
