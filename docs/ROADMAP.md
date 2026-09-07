@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.115 |
+| Check | Result after 0.116 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1480 passed; none failed or ignored |
+| `cargo test --workspace` | 1500 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 66 pass / 0 known_gap; compat 22 pass |
-| `pyrs --version` | `PyRs 0.115.0` |
+| `pyrs --version` | `PyRs 0.116.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -365,6 +365,9 @@ documentation and the relevant gates.
       natively. pytest under CPython tests the logic; only a native runner
       tests whether the compiled program agrees, which is the failure mode a
       subset compiler actually has.
+- [x] Close the loop (0.116): `pyrs init` scaffolds a test that passes, a
+      build reports whether it did any work, and `build-extension`'s fifteen
+      entry-point rejections are tested rather than merely written down.
 - [x] Command-line experience (0.112): project-aware `pyrs build` writing
       `target/NAME`, `pyrs clean`, `pyrs doctor`, shell completions, and
       argument errors that name the argument and suggest the real one.

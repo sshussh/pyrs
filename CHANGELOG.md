@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.116.0 — Closing the loop: a scaffolded test, build feedback, extension contracts
+
+**`pyrs init` now scaffolds a test**, so `pyrs init myapp && cd myapp &&
+pyrs test` passes without editing anything, the way `cargo new` then
+`cargo test` does. A scaffold that cannot be tested was half a scaffold once
+`pyrs test` existed.
+
+The starter test deliberately imports nothing. The scaffolded entry calls
+`main()` at import time — PyRs has no `__name__` yet, so there is no guard to
+put it behind — and a scaffolded test that printed on every run would teach
+the wrong shape. `--script` still produces a single file and no `tests/`.
+
+**A build says what it did.** `pyrs build` was silent for 2.5 seconds and
+then silent again for 1 millisecond, with nothing to distinguish them:
+
+```console
+$ pyrs build
+  Finished target/app in 2.65s
+$ pyrs build
+  Finished target/app in 1ms (cached)
+```
+
+On **stderr**, so stdout stays clean for anything reading a build's output —
+and because the compatibility harness classifies a build partly by its stdout
+being empty. `--quiet` suppresses it. `pyrs run` stays silent: it stands in
+for `python3`, and is compared against it byte for byte.
+
+**`build-extension`'s rejection contract is now tested.** The extension
+boundary hands compiled code to a CPython process that will call it with
+objects PyRs did not create, and every rejection is a promise about what
+cannot cross — but the only existing test exercised the *runtime* side, so
+all fifteen entry-point rejections were unchecked. `cli/tests/extension_contracts.rs`
+covers module names, module-level code, imports, classes, decorators and
+defaults, private-only sources, object identity, unsupported calls, dynamic
+constructs, output-overwrites-source, and the manifest's defaults and
+overrides — with the complements, so a rejection that becomes total is caught
+too.
+
+That work turned up one thing worth recording rather than changing: `int`,
+`float` and `str` are parsed as **conversions, not calls**, so they never
+reach the call allow-list. That is consistent with `chr` being on it — a
+kernel may already produce a string — but it is an asymmetry nothing was
+checking, and now something is.
+
 ## 0.115.0 — `pyrs test`
 
 ```console

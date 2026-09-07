@@ -124,6 +124,10 @@ pick its own default.
 | `--script` | A flat `main.py` instead of the `src/` layout, for a single-file program |
 | `--vcs git\|none` | `git init` unless told not to; never nested inside an existing repository |
 
+A scaffolded project also gets `tests/test_<module>.py`, so `pyrs test`
+passes in a fresh project without editing anything. `--script` produces a
+single file and no `tests/`.
+
 `init` refuses to overwrite an existing `[tool.pyrs]` table, and never
 overwrites a file that is already there — every file it produces is a
 starting point, and `init` on an existing project is a normal thing to do.
@@ -143,7 +147,17 @@ pyrs clean          # removes target/
 ```
 
 Outside a project the default is still `a.out`, and an explicit `-o` always
-wins.
+wins. A build reports what it did, on stderr so stdout stays clean:
+
+```console
+$ pyrs build
+  Finished target/app in 2.65s
+$ pyrs build
+  Finished target/app in 1ms (cached)
+```
+
+`--quiet` suppresses that. `pyrs run` prints no summary at all: it stands in
+for `python3` and is compared against it byte for byte.
 
 `pyrs clean` removes the project's target directory and nothing else. The
 machine-wide build cache is `pyrs cache clean`: conflating them would mean
@@ -157,7 +171,7 @@ program, and which interpreter will `--compat` use:
 
 ```console
 $ pyrs doctor
-pyrs 0.115.0
+pyrs 0.116.0
   target       x86_64-linux
   C compiler   cc (cc (GCC) 16.2.1)
   interpreter  python3 (python3 on PATH, Python 3.14)

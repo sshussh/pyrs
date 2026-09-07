@@ -359,6 +359,10 @@ pub struct CompileCommand {
     #[arg(long)]
     pub no_cache: bool,
 
+    /// Do not print the build summary
+    #[arg(short, long)]
+    pub quiet: bool,
+
     /// How to print diagnostics
     #[arg(long, value_name = "FORMAT", default_value = "human")]
     pub message_format: crate::diagnostics::Format,

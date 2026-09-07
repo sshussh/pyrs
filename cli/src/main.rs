@@ -294,7 +294,8 @@ fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
         .or_else(|| m.as_ref().and_then(|m| m.opt_level))
         .unwrap_or(2);
 
-    compile(
+    let started = std::time::Instant::now();
+    let outcome = compile(
         &input,
         &output,
         m.as_ref().map(|m| m.root_path()),
@@ -303,7 +304,38 @@ fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
         !cmd.no_cache,
         cmd.message_format,
     )?;
+    // On stderr, so stdout stays clean for anything reading a build's
+    // output -- and because the compatibility harness classifies a build by
+    // its stdout being empty.
+    if !cmd.quiet {
+        eprintln!(
+            "  Finished {} in {}{}",
+            output.display(),
+            elapsed(started),
+            match outcome {
+                Built::FromCache => " (cached)",
+                Built::Compiled => "",
+            }
+        );
+    }
     Ok(0)
+}
+
+/// Whether a build did any work, which is the difference between 9 ms and
+/// 2.5 s and worth saying out loud.
+enum Built {
+    FromCache,
+    Compiled,
+}
+
+/// Elapsed time at a resolution a person reads rather than counts.
+fn elapsed(since: std::time::Instant) -> String {
+    let ms = since.elapsed().as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.2}s", ms as f64 / 1000.0)
+    }
 }
 
 /// The full pipeline: source file(s) in, linked native executable out.
@@ -316,7 +348,7 @@ fn compile(
     emit_llvm: bool,
     use_cache: bool,
     format: Format,
-) -> Result<(), String> {
+) -> Result<Built, String> {
     let loaded = match &import_root {
         Some(root) => modules::load_program_in_project(input, root),
         None => modules::load_program(input),
@@ -340,7 +372,7 @@ fn compile(
     {
         fs::copy(&cached, output)
             .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
-        return Ok(());
+        return Ok(Built::FromCache);
     }
     let module = analyze(loaded).map_err(|f| f.render(format))?;
     compile_module(&module, output, opt_level, emit_llvm, use_cache)?;
@@ -348,7 +380,7 @@ fn compile(
         cache::program_store(key, output);
         cache::maintain();
     }
-    Ok(())
+    Ok(Built::Compiled)
 }
 
 fn analyze(loaded: Vec<modules::Loaded>) -> Result<ir::Module, Box<Failure>> {
@@ -1149,6 +1181,22 @@ fn init_project(cmd: cli::InitCommand) -> Result<i32, String> {
         &entry_path,
         &format!("def main() -> None:\n    print(\"Hello from {name}!\")\n\n\nmain()\n"),
     ));
+
+    if scaffolding && !cmd.script {
+        // A scaffold that cannot be tested is half a scaffold: `cargo new`
+        // writes one, and `pyrs test` now exists to run it.
+        //
+        // The starter test deliberately imports nothing. The entry module
+        // calls `main()` at import time — PyRs has no `__name__` yet, so
+        // there is no guard to put it behind — and a scaffolded test that
+        // printed on every run would teach the wrong shape.
+        wrote.extend(write_new(
+            &dir.join("tests").join(format!("test_{module}.py")),
+            "# Ordinary Python: `pyrs test` compiles and runs these natively,\n\
+             # and pytest runs the same files under CPython.\n\n\n\
+             def test_arithmetic() -> None:\n    assert 2 + 2 == 4\n",
+        ));
+    }
 
     if cmd.vcs == cli::Vcs::Git && scaffolding {
         init_git(&dir);

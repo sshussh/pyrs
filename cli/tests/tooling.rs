@@ -510,3 +510,71 @@ fn tree_reports_a_broken_import_rather_than_a_partial_graph() {
     let message = err(&root, &cache, &["tree", "-i", "prog.py"]);
     assert!(message.contains("nothing_at_all"), "{message}");
 }
+
+// ---------------------------------------------------------------------------
+// Build feedback
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_build_says_what_it_did_and_whether_it_did_anything() {
+    let (_d, root, cache) = project("build-summary");
+    scaffold(&root, "");
+
+    let first = pyrs_in(&root, &cache, &["build"]);
+    let text = String::from_utf8_lossy(&first.stderr);
+    assert!(text.contains("Finished"), "{text}");
+    assert!(text.contains("target/demo"), "{text}");
+    assert!(
+        !text.contains("(cached)"),
+        "the first build was not a build: {text}"
+    );
+
+    // The difference between 2.5 s and 1 ms is worth saying out loud.
+    let second = pyrs_in(&root, &cache, &["build"]);
+    let text = String::from_utf8_lossy(&second.stderr);
+    assert!(text.contains("(cached)"), "{text}");
+}
+
+#[test]
+fn the_build_summary_never_touches_stdout() {
+    // The compatibility harness classifies a build partly by its stdout
+    // being empty, and anything reading a build's output wants it clean.
+    let (_d, root, cache) = project("build-stdout");
+    scaffold(&root, "");
+    let out = pyrs_in(&root, &cache, &["build"]);
+    assert!(out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn quiet_suppresses_the_summary() {
+    let (_d, root, cache) = project("build-quiet");
+    scaffold(&root, "");
+    let out = pyrs_in(&root, &cache, &["build", "--quiet"]);
+    assert!(out.status.success());
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(root.join("target/demo").is_file());
+}
+
+#[test]
+fn run_stays_silent_because_it_stands_in_for_python() {
+    // `pyrs prog.py` is compared byte-for-byte against `python3 prog.py`;
+    // a build summary on either stream would break that.
+    let (_d, root, cache) = project("run-silent");
+    write(&root.join("prog.py"), "print(1)\n");
+    let out = pyrs_in(&root, &cache, &["run", "-i", "prog.py"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

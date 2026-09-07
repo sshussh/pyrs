@@ -96,6 +96,7 @@ fn init_scaffolds_the_layout_cargo_and_uv_both_produce() {
     for file in [
         "src/proj/main.py",
         "src/proj/__init__.py",
+        "tests/test_proj.py",
         "README.md",
         ".gitignore",
         ".python-version",
@@ -113,6 +114,10 @@ fn init_scaffolds_the_layout_cargo_and_uv_both_produce() {
     assert_eq!(ok(&root, &cache, &["run"]), "Hello from proj!\n");
     ok(&root, &cache, &["build"]);
     assert!(root.join("target/proj").is_file());
+    // The loop closes: a fresh project's tests pass without editing
+    // anything, the way `cargo new` then `cargo test` does.
+    let tested = ok(&root, &cache, &["test"]);
+    assert!(tested.contains("test result: ok. 1 passed"), "{tested}");
 }
 
 #[test]
@@ -125,6 +130,7 @@ fn init_script_scaffolds_a_single_file_program() {
     assert!(!manifest.contains("root ="), "{manifest}");
     assert!(root.join("main.py").is_file());
     assert!(!root.join("src").exists());
+    assert!(!root.join("tests").exists());
     assert_eq!(ok(&root, &cache, &["run"]), "Hello from proj!\n");
 }
 

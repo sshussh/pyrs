@@ -277,6 +277,46 @@ that runs the same test files under CPython to confirm the premise, and one
 that indexes past the end of a list mid-suite to confirm a crash is not
 reported as a pass.
 
+## Milestone 0.116.0 — closing the loop
+
+Three gaps, each identified earlier and each small on its own.
+
+**`pyrs init` scaffolds a test.** Once `pyrs test` existed, a scaffold that
+could not be tested was half a scaffold; `cargo new` then `cargo test` passes
+and so should this. The starter test imports nothing on purpose: the
+scaffolded entry calls `main()` at import time — PyRs has no `__name__`, so
+there is no guard to put it behind — and a scaffolded test that printed on
+every run would teach the wrong shape.
+
+**A build says what it did.** `pyrs build` was silent for 2.5 s and silent
+again for 1 ms with nothing to tell them apart. The summary goes to stderr,
+for two reasons: stdout should stay clean for anything reading a build's
+output, and the compatibility harness classifies a build partly by its stdout
+being empty (`compatibility/run.py`, the `known_gap` branch). `pyrs run` gets
+no summary at all — it stands in for `python3` and is compared byte for byte.
+
+**`build-extension`'s rejection contract is tested.** Fifteen entry-point
+rejections existed and none were checked; the one existing test drove the
+*runtime* boundary through a Python suite. Each rejection is a promise about
+what cannot cross into a CPython process, and an untested promise is one that
+quietly stops being true. The new suite pairs rejections with their
+complements — a docstring is allowed, a sibling call is allowed, the
+numerical builtins are allowed — so a rejection that becomes total is caught
+as well as one that becomes permissive.
+
+That work surfaced one thing worth recording rather than changing: `int`,
+`float` and `str` parse as **`E::Cast`, not `E::Call`**, so they never reach
+the call allow-list in `extension.rs`. It is consistent with `chr` being on
+that list — a kernel may already produce a string — but it is an asymmetry
+nothing was checking. Pinned by a test rather than "fixed", because changing
+it would narrow a working surface on a guess.
+
+### Verification
+
+16 tests in `cli/tests/extension_contracts.rs`, 4 in `cli/tests/tooling.rs`
+for the build summary and `run`'s continued silence, and the fresh-project
+test in `cli/tests/project.rs` now runs `pyrs test` and expects it to pass.
+
 ## Later, planned but not scheduled here
 
 - Stable error codes and `pyrs explain`, especially valuable for a *subset*
