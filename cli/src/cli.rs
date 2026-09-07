@@ -93,7 +93,9 @@ impl Cli {
                         }
                         break;
                     }
-                    Some("--python" | "-O" | "--opt-level" | "-i" | "--input") => i += 2,
+                    Some(
+                        "--python" | "-O" | "--opt-level" | "-i" | "--input" | "--message-format",
+                    ) => i += 2,
                     Some("--") => break,
                     Some(arg)
                         if (arg.starts_with("-c") || arg.starts_with("-m")) && arg.len() > 2 =>
@@ -166,6 +168,24 @@ pub enum Command {
 
     /// Print a shell completion script
     Completions(CompletionsCommand),
+
+    /// Show the import graph the compiler resolved
+    Tree(TreeCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct TreeCommand {
+    /// Input file path (default: the project's [tool.pyrs] entry)
+    #[arg(short, long)]
+    pub input: Option<path::PathBuf>,
+
+    /// Show the file each module was resolved from
+    #[arg(long)]
+    pub paths: bool,
+
+    /// Limit the depth shown
+    #[arg(long, value_name = "N")]
+    pub depth: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -312,6 +332,10 @@ pub struct CompileCommand {
     /// Recompile from scratch, reusing and publishing nothing
     #[arg(long)]
     pub no_cache: bool,
+
+    /// How to print diagnostics
+    #[arg(long, value_name = "FORMAT", default_value = "human")]
+    pub message_format: crate::diagnostics::Format,
 }
 
 #[derive(Debug, Args)]
@@ -348,6 +372,10 @@ pub struct RunCommand {
     #[arg(long)]
     pub no_cache: bool,
 
+    /// How to print diagnostics
+    #[arg(long, value_name = "FORMAT", default_value = "human")]
+    pub message_format: crate::diagnostics::Format,
+
     /// Script and arguments, or just arguments with -i/-c/-m; '-' reads stdin
     #[arg(trailing_var_arg = true)]
     pub args: Vec<OsString>,
@@ -358,6 +386,10 @@ pub struct CheckCommand {
     /// Input file path (default: the project's [tool.pyrs] entry)
     #[arg(short, long)]
     pub input: Option<path::PathBuf>,
+
+    /// How to print diagnostics
+    #[arg(long, value_name = "FORMAT", default_value = "human")]
+    pub message_format: crate::diagnostics::Format,
 }
 
 #[derive(Debug, Args)]

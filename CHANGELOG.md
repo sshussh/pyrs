@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.114.0 — Machine-readable diagnostics, and the import graph
+
+**`--message-format=json`** on `check`, `build` and `run`. An editor cannot
+get a span out of prose, and until now prose was all PyRs produced — so no
+editor integration was possible at all, whatever else the compiler got right.
+
+```console
+$ pyrs check -i prog.py --message-format json
+{"level":"error","phase":"semantic","message":"type mismatch ...","file":"prog.py",
+ "line":2,"column":10,"end_line":2,"end_column":13,"byte_start":20,"byte_end":23,
+ "rendered":"error[semantic]: ...\n --> prog.py:2:10\n  |\n2 | y: int = 2.5\n  |          ^^^"}
+```
+
+One object per line, following `cargo --message-format=json`, carrying both
+the machine fields and the `rendered` human text — so a tool can show exactly
+what the terminal would have shown without reimplementing the renderer.
+
+Getting there meant diagnostics keeping their structure until the moment they
+are printed: `LoadError` was a rendered string, so lex, parse and import
+failures had already lost their spans by the time the driver saw them. All
+three phases now reach JSON with a real position. A failure with **no**
+position — an unreadable file, a link step that failed — is still emitted as
+JSON, because a tool's parser must not break on exactly the errors it did not
+anticipate.
+
+**`pyrs tree`** shows the import graph the resolver actually resolved:
+
+```console
+$ pyrs tree
+__main__
+├── app
+├── app.util
+│   ├── app (*)
+│   └── app.shared
+└── app.shared (*)
+
+4 modules
+```
+
+PyRs is closed-world, so this is a *fact* rather than an estimate: it is
+exactly the set of modules that will be compiled into the program. A module
+reached twice is printed once and marked `(*)`, the way cargo does, since
+repeating a shared subtree turns a diamond into an unreadable expansion.
+`--paths` shows where each module was resolved from, and `--depth` limits
+what is expanded without changing what is counted.
+
 ## 0.113.0 — `pyrs init` scaffolds the layout cargo and uv both produce
 
 `pyrs init` wrote a flat `main.py` and one table. `cargo new` and `uv init`

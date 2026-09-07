@@ -12,11 +12,14 @@ use std::{
 
 mod cache;
 mod cli;
+mod diagnostics;
 mod extension;
 mod hash;
 mod interpreter;
 mod manifest;
 mod modules;
+
+use diagnostics::{Failure, Format};
 
 fn main() {
     let args = cli::Cli::parse_env();
@@ -61,6 +64,7 @@ fn run(args: cli::Cli) -> Result<i32, String> {
         cli::Command::Init(cmd) => init_project(cmd),
         cli::Command::Cache(cmd) => manage_cache(cmd),
         cli::Command::Clean(cmd) => clean_project(cmd),
+        cli::Command::Tree(cmd) => show_tree(cmd),
         cli::Command::Doctor => doctor(),
         cli::Command::Completions(cmd) => {
             use clap::CommandFactory;
@@ -152,9 +156,10 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
         });
     }
 
+    let format = cmd.message_format;
     let (loaded, argv0) = if let Some(code) = cmd.code {
         (
-            modules::load_inline(code, "<string>").map_err(|e| e.0)?,
+            modules::load_inline(code, "<string>").map_err(|e| fail(e, format))?,
             OsString::from("-c"),
         )
     } else if let Some(path) = input.filter(|p| p != Path::new("-")) {
@@ -162,14 +167,14 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
             Some(root) => modules::load_program_in_project(&path, root),
             None => modules::load_program(&path),
         };
-        (loaded.map_err(|e| e.0)?, path.into_os_string())
+        (loaded.map_err(|e| fail(e, format))?, path.into_os_string())
     } else {
         let mut source = String::new();
         io::stdin()
             .read_to_string(&mut source)
             .map_err(|e| format!("failed to read stdin: {e}"))?;
         (
-            modules::load_inline(source, "<stdin>").map_err(|e| e.0)?,
+            modules::load_inline(source, "<stdin>").map_err(|e| fail(e, format))?,
             OsString::from("-"),
         )
     };
@@ -196,7 +201,7 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
             .map_err(|e| format!("failed to run compiled program: {e}"));
     }
 
-    let module = analyze(loaded)?;
+    let module = analyze(loaded).map_err(|f| f.render(format))?;
     let workdir = temp_workdir()?;
     let exe = workdir.join("program");
     let result = compile_module(&module, &exe, opt_level, false, !cmd.no_cache).and_then(|()| {
@@ -294,11 +299,13 @@ fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
         opt_level,
         cmd.emit_llvm,
         !cmd.no_cache,
+        cmd.message_format,
     )?;
     Ok(0)
 }
 
 /// The full pipeline: source file(s) in, linked native executable out.
+#[allow(clippy::too_many_arguments)]
 fn compile(
     input: &Path,
     output: &Path,
@@ -306,12 +313,13 @@ fn compile(
     opt_level: u8,
     emit_llvm: bool,
     use_cache: bool,
+    format: Format,
 ) -> Result<(), String> {
     let loaded = match &import_root {
         Some(root) => modules::load_program_in_project(input, root),
         None => modules::load_program(input),
     }
-    .map_err(|e| e.0)?;
+    .map_err(|e| fail(e, format))?;
     // A default output under `target/` may name a directory nothing created.
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -332,7 +340,7 @@ fn compile(
             .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
         return Ok(());
     }
-    let module = analyze(loaded)?;
+    let module = analyze(loaded).map_err(|f| f.render(format))?;
     compile_module(&module, output, opt_level, emit_llvm, use_cache)?;
     if let Some(key) = &key {
         cache::program_store(key, output);
@@ -341,7 +349,7 @@ fn compile(
     Ok(())
 }
 
-fn analyze(loaded: Vec<modules::Loaded>) -> Result<ir::Module, String> {
+fn analyze(loaded: Vec<modules::Loaded>) -> Result<ir::Module, Box<Failure>> {
     let inputs: Vec<semantic::ModuleInput> = loaded
         .iter()
         .map(|m| semantic::ModuleInput {
@@ -352,12 +360,16 @@ fn analyze(loaded: Vec<modules::Loaded>) -> Result<ir::Module, String> {
 
     semantic::analyze_program(&inputs).map_err(|d| {
         let m = &loaded[d.file.min(loaded.len() - 1)];
-        if d.span == Span::default() {
-            format!("{d}")
-        } else {
-            d.render(&m.display, &m.source)
-        }
+        Box::new(Failure::located(&d, &m.display, &m.source))
     })
+}
+
+/// Render a failure in the requested format.
+///
+/// Everything the driver reports goes through here, so a consumer that asked
+/// for JSON never receives a line of prose it cannot parse.
+fn fail(failure: impl Into<Failure>, format: Format) -> String {
+    failure.into().render(format)
 }
 
 fn compile_module(
@@ -499,7 +511,8 @@ fn check_program(cmd: cli::CheckCommand) -> Result<i32, String> {
         Some(root) => modules::load_program_in_project(&input, &root),
         None => modules::load_program(&input),
     };
-    analyze(loaded.map_err(|e| e.0)?)?;
+    let format = cmd.message_format;
+    analyze(loaded.map_err(|e| fail(e, format))?).map_err(|f| f.render(format))?;
     Ok(0)
 }
 
@@ -615,6 +628,119 @@ fn report_removed(verb: &str, removed: &cache::Removed, dry_run: bool) {
         println!("would have {verb} {what}");
     } else {
         println!("{verb} {what}");
+    }
+}
+
+/// `pyrs tree`: the import graph, as the resolver actually resolved it.
+///
+/// PyRs is closed-world, so this graph is a *fact* rather than an estimate:
+/// it is exactly the set of modules that will be compiled into the program,
+/// which is what makes it worth printing. `cargo tree` is the shape.
+fn show_tree(cmd: cli::TreeCommand) -> Result<i32, String> {
+    let project = if cmd.input.is_none() {
+        match std::env::current_dir() {
+            Ok(dir) => manifest::discover(&dir)?,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let m = match &project {
+        Some(path) => Some(manifest::load(path)?),
+        None => None,
+    };
+    let input = match (&cmd.input, m.as_ref().and_then(|m| m.entry_path())) {
+        (Some(i), _) => i.clone(),
+        (None, Some(entry)) => entry,
+        (None, None) => {
+            return Err(
+                "no input: pass -i, or run inside a project with [tool.pyrs] entry".to_string(),
+            );
+        }
+    };
+
+    let loaded = match m.as_ref().map(|m| m.root_path()) {
+        Some(root) => modules::load_program_in_project(&input, &root),
+        None => modules::load_program(&input),
+    }
+    .map_err(|e| e.message)?;
+
+    let mut printer = TreePrinter {
+        by_name: loaded.iter().map(|m| (m.name.as_str(), m)).collect(),
+        seen: std::collections::HashSet::new(),
+        paths: cmd.paths,
+        max_depth: cmd.depth,
+    };
+    printer.walk(modules::ROOT_NAME, "", true, true, 0);
+
+    // The count is the point of the exercise as often as the shape is.
+    println!();
+    println!(
+        "{} module{}",
+        loaded.len(),
+        if loaded.len() == 1 { "" } else { "s" }
+    );
+    Ok(0)
+}
+
+/// State the tree walk carries, so the recursion passes a position rather
+/// than re-threading the whole graph at every level.
+struct TreePrinter<'a> {
+    by_name: std::collections::HashMap<&'a str, &'a modules::Loaded>,
+    seen: std::collections::HashSet<String>,
+    paths: bool,
+    max_depth: Option<usize>,
+}
+
+impl TreePrinter<'_> {
+    fn walk(&mut self, name: &str, prefix: &str, is_last: bool, is_root: bool, depth: usize) {
+        let module = self.by_name.get(name).copied();
+        // A module reached twice is printed once and marked, the way cargo
+        // does: repeating a shared subtree turns a graph into an unreadable
+        // expansion.
+        let repeat = !self.seen.insert(name.to_string());
+        let label = match (module, self.paths) {
+            (Some(m), true) => format!("{name} ({})", m.display),
+            _ => name.to_string(),
+        };
+        let connector = match (is_root, is_last) {
+            (true, _) => "",
+            (false, true) => "\u{2514}\u{2500}\u{2500} ",
+            (false, false) => "\u{251c}\u{2500}\u{2500} ",
+        };
+        println!(
+            "{prefix}{connector}{label}{}",
+            if repeat { " (*)" } else { "" }
+        );
+
+        if repeat || self.max_depth.is_some_and(|max| depth >= max) {
+            return;
+        }
+        let Some(module) = module else { return };
+        // Only edges to modules actually in the graph.
+        let children: Vec<String> = module
+            .deps
+            .iter()
+            .filter(|d| self.by_name.contains_key(d.as_str()))
+            .cloned()
+            .collect();
+
+        // A child's guide line continues its parent's unless the parent was
+        // the last of its siblings, in which case the column is closed off.
+        let child_prefix = match (is_root, is_last) {
+            (true, _) => String::new(),
+            (false, true) => format!("{prefix}    "),
+            (false, false) => format!("{prefix}\u{2502}   "),
+        };
+        for (i, child) in children.iter().enumerate() {
+            self.walk(
+                child,
+                &child_prefix,
+                i + 1 == children.len(),
+                false,
+                depth + 1,
+            );
+        }
     }
 }
 
@@ -991,6 +1117,24 @@ fn init_git(dir: &Path) {
         .arg("--quiet")
         .current_dir(dir)
         .status();
+}
+
+impl From<modules::LoadError> for Failure {
+    fn from(e: modules::LoadError) -> Self {
+        match e.located {
+            Some((phase, message, span, file, source)) => Failure {
+                message: e.message,
+                located: Some(diagnostics::Located {
+                    phase: phase.to_string(),
+                    message,
+                    span,
+                    file,
+                    source,
+                }),
+            },
+            None => Failure::plain(e.message),
+        }
+    }
 }
 
 fn read_source(path: &Path) -> Result<String, String> {

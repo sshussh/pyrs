@@ -157,7 +157,7 @@ program, and which interpreter will `--compat` use:
 
 ```console
 $ pyrs doctor
-pyrs 0.113.0
+pyrs 0.114.0
   target       x86_64-linux
   C compiler   cc (cc (GCC) 16.2.1)
   interpreter  python3 (python3 on PATH, Python 3.14)
@@ -224,6 +224,43 @@ pyrs completions bash > /etc/bash_completion.d/pyrs
 ```
 
 `bash`, `zsh`, `fish`, `elvish` and `powershell`.
+
+## Diagnostics for tools
+
+`check`, `build` and `run` take `--message-format`. The default is `human`;
+`json` emits one object per line, following `cargo --message-format=json`:
+
+```console
+$ pyrs check -i prog.py --message-format json
+{"level":"error","phase":"semantic","message":"type mismatch ...",
+ "file":"prog.py","line":2,"column":10,"end_line":2,"end_column":13,
+ "byte_start":20,"byte_end":23,"rendered":"error[semantic]: ..."}
+```
+
+`rendered` carries the annotated snippet the terminal would have shown, so a
+tool need not reimplement the renderer. Lex, parse, import and semantic
+failures all arrive with a real position; a failure that has none — an
+unreadable file, a failed link — is still JSON, because a parser must not
+break on exactly the errors it did not anticipate.
+
+## `pyrs tree`
+
+```console
+$ pyrs tree
+__main__
+├── app
+├── app.util
+│   ├── app (*)
+│   └── app.shared
+└── app.shared (*)
+
+4 modules
+```
+
+PyRs is closed-world, so this is the exact set of modules that will be
+compiled into the program rather than an estimate. `(*)` marks a module
+already shown, `--paths` shows where each was resolved from, and `--depth`
+limits what is expanded without changing what is counted.
 
 ## Interpreter resolution
 

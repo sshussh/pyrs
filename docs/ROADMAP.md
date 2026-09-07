@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.113 |
+| Check | Result after 0.114 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1443 passed; none failed or ignored |
+| `cargo test --workspace` | 1459 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 66 pass / 0 known_gap; compat 22 pass |
-| `pyrs --version` | `PyRs 0.113.0` |
+| `pyrs --version` | `PyRs 0.114.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -356,6 +356,11 @@ documentation and the relevant gates.
       `.gitignore`, README, pinned `.python-version` and repository that
       `cargo new` and `uv init` both do, while a directory that already has a
       `pyproject.toml` still gets one table and nothing else.
+- [x] Machine-readable diagnostics (0.114): `--message-format=json` on
+      `check`, `build` and `run`, with lex, parse, import and semantic
+      failures all keeping their spans through to the driver — the
+      prerequisite for any editor integration. `pyrs tree` prints the
+      resolved import graph.
 - [x] Command-line experience (0.112): project-aware `pyrs build` writing
       `target/NAME`, `pyrs clean`, `pyrs doctor`, shell completions, and
       argument errors that name the argument and suggest the real one.

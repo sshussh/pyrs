@@ -43,11 +43,43 @@ pub struct Loaded {
     pub source: String,
     /// AST with relative imports already rewritten to absolute (`level = 0`).
     pub ast: ast::Module,
+    /// Absolute names this module imports directly, in source order. Parent
+    /// packages are required automatically and do not appear here.
+    pub deps: Vec<String>,
 }
 
-/// A load failure already rendered against the right file.
+/// A load failure, rendered against the right file and — when it has a
+/// source position — still structured, so `--message-format=json` can give
+/// an editor a span rather than prose to parse.
 #[derive(Debug)]
-pub struct LoadError(pub String);
+pub struct LoadError {
+    pub message: String,
+    /// `(phase, message, span, display path, source)` for a positioned
+    /// failure. A missing file or an unreadable directory has no position.
+    pub located: Option<(common::Phase, String, common::Span, String, String)>,
+}
+
+impl LoadError {
+    pub fn plain(message: impl Into<String>) -> Self {
+        LoadError {
+            message: message.into(),
+            located: None,
+        }
+    }
+
+    fn at(diag: &Diagnostic, display: &str, source: &str) -> Self {
+        LoadError {
+            message: render(diag, display, source),
+            located: Some((
+                diag.phase,
+                diag.message.clone(),
+                diag.span,
+                display.to_string(),
+                source.to_string(),
+            )),
+        }
+    }
+}
 
 /// Where a module's source was found.
 #[derive(Debug, Clone)]
@@ -138,7 +170,7 @@ pub fn load_program_with_roots(root: &Path, roots: &[PathBuf]) -> Result<Vec<Loa
 /// Inline and stdin source use the caller's working directory for imports.
 pub fn load_inline(source: String, display: &str) -> Result<Vec<Loaded>, LoadError> {
     let cwd = std::env::current_dir()
-        .map_err(|e| LoadError(format!("failed to read working directory: {e}")))?;
+        .map_err(|e| LoadError::plain(format!("failed to read working directory: {e}")))?;
     let roots = import_fs_roots(cwd);
     let parsed = parse_source(display.to_string(), source, ROOT_NAME, None, false, &roots)?;
     load_parsed(parsed, &roots)
@@ -158,7 +190,7 @@ fn load_parsed(root_parsed: Parsed, roots: &[PathBuf]) -> Result<Vec<Loaded>, Lo
     let mut out = Vec::new();
     for name in state.order {
         let p = state.modules.remove(&name).ok_or_else(|| {
-            LoadError(format!(
+            LoadError::plain(format!(
                 "internal error: module '{name}' missing from load graph after topo order \
                  (loader invariant broken)"
             ))
@@ -168,6 +200,7 @@ fn load_parsed(root_parsed: Parsed, roots: &[PathBuf]) -> Result<Vec<Loaded>, Lo
             display: p.display,
             source: p.source,
             ast: p.ast,
+            deps: p.deps.into_iter().map(|(dep, _)| dep).collect(),
         });
     }
     Ok(out)
@@ -227,7 +260,7 @@ impl LoadState {
                 format!("circular import: '{importer}' and '{name}' import each other"),
                 span,
             );
-            return Err(LoadError(render(&d, &display, &source)));
+            return Err(LoadError::at(&d, &display, &source));
         }
 
         self.ensure_loaded(name, span, importer)?;
@@ -280,7 +313,7 @@ impl LoadState {
                         format!("No module named '{name}'; '{partial}' is not a package"),
                         span,
                     );
-                    return Err(LoadError(render(&d, &display, &source)));
+                    return Err(LoadError::at(&d, &display, &source));
                 }
                 continue;
             }
@@ -294,7 +327,7 @@ impl LoadState {
                             format!("No module named '{name}'; '{partial}' is not a package"),
                             span,
                         );
-                        return Err(LoadError(render(&d, &display, &source)));
+                        return Err(LoadError::at(&d, &display, &source));
                     }
                     let package = package_of(&partial, is_package);
                     let parsed = parse_loc(loc, &partial, package, &self.roots)?;
@@ -307,7 +340,7 @@ impl LoadState {
                         format!("No module named '{name}'"),
                         span,
                     );
-                    return Err(LoadError(render(&d, &display, &source)));
+                    return Err(LoadError::at(&d, &display, &source));
                 }
             }
         }
@@ -538,7 +571,7 @@ fn parse_file(
     roots: &[PathBuf],
 ) -> Result<Parsed, LoadError> {
     let source = std::fs::read_to_string(path)
-        .map_err(|e| LoadError(format!("failed to read {}: {e}", path.display())))?;
+        .map_err(|e| LoadError::plain(format!("failed to read {}: {e}", path.display())))?;
     let display = path.display().to_string();
     let is_package = path.file_name().is_some_and(|f| f == "__init__.py");
     parse_source(display, source, name, package, is_package, roots)
@@ -552,8 +585,7 @@ fn parse_source(
     is_package: bool,
     roots: &[PathBuf],
 ) -> Result<Parsed, LoadError> {
-    let mut module =
-        parser::parse(&source).map_err(|d| LoadError(render(&d, &display, &source)))?;
+    let mut module = parser::parse(&source).map_err(|d| LoadError::at(&d, &display, &source))?;
 
     rewrite_relative_imports(&mut module, package.as_deref(), &display, &source)?;
     let deps = collect_deps(&module, name, roots);
@@ -1082,7 +1114,7 @@ fn rewrite_relative_in_stmts(
                 if *level != 0 {
                     let abs = resolve_relative(*level, m, package).map_err(|msg| {
                         let d = Diagnostic::new(common::Phase::Load, msg, *span);
-                        LoadError(render(&d, display, source))
+                        LoadError::at(&d, display, source)
                     })?;
                     *m = abs;
                     *level = 0;
@@ -1444,7 +1476,11 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected load error for incomplete package shadow"),
         };
-        assert!(err.0.contains("No module named 'os.path'"), "err={}", err.0);
+        assert!(
+            err.message.contains("No module named 'os.path'"),
+            "err={}",
+            err.message
+        );
 
         let _ = std::fs::remove_dir_all(&user);
     }
@@ -1476,7 +1512,11 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected load error for incomplete package shadow"),
         };
-        assert!(err.0.contains("No module named 'os.path'"), "err={}", err.0);
+        assert!(
+            err.message.contains("No module named 'os.path'"),
+            "err={}",
+            err.message
+        );
 
         let _ = std::fs::remove_dir_all(&user);
         let _ = std::fs::remove_dir_all(&stdlib);

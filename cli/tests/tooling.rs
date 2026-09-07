@@ -299,3 +299,214 @@ fn a_mistyped_nested_subcommand_suggests_the_real_one() {
     let message = err(&root, &cache, &["cache", "prun"]);
     assert!(message.contains("prune"), "{message}");
 }
+
+// ---------------------------------------------------------------------------
+// Machine-readable diagnostics
+// ---------------------------------------------------------------------------
+//
+// An editor cannot get a span out of prose. These pin the fields a consumer
+// would index on, and the property that makes the format usable at all:
+// every failure comes out as JSON, including the ones with no position.
+
+/// Minimal field lookup — enough to assert on the shape without a JSON
+/// dependency in the test suite either.
+fn field<'a>(json: &'a str, key: &str) -> &'a str {
+    let at = json
+        .find(&format!("\"{key}\":"))
+        .unwrap_or_else(|| panic!("no key {key} in {json}"));
+    let rest = &json[at + key.len() + 3..];
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let mut end = 0;
+        let bytes = stripped.as_bytes();
+        while end < bytes.len() {
+            if bytes[end] == b'\\' {
+                end += 2;
+                continue;
+            }
+            if bytes[end] == b'"' {
+                break;
+            }
+            end += 1;
+        }
+        &stripped[..end]
+    } else {
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        &rest[..end]
+    }
+}
+
+#[test]
+fn json_diagnostics_carry_a_span_an_editor_can_use() {
+    let (_d, root, cache) = project("json-semantic");
+    write(&root.join("prog.py"), "x: int = 1\ny: int = 2.5\n");
+    let out = pyrs_in(
+        &root,
+        &cache,
+        &["check", "-i", "prog.py", "--message-format", "json"],
+    );
+    assert!(!out.status.success());
+    let json = String::from_utf8_lossy(&out.stderr);
+    let json = json.trim();
+
+    assert!(json.starts_with('{') && json.ends_with('}'), "{json}");
+    assert_eq!(json.lines().count(), 1, "line-delimited: {json}");
+    assert_eq!(field(json, "level"), "error");
+    assert_eq!(field(json, "phase"), "semantic");
+    assert_eq!(field(json, "file"), "prog.py");
+    assert_eq!(field(json, "line"), "2");
+    assert_eq!(field(json, "column"), "10");
+    // The pretty rendering travels with it, so a tool need not reimplement
+    // the renderer to show what the terminal would have shown.
+    assert!(
+        field(json, "rendered").contains("--> prog.py:2:10"),
+        "{json}"
+    );
+}
+
+#[test]
+fn json_diagnostics_cover_every_phase_that_can_fail() {
+    let (_d, root, cache) = project("json-phases");
+    for (source, phase) in [
+        ("def f(:\n", "parse"),
+        ("x: int = 2.5\n", "semantic"),
+        ("import nothing_at_all\n", "load"),
+    ] {
+        write(&root.join("prog.py"), source);
+        let out = pyrs_in(
+            &root,
+            &cache,
+            &["check", "-i", "prog.py", "--message-format", "json"],
+        );
+        assert!(!out.status.success(), "{source} compiled");
+        let json = String::from_utf8_lossy(&out.stderr);
+        let json = json.trim();
+        assert!(json.starts_with('{'), "{phase} was not JSON: {json}");
+        assert_eq!(field(json, "phase"), phase, "{json}");
+    }
+}
+
+#[test]
+fn a_failure_with_no_source_position_is_still_json() {
+    // A tool's parser must not break on exactly the errors it did not
+    // anticipate, so the format is honored even when there is no span.
+    let (_d, root, cache) = project("json-positionless");
+    let out = pyrs_in(
+        &root,
+        &cache,
+        &["check", "-i", "absent.py", "--message-format", "json"],
+    );
+    assert!(!out.status.success());
+    let json = String::from_utf8_lossy(&out.stderr);
+    let json = json.trim();
+    assert!(json.starts_with('{') && json.ends_with('}'), "{json}");
+    assert!(field(json, "message").contains("absent.py"), "{json}");
+}
+
+#[test]
+fn run_and_build_honor_the_format_too() {
+    let (_d, root, cache) = project("json-commands");
+    write(&root.join("prog.py"), "x: int = 2.5\n");
+    for command in ["run", "build"] {
+        let out = pyrs_in(
+            &root,
+            &cache,
+            &[command, "-i", "prog.py", "--message-format", "json"],
+        );
+        assert!(!out.status.success(), "{command}");
+        let json = String::from_utf8_lossy(&out.stderr);
+        assert!(json.trim().starts_with('{'), "{command}: {json}");
+    }
+}
+
+#[test]
+fn the_human_format_is_the_default_and_is_unchanged() {
+    let (_d, root, cache) = project("json-default");
+    write(&root.join("prog.py"), "x: int = 2.5\n");
+    let out = pyrs_in(&root, &cache, &["check", "-i", "prog.py"]);
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.starts_with("error[semantic]"), "{text}");
+    assert!(text.contains("^"), "{text}");
+    assert!(!text.starts_with('{'), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// tree
+// ---------------------------------------------------------------------------
+
+/// A project whose graph has a diamond: `main` and `util` both import
+/// `shared`, which is what exercises the repeat marker.
+fn diamond(root: &Path) {
+    write(
+        &root.join("pyproject.toml"),
+        "[project]\nname = \"app\"\n\n[tool.pyrs]\nentry = \"src/app/main.py\"\nroot = \"src\"\n",
+    );
+    write(&root.join("src/app/__init__.py"), "");
+    write(
+        &root.join("src/app/shared.py"),
+        "def g() -> int:\n    return 2\n",
+    );
+    write(
+        &root.join("src/app/util.py"),
+        "from app import shared\n\n\ndef f() -> int:\n    return shared.g()\n",
+    );
+    write(
+        &root.join("src/app/main.py"),
+        "from app import util, shared\n\nprint(util.f() + shared.g())\n",
+    );
+}
+
+#[test]
+fn tree_shows_the_graph_the_compiler_resolved() {
+    let (_d, root, cache) = project("tree");
+    diamond(&root);
+    let out = ok(&root, &cache, &["tree"]);
+
+    assert!(out.starts_with("__main__\n"), "{out}");
+    assert!(out.contains("app.util"), "{out}");
+    assert!(out.contains("app.shared"), "{out}");
+    // A module reached twice is printed once and marked, or a diamond turns
+    // into an unreadable expansion. `app.shared` is reached from both
+    // `__main__` and `app.util`; the second is a leaf.
+    assert_eq!(out.matches("app.shared").count(), 2, "{out}");
+    assert!(out.contains("app.shared (*)"), "{out}");
+    assert!(out.contains("4 modules"), "{out}");
+    // Box drawing that actually nests.
+    assert!(out.contains("└──") && out.contains("├──"), "{out}");
+    assert!(out.contains("│   "), "the guide column is not drawn: {out}");
+}
+
+#[test]
+fn tree_can_show_where_each_module_came_from() {
+    let (_d, root, cache) = project("tree-paths");
+    diamond(&root);
+    let out = ok(&root, &cache, &["tree", "--paths"]);
+    assert!(out.contains("src/app/shared.py"), "{out}");
+    assert!(out.contains("src/app/util.py"), "{out}");
+}
+
+#[test]
+fn tree_depth_limits_what_is_expanded_not_what_is_counted() {
+    let (_d, root, cache) = project("tree-depth");
+    diamond(&root);
+    let out = ok(&root, &cache, &["tree", "--depth", "1"]);
+    // The count is the whole graph regardless: it is what will be compiled.
+    assert!(out.contains("4 modules"), "{out}");
+    assert!(!out.contains("│   "), "depth 1 expanded a child: {out}");
+}
+
+#[test]
+fn tree_works_without_a_project() {
+    let (_d, root, cache) = project("tree-bare");
+    write(&root.join("prog.py"), "print(1)\n");
+    let out = ok(&root, &cache, &["tree", "-i", "prog.py"]);
+    assert!(out.contains("__main__"), "{out}");
+    assert!(out.contains("1 module\n"), "{out}");
+}
+
+#[test]
+fn tree_reports_a_broken_import_rather_than_a_partial_graph() {
+    let (_d, root, cache) = project("tree-broken");
+    write(&root.join("prog.py"), "import nothing_at_all\n");
+    let message = err(&root, &cache, &["tree", "-i", "prog.py"]);
+    assert!(message.contains("nothing_at_all"), "{message}");
+}

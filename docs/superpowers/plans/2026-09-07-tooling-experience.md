@@ -197,15 +197,49 @@ show the root is what makes the layout work. The git tests need
 `GIT_CEILING_DIRECTORIES`, because the test tree lives inside PyRs's own
 repository and git's search walks upward.
 
+## Milestone 0.114.0 — machine-readable diagnostics and the import graph
+
+`--message-format=json` is the cheapest large-payoff item on the list, and
+the one nothing else can substitute for: an editor cannot get a span out of
+prose, so until it exists no editor integration is possible at all whatever
+else the compiler gets right.
+
+The work is not the JSON. It is that **diagnostics were losing their
+structure on the way out**: `LoadError` was a rendered `String`, so every
+lex, parse and import failure had already become prose before the driver saw
+it, and only semantic errors still had a span. `LoadError` keeps the
+diagnostic alongside the rendered text, and a `Failure` type carries both to
+the print site, where the format decides.
+
+Two details worth stating:
+
+- A failure with **no** position — an unreadable file, a failed link — is
+  still emitted as JSON. Falling back to prose there would mean a tool's
+  parser breaks on exactly the errors it did not anticipate.
+- The encoder escapes every control character, not just the familiar ones.
+  Diagnostics quote user source, and a raw byte below 0x20 makes the whole
+  line unparseable.
+
+No dependency: one flat object shape does not earn `serde_json` in a
+workspace of 37 crates.
+
+`pyrs tree` rides along because it needs the same plumbing — the resolver
+already computed the graph exactly, `Loaded` just never exposed it. For a
+closed-world compiler the output is a fact rather than an estimate: it is the
+set of modules that will be compiled in.
+
+### Verification
+
+Six unit tests in `diagnostics.rs` (location fields, single-line output,
+hostile source text, the position-less case, the unchanged human format, the
+phase surviving both) and twelve in `cli/tests/tooling.rs` (28 total),
+including one that asserts all three failing phases reach JSON.
+
 ## Later, planned but not scheduled here
 
-- `--message-format=json` for diagnostics, which is what makes an editor
-  plugin possible at all.
 - Stable error codes and `pyrs explain`, especially valuable for a *subset*
   compiler where the common error is "this exists in Python but not here" and
   the useful answer is a paragraph.
-- `pyrs tree` over the import graph, which the module resolver already
-  computes exactly.
 - `--debug` (`-g`) so compiled programs can be profiled or debugged at all.
 - `pyrs test`: compile `test_*.py` and run it natively. pytest under CPython
   tests your logic; only a native runner catches PyRs-vs-CPython divergence
