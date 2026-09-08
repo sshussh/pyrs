@@ -1775,8 +1775,12 @@ Container notes:
   `T` in `{int, float, bool, str, list, tuple, dict, set, None}` plus
   class and exception type names (`isinstance(True, int)` is True); peels
   unions and class bases in `if` then/else arms and mid-expression `and`.
-  `any`/`all` on list/str/tuple/set; `enumerate`/`zip`/`reversed` for
-  iteration and as values (**materialize to lists** — not lazy iterators).
+  `any`/`all` on list/str/tuple/set. `zip` and `enumerate` **advance their
+  inputs lazily** wherever they are iterated or consumed — a `for` loop, a
+  comprehension, `list`/`sorted`/`sum`/`min`/`max`/`any`/`all`/`join` — so
+  `zip` stops at the shortest input without draining the others and
+  `zip(infinite(), [1])` terminates. Used as a *value* (`it = zip(a, b)`)
+  they still materialize a list, as `reversed` does everywhere.
 - **unions / Optional:** first-class `None`; `T | U` and `Optional[T]`;
   `is`/`is not` with `None` and same-type identity; `|` is bitwise-or in
   expressions (and set union), union in type annotations.

@@ -135,6 +135,13 @@
       "native": "pass"
     },
     {
+      "id": "lazy-iteration",
+      "group": "core",
+      "file": "cases/lazy_iteration.py",
+      "native": "pass",
+      "reason": "zip advances inputs in lockstep; draining them first did not terminate on an infinite input"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",

@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.118 |
+| Check | Result after 0.119 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1502 passed; none failed or ignored |
+| `cargo test --workspace` | 1520 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
-| `make compatibility` | native 66 pass / 6 skipped; compat 22 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.118.0` |
+| `make compatibility` | native 69 pass / 6 skipped; compat 23 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
+| `pyrs --version` | `PyRs 0.119.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -104,12 +104,13 @@ why correctness rather than new capability sets the near-term order.
 | `f"{xs:}"` | `[1, 2]` | `[1, 2]` | **closed in review** |
 | `e.args` display | `('z',)` | `['z']` | open — see below |
 | `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | `(1, 2)`, `[1, 2]` | **closed in 0.108** |
-| `list(zip(infinite(), [1]))` | `[(0, 1)]` | does not terminate | open — see below |
+| `list(zip(infinite(), [1]))` | `[(0, 1)]` | `[(0, 1)]` | **closed in 0.119** |
 | `(x for x in range(bound()))` | `bound()` at creation | `bound()` at first iteration | open — see below |
 | `"ΟΣ".lower()` | `ος` | `ος` | **closed in review** |
 | `"{0} {0}".format(side())` | one call | one call | **closed in review** |
 | `print([e])` for a caught `e` | `[ValueError('x')]` | `[ValueError('x')]` | **closed in review** |
 | `repr(RuntimeError(""))` | `RuntimeError('')` | `RuntimeError()` | open — see below |
+| `range(a(), b())` operand order | `a()` then `b()` | `a()` then `b()` | **closed in 0.119** |
 
 All seven rows measured on 2026-09-05 are closed; the four still open were
 appended by later review. The table is release gate 2's outstanding list, so
@@ -187,6 +188,21 @@ lockstep, which is the same machinery `itertools`-style laziness would need.
 That is a milestone of its own rather than a fix, and it is tracked in
 workstream C below.
 
+**0.119 closed the first of the two.** The protocol turned out to already
+exist in half the compiler: comprehensions lowered through `CompIterParts`,
+a compile-time cursor of `{cond, element, step, kind}`, while `for` loops had
+a parallel family of hand-written `lower_for_*` functions and the eager
+builtins had a third path that drained to a list. Composition needed one new
+operation — normalising a cursor into *(statements that try to produce an
+element, test for whether one appeared)* — after which `zip` is those pairs
+nested inside each other, so component *k+1* is only advanced when component
+*k* produced. `for`, comprehensions and the eager consumers now share it.
+
+The second row needs `range` and `zip` to be **values**, not just iteration
+forms; the genexp hoist at `semantic/src/lib.rs` already prefers the eager
+path and falls back only when `lower_expr` fails, so reifying those calls
+closes it without touching the genexp lowering at all.
+
 ## Product contract
 
 Native execution by default, with an explicit opt-in CPython compatibility
@@ -263,7 +279,11 @@ documentation and the relevant gates.
 
 ### C. Python values, typing and protocols
 
-- [ ] **Lazy iteration protocol.** Advance iterables in lockstep instead of
+- [ ] **Lazy iteration protocol.** Half closed in 0.119: `zip` and
+      `enumerate` compose as cursors and advance in lockstep wherever they are
+      iterated or consumed. What remains is iterators as *values*, which is
+      what the generator-expression row needs.
+      Original statement: Advance iterables in lockstep instead of
       materializing them: `zip` must stop at the shortest input rather than
       draining each one first (today `zip(infinite(), [1])` hangs), and a
       generator expression must evaluate its outermost iterable at creation

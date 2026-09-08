@@ -14937,6 +14937,14 @@ fn lower_for(
         return lower_for_range(target, &plain, iter.span, body, orelse, ctx, out);
     }
 
+    // `for ... in zip(...)` / `enumerate(...)` — advanced in lockstep, with
+    // no list and no per-element tuple beyond the one the target binds.
+    if is_lazy_combinator(iter, ctx) {
+        let mut setup = Vec::new();
+        let parts = lower_comp_iter(iter, false, ctx, &mut setup)?;
+        return lower_for_parts(target, parts, setup, body, orelse, ctx, out);
+    }
+
     // general case: list/string by index, or file via readline until ""
     let seq = lower_expr(iter, ctx)?;
     match seq.ty {
@@ -15579,6 +15587,37 @@ fn lower_for_file(
 }
 
 /// `for x in xs` / `for c in s` — index from 0 to len (re-read each iteration).
+/// Emit a `for` loop over an already-built cursor.
+///
+/// The cursor protocol was only used by comprehensions and drains; `for` had
+/// a parallel family of `lower_for_*` functions. Routing `for` through it too
+/// is what lets one iterable form — a composed `zip`, say — serve every
+/// consumer, and it keeps `break`/`continue`/`else` and the type-refinement
+/// lifecycle in exactly one place.
+fn lower_for_parts(
+    target: &ast::AssignTarget,
+    parts: CompIterParts,
+    setup: Vec<ir::Stmt>,
+    body: &[ast::Stmt],
+    orelse: &[ast::Stmt],
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    out.extend(setup);
+    let entry_ref = ctx.type_refinements.clone();
+    let bind = bind_for_target(target, parts.element, ctx)?;
+    ctx.loop_depth += 1;
+    let user_body = lower_nested_block(body, ctx);
+    ctx.loop_depth -= 1;
+    restore_refinements_after_for(ctx, entry_ref, target, body, orelse);
+    let mut payload = bind;
+    payload.extend(user_body?);
+    let loop_body = comp_kind_body(parts.kind, payload);
+    push_loop_with_else(parts.cond, loop_body, parts.step, orelse, ctx, out)?;
+    clear_orelse_assigns(ctx, orelse);
+    Ok(())
+}
+
 fn lower_for_indexed(
     target: &ast::AssignTarget,
     seq: ir::Expr,
@@ -15744,15 +15783,11 @@ fn lower_for_range(
     // target at the top of each iteration. After exhaustion the variable
     // holds the last *yielded* value (not one past), an empty range never
     // assigns it, and mutating it inside the body cannot derail the loop.
-    let stop_t = ctx.fresh_temp("range.stop", ir::Ty::Int);
-    out.push(ir::Stmt::Assign {
-        name: stop_t.clone(),
-        value: stop,
-    });
-    let stop_local = ir::Expr {
-        ty: ir::Ty::Int,
-        kind: ir::ExprKind::Local(stop_t),
-    };
+    // Bind start, then stop, then step (below): CPython evaluates a call's
+    // arguments left to right, and `lower_expr` leaves side effects inside
+    // the expression, so the order these temps are assigned in *is* the
+    // order the operands run in. Binding stop first made
+    // `range(a(), b())` call `b()` before `a()`.
     let it_t = ctx.fresh_temp("range.it", ir::Ty::Int);
     out.push(ir::Stmt::Assign {
         name: it_t.clone(),
@@ -15761,6 +15796,15 @@ fn lower_for_range(
     let it_local = ir::Expr {
         ty: ir::Ty::Int,
         kind: ir::ExprKind::Local(it_t.clone()),
+    };
+    let stop_t = ctx.fresh_temp("range.stop", ir::Ty::Int);
+    out.push(ir::Stmt::Assign {
+        name: stop_t.clone(),
+        value: stop,
+    });
+    let stop_local = ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Local(stop_t),
     };
 
     // constant steps get a simple condition; dynamic steps need a zero
@@ -18433,10 +18477,13 @@ fn homogeneous_tuple_elem(elems: &[ir::Ty], span: Span) -> SResult<ir::Ty> {
     }
 }
 
-fn wrap_comp_level(level: CompLevel, inner: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
-    let mut payload = level.bind;
-    payload.extend(wrap_comp_ifs(&level.ifs, inner));
-    let while_body = match level.kind {
+/// The loop body for one cursor: try to produce an element, and run `payload`
+/// if one appeared.
+///
+/// Shared by comprehensions, drains and `for` loops, so all three agree on
+/// what a cursor means.
+fn comp_kind_body(kind: CompIterKind, payload: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
+    match kind {
         CompIterKind::Indexed => payload,
         CompIterKind::StopTry { next_assign, more } => vec![ir::Stmt::Try {
             body: vec![*next_assign],
@@ -18460,15 +18507,264 @@ fn wrap_comp_level(level: CompLevel, inner: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
             });
             b
         }
-    };
+    }
+}
+
+/// A cursor's advance, split so it can be nested inside another cursor's.
+///
+/// Returns the statements that attempt to produce the next element, and the
+/// test that says whether one appeared. Composition needs this shape and the
+/// three kinds do not share it: `Indexed` tests before producing, while the
+/// other two produce and then discover exhaustion.
+fn parts_to_advance(parts: &CompIterParts) -> (Vec<ir::Stmt>, ir::Expr) {
+    match &parts.kind {
+        CompIterKind::Indexed => (Vec::new(), parts.cond.clone()),
+        CompIterKind::StopTry { next_assign, more } => (
+            vec![ir::Stmt::Try {
+                body: vec![(**next_assign).clone()],
+                handlers: vec![(
+                    Some(vec![ir::ExcType::StopIteration]),
+                    None,
+                    vec![assign_const_bool(more.clone(), false)],
+                )],
+                orelse: Vec::new(),
+                finally: Vec::new(),
+            }],
+            parts.cond.clone(),
+        ),
+        CompIterKind::ExhaustIf {
+            prelude,
+            exhausted,
+            more,
+        } => {
+            let mut advance = prelude.clone();
+            advance.push(ir::Stmt::If {
+                branches: vec![(
+                    exhausted.clone(),
+                    vec![assign_const_bool(more.clone(), false)],
+                )],
+                orelse: Vec::new(),
+            });
+            (advance, parts.cond.clone())
+        }
+    }
+}
+
+fn wrap_comp_level(level: CompLevel, inner: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
+    let mut payload = level.bind;
+    payload.extend(wrap_comp_ifs(&level.ifs, inner));
     let while_stmt = ir::Stmt::While {
         cond: level.cond,
-        body: while_body,
+        body: comp_kind_body(level.kind, payload),
         step: level.step,
     };
     let mut wrapped = level.setup;
     wrapped.push(while_stmt);
     wrapped
+}
+
+/// Whether `e` is a call to a builtin that this module can advance lazily,
+/// rather than by materializing a list first.
+fn is_lazy_combinator(e: &ast::Expr, ctx: &FnCtx) -> bool {
+    matches!(&e.kind, ast::ExprKind::Call { func, .. }
+        if matches!(func.as_str(), "zip" | "enumerate") && !ctx.funcs().contains_key(func.as_str()))
+}
+
+/// `zip(a, b, ...)` as one cursor.
+///
+/// The components are advanced **inside each other**, left to right:
+/// component *k+1* is only advanced when component *k* produced an element.
+/// That is CPython's order, and it is the whole point — the previous
+/// lowering drained every argument into a list before pairing them, so
+/// `list(zip(infinite(), [1]))` never reached the shortest input and did not
+/// terminate.
+///
+/// The generated shape, for two components:
+///
+/// ```text
+/// setup:  <a's setup>; <b's setup>; more = True; done = False
+/// body:   <a's advance>
+///         if <a produced>:
+///             e0 = <a's element>; <a's step>
+///             <b's advance>
+///             if <b produced>:
+///                 e1 = <b's element>; <b's step>
+///             else: done = True
+///         else: done = True
+///         if done: more = False else: <payload with (e0, e1)>
+/// ```
+fn zip_parts(
+    args: &[&ast::Expr],
+    ctx: &mut FnCtx,
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<CompIterParts> {
+    if args.is_empty() {
+        // CPython: `list(zip())` is `[]`. A cursor that never produces is the
+        // composition-friendly way to say that.
+        let (more_t, more_local) = push_comp_more(ctx, setup);
+        return Ok(CompIterParts {
+            cond: more_local,
+            step: Vec::new(),
+            element: ir::Expr {
+                ty: ir::tuple_of(&[]),
+                kind: ir::ExprKind::TupleLit(Vec::new()),
+            },
+            cap: Some(int_const(0)),
+            kind: CompIterKind::ExhaustIf {
+                prelude: Vec::new(),
+                exhausted: ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::ConstBool(true),
+                },
+                more: more_t,
+            },
+        });
+    }
+    // Component setups run first and in source order, so `zip(a(), b())`
+    // evaluates `a()` before `b()` exactly as a call would.
+    let mut components: Vec<(CompIterParts, String)> = Vec::new();
+    for arg in args {
+        let parts = lower_comp_iter(arg, false, ctx, setup)?;
+        let slot = ctx.fresh_temp("zip.elem", parts.element.ty);
+        components.push((parts, slot));
+    }
+    let (more_t, more_local) = push_comp_more(ctx, setup);
+    // A separate `done` flag rather than negating `more`: the IR has no
+    // boolean not, and testing a flag set by the advance is clearer than
+    // threading an inverted condition through the nesting.
+    let done_t = ctx.fresh_temp("zip.done", ir::Ty::Bool);
+    setup.push(assign_const_bool(done_t.clone(), false));
+
+    let elem_tys: Vec<ir::Ty> = components.iter().map(|(p, _)| p.element.ty).collect();
+    let element = ir::Expr {
+        ty: ir::tuple_of(&elem_tys),
+        kind: ir::ExprKind::TupleLit(
+            components
+                .iter()
+                .map(|(p, slot)| ir::Expr {
+                    ty: p.element.ty,
+                    kind: ir::ExprKind::Local(slot.clone()),
+                })
+                .collect(),
+        ),
+    };
+
+    // Build the nesting from the inside out, so the first component ends up
+    // outermost and the last one is only reached when all before it produced.
+    let mut prelude: Vec<ir::Stmt> = Vec::new();
+    for (parts, slot) in components.into_iter().rev() {
+        let (advance, produced) = parts_to_advance(&parts);
+        let mut then = vec![ir::Stmt::Assign {
+            name: slot,
+            value: parts.element,
+        }];
+        then.extend(parts.step);
+        then.extend(prelude);
+        let mut block = advance;
+        block.push(ir::Stmt::If {
+            branches: vec![(produced, then)],
+            orelse: vec![assign_const_bool(done_t.clone(), true)],
+        });
+        prelude = block;
+    }
+
+    Ok(CompIterParts {
+        cond: more_local,
+        step: Vec::new(),
+        element,
+        // The components' lengths are not all knowable, and the shortest
+        // decides; presizing is given up rather than guessed.
+        cap: None,
+        kind: CompIterKind::ExhaustIf {
+            prelude,
+            exhausted: ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Local(done_t),
+            },
+            more: more_t,
+        },
+    })
+}
+
+/// `enumerate(it)` / `enumerate(it, start)` as one cursor.
+///
+/// The counter rides along on the inner cursor: same exhaustion shape, one
+/// extra step. No list and no intermediate `list[tuple[int, T]]`.
+fn enumerate_parts(
+    args: &[&ast::Expr],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<CompIterParts> {
+    // The argument contract is unchanged from the eager lowering; only how
+    // the sequence is consumed differs.
+    if let Some(kw) = keywords.iter().find(|k| k.name != "start") {
+        return Err(err(
+            "enumerate() only supports the optional start= keyword",
+            kw.name_span,
+        ));
+    }
+    if args.is_empty() || args.len() > 2 {
+        return Err(err(
+            format!(
+                "enumerate() takes 1 or 2 positional arguments ({} given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    if args.len() == 2 && keywords.iter().any(|k| k.name == "start") {
+        return Err(err(
+            "enumerate() got multiple values for argument 'start'",
+            span,
+        ));
+    }
+    // Iterable first, then `start`: CPython evaluates arguments left to right.
+    let inner = lower_comp_iter(args[0], false, ctx, setup)?;
+    let start = if let Some(kw) = keywords.iter().find(|k| k.name == "start") {
+        let v = lower_expr(&kw.value, ctx)?;
+        coerce(v, ir::Ty::Int, kw.value.span, "enumerate start")?
+    } else if let Some(a) = args.get(1) {
+        let v = lower_expr(a, ctx)?;
+        coerce(v, ir::Ty::Int, a.span, "enumerate start")?
+    } else {
+        int_const(0)
+    };
+    let idx_t = ctx.fresh_temp("enum.i", ir::Ty::Int);
+    setup.push(ir::Stmt::Assign {
+        name: idx_t.clone(),
+        value: start,
+    });
+    let idx_local = ir::Expr {
+        ty: ir::Ty::Int,
+        kind: ir::ExprKind::Local(idx_t.clone()),
+    };
+
+    let elem_ty = inner.element.ty;
+    let element = ir::Expr {
+        ty: ir::tuple_of(&[ir::Ty::Int, elem_ty]),
+        kind: ir::ExprKind::TupleLit(vec![idx_local.clone(), inner.element]),
+    };
+    let mut step = inner.step;
+    step.push(ir::Stmt::Assign {
+        name: idx_t,
+        value: ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Binary {
+                op: ir::BinOp::Add,
+                left: Box::new(idx_local),
+                right: Box::new(int_const(1)),
+            },
+        },
+    });
+    Ok(CompIterParts {
+        cond: inner.cond,
+        step,
+        element,
+        cap: inner.cap,
+        kind: inner.kind,
+    })
 }
 
 /// Build loop setup for one comprehension generator.
@@ -18479,6 +18775,23 @@ fn lower_comp_iter(
     ctx: &mut FnCtx,
     setup: &mut Vec<ir::Stmt>,
 ) -> SResult<CompIterParts> {
+    if let ast::ExprKind::Call {
+        func,
+        args,
+        keywords,
+        ..
+    } = &iter.kind
+        && matches!(func.as_str(), "zip" | "enumerate")
+        && !ctx.funcs().contains_key(func.as_str())
+    {
+        return if func == "zip" {
+            let plain = require_plain_args(args, func, iter.span)?;
+            zip_parts(&plain, ctx, setup)
+        } else {
+            let plain = require_plain_args(args, func, iter.span)?;
+            enumerate_parts(&plain, keywords, iter.span, ctx, setup)
+        };
+    }
     if let ast::ExprKind::Call { func, args, .. } = &iter.kind
         && func == "range"
         && !ctx.funcs().contains_key("range")
@@ -18507,15 +18820,8 @@ fn lower_comp_iter(
                 (lowered.remove(0), stop, step)
             }
         };
-        let stop_t = ctx.fresh_temp("comp.stop", ir::Ty::Int);
-        setup.push(ir::Stmt::Assign {
-            name: stop_t.clone(),
-            value: stop,
-        });
-        let stop_local = ir::Expr {
-            ty: ir::Ty::Int,
-            kind: ir::ExprKind::Local(stop_t),
-        };
+        // start, then stop, then step -- see `lower_for_range` for why the
+        // assignment order is the evaluation order.
         let it_t = ctx.fresh_temp("comp.it", ir::Ty::Int);
         setup.push(ir::Stmt::Assign {
             name: it_t.clone(),
@@ -18524,6 +18830,15 @@ fn lower_comp_iter(
         let it_local = ir::Expr {
             ty: ir::Ty::Int,
             kind: ir::ExprKind::Local(it_t.clone()),
+        };
+        let stop_t = ctx.fresh_temp("comp.stop", ir::Ty::Int);
+        setup.push(ir::Stmt::Assign {
+            name: stop_t.clone(),
+            value: stop,
+        });
+        let stop_local = ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::Local(stop_t),
         };
 
         let (loop_cond, step_value, cap) = match step.kind {
@@ -19007,6 +19322,14 @@ fn materialize_iterable_value(value: ir::Expr, ctx: &mut FnCtx) -> SResult<ir::E
 /// comprehension machinery already handles it on. Probing rather than
 /// enumerating keeps this correct as more iterables become values.
 fn materialize_iterable_arg(e: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    // A combinator *can* be lowered as a value -- into a materialized list --
+    // so probing `lower_expr` first would find the eager path and never
+    // reach the lazy one. These are taken before the probe, not after it.
+    if is_lazy_combinator(e, ctx) {
+        let mut setup = Vec::new();
+        let parts = lower_comp_iter(e, false, ctx, &mut setup)?;
+        return drain_parts_to_list(parts, setup, ctx);
+    }
     match lower_expr(e, ctx) {
         Ok(v) => materialize_iterable_value(v, ctx),
         Err(direct) => {
@@ -21500,6 +21823,14 @@ fn lower_call(
                 }
                 // `list(range(n))` and friends: range is not a value, so the
                 // argument is materialized through the comprehension path.
+                // `list(zip(...))` takes it too, and must take it *before*
+                // the probe below, which would otherwise find the eager
+                // lowering and drain an infinite input.
+                if is_lazy_combinator(args[0], ctx) {
+                    let mut setup = Vec::new();
+                    let parts = lower_comp_iter(args[0], false, ctx, &mut setup)?;
+                    return drain_parts_to_list(parts, setup, ctx);
+                }
                 match lower_expr(args[0], ctx) {
                     Ok(arg) => lower_list_ctor(arg, args[0].span, ctx),
                     Err(direct) => {

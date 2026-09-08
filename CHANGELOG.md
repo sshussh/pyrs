@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.119.0 — Lazy `zip` and `enumerate`, and the range operand order
+
+Two measured defects close. Both were silent wrong answers in the supported
+surface, which is release gate 2's outstanding list.
+
+### `zip` no longer drains what it is about to discard
+
+```python
+print(list(zip(infinite(), [10])))     # hung; now [(0, 10)], as CPython
+```
+
+`zip` materialized **every** argument into a list before pairing them, so it
+computed `min(len(...))` only after it had already tried to drain an infinite
+input. Any finite generator's side effects also all ran up front, in the
+wrong order.
+
+**The algorithm.** Half the protocol already existed: comprehensions lowered
+through `CompIterParts`, a compile-time cursor of `{cond, element, step,
+kind}`, where `kind` is one of three advance shapes — `Indexed` (test, then
+read: lists, strings, tuples, `range`), `ExhaustIf` (fetch, then discover
+exhaustion: generators, files) and `StopTry` (call `__next__` inside a `try`:
+user iterators). `for` loops had a parallel family of hand-written
+`lower_for_*` functions, and the eager builtins had a third path that drained
+to a list.
+
+Composition needed one new operation, `parts_to_advance`: normalise any cursor
+into *(the statements that try to produce an element, the test for whether one
+appeared)*. The three kinds do not share that shape — `Indexed` tests before
+producing while the other two produce and then discover — which is exactly why
+they could not be composed before.
+
+With that, `zip` is those pairs **nested inside each other**:
+
+```text
+<a's advance>
+if <a produced>:
+    e0 = <a's element>; <a's step>
+    <b's advance>
+    if <b produced>:
+        e1 = <b's element>; <b's step>
+    else: done = True
+else: done = True
+```
+
+Component *k+1* is only advanced when component *k* produced, so an exhausted
+input stops the ones after it from being touched at all — CPython's order, and
+observable through side effects, so the tests assert pull *counts* rather than
+just results. `enumerate` is the same cursor with a counter riding along on
+its step.
+
+`for`, comprehensions and the eager consumers (`list`, `sorted`, `sum`,
+`min`/`max`, `any`/`all`, `str.join`) now share one protocol, so a composed
+`zip` works in all of them. `for i, x in enumerate(xs)` no longer builds a
+list or *N* tuples; `for a, b in zip(xs, ys)` no longer drains twice. Used as
+a *value* (`it = zip(a, b)`) they still materialize — that needs iterators to
+be first-class, which is the next milestone and also what closes the
+generator-expression row.
+
+### `range(a(), b())` called `b()` first
+
+Found while writing the above. `stop` was bound to a temp before `start`, and
+`lower_expr` leaves side effects inside the expression, so the assignment
+order *was* the evaluation order. Present in both the `for` and comprehension
+paths, invisible for the overwhelmingly common `range(n)`. Now start, stop,
+step — CPython's left-to-right.
+
+18 differential tests in `cli/tests/lazy_iteration.rs` at `-O0`/`-O2`/`-O3`,
+each with a timeout, since a hung test process reports nothing. A new
+`lazy-iteration` compatibility probe covers it under GC stress.
+
 ## 0.118.0 — Make the gates measure what they claim
 
 Housekeeping before the correctness work, because every later milestone's
