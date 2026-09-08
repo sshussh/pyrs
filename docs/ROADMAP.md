@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.124 |
+| Check | Result after 0.125 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1575 passed; none failed or ignored |
+| `cargo test --workspace` | 1576 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 78 pass / 6 skipped; compat 26 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.124.0` |
+| `pyrs --version` | `PyRs 0.125.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -437,6 +437,10 @@ documentation and the relevant gates.
 - [x] Make the gates measure what they claim (0.118): `make compatibility`
       runs every group, so the scientific/data cases the product contract
       names are counted as `skipped` rather than excluded by `--group core`.
+- [ ] Inline the small-int fast path, or link the runtime with LTO. Every
+      `int` operation is an out-of-line call the optimizer cannot see through,
+      which is the whole of the integer-benchmark gap: the same trial division
+      in floats goes from 0.8x to 21x. Measured 2026-09-08.
 - [ ] Declare the supported host/target matrix (initially Linux x86-64) and
       exercise each claimed platform in CI.
 - [ ] Reproducible release builds, checksums, install instructions,

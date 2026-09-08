@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.125.0 — An unpack target binds directly; the benchmark table is re-measured
+
+**`for a, b in zip(xs, ys)` allocated a heap tuple per element** and
+destructured it on the next line. 0.119 removed the intermediate *list* and
+recorded the per-element tuple as a deferred sub-step; benchmarking showed it
+was the whole remaining cost. On a 1M-element zip: building the two lists took
+19 ms, and the loop that paired them took a further **332 ms** against
+CPython's 66 ms.
+
+When the target's arity is known and matches the cursor's element — which is
+exactly `zip` and `enumerate` — the components bind straight from the cursor
+and no tuple is built. A single-name target still receives the whole tuple, and
+a starred target keeps it too, since `*rest` consumes an unknown number of
+elements and the arity match does not describe it.
+
+The 1M-element zip loop went **351 ms → 33 ms**, from 1.6× slower than CPython
+to 6.5× faster.
+
+### The benchmark table was two months stale
+
+The README recorded 25.4× overall and `fib(35)` at 25 ms. Measured now on a
+quiet machine, best-of-5: 3.2× overall and `fib(35)` at 168 ms. The recorded
+numbers date from **2026-07-08 (v0.5)**; tagged small-int and bignum
+arithmetic landed **2026-07-15 (v0.17)**, a week later. They were measured
+against a compiler whose `int` was a machine `i64`.
+
+The table is replaced with what the current compiler does, and the headline
+claim with it — "6–170× faster" becomes "float-heavy code runs 5–21× faster;
+integer-heavy code is currently slower".
+
+**One cause, measured rather than guessed.** Every `int` operation is an
+out-of-line call into the runtime, because arbitrary precision needs a tagged
+representation with an overflow check and the runtime is linked as a separate
+object the optimizer cannot inline through. The `is_prime` inner loop makes six
+such calls per iteration. Rewriting the same trial division in floats takes it
+from 0.8× to 21×, which accounts for the entire gap.
+
+Three benchmarks added for what 0.119–0.124 shipped: `iteration` (`zip` /
+`enumerate`), `pipeline` (lazy `map`/`filter`) and `exceptions` (raise/catch
+through a call boundary). Each is byte-checked against CPython before timing,
+like the rest.
+
 ## 0.124.0 — `__name__`, `sys.exit`, and `print(file=...)`
 
 ```python

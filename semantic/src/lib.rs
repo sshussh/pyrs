@@ -15203,6 +15203,38 @@ fn assign_target_span(target: &ast::AssignTarget) -> Span {
 }
 
 /// Bind a for-loop / comprehension element into an assignment target.
+/// Bind a cursor element into a `for` target, without building the tuple when
+/// the target immediately takes it apart again.
+///
+/// `for a, b in zip(xs, ys)` produced a heap tuple per element and destructured
+/// it on the next line. Measured on a 1M-element zip, that was the whole cost:
+/// building the two lists took 19 ms, and the loop that paired them took a
+/// further 332 ms against CPython's 66 ms. The allocation is pure overhead
+/// whenever the arity is known and matches, which is exactly the `zip` and
+/// `enumerate` cases.
+fn bind_cursor_element(
+    target: &ast::AssignTarget,
+    element: ir::Expr,
+    ctx: &mut FnCtx,
+) -> SResult<Vec<ir::Stmt>> {
+    if let ast::AssignTarget::Tuple(parts) = target
+        && let ir::ExprKind::TupleLit(items) = &element.kind
+        && parts.len() == items.len()
+        // A starred target consumes an unknown number of elements, so the
+        // arity match above does not describe it.
+        && !parts
+            .iter()
+            .any(|t| matches!(t, ast::AssignTarget::Starred { .. }))
+    {
+        let mut stmts = Vec::new();
+        for (part, item) in parts.iter().zip(items.iter()) {
+            stmts.extend(bind_for_target(part, item.clone(), ctx)?);
+        }
+        return Ok(stmts);
+    }
+    bind_for_target(target, element, ctx)
+}
+
 fn bind_for_target(
     target: &ast::AssignTarget,
     value: ir::Expr,
@@ -15899,7 +15931,7 @@ fn lower_for_parts(
 ) -> SResult<()> {
     out.extend(setup);
     let entry_ref = ctx.type_refinements.clone();
-    let bind = bind_for_target(target, parts.element, ctx)?;
+    let bind = bind_cursor_element(target, parts.element, ctx)?;
     ctx.loop_depth += 1;
     let user_body = lower_nested_block(body, ctx);
     ctx.loop_depth -= 1;

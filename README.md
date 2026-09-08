@@ -6,7 +6,8 @@ A Python compiler written in Rust, emitting native code through LLVM.
 
 PyRs compiles a **statically typed subset of Python** straight to machine
 code — no interpreter, no VM, no runtime dependency on CPython. Compute-bound
-code runs 6–170× faster than CPython ([benchmarks](#benchmarks)).
+float-heavy code runs 5–21× faster than CPython; integer-heavy code is
+currently slower ([benchmarks](#benchmarks)).
 
 ```console
 $ cat examples/fib.py
@@ -40,7 +41,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.124.0**.
+Current milestone: **v0.125.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -196,19 +197,32 @@ nonmoving mark–sweep [collector](docs/GC.md).
 ## Benchmarks
 
 `benchmarks/run.sh` compiles each program with `pyrs -O2`, checks its output
-is byte-identical to `python3`'s, then reports best-of-3 wall times:
+is byte-identical to `python3`'s, then reports best-of-5 wall times:
 
-| benchmark  | workload                                 | python3 |   PyRs | speedup |
-| ---------- | ---------------------------------------- | ------: | -----: | ------: |
-| fib        | recursion, 12M calls (`fib(35)`)         |  1.163s | 0.025s |   45.8× |
-| listcomp   | comprehensions, 3M-element map/filter    |  0.570s | 0.033s |   17.0× |
-| mandelbrot | float math, 500×500 escape iterations    |  0.944s | 0.017s |   54.8× |
-| matmul     | nested lists, 250×250 matrix multiply    |  0.783s | 0.018s |   44.7× |
-| nbody      | float + list, 5-body gravity, 100k steps |  1.352s | 0.008s |  172.7× |
-| primes     | int loops, trial division to 300k        |  0.629s | 0.064s |    9.8× |
-| sort       | list indexing, bubble sort of 5000       |  1.008s | 0.022s |   46.6× |
-| strings    | per-char iteration, 2.6M comparisons     |  0.656s | 0.103s |    6.4× |
-| **total**  |                                          |  6.535s | 0.257s |   25.4× |
+| benchmark  | workload                                  | python3 |   PyRs | speedup |
+| ---------- | ----------------------------------------- | ------: | -----: | ------: |
+| mandelbrot | float math, 500×500 escape iterations     |  0.599s | 0.028s |   21.5× |
+| nbody      | float + list, 5-body gravity, 100k steps  |  0.791s | 0.042s |   18.8× |
+| pipeline   | lazy `map`/`filter` over 2M elements      |  0.300s | 0.029s |   10.4× |
+| iteration  | `zip`/`enumerate`, 2M paired steps        |  0.311s | 0.045s |    7.0× |
+| matmul     | nested lists, 250×250 matrix multiply     |  0.529s | 0.097s |    5.4× |
+| fib        | recursion, 30M calls (`fib(35)`)          |  0.695s | 0.168s |    4.1× |
+| sort       | list indexing, bubble sort of 5000        |  0.657s | 0.205s |    3.2× |
+| strings    | per-char iteration, 2.6M comparisons      |  0.369s | 0.130s |    2.8× |
+| listcomp   | comprehensions, 3M-element map/filter     |  0.403s | 0.257s |    1.6× |
+| exceptions | 400k calls, 171k raise/catch round trips  |  0.101s | 0.109s |    0.9× |
+| primes     | int loops, trial division to 300k         |  0.426s | 0.509s |    0.8× |
+| **total**  |                                           |  5.182s | 1.618s |    3.2× |
+
+**Integer-heavy code is the weak spot, and it is one cause.** Every `int`
+operation is an out-of-line call into the runtime — `pyrs_int_add`,
+`pyrs_int_mul`, `pyrs_int_cmp` — because arbitrary precision needs a tagged
+representation with an overflow check, and the runtime is linked as a separate
+object the optimizer cannot inline through. Float code has no such call and
+runs 19–21× faster. The same trial-division algorithm rewritten in floats goes
+from 0.8× to 21× on this machine, which is the whole gap. Exceptions are
+slower for a related reason: the loop around them is 3.9× faster than CPython,
+but each raise/catch costs about 525 ns against CPython's 228 ns.
 
 (Linux, LLVM 22, CPython 3.14; run `./benchmarks/run.sh` to reproduce.)
 
@@ -235,7 +249,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.124.0 && git push origin v0.124.0`.
+Release tags: `git tag v0.125.0 && git push origin v0.125.0`.
 
 ## Documentation
 
