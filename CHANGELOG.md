@@ -45,6 +45,8 @@ build many short-lived strings, and every managed object is still an individual
 `calloc` on one global intrusive list. That is now the single largest remaining
 item, and it is the same root cause in both benchmarks.
 
+Design notes: [2026-09-08-per-operation-calls](docs/superpowers/plans/2026-09-08-per-operation-calls.md).
+
 ## 0.132.0 — String equality and ASCII indexing stop calling the runtime
 
 `strings` was the slowest benchmark at 3.2x. It walks an 88k-character string
@@ -102,6 +104,8 @@ one such clobber stops LICM regardless of what the other calls claim. `sort`'s
 profile also says the prize is one instruction in a ~50-instruction loop body.
 Not worth the silent-miscompilation surface, and recorded in the roadmap so it
 is not attempted again without a different plan.
+
+Design notes: [2026-09-08-per-operation-calls](docs/superpowers/plans/2026-09-08-per-operation-calls.md).
 
 ## 0.131.0 — A `try` stops making a syscall, and a caught exception stops allocating
 
@@ -162,6 +166,8 @@ Beyond the allocations, this is what makes `pyrs_int_cmp` and `pyrs_int_eq`
 provably non-allocating and non-trapping, which the next milestone needs before
 it can attribute them for LLVM.
 
+Design notes: [2026-09-08-per-operation-calls](docs/superpowers/plans/2026-09-08-per-operation-calls.md).
+
 ## 0.130.0 — The collector stops sorting its heap on every pass
 
 `objects` ran at **0.7× CPython**. Turning the collector off with `PYRS_GC=none`
@@ -200,6 +206,8 @@ were the cost, and the benchmark that says so is in the table.
 buffers mixed with small ones, sizes straddling granule boundaries, nested
 containers traced through both tiers, dict and set tables, and values held only
 by a generator frame or by a local live across a raise.
+
+Design notes: [2026-09-08-collector-and-backend](docs/superpowers/plans/2026-09-08-collector-and-backend.md).
 
 ## 0.129.0 — The mark phase stops paying a call per list element
 
@@ -242,6 +250,8 @@ Every managed object is also an individual `calloc` on one global intrusive
 list. That is the next milestone; the benchmark exists so it is measured
 against evidence rather than intuition.
 
+Design notes: [2026-09-08-collector-and-backend](docs/superpowers/plans/2026-09-08-collector-and-backend.md).
+
 ## 0.128.0 — The backend learns the optimization level, and gets a `--target-cpu`
 
 Two knobs in `codegen/shim/src/lib.cc` had never been plumbed.
@@ -283,6 +293,8 @@ instructions to 21.
 Recorded as measured rather than as a headline: the flag is there for code that
 can use it, and the published benchmark table stays on `generic`, which is what
 `pyrs compile` actually produces.
+
+Design notes: [2026-09-08-collector-and-backend](docs/superpowers/plans/2026-09-08-collector-and-backend.md).
 
 ## 0.127.0 — A `try` no longer pins every local in the function to memory
 
@@ -339,6 +351,8 @@ written inside the `try` and read in the handler, one written only before it,
 nested tries, a handler that writes, a loop counter incremented outside the try
 and read inside it, heap values live across a raise (under GC stress), and a
 generator, whose frame storage already survives a resume and is unaffected.
+
+Design notes: [2026-09-08-collector-and-backend](docs/superpowers/plans/2026-09-08-collector-and-backend.md).
 
 ## 0.126.0 — Integer arithmetic is inlined; the corpus goes from 3.2x to 9.5x
 

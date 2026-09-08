@@ -131,7 +131,7 @@ Organize work by **family**, not a flat list of C functions.
 |--------|----------------|-------------------------|------|
 | **Core / memory** | Managed allocation, tracing, owned-buffer accounting | `pyrs_gc_alloc`, mark–sweep, external-byte hooks | C |
 | **Numeric** | Scalar ops beyond pure LLVM | `abs`, `ipow`, floored float ops | IR and/or C |
-| **str** | Immutable strings, ASCII policy today | `concat`, `find`, `split`, `isdigit` | C; index path may IR |
+| **str** | Immutable strings, ASCII policy today | `concat`, `find`, `split`, `isdigit` | C; index and `==` are IR (v0.132) |
 | **list** | Growable slots, mutators | `push`, `pop`, `insert`, `+`, `==` | C + IR for index/len |
 | **file / io** | Text files, stdin, argv | `open`, `read`, `input`, `argv` | C |
 | **print / traps** | CPython-like output and errors | `print_*`, `die` | C |
@@ -252,6 +252,9 @@ below) as symbols are added.
 | `len(x)` | core | yes | IR | yes | yes | |
 | `s.isdigit()` | str | no | C | yes | yes | ASCII digits |
 | `xs[i]` | list | yes | IR | yes | yes | bounds + slot |
+| `s[i]` | str | yes | IR | yes | yes | one-byte-per-code-point path; runtime otherwise |
+| `a == b` | str | yes | IR | yes | yes | identity, then length, then one byte |
+| `a + b` (int) | numeric | yes | IR | yes | yes | tagged fast path; runtime for bignums |
 | `open` | io | no | C | yes | yes | |
 | `xs.insert` | list | med | C | … | … | example gap |
 | `dict` get/set | dict | yes | C (+ IR later?) | … | … | planned family |

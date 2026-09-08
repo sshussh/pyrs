@@ -46,6 +46,31 @@ valid one-past pointer, keeps its managed owner alive, and sweeping the owner
 releases the backing storage. This preserves derived pointers without treating
 untyped buffers as independent language objects.
 
+### Finding a candidate's owner
+
+Marking answers "which object contains this address" for every candidate word,
+so that lookup is the mark phase's inner loop. Two things make it cheap.
+
+An **envelope** records the lowest and highest address any range covers, and a
+candidate outside it is rejected by two compares. Most candidates are not
+pointers at all — a tagged small int is odd and tiny, a `float` bit-cast into a
+list slot is enormous — and a `list[int]` of N elements offers N of them on
+every pass. Contiguous slot runs are handed to the collector in bulk rather
+than one at a time, so those bounds stay in registers across the run.
+
+Ranges are then filed under **every 256-byte granule they cover**, in an
+open-addressed table built in one linear pass; a lookup hashes the candidate's
+granule and scans to the first empty slot. Ranges too wide to file that way —
+typically the large slot arrays owned by a program's lists — go to a small
+sorted tier that is binary-searched. Marking retains *every* range containing
+the candidate rather than only the nearest, which is what covers an address
+that is simultaneously one allocation's one-past-the-end and the next one's
+start.
+
+This replaced sorting all live ranges and binary searching them, which cost an
+O(n log n) sort before marking could begin and about twenty cache-missing
+probes per real pointer.
+
 The nonmoving design is deliberate. PyRs values currently cross generated
 LLVM, C runtime helpers, native stack slots, and `i64` payload slots as raw
 pointers. Keeping object addresses stable makes collection safe without
@@ -131,6 +156,13 @@ The current backend prioritizes safety and complete heap coverage over pause
 time and locality:
 
 - mark and sweep pauses scale with the managed heap;
+- **every managed object is an individual `calloc` on one global intrusive
+  list**, which is the measured bottleneck rather than a theoretical one: the
+  collector walks a cache-cold pointer chain twice per pass and records one
+  range per live object. On the `objects` benchmark that is the whole gap
+  against CPython — 47 ms with `PYRS_GC=none` against 111 ms with the collector
+  on. Size-classed blocks, aligned so a candidate's owner is a mask and a
+  divide, would retire the range array and the granule index along with it;
 - conservative native roots and erased payload slots may delay reclamation;
 - nonmoving sweep can fragment the native allocator;
 - there is no nursery, remembered set, incremental marking, compaction, or
