@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.132 |
+| Check | Result after 0.133 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1634 passed; none failed or ignored |
+| `cargo test --workspace` | 1641 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 6 skipped; compat 27 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.132.0` |
+| `pyrs --version` | `PyRs 0.133.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -498,6 +498,13 @@ documentation and the relevant gates.
       granule it covers, in a table built in one linear pass, with a small
       sorted tier for ranges too wide to file. `objects` 109ms -> 61ms, 0.7x ->
       1.1x, and every benchmark in the corpus is now faster than CPython.
+- [x] Measure and fix dict/set lookups (0.133). Nothing in the corpus touched a
+      dict, so hashing a string key byte-at-a-time on every lookup was
+      invisible; `benchmarks/dicts.py` put it at 0.8x. Slots now cache the top
+      byte of the key's hash in existing padding — the full hash grew the slot
+      and made it slower — and string keys hash eight bytes at a time behind a
+      `fmix64` finalizer, without which a word-at-a-time hash collides
+      catastrophically on a `h & mask` bucket index. 314ms -> 282ms.
 - [ ] Replace the per-object `calloc` allocator. Every managed object is still
       an individual `calloc` on one global intrusive list. Left alone
       deliberately in 0.130: with the range table fixed, `objects` spends 25ms

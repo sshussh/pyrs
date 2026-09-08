@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.133.0 — Dicts and sets, which nothing was measuring
+
+Nothing in the corpus touched a dict, so `hash_key` recomputing FNV-1a
+byte-at-a-time over the whole key on **every** lookup, insert and membership
+test was invisible. `benchmarks/dicts.py` — 400k string-keyed dict operations,
+400k set operations, 400k int-keyed ones — put it at **0.8x CPython**, with
+`set_lookup` at 45% and `hash_key` at 18%.
+
+Two changes, and a third that was tried and reverted.
+
+**A slot caches the top byte of its key's hash.** A probe that lands on a
+colliding full slot now rejects it with one compare instead of a full key
+comparison, which for a string key is a length check and a `memcmp`.
+
+One byte, not the whole hash, and that distinction is the whole result.
+`DictSlot` is 25 bytes of payload padded to 32, so a `char` is free while a
+`long long` takes it to 40 — a quarter more memory traffic on every probe.
+Storing the full hash was implemented first and made the benchmark **slower**
+(241 ms to 262 ms with the collector off); the byte version made it faster
+(235 ms). `_Static_assert`s now pin both slot sizes so the tag cannot silently
+stop being free. The top byte is the one cached, because the low bits already
+chose the bucket.
+
+**String keys hash eight bytes at a time.** Byte-wise FNV is a chain of
+dependent multiplies, one per byte.
+
+That change alone was a **6x regression** — 314 ms to 1817 ms — and the reason
+is worth recording. The bucket index is `h & mask`, so only the low bits
+matter, and the low bits of a product depend only on the low bits of its
+inputs. Multiplying once per byte stirs every byte into the low bits many times
+over; multiplying once per word does not, so keys differing in their last
+characters all landed in one bucket. A `fmix64` finalizer — two multiplies,
+three xor-shifts — fixes it by making every input bit reach every output bit.
+
+Result: `set_lookup` 45% -> 10%, `hash_key` 18% -> 9%, and the benchmark
+314 ms -> 282 ms.
+
+### What the benchmark says next
+
+With the table work done, **the collector is what is left**: `dicts` runs in
+282 ms with it and 235 ms without, and `objects` in 95 ms against 47 ms. Both
+build many short-lived strings, and every managed object is still an individual
+`calloc` on one global intrusive list. That is now the single largest remaining
+item, and it is the same root cause in both benchmarks.
+
 ## 0.132.0 — String equality and ASCII indexing stop calling the runtime
 
 `strings` was the slowest benchmark at 3.2x. It walks an 88k-character string

@@ -6306,7 +6306,22 @@ typedef struct {
     int key_tag;
     int val_tag;
     unsigned char state; /* 0 empty, 1 full, 2 tomb */
+    /* Top byte of the key's hash, so a probe rejects a colliding slot with one
+     * compare instead of a full key comparison -- for a string key that means
+     * a length check and a memcmp, which was most of the lookup's time.
+     *
+     * One byte, not the whole hash, because it has to be free. This struct is
+     * 25 bytes of payload padded to 32, so a `char` here costs nothing while a
+     * `long long` would take it to 40 and cost a quarter more memory traffic
+     * on every probe -- measured, and it made the dict benchmark slower rather
+     * than faster. The top byte is used because the low bits already pick the
+     * bucket, so they carry no information a probe has not used. */
+    unsigned char hash_tag;
 } DictSlot;
+
+/* The hash tag has to stay free. If either of these grows, the probe is paying
+ * memory traffic for it and the tag should be reconsidered rather than kept. */
+_Static_assert(sizeof(DictSlot) == 32, "the dict hash tag must fit in padding");
 
 struct PyrsDict {
     long long len; /* item count — first field for pyrs_len */
@@ -6376,11 +6391,48 @@ static unsigned long long hash_key(long long key, int tag) {
     }
     if (tag == TAG_STR) {
         const PyrsStr *s = (const PyrsStr *)(uintptr_t)key;
+        /* FNV-1a over 8-byte blocks rather than single bytes. Byte-at-a-time
+         * FNV is a chain of dependent multiplies -- one per byte -- and
+         * hashing was 18% of the dict benchmark. Mixing a whole word per
+         * multiply keeps the same shape with an eighth of the chain.
+         *
+         * The result differs from the byte-wise version, which is fine: a
+         * hash only has to be deterministic within a run. Nothing persists
+         * it, and iteration order comes from the insertion-order array rather
+         * than from the table. */
         unsigned long long h = 14695981039346656037ULL;
-        for (long long i = 0; i < s->len; i++) {
-            h ^= (unsigned char)s->data[i];
+        long long n = s->len;
+        long long i = 0;
+        for (; i + 8 <= n; i += 8) {
+            unsigned long long block;
+            memcpy(&block, s->data + i, sizeof(block));
+            h ^= block;
             h *= 1099511628211ULL;
         }
+        if (i < n) {
+            unsigned long long tail = 0;
+            memcpy(&tail, s->data + i, (size_t)(n - i));
+            h ^= tail;
+            h *= 1099511628211ULL;
+        }
+        /* Length participates so "ab" and "ab\0" cannot collide through the
+         * zero-padded tail. */
+        h ^= (unsigned long long)n;
+        h *= 1099511628211ULL;
+        /* Avalanche, and this is not optional. The table index is `h & mask`,
+         * so only the low bits are used. Byte-wise FNV multiplies once per
+         * byte, which stirs every byte into the low bits several times over;
+         * hashing a whole word per multiply does not, because the low bits of
+         * a product depend only on the low bits of its inputs. Without this
+         * finalizer, keys differing in their last characters landed in the
+         * same bucket and the dict benchmark went from 314ms to 1817ms.
+         * murmur3's fmix64: two multiplies to make every input bit reach
+         * every output bit. */
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33;
         return h;
     }
     pyrs_die("TypeError: unhashable dict/set key tag");
@@ -6411,8 +6463,13 @@ PyrsDict *pyrs_dict_new(void) {
 
 static void dict_grow(PyrsDict *d);
 
-static long long dict_lookup(const PyrsDict *d, long long key, int key_tag, int *found) {
-    unsigned long long h = hash_key(key, key_tag);
+/* Probe for `key`, whose hash the caller has already computed.
+ *
+ * Taking the hash as a parameter is what lets a resize re-place entries from
+ * their stored hashes instead of rehashing every key, and lets an insert store
+ * the hash it just computed. */
+static long long dict_lookup_h(const PyrsDict *d, long long key, int key_tag,
+                               unsigned long long h, int *found) {
     long long mask = d->cap - 1;
     long long i = (long long)(h & (unsigned long long)mask);
     long long tomb = -1;
@@ -6426,7 +6483,12 @@ static long long dict_lookup(const PyrsDict *d, long long key, int key_tag, int 
             if (tomb < 0) {
                 tomb = i;
             }
-        } else if (key_eq(s->key, s->key_tag, key, key_tag)) {
+            /* The stored hash rejects a colliding slot in one compare. Without
+             * it every probe step that lands on a full slot ran a full key
+             * comparison -- a length check and a memcmp for a string -- which
+             * was most of this function's time. */
+        } else if (s->hash_tag == (unsigned char)(h >> 56)
+                   && key_eq(s->key, s->key_tag, key, key_tag)) {
             *found = 1;
             return i;
         }
@@ -6434,6 +6496,10 @@ static long long dict_lookup(const PyrsDict *d, long long key, int key_tag, int 
     }
     *found = 0;
     return tomb >= 0 ? tomb : 0;
+}
+
+static long long dict_lookup(const PyrsDict *d, long long key, int key_tag, int *found) {
+    return dict_lookup_h(d, key, key_tag, hash_key(key, key_tag), found);
 }
 
 static void dict_grow(PyrsDict *d) {
@@ -6486,7 +6552,8 @@ void pyrs_dict_set(PyrsDict *d, long long key, int key_tag, long long val, int v
         dict_grow(d);
     }
     int found;
-    long long idx = dict_lookup(d, key, key_tag, &found);
+    unsigned long long h = hash_key(key, key_tag);
+    long long idx = dict_lookup_h(d, key, key_tag, h, &found);
     if (found) {
         d->table[idx].val = val;
         d->table[idx].val_tag = val_tag;
@@ -6494,6 +6561,7 @@ void pyrs_dict_set(PyrsDict *d, long long key, int key_tag, long long val, int v
     }
     d->table[idx].key = key;
     d->table[idx].val = val;
+    d->table[idx].hash_tag = (unsigned char)(h >> 56);
     d->table[idx].key_tag = key_tag;
     d->table[idx].val_tag = val_tag;
     d->table[idx].state = 1;
@@ -6879,7 +6947,10 @@ typedef struct {
     long long key;
     int key_tag;
     unsigned char state;
+    unsigned char hash_tag; /* see DictSlot */
 } SetSlot;
+
+_Static_assert(sizeof(SetSlot) == 16, "the set hash tag must fit in padding");
 
 struct PyrsSet {
     long long len;
@@ -6905,8 +6976,9 @@ PyrsSet *pyrs_set_new(void) {
     return s;
 }
 
-static long long set_lookup(const PyrsSet *s, long long key, int key_tag, int *found) {
-    unsigned long long h = hash_key(key, key_tag);
+/* Set probe with a precomputed hash; see dict_lookup_h. */
+static long long set_lookup_h(const PyrsSet *s, long long key, int key_tag,
+                              unsigned long long h, int *found) {
     long long mask = s->cap - 1;
     long long i = (long long)(h & (unsigned long long)mask);
     long long tomb = -1;
@@ -6920,7 +6992,8 @@ static long long set_lookup(const PyrsSet *s, long long key, int key_tag, int *f
             if (tomb < 0) {
                 tomb = i;
             }
-        } else if (key_eq(e->key, e->key_tag, key, key_tag)) {
+        } else if (e->hash_tag == (unsigned char)(h >> 56)
+                   && key_eq(e->key, e->key_tag, key, key_tag)) {
             *found = 1;
             return i;
         }
@@ -6928,6 +7001,10 @@ static long long set_lookup(const PyrsSet *s, long long key, int key_tag, int *f
     }
     *found = 0;
     return tomb >= 0 ? tomb : 0;
+}
+
+static long long set_lookup(const PyrsSet *s, long long key, int key_tag, int *found) {
+    return set_lookup_h(s, key, key_tag, hash_key(key, key_tag), found);
 }
 
 static void set_grow(PyrsSet *s) {
@@ -6977,11 +7054,13 @@ void pyrs_set_add(PyrsSet *s, long long key, int key_tag) {
         set_grow(s);
     }
     int found;
-    long long idx = set_lookup(s, key, key_tag, &found);
+    unsigned long long h = hash_key(key, key_tag);
+    long long idx = set_lookup_h(s, key, key_tag, h, &found);
     if (found) {
         return;
     }
     s->table[idx].key = key;
+    s->table[idx].hash_tag = (unsigned char)(h >> 56);
     s->table[idx].key_tag = key_tag;
     s->table[idx].state = 1;
     if (s->order_len == s->order_cap) {
