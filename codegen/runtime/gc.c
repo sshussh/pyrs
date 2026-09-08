@@ -54,8 +54,26 @@ typedef struct {
     uintptr_t hi;
 } PyrsGcRanges;
 
+/* One filing of a range under one granule. `range` is the index into the
+ * range array plus one, so a zeroed slot reads as empty. `tag` is the low bits
+ * of the granule, enough to skip a slot displaced from another chain without
+ * touching the range array. */
+typedef struct {
+    uint32_t tag;
+    uint32_t range;
+} PyrsGcIndexSlot;
+
+typedef struct {
+    PyrsGcIndexSlot *slots;
+    size_t mask;
+    /* Ranges too wide to file by granule, sorted by start and searched. */
+    PyrsGcRange *large;
+    size_t large_len;
+} PyrsGcIndex;
+
 typedef struct {
     PyrsGcRanges *ranges;
+    PyrsGcIndex *index;
     PyrsGcHeader **work;
     size_t work_len;
     size_t work_cap;
@@ -325,6 +343,29 @@ static void add_owned_range(void *start, size_t size, void *opaque) {
     ranges_push(context->ranges, (uintptr_t)start, size, context->owner);
 }
 
+/* Address granule an object range is filed under.
+ *
+ * Marking is conservative, so every candidate word has to be answered with
+ * "which object, if any, contains this address". Sorting all ranges and
+ * binary searching them costs an O(n log n) sort before marking can start and
+ * ~log2(n) cache-missing probes per real pointer; with half a million live
+ * objects that was two thirds of the `objects` benchmark's runtime.
+ *
+ * Instead every range is filed under each 256-byte granule it covers, in an
+ * open-addressed table built in one linear pass. A lookup hashes the
+ * candidate's granule and scans until an empty slot, which is O(1) expected
+ * and touches one or two cache lines.
+ *
+ * A range spanning more granules than PYRS_GC_INDEX_MAX_SPAN would file too
+ * many entries, so those go to a small sorted tier instead. In practice that
+ * is the handful of large `data` buffers a program's lists own. */
+#define PYRS_GC_GRANULE_SHIFT 8
+#define PYRS_GC_INDEX_MAX_SPAN 8
+
+static uintptr_t granule_of(uintptr_t address) {
+    return address >> PYRS_GC_GRANULE_SHIFT;
+}
+
 static int compare_ranges(const void *left, const void *right) {
     const PyrsGcRange *a = left;
     const PyrsGcRange *b = right;
@@ -343,19 +384,91 @@ static int compare_ranges(const void *left, const void *right) {
     return 0;
 }
 
-static size_t range_upper_bound(const PyrsGcRanges *ranges,
+/* Index of the last range whose start is <= candidate, in a sorted array. */
+static size_t range_upper_bound(const PyrsGcRange *items, size_t len,
                                 uintptr_t candidate) {
     size_t lo = 0;
-    size_t hi = ranges->len;
+    size_t hi = len;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (ranges->items[mid].start <= candidate) {
+        if (items[mid].start <= candidate) {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
     return lo;
+}
+
+static size_t index_hash(uintptr_t granule, size_t mask) {
+    /* Fibonacci hashing: the granule's low bits are the ones that vary, so
+     * they have to reach the top of the word before masking. */
+    return (size_t)((granule * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+}
+
+/* File `range` under `granule`, growing nothing: the table is sized up front
+ * for exactly the number of entries the ranges need. */
+static void index_insert(PyrsGcIndex *index, uintptr_t granule, size_t range) {
+    size_t slot = index_hash(granule, index->mask);
+    while (index->slots[slot].range != 0) {
+        slot = (slot + 1) & index->mask;
+    }
+    index->slots[slot].tag = (uint32_t)granule;
+    index->slots[slot].range = (uint32_t)(range + 1);
+}
+
+static void index_build(PyrsGcIndex *index, PyrsGcRanges *ranges) {
+    memset(index, 0, sizeof(*index));
+    if (ranges->len == 0) {
+        return;
+    }
+    /* One pass to size both tiers, so neither ever reallocates. */
+    size_t entries = 0;
+    size_t large = 0;
+    for (size_t i = 0; i < ranges->len; i++) {
+        uintptr_t first = granule_of(ranges->items[i].start);
+        uintptr_t last = granule_of(ranges->items[i].end);
+        uintptr_t span = last - first + 1;
+        if (span > PYRS_GC_INDEX_MAX_SPAN) {
+            large++;
+        } else {
+            entries += (size_t)span;
+        }
+    }
+
+    if (large > 0) {
+        index->large = gc_raw_malloc(large * sizeof(*index->large));
+    }
+    /* Load factor 1/2, so probe chains stay short. */
+    size_t capacity = 16;
+    while (capacity < entries * 2) {
+        capacity *= 2;
+    }
+    index->slots = gc_raw_malloc(capacity * sizeof(*index->slots));
+    memset(index->slots, 0, capacity * sizeof(*index->slots));
+    index->mask = capacity - 1;
+
+    for (size_t i = 0; i < ranges->len; i++) {
+        uintptr_t first = granule_of(ranges->items[i].start);
+        uintptr_t last = granule_of(ranges->items[i].end);
+        if (last - first + 1 > PYRS_GC_INDEX_MAX_SPAN) {
+            index->large[index->large_len++] = ranges->items[i];
+            continue;
+        }
+        for (uintptr_t g = first; g <= last; g++) {
+            index_insert(index, g, i);
+        }
+    }
+    if (index->large_len > 1) {
+        qsort(index->large, index->large_len, sizeof(*index->large),
+              compare_ranges);
+    }
+}
+
+static void index_free(PyrsGcIndex *index) {
+    free(index->slots);
+    free(index->large);
+    memset(index, 0, sizeof(*index));
 }
 
 static void mark_owner(PyrsGcHeader *owner, PyrsGcMarkContext *context) {
@@ -371,26 +484,50 @@ static void mark_owner(PyrsGcHeader *owner, PyrsGcMarkContext *context) {
 
 static void mark_candidate(uintptr_t candidate, void *opaque) {
     PyrsGcMarkContext *context = opaque;
-    /* Reject outside the heap envelope before searching it. This is the whole
-     * cost of tracing a large `list[int]` or `list[float]`, whose slots hold
-     * no pointers at all but are still offered one by one. */
+    /* Reject outside the heap envelope before looking anything up. This is the
+     * whole cost of tracing a large `list[int]` or `list[float]`, whose slots
+     * hold no pointers at all but are still offered one by one. */
     if (candidate < context->ranges->lo || candidate > context->ranges->hi) {
         return;
     }
-    size_t upper = range_upper_bound(context->ranges, candidate);
+    PyrsGcIndex *index = context->index;
+
+    /* Inclusive end matching deliberately keeps an owner alive from a valid
+     * C one-past pointer. Marking every range that contains the candidate --
+     * rather than only the nearest by start -- also covers the case where that
+     * address is where an adjacent allocation begins: both owners are retained
+     * rather than letting ordering decide. */
+    if (index->slots != NULL) {
+        uintptr_t granule = granule_of(candidate);
+        uint32_t tag = (uint32_t)granule;
+        size_t slot = index_hash(granule, index->mask);
+        /* Entries for this granule were inserted from here onwards, so
+         * scanning to the first empty slot sees all of them. */
+        while (index->slots[slot].range != 0) {
+            if (index->slots[slot].tag == tag) {
+                const PyrsGcRange *range =
+                    &context->ranges->items[index->slots[slot].range - 1];
+                if (candidate >= range->start && candidate <= range->end) {
+                    mark_owner(range->owner, context);
+                }
+            }
+            slot = (slot + 1) & index->mask;
+        }
+    }
+
+    if (index->large_len == 0) {
+        return;
+    }
+    size_t upper = range_upper_bound(index->large, index->large_len, candidate);
     if (upper == 0) {
         return;
     }
-
-    /* Inclusive end matching deliberately keeps an owner alive from a valid
-     * C one-past pointer.  If that address is also the start of an adjacent
-     * allocation, retain both owners rather than making ordering decide. */
-    const PyrsGcRange *range = &context->ranges->items[upper - 1];
+    const PyrsGcRange *range = &index->large[upper - 1];
     if (candidate >= range->start && candidate <= range->end) {
         mark_owner(range->owner, context);
     }
     if (candidate == range->start && upper >= 2) {
-        const PyrsGcRange *previous = &context->ranges->items[upper - 2];
+        const PyrsGcRange *previous = &index->large[upper - 2];
         if (candidate == previous->end) {
             mark_owner(previous->owner, context);
         }
@@ -473,11 +610,11 @@ static void gc_collect_inner(uintptr_t stack_top, const void *registers,
         pyrs_gc_visit_owned_ranges((int)header->fields.kind, payload,
                                    header->fields.size, add_owned_range, &owned);
     }
-    qsort(ranges.items, ranges.len, sizeof(*ranges.items), compare_ranges);
+    PyrsGcIndex index;
+    index_build(&index, &ranges);
 
-    PyrsGcHeader **work =
-        gc_raw_malloc(g_live_objects * sizeof(*work));
-    PyrsGcMarkContext context = {&ranges, work, 0, g_live_objects};
+    PyrsGcHeader **work = gc_raw_malloc(g_live_objects * sizeof(*work));
+    PyrsGcMarkContext context = {&ranges, &index, work, 0, g_live_objects};
 
     scan_words(registers, registers_size, &context);
     scan_stack(stack_top, g_stack_bound, &context);
@@ -496,6 +633,7 @@ static void gc_collect_inner(uintptr_t stack_top, const void *registers,
     }
 
     free(work);
+    index_free(&index);
     free(ranges.items);
 
     PyrsGcHeader **link = &g_objects;

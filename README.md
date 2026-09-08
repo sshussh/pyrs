@@ -6,7 +6,7 @@ A Python compiler written in Rust, emitting native code through LLVM.
 
 PyRs compiles a **statically typed subset of Python** straight to machine
 code — no interpreter, no VM, no runtime dependency on CPython. Compute-bound
-code runs **3–48× faster than CPython**, 9.5× across the benchmark corpus
+code runs **3–46× faster than CPython**, 9.4× across the benchmark corpus
 ([benchmarks](#benchmarks)).
 
 ```console
@@ -41,7 +41,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.129.0**.
+Current milestone: **v0.130.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -201,37 +201,42 @@ is byte-identical to `python3`'s, then reports best-of-5 wall times:
 
 | benchmark  | workload                                  | python3 |   PyRs | speedup |
 | ---------- | ----------------------------------------- | ------: | -----: | ------: |
-| nbody      | float + list, 5-body gravity, 100k steps  |  0.735s | 0.015s |   49.3× |
-| mandelbrot | float math, 500×500 escape iterations     |  0.554s | 0.017s |   33.0× |
-| pipeline   | lazy `map`/`filter` over 2M elements      |  0.275s | 0.013s |   20.7× |
-| iteration  | `zip`/`enumerate`, 2M paired steps        |  0.280s | 0.018s |   15.2× |
-| matmul     | nested lists, 250×250 matrix multiply     |  0.500s | 0.037s |   13.4× |
-| primes     | int loops, trial division to 300k         |  0.401s | 0.031s |   13.1× |
-| fib        | recursion, 30M calls (`fib(35)`)          |  0.611s | 0.051s |   11.9× |
-| listcomp   | comprehensions, 3M-element map/filter     |  0.355s | 0.034s |   10.5× |
-| sort       | list indexing, bubble sort of 5000        |  0.586s | 0.070s |    8.3× |
+| nbody      | float + list, 5-body gravity, 100k steps  |  0.738s | 0.016s |   45.8× |
+| mandelbrot | float math, 500×500 escape iterations     |  0.593s | 0.017s |   35.8× |
+| pipeline   | lazy `map`/`filter` over 2M elements      |  0.282s | 0.015s |   18.9× |
+| iteration  | `zip`/`enumerate`, 2M paired steps        |  0.279s | 0.017s |   16.9× |
+| primes     | int loops, trial division to 300k         |  0.380s | 0.030s |   12.9× |
+| fib        | recursion, 30M calls (`fib(35)`)          |  0.615s | 0.050s |   12.3× |
+| matmul     | nested lists, 250×250 matrix multiply     |  0.495s | 0.041s |   12.2× |
+| listcomp   | comprehensions, 3M-element map/filter     |  0.357s | 0.034s |   10.4× |
+| sort       | list indexing, bubble sort of 5000        |  0.600s | 0.068s |    8.8× |
 | strings    | per-char iteration, 2.6M comparisons      |  0.334s | 0.097s |    3.4× |
-| exceptions | 400k calls, 171k raise/catch round trips  |  0.100s | 0.093s |    1.1× |
-| objects    | 400k small live objects, traced and swept |  0.072s | 0.106s |    0.7× |
-| **total**  |                                           |  4.804s | 0.583s |    8.2× |
+| exceptions | 400k calls, 171k raise/catch round trips  |  0.099s | 0.071s |    1.4× |
+| objects    | 400k small live objects, traced and swept |  0.070s | 0.061s |    1.1× |
+| **total**  |                                           |  4.843s | 0.516s |    9.4× |
 
-**Integer arithmetic used to be the weak spot; 0.126 closed it.** Every `int`
-operation was an out-of-line call into the runtime, because arbitrary precision
-needs a tagged representation with an overflow check and the runtime is linked
-as a separate object the optimizer cannot inline through. `primes` ran at 0.8×.
-Each operation now has an inline fast path on the tagged words, with the
-runtime call kept for the bignum edge.
+**Integer arithmetic used to be the weak spot.** Every `int` operation was an
+out-of-line call into the runtime, because arbitrary precision needs a tagged
+representation with an overflow check and the runtime is linked as a separate
+object the optimizer cannot inline through. `primes` ran at 0.8×. Each
+operation now has an inline fast path on the tagged words, with the runtime
+call kept for the bignum edge.
 
 The gain was larger than removing the calls: an opaque call in a loop also
 blocks loop-invariant hoisting and redundant-load elimination for everything
 *around* it, so the float benchmarks — which never called into the runtime for
 arithmetic, but did for their loop counters — roughly doubled as well.
 
-**Two shapes are still slower than CPython, and the corpus says so on purpose.**
-`objects` builds 400k small live objects: the collector rebuilds and sorts a
-range table on every pass and every managed object is an individual `calloc`,
-so allocation-heavy code pays where compute-bound code does not. `exceptions`
-costs about 525 ns per raise/catch round trip against CPython's 228 ns.
+**The collector was the other half.** Marking answered "which object contains
+this address" by sorting every live range and binary searching it, which cost
+two thirds of `objects`' runtime; a granule-keyed index built in one linear
+pass replaced both. Tracing a `list[int]` also offered every element
+individually through an indirect call, when a tagged small int can never be a
+pointer.
+
+`strings` at 3.4× is now the slowest: it calls into the runtime once per
+character. `exceptions` costs about 380 ns per raise/catch round trip against
+CPython's 250 ns.
 
 (Linux, LLVM 22, CPython 3.14; run `./benchmarks/run.sh` to reproduce.)
 
@@ -258,7 +263,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.129.0 && git push origin v0.129.0`.
+Release tags: `git tag v0.130.0 && git push origin v0.130.0`.
 
 ## Documentation
 

@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.129 |
+| Check | Result after 0.130 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1606 passed; none failed or ignored |
+| `cargo test --workspace` | 1612 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 6 skipped; compat 27 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.129.0` |
+| `pyrs --version` | `PyRs 0.130.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -468,12 +468,20 @@ documentation and the relevant gates.
       slot runs are handed to the collector in bulk rather than one at a time.
       `listcomp` 6.3x -> 10.5x, `iteration` 9.9x -> 15.2x, `pipeline` 15.0x ->
       20.7x. `benchmarks/objects.py` added for what the collector governs.
-- [ ] Replace the range table and the per-object `calloc` (`objects` at 0.7x).
-      Every collection walks all live objects and `qsort`s them before marking
-      — `compare_ranges` is 8% of `objects` — and every candidate that is a
-      real pointer costs a binary search over ~1M entries, another 19%. Every
-      managed object is also an individual `calloc` on one global intrusive
-      list. Measured 2026-09-08.
+- [x] Replace the range table (0.130). Marking filed every live range into a
+      sorted array and binary searched it, costing an O(n log n) sort before
+      marking could start; each range is now filed under every 256-byte
+      granule it covers, in a table built in one linear pass, with a small
+      sorted tier for ranges too wide to file. `objects` 109ms -> 61ms, 0.7x ->
+      1.1x, and every benchmark in the corpus is now faster than CPython.
+- [ ] Replace the per-object `calloc` allocator. Every managed object is still
+      an individual `calloc` on one global intrusive list. Left alone
+      deliberately in 0.130: with the range table fixed, `objects` spends 25ms
+      of its 61ms in the collector, so the next measurement should decide
+      whether allocation or the remaining mark and sweep is worth attacking.
+- [ ] Reduce the per-character cost of string iteration (`strings` at 3.4x, now
+      the slowest benchmark). `for c in text` calls `pyrs_str_index` per
+      character, and each `==` calls `pyrs_str_cmp`. Measured 2026-09-08.
 - [ ] Declare the supported host/target matrix (initially Linux x86-64) and
       exercise each claimed platform in CI.
 - [ ] Reproducible release builds, checksums, install instructions,

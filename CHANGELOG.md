@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.130.0 — The collector stops sorting its heap on every pass
+
+`objects` ran at **0.7× CPython**. Turning the collector off with `PYRS_GC=none`
+ran it in **36 ms against 109 ms** — so two thirds of it was collection, over
+just four passes, and the mutator was already twice CPython's speed.
+
+Conservative marking has to answer "which object contains this address" for
+every candidate word. It did that by pushing every live range into an array,
+`qsort`ing it, and binary searching. With half a million live objects that is
+an O(n log n) sort before marking can even start, plus ~20 cache-missing probes
+for every real pointer — `mark_candidate` was 20% of the benchmark and
+`compare_ranges` another 8%, before counting the sort's own time.
+
+Now each range is filed under every 256-byte granule it covers, in an
+open-addressed table built in **one linear pass**. A lookup hashes the
+candidate's granule and scans to the first empty slot: O(1) expected, one or
+two cache lines, no sort at all. Ranges too wide to file that way — the handful
+of large `data` buffers a program's lists own — go to a small sorted tier that
+keeps the old search.
+
+Marking is *more* inclusive than before, not less: it retains every range
+containing the candidate rather than only the nearest by start, which subsumes
+the old special case for an address that is simultaneously one allocation's
+one-past-the-end and the next one's start.
+
+**`objects` 109 ms → 61 ms, from 0.7× to 1.1× CPython.** `exceptions` reached
+1.4×, and with that **every benchmark in the corpus is now faster than
+CPython** — 9.4× overall across twelve.
+
+Nothing about allocation, object lifetime, sweeping or ownership changed. The
+per-object `calloc` is still there; the evidence said the sort and the search
+were the cost, and the benchmark that says so is in the table.
+
+`cli/tests/collector_index.rs` checks the two tiers against CPython under
+`PYRS_GC_STRESS=1` and under tiny thresholds: many small objects, large owned
+buffers mixed with small ones, sizes straddling granule boundaries, nested
+containers traced through both tiers, dict and set tables, and values held only
+by a generator frame or by a local live across a raise.
+
 ## 0.129.0 — The mark phase stops paying a call per list element
 
 Tracing a `list[int]` offered every element to the collector one at a time,
