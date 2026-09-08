@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.127.0 — A `try` no longer pins every local in the function to memory
+
+**One `try` anywhere made every local in the function `volatile`**, which
+defeats `mem2reg` for the whole body. A numeric kernel with a validity check
+around it lost SSA promotion for its accumulators — the check was cold, the
+loop was hot, and the loop paid.
+
+C's setjmp rule (7.13.2.1) is narrower than that: it covers automatic objects
+**changed between the `setjmp` and the `longjmp`**. One written only before the
+`setjmp` keeps its value by the contract of `setjmp` itself, which is what
+`returns_twice` makes LLVM honour. So the rule is now per *variable*, and only
+a **store** inside a `try` disqualifies one — a read inside a `try` records
+nothing, since an alloca with a volatile store is already left in memory and
+marking the read too would only block CSE on it.
+
+```python
+def sim(n: int) -> float:
+    x = 1.0; y = 2.0; z = 3.0
+    vx = 0.1; vy = 0.2; vz = 0.3
+    i = 0
+    while i < n:
+        vx = vx + x * 0.001   # ... six live locals, none touched by the try
+        i += 1
+    try:
+        if x != x:
+            raise ValueError("nan")
+    except ValueError:
+        return -1.0
+    return x + y + z
+```
+
+20M iterations, best-of-5: **114 ms -> 66 ms (1.7x)**. The function body went
+from 40 stack-referencing instructions to 11.
+
+The corpus barely moves, and for a reason worth recording: `exceptions` (81 ms
+-> 79 ms, within noise) puts its whole loop body *inside* the `try`, so its
+locals genuinely are written between the `setjmp` and the `longjmp` and
+correctly stay in memory. The gain is for the common real shape — a hot loop
+beside error handling — not for code that raises in its inner loop.
+
+### How the set is computed
+
+By emitting the function twice. The first pass runs the **real** traversal with
+its output discarded and records every local stored while inside a `try`; the
+second emits for real. A parallel analysis over the statement enum would be
+faster and would risk overlooking a statement kind, and being wrong here is a
+silent miscompilation — a local reading back garbage in a handler, only under
+optimization, only after a real raise. Emission is a small fraction of compile
+time next to LLVM, so the second pass is not measurable.
+
+`cli/tests/setjmp_locals.rs` is the differential check at -O0/-O2/-O3: a local
+written inside the `try` and read in the handler, one written only before it,
+nested tries, a handler that writes, a loop counter incremented outside the try
+and read inside it, heap values live across a raise (under GC stress), and a
+generator, whose frame storage already survives a resume and is unaffected.
+
 ## 0.126.0 — Integer arithmetic is inlined; the corpus goes from 3.2x to 9.5x
 
 **Every `int` operation was an out-of-line call into the C runtime.** 0.125

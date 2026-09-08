@@ -266,8 +266,19 @@ struct Emitter {
     local_storage: HashMap<String, Ty>,
     /// User locals that need a binding bit independent of their value/tag.
     local_bindings: std::collections::HashSet<String>,
-    /// Locals written after setjmp must survive longjmp without SSA promotion.
-    volatile_locals: bool,
+    /// Locals that a `try` in this function touches, and so must stay in
+    /// memory across a `longjmp` rather than being promoted to SSA.
+    ///
+    /// Per *variable*, not per function. A function containing a `try`
+    /// anywhere used to force every local to memory, which defeats `mem2reg`
+    /// for the whole body — C's rule only covers objects changed between the
+    /// `setjmp` and the `longjmp`.
+    volatile_names: std::collections::HashSet<String>,
+    /// True during the discovery pass that fills `volatile_names`. Its output
+    /// is discarded; it exists so the "inside a try" question is answered by
+    /// the real traversal rather than by a parallel one that could miss a
+    /// statement kind.
+    discovering: bool,
     /// Small-int fast-path helpers actually reached, so `finish` defines only
     /// those. Ordered so the emitted module is byte-stable.
     int_helpers: std::collections::BTreeSet<&'static str>,
@@ -304,7 +315,8 @@ impl Default for Emitter {
             classes: Vec::new(),
             local_storage: HashMap::new(),
             local_bindings: std::collections::HashSet::new(),
-            volatile_locals: false,
+            volatile_names: std::collections::HashSet::new(),
+            discovering: false,
             int_helpers: std::collections::BTreeSet::new(),
             inline_int: std::env::var("PYRS_INLINE_INT").as_deref() != Ok("0"),
         }
@@ -1485,10 +1497,8 @@ impl Emitter {
             ));
             self.line(format!("{bound} = icmp ne i32 {flag}, 0"));
         } else {
-            self.line(format!(
-                "{bound} = load {}i1, ptr %bound.{name}",
-                self.local_volatile()
-            ));
+            let vol = self.local_volatile_load(name);
+            self.line(format!("{bound} = load {vol}i1, ptr %bound.{name}"));
         }
         let ok = self.fresh_block("bound.ok");
         let trap = self.fresh_block("bound.trap");
@@ -1503,15 +1513,36 @@ impl Emitter {
     fn mark_local_bound(&mut self, name: &str) {
         // Generator stores update the frame's binding bitmap in the runtime.
         if self.gen_frame.is_none() && self.local_bindings.contains(name) {
-            self.line(format!(
-                "store {}i1 true, ptr %bound.{name}",
-                self.local_volatile()
-            ));
+            let vol = self.local_volatile(name);
+            self.line(format!("store {vol}i1 true, ptr %bound.{name}"));
         }
     }
 
-    fn local_volatile(&self) -> &'static str {
-        if self.volatile_locals {
+    /// Volatility of a **store** to local `name`.
+    ///
+    /// C's setjmp rule covers objects *changed* between the `setjmp` and the
+    /// `longjmp`; one written only before the `setjmp` keeps its value by the
+    /// contract of `setjmp` itself, which `returns_twice` is what makes LLVM
+    /// honour. So a store inside a `try` is what disqualifies a local from
+    /// SSA promotion, and it is recorded here during discovery.
+    fn local_volatile(&mut self, name: &str) -> &'static str {
+        if self.discovering {
+            if !self.tries.is_empty() {
+                self.volatile_names.insert(name.to_string());
+            }
+            return "volatile ";
+        }
+        self.local_volatile_load(name)
+    }
+
+    /// Volatility of a **load** of local `name`: whatever its stores decided.
+    ///
+    /// A read inside a `try` records nothing. Once any store to the local is
+    /// volatile, `mem2reg` leaves the whole alloca in memory, so the read
+    /// already comes from memory without being volatile itself — and marking
+    /// it would additionally block common-subexpression elimination on it.
+    fn local_volatile_load(&mut self, name: &str) -> &'static str {
+        if self.volatile_names.contains(name) {
             "volatile "
         } else {
             ""
@@ -2899,6 +2930,46 @@ impl Emitter {
             self.emit_generator_function(func);
             return;
         }
+        let try_depth = max_try_depth_in_stmts(&func.body);
+        self.volatile_names.clear();
+        if try_depth > 0 {
+            // Discovery: emit once into a scratch buffer to learn which locals
+            // a `try` actually touches. Running the real traversal rather than
+            // a parallel one means a statement kind cannot be overlooked, and
+            // being wrong here is a miscompilation rather than a slowdown. The
+            // output is thrown away; interning is idempotent, and nothing else
+            // in a function body writes module-level state.
+            self.discovering = true;
+            self.emit_function_body(func, try_depth);
+            self.discovering = false;
+        }
+        self.emit_function_body(func, try_depth);
+
+        let params = func
+            .params
+            .iter()
+            .map(|(name, ty)| format!("{} %p.{name}", lty(*ty)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let emits_setjmp = self.body.contains("call i32 @setjmp(");
+        assert!(
+            !emits_setjmp || try_depth > 0,
+            "try-depth pre-scan missed an emitted setjmp"
+        );
+        let gc_try_attr = if emits_setjmp { " #0" } else { "" };
+        self.funcs.push_str(&format!(
+            "define {} @{}({params}){gc_try_attr} {{\n{}}}\n\n",
+            lty_ret(func.ret),
+            mangle(&func.name),
+            self.body
+        ));
+    }
+
+    /// Emit one function's entry prologue and body into `self.body`.
+    ///
+    /// Called twice for a function containing a `try`: once to discover which
+    /// locals need volatile treatment, then once for real.
+    fn emit_function_body(&mut self, func: &Function, try_depth: usize) {
         self.body.clear();
         self.tmp = 0;
         self.blk = 0;
@@ -2921,12 +2992,13 @@ impl Emitter {
             self.local_storage.insert(name.clone(), *ty);
         }
 
+        self.terminated = false;
+        self.handler_exc.clear();
+        self.gen_fin_stack.clear();
         self.start_block("entry");
         // LLVM allocas execute each time control reaches them. Preallocate one
         // control triple per lexical nesting level here so `try` inside a loop
         // does not consume native stack on every iteration.
-        let try_depth = max_try_depth_in_stmts(&func.body);
-        self.volatile_locals = try_depth > 0;
         self.try_pool.clear();
         self.try_pool_next = 0;
         for i in 0..try_depth {
@@ -2941,11 +3013,8 @@ impl Emitter {
         // spill params into allocas so assignment to params just works
         for (name, ty) in &func.params {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
-            self.line(format!(
-                "store {}{} %p.{name}, ptr %v.{name}",
-                self.local_volatile(),
-                lty(*ty)
-            ));
+            let vol = self.local_volatile(name);
+            self.line(format!("store {vol}{} %p.{name}, ptr %v.{name}", lty(*ty)));
         }
         // Initialize storage for safe conservative GC scans, while tracking
         // binding separately: zero, False and None are all valid values.
@@ -2953,10 +3022,8 @@ impl Emitter {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
             if self.local_bindings.contains(name) {
                 self.line(format!("%bound.{name} = alloca i1"));
-                self.line(format!(
-                    "store {}i1 false, ptr %bound.{name}",
-                    self.local_volatile()
-                ));
+                let vol = self.local_volatile(name);
+                self.line(format!("store {vol}i1 false, ptr %bound.{name}"));
             }
             let zero = match ty {
                 Ty::Float => fconst(0.0),
@@ -2976,11 +3043,8 @@ impl Emitter {
                 Ty::Union(_) => "zeroinitializer".to_string(),
                 _ => "0".to_string(),
             };
-            self.line(format!(
-                "store {}{} {zero}, ptr %v.{name}",
-                self.local_volatile(),
-                lty(*ty)
-            ));
+            let vol = self.local_volatile(name);
+            self.line(format!("store {vol}{} {zero}, ptr %v.{name}", lty(*ty)));
         }
         // pending return value for try/finally (only if the function returns)
         if func.ret != Ty::None {
@@ -2999,25 +3063,6 @@ impl Emitter {
                 self.line("unreachable");
             }
         }
-
-        let params = func
-            .params
-            .iter()
-            .map(|(name, ty)| format!("{} %p.{name}", lty(*ty)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let emits_setjmp = self.body.contains("call i32 @setjmp(");
-        assert!(
-            !emits_setjmp || try_depth > 0,
-            "try-depth pre-scan missed an emitted setjmp"
-        );
-        let gc_try_attr = if emits_setjmp { " #0" } else { "" };
-        self.funcs.push_str(&format!(
-            "define {} @{}({params}){gc_try_attr} {{\n{}}}\n\n",
-            lty_ret(func.ret),
-            mangle(&func.name),
-            self.body
-        ));
     }
 
     /// Emit a generator resume function: `i32 @name(ptr %gen)`.
@@ -3032,7 +3077,9 @@ impl Emitter {
         self.fn_ret = Ty::Int;
         self.try_ret_ptr = None;
         self.gen_frame = Some("%gen".to_string());
-        self.volatile_locals = false; // frame storage already survives resume
+        // Generator locals live in the heap frame, which already survives a
+        // resume, so none of them need volatile treatment.
+        self.volatile_names.clear();
         self.gen_local_index.clear();
         self.gen_fin_stack.clear();
         self.gen_yield_ty = func.yield_ty.unwrap_or(Ty::Int);
@@ -3164,11 +3211,8 @@ impl Emitter {
                         "call void @pyrs_gen_set_local(ptr {frame}, i64 {idx}, i64 {slot})"
                     ));
                 } else {
-                    self.line(format!(
-                        "store {}{} {v}, ptr %v.{name}",
-                        self.local_volatile(),
-                        lty(value.ty)
-                    ));
+                    let vol = self.local_volatile(name);
+                    self.line(format!("store {vol}{} {v}, ptr %v.{name}", lty(value.ty)));
                 }
                 self.mark_local_bound(name);
             }
@@ -3896,11 +3940,8 @@ impl Emitter {
                     self.value_from_slot(&slot, storage)
                 } else {
                     let t = self.tmp();
-                    self.line(format!(
-                        "{t} = load {}{}, ptr %v.{name}",
-                        self.local_volatile(),
-                        lty(storage)
-                    ));
+                    let vol = self.local_volatile_load(name);
+                    self.line(format!("{t} = load {vol}{}, ptr %v.{name}", lty(storage)));
                     t
                 }
             }
@@ -3961,11 +4002,8 @@ impl Emitter {
             }
             ExprKind::Let { name, value, body } => {
                 let v = self.emit_expr(value);
-                self.line(format!(
-                    "store {}{} {v}, ptr %v.{name}",
-                    self.local_volatile(),
-                    lty(value.ty)
-                ));
+                let vol = self.local_volatile(name);
+                self.line(format!("store {vol}{} {v}, ptr %v.{name}", lty(value.ty)));
                 self.mark_local_bound(name);
                 self.emit_expr(body)
             }
@@ -6177,10 +6215,8 @@ impl Emitter {
                         "call void @pyrs_gen_set_local(ptr {frame}, i64 {idx}, i64 {slot})"
                     ));
                 } else {
-                    self.line(format!(
-                        "store {}ptr {obj}, ptr %v.{name}",
-                        self.local_volatile()
-                    ));
+                    let vol = self.local_volatile(name);
+                    self.line(format!("store {vol}ptr {obj}, ptr %v.{name}"));
                 }
                 self.mark_local_bound(name);
             }

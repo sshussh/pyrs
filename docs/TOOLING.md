@@ -171,7 +171,7 @@ program, and which interpreter will `--compat` use:
 
 ```console
 $ pyrs doctor
-pyrs 0.126.0
+pyrs 0.127.0
   target       x86_64-linux
   C compiler   cc (cc (GCC) 16.2.1)
   interpreter  python3 (python3 on PATH, Python 3.14)

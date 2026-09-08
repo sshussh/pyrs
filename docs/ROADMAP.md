@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.126 |
+| Check | Result after 0.127 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1592 passed; none failed or ignored |
+| `cargo test --workspace` | 1599 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 6 skipped; compat 27 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.126.0` |
+| `pyrs --version` | `PyRs 0.127.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -446,10 +446,16 @@ documentation and the relevant gates.
       needs matching clang for both halves, makes runtime objects
       non-cacheable, and asks LLVM to rediscover the fast path from opaque C.
       See [the plan](superpowers/plans/2026-09-08-inline-int-arithmetic.md).
-- [ ] Narrow the `volatile` local rule (`exceptions` at 1.1x). A function with
-      a `try` anywhere marks every local volatile, defeating `mem2reg`
-      function-wide; C's setjmp rule only covers locals modified between the
-      `setjmp` and the `longjmp`. Measured 2026-09-08.
+- [x] Narrow the `volatile` local rule (0.127). A function with a `try`
+      anywhere marked every local volatile, defeating `mem2reg` function-wide;
+      C's rule only covers locals *changed* between the `setjmp` and the
+      `longjmp`, so only a store inside a `try` now disqualifies one. A hot
+      loop beside a cold validity check went 114ms -> 66ms. `exceptions` does
+      not move, correctly: its loop body is inside the try.
+- [ ] Reduce the per-raise cost itself (`exceptions` at 1.1x). Each raise/catch
+      round trip costs about 525ns against CPython's 228ns — a try frame push,
+      a `setjmp`, and exception-object construction per iteration. Measured
+      2026-09-08.
 - [ ] Plumb `CodeGenOptLevel` and the target CPU. `createTargetMachine` never
       receives the opt level, so `-O3` never reaches instruction selection or
       scheduling, and the CPU is `"generic"` with an empty feature string —
