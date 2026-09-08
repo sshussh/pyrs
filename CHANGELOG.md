@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.118.0 — Make the gates measure what they claim
+
+Housekeeping before the correctness work, because every later milestone's
+evidence rests on these.
+
+**`make compatibility` ran `--group core`**, which excluded all six numpy and
+pandas cases — the scientific/data workload family the product contract names.
+The reported "native 66 pass / 0 known_gap" meant 22 synthetic cases × 3
+optimization levels, with the only cases capable of producing a `known_gap`
+never run. It now runs every group. A case whose packages are absent reports
+as **`skipped` and is counted**, so a machine without numpy still passes the
+gate while the gap stays visible:
+
+```console
+$ make compatibility
+...
+skipped          native: numpy-arrays (needs numpy)
+{"compat": {"pass": 22, "skipped": 6}, "native": {"pass": 66, "skipped": 6}}
+```
+
+`skipped` is not a failure — a contributor without pandas must still be able
+to run the gate — and never a pass. `make compatibility-science` runs that
+group alone with `--require-all`, which fails rather than skipping. Five tests
+in `compatibility/test_runner.py` pin both halves, including that a skip
+cannot mask a regression.
+
+**Three documentation claims were stale, not aspirational.** Each was checked
+against the code rather than assumed:
+
+- The roadmap said the example-parity gate "still uses command substitution,
+  so the comparison is not byte-exact." It has not since 0.86 —
+  `scripts/check_examples.py` compares raw stdout, stderr and exit status as
+  bytes. Row closed.
+- The guide said str methods use ASCII rules for case and whitespace. They
+  have been Unicode 16.0.0 since 0.91. What genuinely remains ASCII-only is
+  `int(s)` / `float(s)` whitespace stripping — confirmed against CPython,
+  which accepts `int("\u00a042")` where PyRs raises.
+- The README said every unsupported feature is "rejected at compile time,
+  with a diagnostic naming the feature." Many are not: `eval(x)` reports
+  `function 'eval' is not defined`, `raise X from Y` reports
+  `expected end of line after statement, found 'from'`. The claim is now
+  accurate; a later milestone makes the diagnostics match it.
+
+Also fixed: the measured-defect table was split by a paragraph that orphaned
+rows 8–23 so they did not render, and that paragraph read "Every row is now
+closed" directly above four open rows. The 0.112 entry was listed twice.
+
 ## 0.117.0 — The cache ceiling is enforced by growth, not only by the clock
 
 A bug in 0.111, found by looking at the cache after a day of work on this

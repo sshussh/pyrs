@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.117 |
+| Check | Result after 0.118 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 | `cargo test --workspace` | 1502 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
-| `make compatibility` | native 66 pass / 0 known_gap; compat 22 pass |
-| `pyrs --version` | `PyRs 0.117.0` |
+| `make compatibility` | native 66 pass / 6 skipped; compat 22 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
+| `pyrs --version` | `PyRs 0.118.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -66,7 +66,7 @@ not cover them.
 | Numeric and binding semantics | Closed in 0.86 for mixed int/float comparison and conditionally assigned locals. Closed in 0.89: mixed-numeric list/tuple **literals** keep each element's own type instead of promoting to one. Still open: converting an already-typed `list[int]` into `list[float]`/a union by assignment (only a literal's own elements are joined); dynamic negative integer powers trap; module globals, deletion and static use-before-assignment diagnostics | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
 | Generators and dynamism | `yield from` does not forward `send`/`throw`; generator exhaustion uses Optional None in several paths; `Any`, class attributes, inheritance, and class values remain restricted | Stabilize the intended subset and reject unsupported paths clearly; broader CPython dynamism is separate work |
 | Memory confidence | Conservative roots can retain garbage; abandoned generators do not run user finalizers; collection statistics exclude native/allocator overhead | Continue stress and exception-path tests and measure process memory on sustained workloads; see [GC.md](GC.md) |
-| Example parity gate | 0.86 makes the recipe fail when either process fails; it still uses command substitution, so trailing newlines are stripped and the comparison is not byte-exact | Compare actual bytes and test the gate's own failure paths |
+| Example parity gate | Closed in 0.86: `scripts/check_examples.py` compares raw stdout, stderr and exit status as bytes, builds and runs as separate steps, and its own failure paths are tested by `scripts/test_gates.py` | — |
 | Borrowed CPython buffers | Closed in 0.86 for reallocation: growth sites raise `BufferError` rather than freeing exporter- or `PyMem`-owned memory. Direct element stores are still only prevented by the extension frontend's allowlist | Add a store-side check or a distinct immutable buffer type before the bridge is non-experimental |
 | Failure artifacts | Closed in 0.88: integration tests build under `CARGO_TARGET_TMPDIR` (`target/tmp`, the path CI uploads) and retain their inputs when the thread is panicking | — |
 | Release delivery | The compiler links system LLVM dynamically; archives have no clean-environment dependency check; manually selected release tags do not control archive version naming | State supported hosts/dependencies and verify extracted archives on clean hosts. Version agreement across crates, lockfile, docs and the binary is checked by `make hygiene` as of 0.88; tag-to-version agreement is not |
@@ -94,9 +94,6 @@ why correctness rather than new capability sets the near-term order.
 | `"ß".upper()` | `SS` | `SS` | **closed in 0.91** |
 | `"é".isalpha()` | `True` | `True` | **closed in 0.91** |
 
-Every row measured on 2026-09-05 is now closed. The table is kept as the
-record of what release gate 2 has cleared, not as an outstanding list; new
-probes append to it.
 | `2 ** 53 + 1 == 9007199254740992.0` | `False` | `False` | **closed in 0.86** |
 | `[1, 2.5, 1]` | `[1, 2.5, 1]` | `[1, 2.5, 1]` | **closed in 0.89** |
 | `a != b`, `a: Base` holding a `Child` defining `__ne__` | `Child.__ne__` runs | `Child.__ne__` runs | **closed in 0.89** |
@@ -113,6 +110,11 @@ probes append to it.
 | `"{0} {0}".format(side())` | one call | one call | **closed in review** |
 | `print([e])` for a caught `e` | `[ValueError('x')]` | `[ValueError('x')]` | **closed in review** |
 | `repr(RuntimeError(""))` | `RuntimeError('')` | `RuntimeError()` | open — see below |
+
+All seven rows measured on 2026-09-05 are closed; the four still open were
+appended by later review. The table is release gate 2's outstanding list, so
+a row leaves it only by closing or by a recorded scope decision, and new
+probes append to it.
 
 `KeyError.__str__` is CPython's `repr(args[0])`, so a str key displays quoted
 and an int key does not. This is now handled by the display-vs-storage
@@ -371,9 +373,9 @@ documentation and the relevant gates.
 - [x] Bound the cache for real (0.117): the 0.111 ceiling was checked once a
       day and nothing else, which let the cache reach 3.6 GiB against a 2 GiB
       limit in 46 minutes. The prune now also triggers on growth.
-- [x] Command-line experience (0.112): project-aware `pyrs build` writing
-      `target/NAME`, `pyrs clean`, `pyrs doctor`, shell completions, and
-      argument errors that name the argument and suggest the real one.
+- [x] Make the gates measure what they claim (0.118): `make compatibility`
+      runs every group, so the scientific/data cases the product contract
+      names are counted as `skipped` rather than excluded by `--group core`.
 - [ ] Declare the supported host/target matrix (initially Linux x86-64) and
       exercise each claimed platform in CI.
 - [ ] Reproducible release builds, checksums, install instructions,

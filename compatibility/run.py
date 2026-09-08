@@ -74,6 +74,26 @@ def same_result(got, want):
     ))
 
 
+def missing_requirements(case, packages):
+    """Packages a case needs that the oracle interpreter does not have.
+
+    A case with unmet requirements is skipped and counted rather than
+    dropped from the selection: excluding it would make the headline number
+    describe a smaller suite than the manifest declares, which is how the
+    scientific/data cases stayed invisible while `make compatibility`
+    reported "0 known_gap".
+    """
+    return sorted(p for p in case.get("requires", []) if packages.get(p) is None)
+
+
+def exit_code(results):
+    """0 when nothing regressed. `skipped` is not a failure -- it is a
+    recorded absence -- but it is also never a pass."""
+    return int(any(
+        r["status"] not in {"pass", "known_gap", "skipped"} for r in results
+    ))
+
+
 def classify(case, mode, oracle, compile_result, actual):
     if oracle["timeout"] or oracle["returncode"] != 0:
         return "oracle_error"
@@ -118,6 +138,10 @@ def main():
     parser.add_argument("--opt-levels", nargs="+", type=int, choices=range(4), default=[2])
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--gc-stress", action="store_true")
+    parser.add_argument(
+        "--require-all", action="store_true",
+        help="fail instead of skipping when a case's requirements are absent",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -143,17 +167,28 @@ def main():
                 del env[key]
         env.update(PYTHONHASHSEED="0", OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1")
         packages = sorted({p for case in cases for p in case.get("requires", [])})
+        # Report each package's version or None, rather than failing on the
+        # first missing one. A case whose requirements are absent is *skipped
+        # and counted*, not silently dropped: excluding it from the selection
+        # would make the headline number describe a smaller suite than the one
+        # the manifest declares.
         metadata_code = (
-            "import importlib.metadata as m, json, sys; "
-            "print(json.dumps({'version': sys.version, 'implementation': sys.implementation.name, "
-            "'executable': sys.executable, 'packages': {p: m.version(p) for p in sys.argv[1:]}}))"
+            "import importlib.metadata as m, json, sys\n"
+            "def v(p):\n"
+            "    try: return m.version(p)\n"
+            "    except Exception: return None\n"
+            "print(json.dumps({'version': sys.version, 'implementation': sys.implementation.name,\n"
+            "  'executable': sys.executable, 'packages': {p: v(p) for p in sys.argv[1:]}}))"
         )
         with tempfile.TemporaryDirectory(prefix="pyrs-compatibility-") as tmp:
             root = Path(tmp)
             metadata = run([python, "-c", metadata_code, *packages], root, env, args.timeout)
             if metadata["returncode"] != 0 or metadata["timeout"]:
-                raise ValueError(f"oracle dependencies unavailable; install {packages} in --python's environment:\n{metadata['stderr']}")
+                raise ValueError(f"cannot inspect the oracle interpreter:\n{metadata['stderr']}")
             python_info = json.loads(metadata["stdout"])
+            if args.require_all and any(v is None for v in python_info["packages"].values()):
+                absent = sorted(p for p, v in python_info["packages"].items() if v is None)
+                raise ValueError(f"--require-all: install {absent} in --python's environment")
             if python_info["implementation"] != "cpython":
                 raise ValueError("the differential oracle must be CPython")
             version = run([pyrs, "--version"], root, env, args.timeout)
@@ -169,6 +204,16 @@ def main():
             }
             modes = ["native", "compat"] if args.mode == "both" else [args.mode]
             for case in cases:
+                missing = missing_requirements(case, python_info["packages"])
+                if missing:
+                    for mode in modes:
+                        report["results"].append({
+                            "id": case["id"], "mode": mode, "opt_level": None,
+                            "status": "skipped", "expected_native": case["native"],
+                            "reason": case.get("reason"), "missing_requirements": missing,
+                        })
+                        print(f"{'skipped':16} {mode}: {case['id']} (needs {', '.join(missing)})")
+                    continue
                 source = (args.manifest.parent / case["file"]).read_bytes()
                 program_args = case.get("args", [])
                 reset(root, source)
@@ -207,7 +252,7 @@ def main():
             if args.output:
                 args.output.parent.mkdir(parents=True, exist_ok=True)
                 args.output.write_text(json.dumps(report, indent=2) + "\n")
-            return int(any(r["status"] not in {"pass", "known_gap"} for r in report["results"]))
+            return exit_code(report["results"])
     except (OSError, ValueError, KeyError) as error:
         print(f"compatibility runner: {error}", file=sys.stderr)
         return 2

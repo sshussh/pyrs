@@ -1703,9 +1703,10 @@ deliberate exceptions:
    including scalar, None and generator-frame locals. Unbound free cells raise
    `NameError`. Straight-line use-before-assignment is often caught at compile
    time; module/global binding and `del name` parity remain incomplete.
-8. **str methods use ASCII rules** for case (`upper`/`lower`) and
-   whitespace (`strip`/`split`) — Python is Unicode-aware. `int(s)` /
-   `float(s)` also strip **ASCII** whitespace only (same set as `strip`).
+8. **`int(s)` / `float(s)` strip ASCII whitespace only.** Every `str` method
+   follows Unicode 16.0.0 as of 0.91 — case, predicates and whitespace — but
+   the numeric parsers still accept the ASCII whitespace set alone, where
+   CPython accepts any Unicode whitespace.
 9. **GC is nonmoving mark–sweep with conservative native roots.** Unreachable
    managed objects, including cycles, are reclaimed, but pointer-like values
    on the native stack can keep an object alive longer than necessary. The

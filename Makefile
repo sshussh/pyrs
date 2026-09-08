@@ -88,10 +88,18 @@ fmt-check: ## Check formatting without changing anything
 .PHONY: ci
 ci: fmt-check clippy test hygiene examples compatibility ## Full gate: format + lints + tests + hygiene + parity probes
 
+# Every group, not just `core`. The science cases are the scientific/data
+# workload family the product contract names, and running only `core` made the
+# headline number describe a suite that excluded them. Cases whose packages are
+# absent report as `skipped` and are counted, so the gap stays visible.
 .PHONY: compatibility
-compatibility: release ## Core compatibility probes (native + CPython, O0/O2/O3)
+compatibility: release ## Compatibility probes, every group (native + CPython, O0/O2/O3)
 	$(PYTHON) -m unittest discover -s compatibility -p test_runner.py
-	$(PYTHON) compatibility/run.py --pyrs $(PYRS) --group core --mode both --opt-levels 0 2 3 --gc-stress --output target/compatibility/core.json
+	$(PYTHON) compatibility/run.py --pyrs $(PYRS) --group all --mode both --opt-levels 0 2 3 --gc-stress --output target/compatibility/all.json
+
+.PHONY: compatibility-science
+compatibility-science: release ## Science probes only; fails if numpy/pandas are absent
+	$(PYTHON) compatibility/run.py --pyrs $(PYRS) --group science --mode both --opt-levels 0 2 3 --gc-stress --require-all --output target/compatibility/science.json
 
 .PHONY: hygiene
 hygiene: release ## Version agreement + documentation link checks (and the gates' own tests)
