@@ -230,6 +230,14 @@ typedef struct {
 /* Every code point is one byte exactly when the string is ASCII. */
 #define STR_IS_ASCII(s) ((s)->cplen == (s)->len)
 
+/* One interned single-byte string. Layout-compatible with PyrsStr, and
+ * mirrored in codegen as `{ i64, i64, [2 x i8] }`. */
+typedef struct {
+    long long cplen;
+    long long len;
+    char data[2];
+} PyrsSingleChar;
+
 /* Defined with the string section below; the exception helpers above it need
  * to build PyrsStr values too. */
 static PyrsStr *str_from_utf8(const char *buf, long long len);
@@ -3097,24 +3105,41 @@ int pyrs_str_cmp(const PyrsStr *a, const PyrsStr *b) {
     return a->len > b->len ? 1 : -1;
 }
 
-/* Single-ASCII-character strings are interned, so indexing or iterating an
- * ASCII string allocates nothing.  Only 0x00-0x7f can be interned this way:
- * a byte >= 0x80 is a fragment of a UTF-8 sequence, never a string of its
- * own, so non-ASCII code points go through str_from_cp instead. */
-static struct {
-    long long cplen;
-    long long len;
-    char data[2];
-} single_chars[128];
+/* Single-byte strings are interned, so indexing or iterating a string whose
+ * code points are one byte each allocates nothing.
+ *
+ * The table covers all 256 byte values, not just 0x00-0x7f. A byte >= 0x80 is
+ * normally a fragment of a UTF-8 sequence and reaches str_from_cp instead --
+ * but not always: utf8_next treats an invalid or truncated byte as a single
+ * latin-1 code point (returning 1), so str_done_scan counts it as one, and a
+ * string of such bytes read from a file satisfies STR_IS_ASCII. Indexing it
+ * then asks to intern a high byte. With a 128-entry table that wrote three
+ * fields about 2.5 KiB past the end; sizing it to 256 makes the answer
+ * correct instead, and consistent with how the parent string was measured:
+ * the byte counts as one code point there and yields a one-code-point string
+ * here, so slicing and re-joining still round-trip.
+ *
+ * Statically initialized rather than filled on first use, and exported rather
+ * than static, because codegen indexes it directly: the ASCII path of
+ * `s[i]` is a bounds check and a load, with no call and no lazy-init branch.
+ * The IR names the layout as `[256 x { i64, i64, [2 x i8] }]`, so the size
+ * below is part of that contract. */
+#define PYRS_SC1(c) {1, 1, {(char)(c), 0}}
+#define PYRS_SC4(c) PYRS_SC1(c), PYRS_SC1((c) + 1), PYRS_SC1((c) + 2), PYRS_SC1((c) + 3)
+#define PYRS_SC16(c) PYRS_SC4(c), PYRS_SC4((c) + 4), PYRS_SC4((c) + 8), PYRS_SC4((c) + 12)
+#define PYRS_SC64(c) \
+    PYRS_SC16(c), PYRS_SC16((c) + 16), PYRS_SC16((c) + 32), PYRS_SC16((c) + 48)
+
+PyrsSingleChar pyrs_single_chars[256] = {PYRS_SC64(0), PYRS_SC64(64),
+                                         PYRS_SC64(128), PYRS_SC64(192)};
+
+_Static_assert(sizeof(pyrs_single_chars[0]) == 24,
+               "codegen indexes pyrs_single_chars with a 24-byte stride");
+_Static_assert(sizeof(pyrs_single_chars) == 256 * 24,
+               "codegen assumes 256 interned single-byte strings");
 
 static PyrsStr *single_char(unsigned char c) {
-    if (single_chars[c].len == 0) {
-        single_chars[c].cplen = 1;
-        single_chars[c].len = 1;
-        single_chars[c].data[0] = (char)c;
-        single_chars[c].data[1] = '\0';
-    }
-    return (PyrsStr *)&single_chars[c];
+    return (PyrsStr *)&pyrs_single_chars[c];
 }
 
 static struct {

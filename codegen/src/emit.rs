@@ -282,6 +282,9 @@ struct Emitter {
     /// Small-int fast-path helpers actually reached, so `finish` defines only
     /// those. Ordered so the emitted module is byte-stable.
     int_helpers: std::collections::BTreeSet<&'static str>,
+    /// String fast-path helpers actually reached, same contract as
+    /// `int_helpers`.
+    str_helpers: std::collections::BTreeSet<&'static str>,
     /// Whether to route int operations through the inline fast paths at all.
     /// `PYRS_INLINE_INT=0` reverts every site to a plain runtime call, which
     /// is what makes the inline-vs-runtime differential test possible.
@@ -318,6 +321,7 @@ impl Default for Emitter {
             volatile_names: std::collections::HashSet::new(),
             discovering: false,
             int_helpers: std::collections::BTreeSet::new(),
+            str_helpers: std::collections::BTreeSet::new(),
             inline_int: std::env::var("PYRS_INLINE_INT").as_deref() != Ok("0"),
         }
     }
@@ -1254,6 +1258,16 @@ impl Emitter {
         for op in &self.int_helpers {
             out.push_str(&crate::intfast::define(op));
         }
+        if self
+            .str_helpers
+            .iter()
+            .any(|op| crate::strfast::needs_single_chars(op))
+        {
+            out.push_str(crate::strfast::SINGLE_CHARS_DECL);
+        }
+        for op in &self.str_helpers {
+            out.push_str(&crate::strfast::define(op));
+        }
         out.push_str(&self.global_defs);
         out.push_str(&self.string_defs);
         out.push('\n');
@@ -1440,6 +1454,18 @@ impl Emitter {
         }
         self.int_helpers.insert(op);
         Some(crate::intfast::symbol(op))
+    }
+
+    /// Symbol of a string fast-path helper. Shares `PYRS_INLINE_INT` as its
+    /// escape hatch: both are "compare inline, call the runtime otherwise",
+    /// and one switch to turn the whole family off keeps the differential
+    /// test simple.
+    fn str_fast(&mut self, op: &'static str) -> Option<String> {
+        if !self.inline_int {
+            return None;
+        }
+        self.str_helpers.insert(op);
+        Some(crate::strfast::symbol(op))
     }
 
     fn tmp(&mut self) -> String {
@@ -4071,7 +4097,13 @@ impl Emitter {
                     Ty::Str => {
                         let i = self.emit_unbox_i64(&i_tagged);
                         let t = self.tmp();
-                        self.line(format!("{t} = call ptr @pyrs_str_index(ptr {b}, i64 {i})"));
+                        match self.str_fast("index") {
+                            Some(sym) => {
+                                self.line(format!("{t} = call ptr {sym}(ptr {b}, i64 {i})"));
+                            }
+                            None => self
+                                .line(format!("{t} = call ptr @pyrs_str_index(ptr {b}, i64 {i})")),
+                        }
                         t
                     }
                     Ty::List(elem) => {
@@ -6743,12 +6775,29 @@ impl Emitter {
                 self.line(format!("{t} = call ptr @pyrs_str_repeat(ptr {l}, i64 {n})"));
                 t
             }
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            // Equality is decided by pointer identity, then by length, then
+            // — for the one-character case that string iteration produces —
+            // by the single byte, without leaving the caller. Ordering needs
+            // the full lexicographic answer and keeps the call.
+            BinOp::Eq | BinOp::Ne => {
+                let name = if matches!(op, BinOp::Eq) { "eq" } else { "ne" };
+                let t = self.tmp();
+                match self.str_fast(name) {
+                    Some(sym) => {
+                        self.line(format!("{t} = call i1 {sym}(ptr {l}, ptr {r})"));
+                    }
+                    None => {
+                        let c = self.tmp();
+                        self.line(format!("{c} = call i32 @pyrs_str_cmp(ptr {l}, ptr {r})"));
+                        self.line(format!("{t} = icmp {name} i32 {c}, 0"));
+                    }
+                }
+                t
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let c = self.tmp();
                 self.line(format!("{c} = call i32 @pyrs_str_cmp(ptr {l}, ptr {r})"));
                 let cc = match op {
-                    BinOp::Eq => "eq",
-                    BinOp::Ne => "ne",
                     BinOp::Lt => "slt",
                     BinOp::Le => "sle",
                     BinOp::Gt => "sgt",

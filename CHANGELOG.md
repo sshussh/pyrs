@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.132.0 — String equality and ASCII indexing stop calling the runtime
+
+`strings` was the slowest benchmark at 3.2x. It walks an 88k-character string
+sixty times, comparing each character against five literals, and every one of
+those operations left the caller. **3.2x -> 15.9x**, and the corpus 10.1x ->
+11.6x.
+
+### An out-of-bounds write, fixed first
+
+`utf8_next` treats an invalid or truncated byte as a single latin-1 code point,
+so `str_done_scan` counts it as one and a non-UTF-8 file read satisfies
+`STR_IS_ASCII` (`cplen == len`). Indexing such a string then asked to intern a
+byte >= 0x80 in a **128-entry** table: `single_char(0xE9)` wrote three fields
+about 2.5 KiB past the end.
+
+The table is now 256 entries, which makes the answer correct rather than merely
+in-bounds — the byte counts as one code point in the parent string and yields a
+one-code-point string here, so slicing and re-joining still round-trip. It is
+also statically initialized and exported, because codegen indexes it directly.
+
+This landed before the optimization, so the fast path is built on correct
+ground.
+
+### `==` computed a three-way ordering to answer a yes/no question
+
+`pyrs_str_cmp` has no length short-circuit and no identity check, so comparing
+two one-character strings cost an opaque call plus a `memcmp` PLT call — 43% of
+the benchmark. Three facts now decide most comparisons inline: same pointer
+(positively only — a literal is a module global while `s[i]` is the runtime's
+interned singleton, so equal characters routinely differ in address), different
+byte length, or one byte each. **~100 ms -> 25 ms.**
+
+Ordering comparisons keep the call; they need the full lexicographic answer.
+
+### `s[i]` re-derived what the caller already knew
+
+That left `pyrs_str_index` at 41%. Its fast path is the same `cplen == len`
+test the runtime makes, then a bounds check and a load, ending at the address
+of an interned entry — no call, no allocation, and no lazy-init branch now that
+the table is statically initialized. Out of range and non-ASCII fall through to
+the runtime, so the `IndexError` text stays in one place. **25 ms -> 22 ms.**
+
+### Tried and reverted: runtime attributes and list alias scopes
+
+Also implemented, measured, and **removed**: `!alias.scope`/`!noalias`
+separating a container header from its element buffer, and `nounwind` /
+`memory(read)` / `willreturn` on the nine runtime functions that provably
+neither allocate nor trap.
+
+Effect on every benchmark, and on a purpose-built read-only float loop: none.
+The header-load count in `sort`'s hot loop was unchanged at 14. The reason is
+that every loop carries a tagged-int counter whose `pyrs.int.add` cold edge
+calls `pyrs_int_add`, which can allocate a bignum and so cannot be attributed;
+one such clobber stops LICM regardless of what the other calls claim. `sort`'s
+profile also says the prize is one instruction in a ~50-instruction loop body.
+Not worth the silent-miscompilation surface, and recorded in the roadmap so it
+is not attempted again without a different plan.
+
 ## 0.131.0 — A `try` stops making a syscall, and a caught exception stops allocating
 
 Four independent changes, each with a measurement behind it. `exceptions` goes

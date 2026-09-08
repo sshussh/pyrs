@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.131 |
+| Check | Result after 0.132 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1621 passed; none failed or ignored |
+| `cargo test --workspace` | 1634 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 6 skipped; compat 27 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.131.0` |
+| `pyrs --version` | `PyRs 0.132.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -458,6 +458,23 @@ documentation and the relevant gates.
       matching restore per longjmp. And `pyrs_exc_object()` ran at every
       handler entry, allocating twice for a result only a bound name or a bare
       `raise` reads. `exceptions` 1.3x -> 6.3x.
+- [ ] ~~Attribute the runtime declarations and separate list-header from
+      element aliasing.~~ **Tried and reverted, 2026-09-08.** Both were
+      implemented: `!alias.scope`/`!noalias` separating a container header
+      from its element buffer, and `nounwind` / `memory(read)` /
+      `willreturn` on the nine runtime functions that provably neither
+      allocate nor trap. Measured effect on every benchmark, and on a
+      purpose-built read-only float loop: **none** — within noise, and the
+      header-load count in the hot loop was unchanged. The reason is that
+      every loop carries a tagged-int counter whose `pyrs.int.add` cold edge
+      calls `pyrs_int_add`, which can allocate a bignum and so cannot be
+      attributed; one such clobber is enough to stop LICM regardless of what
+      the other calls claim. Attributing the allocating int family would need
+      `memory(read, inaccessiblemem: readwrite)`, and `sort`'s profile says
+      the prize is one instruction in a ~50-instruction loop body. Not worth
+      the silent-miscompilation surface. The route that would pay is a
+      machine-`i64` induction variable for `range` loops with statically small
+      bounds, which removes the clobber rather than describing it.
 - [ ] Reduce the remaining per-`try` cost. Each entry still `malloc`s a
       240-byte `PyrsExcFrame`, pushes it onto two intrusive lists, and stores
       four volatile control words; each raise `snprintf`s the message into a
@@ -486,9 +503,17 @@ documentation and the relevant gates.
       deliberately in 0.130: with the range table fixed, `objects` spends 25ms
       of its 61ms in the collector, so the next measurement should decide
       whether allocation or the remaining mark and sweep is worth attacking.
-- [ ] Reduce the per-character cost of string iteration (`strings` at 3.4x, now
-      the slowest benchmark). `for c in text` calls `pyrs_str_index` per
-      character, and each `==` calls `pyrs_str_cmp`. Measured 2026-09-08.
+- [x] Reduce the per-character cost of string iteration (0.132). `==` computed
+      a full three-way `memcmp` ordering to answer a yes/no question about two
+      single characters, and `s[i]` was an opaque call per character. Both now
+      decide inline — pointer identity, byte length, then the single byte for
+      equality; `cplen == len` then a bounds check and a load for indexing.
+      `strings` 3.2x -> 15.9x.
+- [x] Fix an out-of-bounds write in `single_char` (0.132). A non-UTF-8 file
+      read satisfies `STR_IS_ASCII`, because `utf8_next` counts an invalid byte
+      as one latin-1 code point; indexing it interned a byte >= 0x80 in a
+      128-entry table, writing about 2.5 KiB past the end. The table is now 256
+      entries, so the byte round-trips instead.
 - [ ] Declare the supported host/target matrix (initially Linux x86-64) and
       exercise each claimed platform in CI.
 - [ ] Reproducible release builds, checksums, install instructions,

@@ -11,6 +11,7 @@
 
 pub mod emit;
 pub mod intfast;
+pub mod strfast;
 
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
