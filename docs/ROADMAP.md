@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.121 |
+| Check | Result after 0.122 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1538 passed; none failed or ignored |
+| `cargo test --workspace` | 1546 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
-| `make compatibility` | native 72 pass / 6 skipped; compat 24 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.121.0` |
+| `make compatibility` | native 75 pass / 6 skipped; compat 25 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
+| `pyrs --version` | `PyRs 0.122.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish

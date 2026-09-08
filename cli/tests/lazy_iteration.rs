@@ -427,3 +427,115 @@ fn a_genexp_over_range_is_still_lazy_in_its_elements() {
          print(next(g), next(g), next(g))\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// map and filter
+// ---------------------------------------------------------------------------
+//
+// Neither existed. They are here rather than in a suite of their own because
+// they are the same cursor protocol: `map` passes the inner cursor through
+// with its element transformed, and `filter` loops inside the advance until
+// it finds a passing element — which is what lets a filtered cursor be
+// zipped without a skipped element being paired.
+
+#[test]
+fn map_applies_every_callable_form() {
+    matches_python(
+        "map-forms",
+        "xs: list[int] = [1, 2, 3]\n\n\n\
+         def double(n: int) -> int:\n    return n * 2\n\n\n\
+         print(list(map(str, xs)))\n\
+         print(list(map(double, xs)))\n\
+         print(list(map(lambda n: n + 1, xs)))\n\
+         print(list(map(abs, [-1, 2, -3])))\n",
+    );
+}
+
+#[test]
+fn filter_keeps_what_the_predicate_accepts() {
+    matches_python(
+        "filter-forms",
+        "xs: list[int] = [1, 2, 3, 4, 5]\n\n\n\
+         def odd(n: int) -> bool:\n    return n % 2 == 1\n\n\n\
+         print(list(filter(odd, xs)))\n\
+         print(list(filter(lambda n: n > 3, xs)))\n",
+    );
+}
+
+#[test]
+fn filter_none_keeps_the_truthy_elements() {
+    matches_python(
+        "filter-none",
+        "print(list(filter(None, [1, 0, 2, 0, 3])))\n\
+         print(list(filter(None, [\"\", \"a\", \"\", \"b\"])))\n\
+         print(list(filter(None, [True, False, True])))\n",
+    );
+}
+
+#[test]
+fn a_filter_that_matches_nothing_or_everything_still_terminates() {
+    // The advance loops until it finds a match; an empty result means it ran
+    // to exhaustion, which is where an off-by-one would hang or over-read.
+    matches_python(
+        "filter-edges",
+        "xs: list[int] = [1, 2, 3]\n\
+         empty: list[int] = []\n\
+         print(list(filter(lambda n: n > 100, xs)))\n\
+         print(list(filter(lambda n: n > 0, xs)))\n\
+         print(list(filter(None, empty)))\n\
+         print(list(map(str, empty)))\n",
+    );
+}
+
+#[test]
+fn map_and_filter_stay_lazy_under_zip() {
+    // The point of building them on the cursor: an infinite input must not be
+    // drained, and a filtered element must not be paired.
+    matches_python(
+        "map-filter-lazy",
+        &format!(
+            "{INFINITE}def double(n: int) -> int:\n    return n * 2\n\n\n\
+             def odd(n: int) -> bool:\n    return n % 2 == 1\n\n\n\
+             print(list(zip(map(double, infinite()), [10])))\n\
+             print(list(zip(filter(odd, infinite()), [10, 20])))\n"
+        ),
+    );
+}
+
+#[test]
+fn map_and_filter_compose_with_each_other_and_the_consumers() {
+    matches_python(
+        "map-filter-compose",
+        "xs: list[int] = [1, 2, 3, 4, 5]\n\n\n\
+         def double(n: int) -> int:\n    return n * 2\n\n\n\
+         def odd(n: int) -> bool:\n    return n % 2 == 1\n\n\n\
+         for v in map(double, filter(odd, xs)):\n    print(v)\n\
+         print(sorted(map(double, xs)))\n\
+         print(sum(map(double, xs)))\n\
+         print(any(map(odd, xs)), all(map(odd, xs)))\n\
+         print([v for v in filter(odd, map(double, xs))])\n\
+         print(list(enumerate(filter(odd, xs), 1)))\n",
+    );
+}
+
+#[test]
+fn map_evaluates_the_callable_before_the_iterable() {
+    // CPython's left-to-right argument order. The iterable has to be lowered
+    // first to type the callable, so the *setup* order is what preserves it.
+    matches_python(
+        "map-arg-order",
+        "def pick() -> int:\n    print(\"pick\")\n    return 0\n\n\n\
+         def seq() -> list[int]:\n    print(\"seq\")\n    return [1, 2]\n\n\n\
+         print(list(map(lambda n: n + pick(), seq())))\n",
+    );
+}
+
+#[test]
+fn map_over_a_range_builds_no_intermediate_list() {
+    // A billion-element range would not fit if the cursor materialized.
+    matches_python(
+        "map-lazy-range",
+        "g = (v for v in map(lambda n: n * 2, range(1000000000)))\n\
+         print(next(g), next(g), next(g))\n",
+    );
+}

@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.122.0 — `map` and `filter`
+
+Neither existed; both are among the most-missed absent builtins. They are
+small **now** because 0.119 built the cursor protocol they ride on — and they
+are lazy for the same reason:
+
+```python
+any(map(f, infinite()))          # short-circuits, as CPython does
+list(zip(filter(odd, xs), ys))   # a filtered element is skipped, not paired
+```
+
+**`map` is the inner cursor with its element transformed.** The exhaustion
+shape, the step and the capacity all pass through, so `map` over a list stays
+`Indexed` and allocation-free and `map` over a generator stays lazy. The
+callable is resolved by the machinery `sorted(key=…)` already had, which
+covers lambdas, nested and free functions, imported functions and the
+builtins that take one argument.
+
+**`filter` cannot be a guard around the loop body.** A cursor advances once
+per iteration, and a skipped element must not be *paired* by an enclosing
+`zip`. So the advance itself loops until it either finds a passing element or
+exhausts the input, which keeps "an element appeared" meaning "an element the
+consumer should see" and lets a filtered cursor compose like any other.
+`filter(None, xs)` keeps the truthy elements.
+
+**`any`/`all` needed their own route.** They short-circuit, so they cannot go
+through the drain-to-a-list path the other eager builtins use. They now
+normalise the cursor through the same `parts_to_advance` reconciliation `zip`
+uses — necessary because stopping early means clearing a flag, and an
+`Indexed` cursor has none: its condition is an index test.
+
+Argument order is CPython's. The iterable has to be lowered first to type the
+callable, so the *setup* order is what preserves `map(f(), it())` calling
+`f()` first.
+
+`map` takes one iterable, not several; that needs dynamic-arity tuples, the
+same thing `zip(*rows)` waits on.
+
+Eight differential tests added to `cli/tests/lazy_iteration.rs` (32 total) and
+a `map-filter` compatibility probe under GC stress.
+
 ## 0.121.0 — Exception fidelity; release gate 2's list is empty
 
 ### An argument given is not an argument that is empty

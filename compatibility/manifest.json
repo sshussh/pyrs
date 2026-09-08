@@ -149,6 +149,13 @@
       "reason": "repr distinguishes a missing argument from an empty one; LookupError and ArithmeticError catch what CPython says they catch"
     },
     {
+      "id": "map-filter",
+      "group": "core",
+      "file": "cases/map_filter.py",
+      "native": "pass",
+      "reason": "map and filter advance lazily on the cursor protocol; a filtered element is skipped, not paired"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",

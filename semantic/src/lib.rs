@@ -18672,7 +18672,8 @@ fn wrap_comp_level(level: CompLevel, inner: Vec<ir::Stmt>) -> Vec<ir::Stmt> {
 /// rather than by materializing a list first.
 fn is_lazy_combinator(e: &ast::Expr, ctx: &FnCtx) -> bool {
     matches!(&e.kind, ast::ExprKind::Call { func, .. }
-        if matches!(func.as_str(), "zip" | "enumerate") && !ctx.funcs().contains_key(func.as_str()))
+        if matches!(func.as_str(), "zip" | "enumerate" | "map" | "filter")
+            && !ctx.funcs().contains_key(func.as_str()))
 }
 
 /// `zip(a, b, ...)` as one cursor.
@@ -18872,6 +18873,146 @@ fn enumerate_parts(
     })
 }
 
+/// `map(f, it)` as one cursor.
+///
+/// The inner cursor's element, with `f` applied. Nothing else changes — the
+/// exhaustion shape, the step and the capacity all pass through — so `map`
+/// over a list stays `Indexed` and allocation-free, and `map` over a
+/// generator stays lazy.
+fn map_parts(
+    args: &[&ast::Expr],
+    span: Span,
+    ctx: &mut FnCtx,
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<CompIterParts> {
+    if args.len() != 2 {
+        return Err(err(
+            format!(
+                "map() takes a function and one iterable ({} arguments given); \
+                 mapping over several iterables at once is not supported yet",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    // The iterable is lowered first because resolving the callable needs the
+    // element type, but its setup is emitted *second*, so a side-effecting
+    // callable expression still runs before the iterable — CPython's
+    // left-to-right argument order.
+    let mut iter_setup = Vec::new();
+    let inner = lower_comp_iter(args[1], false, ctx, &mut iter_setup)?;
+    let (key, _) = resolve_sort_key(args[0], inner.element.ty, ctx)?;
+    let (key, key_setup) = bind_sort_key(key, ctx);
+    setup.extend(key_setup);
+    setup.extend(iter_setup);
+
+    let element = call_sort_key(&key, inner.element, args[1].span, ctx)?;
+    Ok(CompIterParts {
+        cond: inner.cond,
+        step: inner.step,
+        element,
+        cap: inner.cap,
+        kind: inner.kind,
+    })
+}
+
+/// `filter(f, it)` as one cursor, and `filter(None, it)` for truthiness.
+///
+/// Filtering cannot be a guard around the loop body: a cursor advances once
+/// per iteration, and a skipped element must not be *paired* by an enclosing
+/// `zip`. So the advance itself loops until it either finds a passing element
+/// or exhausts the input, which keeps `ok` meaning "an element the consumer
+/// should see" and lets a filtered cursor compose like any other.
+fn filter_parts(
+    args: &[&ast::Expr],
+    span: Span,
+    ctx: &mut FnCtx,
+    setup: &mut Vec<ir::Stmt>,
+) -> SResult<CompIterParts> {
+    if args.len() != 2 {
+        return Err(err(
+            format!(
+                "filter() takes a predicate (or None) and one iterable \
+                 ({} arguments given)",
+                args.len()
+            ),
+            span,
+        ));
+    }
+    let mut iter_setup = Vec::new();
+    let inner = lower_comp_iter(args[1], false, ctx, &mut iter_setup)?;
+    let elem_ty = inner.element.ty;
+    let pred = match &args[0].kind {
+        // `filter(None, xs)` keeps the truthy elements.
+        ast::ExprKind::NoneLit => Option::None,
+        _ => {
+            let (key, key_setup) = {
+                let (key, _) = resolve_sort_key(args[0], elem_ty, ctx)?;
+                bind_sort_key(key, ctx)
+            };
+            setup.extend(key_setup);
+            Some(key)
+        }
+    };
+    setup.extend(iter_setup);
+
+    let (more_t, more_local) = push_comp_more(ctx, setup);
+    let found_t = ctx.fresh_temp("filter.found", ir::Ty::Bool);
+    let done_t = ctx.fresh_temp("filter.done", ir::Ty::Bool);
+    setup.push(assign_const_bool(done_t.clone(), false));
+    let slot = ctx.fresh_temp("filter.elem", elem_ty);
+    let found_local = local_expr(found_t.clone(), ir::Ty::Bool);
+    let done_local = local_expr(done_t.clone(), ir::Ty::Bool);
+
+    // if <predicate holds>: found = True
+    let kept = match &pred {
+        Some(key) => {
+            let call = call_sort_key(key, local_expr(slot.clone(), elem_ty), args[0].span, ctx)?;
+            to_bool(call, args[0].span, ctx)?
+        }
+        Option::None => to_bool(local_expr(slot.clone(), elem_ty), args[1].span, ctx)?,
+    };
+
+    let (advance, produced) = parts_to_advance(&inner);
+    let mut attempt = advance;
+    let mut keep = vec![ir::Stmt::Assign {
+        name: slot.clone(),
+        value: inner.element,
+    }];
+    keep.extend(inner.step);
+    keep.push(ir::Stmt::If {
+        branches: vec![(kept, vec![assign_const_bool(found_t.clone(), true)])],
+        orelse: Vec::new(),
+    });
+    attempt.push(ir::Stmt::If {
+        branches: vec![(produced, keep)],
+        orelse: vec![assign_const_bool(done_t.clone(), true)],
+    });
+
+    // found = False; while not found and not done: <attempt>
+    let prelude = vec![
+        assign_const_bool(found_t.clone(), false),
+        ir::Stmt::While {
+            cond: bool_and(bool_not(found_local), bool_not(done_local.clone())),
+            body: attempt,
+            step: Vec::new(),
+        },
+    ];
+
+    Ok(CompIterParts {
+        cond: more_local,
+        step: Vec::new(),
+        element: local_expr(slot, elem_ty),
+        // How many survive the predicate is not knowable, so no presize.
+        cap: Option::None,
+        kind: CompIterKind::ExhaustIf {
+            prelude,
+            exhausted: done_local,
+            more: more_t,
+        },
+    })
+}
+
 /// Build loop setup for one comprehension generator.
 /// Appends setup into `setup`.
 fn lower_comp_iter(
@@ -18886,15 +19027,15 @@ fn lower_comp_iter(
         keywords,
         ..
     } = &iter.kind
-        && matches!(func.as_str(), "zip" | "enumerate")
+        && matches!(func.as_str(), "zip" | "enumerate" | "map" | "filter")
         && !ctx.funcs().contains_key(func.as_str())
     {
-        return if func == "zip" {
-            let plain = require_plain_args(args, func, iter.span)?;
-            zip_parts(&plain, ctx, setup)
-        } else {
-            let plain = require_plain_args(args, func, iter.span)?;
-            enumerate_parts(&plain, keywords, iter.span, ctx, setup)
+        let plain = require_plain_args(args, func, iter.span)?;
+        return match func.as_str() {
+            "zip" => zip_parts(&plain, ctx, setup),
+            "map" => map_parts(&plain, iter.span, ctx, setup),
+            "filter" => filter_parts(&plain, iter.span, ctx, setup),
+            _ => enumerate_parts(&plain, keywords, iter.span, ctx, setup),
         };
     }
     if let ast::ExprKind::Call { func, args, .. } = &iter.kind
@@ -22542,6 +22683,64 @@ fn lower_isinstance(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult
 /// truthy element, so a side-effecting or infinite generator behaves as it
 /// does in CPython. (The list path does not short-circuit either, but over a
 /// list that is unobservable.)
+/// `any` / `all` over a cursor, short-circuiting.
+///
+/// These cannot go through the drain-to-a-list path the other eager builtins
+/// use: they must stop at the deciding element, so `any(map(f, infinite()))`
+/// terminates when `f` first returns something truthy.
+///
+/// The cursor is normalised to its advance form first, because stopping early
+/// means clearing a flag and an `Indexed` cursor has none — its condition is
+/// an index test. `parts_to_advance` is the same reconciliation `zip` needs.
+fn lower_any_all_cursor(
+    is_any: bool,
+    parts: CompIterParts,
+    mut stmts: Vec<ir::Stmt>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let name = if is_any { "any" } else { "all" };
+    let more_t = ctx.fresh_temp(&format!("{name}.more"), ir::Ty::Bool);
+    stmts.push(assign_const_bool(more_t.clone(), true));
+    let acc_t = ctx.fresh_temp(&format!("{name}.acc"), ir::Ty::Bool);
+    stmts.push(assign_const_bool(acc_t.clone(), !is_any));
+
+    let (advance, produced) = parts_to_advance(&parts);
+    // The element decides when its truthiness equals `is_any`: a truthy
+    // element settles `any`, a falsy one settles `all`.
+    let truth = to_bool(parts.element, span, ctx)?;
+    let decides = if is_any { truth } else { bool_not(truth) };
+    let mut kept = parts.step;
+    kept.push(ir::Stmt::If {
+        branches: vec![(
+            decides,
+            vec![
+                assign_const_bool(acc_t.clone(), is_any),
+                assign_const_bool(more_t.clone(), false),
+            ],
+        )],
+        orelse: Vec::new(),
+    });
+
+    let mut body = advance;
+    body.push(ir::Stmt::If {
+        branches: vec![(produced, kept)],
+        orelse: vec![assign_const_bool(more_t.clone(), false)],
+    });
+    stmts.push(ir::Stmt::While {
+        cond: local_expr(more_t, ir::Ty::Bool),
+        body,
+        step: Vec::new(),
+    });
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(acc_t, ir::Ty::Bool)),
+        },
+    })
+}
+
 fn lower_any_all_generator(
     is_any: bool,
     gen_expr: ir::Expr,
@@ -22640,6 +22839,13 @@ fn lower_any_all(
             format!("{name}() takes exactly one argument ({} given)", args.len()),
             span,
         ));
+    }
+    // A lazy combinator is not a value, and must short-circuit rather than
+    // be drained, so it takes the cursor path.
+    if is_lazy_combinator(args[0], ctx) {
+        let mut setup = Vec::new();
+        let parts = lower_comp_iter(args[0], false, ctx, &mut setup)?;
+        return lower_any_all_cursor(is_any, parts, setup, span, ctx);
     }
     let seq = lower_expr(args[0], ctx)?;
     if let ir::Ty::Generator { yield_ty } = seq.ty {
