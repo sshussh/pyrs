@@ -10,6 +10,7 @@
 //! the system C compiler at link time.
 
 pub mod emit;
+pub mod intfast;
 
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;

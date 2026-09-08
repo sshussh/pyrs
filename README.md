@@ -6,8 +6,8 @@ A Python compiler written in Rust, emitting native code through LLVM.
 
 PyRs compiles a **statically typed subset of Python** straight to machine
 code — no interpreter, no VM, no runtime dependency on CPython. Compute-bound
-float-heavy code runs 5–21× faster than CPython; integer-heavy code is
-currently slower ([benchmarks](#benchmarks)).
+code runs **3–48× faster than CPython**, 9.5× across the benchmark corpus
+([benchmarks](#benchmarks)).
 
 ```console
 $ cat examples/fib.py
@@ -41,7 +41,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.125.0**.
+Current milestone: **v0.126.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -201,28 +201,36 @@ is byte-identical to `python3`'s, then reports best-of-5 wall times:
 
 | benchmark  | workload                                  | python3 |   PyRs | speedup |
 | ---------- | ----------------------------------------- | ------: | -----: | ------: |
-| mandelbrot | float math, 500×500 escape iterations     |  0.599s | 0.028s |   21.5× |
-| nbody      | float + list, 5-body gravity, 100k steps  |  0.791s | 0.042s |   18.8× |
-| pipeline   | lazy `map`/`filter` over 2M elements      |  0.300s | 0.029s |   10.4× |
-| iteration  | `zip`/`enumerate`, 2M paired steps        |  0.311s | 0.045s |    7.0× |
-| matmul     | nested lists, 250×250 matrix multiply     |  0.529s | 0.097s |    5.4× |
-| fib        | recursion, 30M calls (`fib(35)`)          |  0.695s | 0.168s |    4.1× |
-| sort       | list indexing, bubble sort of 5000        |  0.657s | 0.205s |    3.2× |
-| strings    | per-char iteration, 2.6M comparisons      |  0.369s | 0.130s |    2.8× |
-| listcomp   | comprehensions, 3M-element map/filter     |  0.403s | 0.257s |    1.6× |
-| exceptions | 400k calls, 171k raise/catch round trips  |  0.101s | 0.109s |    0.9× |
-| primes     | int loops, trial division to 300k         |  0.426s | 0.509s |    0.8× |
-| **total**  |                                           |  5.182s | 1.618s |    3.2× |
+| nbody      | float + list, 5-body gravity, 100k steps  |  0.769s | 0.016s |   48.2× |
+| mandelbrot | float math, 500×500 escape iterations     |  0.566s | 0.015s |   37.0× |
+| pipeline   | lazy `map`/`filter` over 2M elements      |  0.271s | 0.018s |   15.0× |
+| matmul     | nested lists, 250×250 matrix multiply     |  0.518s | 0.039s |   13.1× |
+| fib        | recursion, 30M calls (`fib(35)`)          |  0.614s | 0.048s |   12.8× |
+| primes     | int loops, trial division to 300k         |  0.382s | 0.031s |   12.4× |
+| iteration  | `zip`/`enumerate`, 2M paired steps        |  0.288s | 0.029s |    9.9× |
+| sort       | list indexing, bubble sort of 5000        |  0.588s | 0.071s |    8.3× |
+| listcomp   | comprehensions, 3M-element map/filter     |  0.363s | 0.058s |    6.3× |
+| strings    | per-char iteration, 2.6M comparisons      |  0.332s | 0.096s |    3.4× |
+| exceptions | 400k calls, 171k raise/catch round trips  |  0.091s | 0.081s |    1.1× |
+| **total**  |                                           |  4.781s | 0.503s |    9.5× |
 
-**Integer-heavy code is the weak spot, and it is one cause.** Every `int`
-operation is an out-of-line call into the runtime — `pyrs_int_add`,
-`pyrs_int_mul`, `pyrs_int_cmp` — because arbitrary precision needs a tagged
-representation with an overflow check, and the runtime is linked as a separate
-object the optimizer cannot inline through. Float code has no such call and
-runs 19–21× faster. The same trial-division algorithm rewritten in floats goes
-from 0.8× to 21× on this machine, which is the whole gap. Exceptions are
-slower for a related reason: the loop around them is 3.9× faster than CPython,
-but each raise/catch costs about 525 ns against CPython's 228 ns.
+**Integer arithmetic used to be the weak spot; 0.126 closed it.** Every `int`
+operation was an out-of-line call into the runtime, because arbitrary precision
+needs a tagged representation with an overflow check and the runtime is linked
+as a separate object the optimizer cannot inline through. `primes` ran at 0.8×.
+Each operation now has an inline fast path on the tagged words, with the
+runtime call kept for the bignum edge — `primes` is 12.4×, and every benchmark
+in the corpus is faster than CPython.
+
+The gain is larger than removing the calls: an opaque call in a loop also
+blocks loop-invariant hoisting and redundant-load elimination for everything
+*around* it, so the float benchmarks — which never called into the runtime for
+arithmetic, but did for their loop counters — roughly doubled as well.
+
+`exceptions` at 1.1× is the remaining outlier. The loop around the raises is
+much faster than CPython; each raise/catch costs about 525 ns against CPython's
+228 ns, and a function containing a `try` currently forces every local to
+memory.
 
 (Linux, LLVM 22, CPython 3.14; run `./benchmarks/run.sh` to reproduce.)
 
@@ -249,7 +257,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.125.0 && git push origin v0.125.0`.
+Release tags: `git tag v0.126.0 && git push origin v0.126.0`.
 
 ## Documentation
 

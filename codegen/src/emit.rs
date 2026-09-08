@@ -268,6 +268,13 @@ struct Emitter {
     local_bindings: std::collections::HashSet<String>,
     /// Locals written after setjmp must survive longjmp without SSA promotion.
     volatile_locals: bool,
+    /// Small-int fast-path helpers actually reached, so `finish` defines only
+    /// those. Ordered so the emitted module is byte-stable.
+    int_helpers: std::collections::BTreeSet<&'static str>,
+    /// Whether to route int operations through the inline fast paths at all.
+    /// `PYRS_INLINE_INT=0` reverts every site to a plain runtime call, which
+    /// is what makes the inline-vs-runtime differential test possible.
+    inline_int: bool,
 }
 
 impl Default for Emitter {
@@ -298,6 +305,8 @@ impl Default for Emitter {
             local_storage: HashMap::new(),
             local_bindings: std::collections::HashSet::new(),
             volatile_locals: false,
+            int_helpers: std::collections::BTreeSet::new(),
+            inline_int: std::env::var("PYRS_INLINE_INT").as_deref() != Ok("0"),
         }
     }
 }
@@ -1216,7 +1225,14 @@ impl Emitter {
         // Functions containing setjmp reserve that register as an actual frame
         // pointer, so every managed value restored by longjmp is either in a
         // plain saved callee register or in stack memory visible to the GC.
+        if !self.int_helpers.is_empty() {
+            out.push_str(crate::intfast::INTRINSIC_DECLS);
+            out.push('\n');
+        }
         out.push_str("attributes #0 = { \"frame-pointer\"=\"all\" }\n\n");
+        for op in &self.int_helpers {
+            out.push_str(&crate::intfast::define(op));
+        }
         out.push_str(&self.global_defs);
         out.push_str(&self.string_defs);
         out.push('\n');
@@ -1392,6 +1408,17 @@ impl Emitter {
         self.body.push_str("  ");
         self.body.push_str(s.as_ref());
         self.body.push('\n');
+    }
+
+    /// Symbol of a small-int fast-path helper, recording it so `finish`
+    /// defines it. `None` means inlining is off and the caller should emit the
+    /// plain runtime call.
+    fn int_fast(&mut self, op: &'static str) -> Option<String> {
+        if !self.inline_int {
+            return None;
+        }
+        self.int_helpers.insert(op);
+        Some(crate::intfast::symbol(op))
     }
 
     fn tmp(&mut self) -> String {
@@ -1837,14 +1864,20 @@ impl Emitter {
     /// Tag a machine i64 as a Python int (small or heap).
     fn emit_box_i64(&mut self, machine: &str) -> String {
         let t = self.tmp();
-        self.line(format!("{t} = call i64 @pyrs_int_from_i64(i64 {machine})"));
+        match self.int_fast("box") {
+            Some(sym) => self.line(format!("{t} = call i64 {sym}(i64 {machine})")),
+            None => self.line(format!("{t} = call i64 @pyrs_int_from_i64(i64 {machine})")),
+        }
         t
     }
 
     /// Unbox a Python int to a machine i64 (OverflowError if out of range).
     fn emit_unbox_i64(&mut self, tagged: &str) -> String {
         let t = self.tmp();
-        self.line(format!("{t} = call i64 @pyrs_int_as_i64(i64 {tagged})"));
+        match self.int_fast("unbox") {
+            Some(sym) => self.line(format!("{t} = call i64 {sym}(i64 {tagged})")),
+            None => self.line(format!("{t} = call i64 @pyrs_int_as_i64(i64 {tagged})")),
+        }
         t
     }
 
@@ -4918,14 +4951,16 @@ impl Emitter {
                 let v = self.emit_expr(operand);
                 let t = self.tmp();
                 match (op, operand.ty) {
-                    (UnOp::Neg, Ty::Int) => {
-                        self.line(format!("{t} = call i64 @pyrs_int_neg(i64 {v})"))
-                    }
+                    (UnOp::Neg, Ty::Int) => match self.int_fast("neg") {
+                        Some(sym) => self.line(format!("{t} = call i64 {sym}(i64 {v})")),
+                        None => self.line(format!("{t} = call i64 @pyrs_int_neg(i64 {v})")),
+                    },
                     (UnOp::Neg, Ty::Float) => self.line(format!("{t} = fneg double {v}")),
                     (UnOp::Not, Ty::Bool) => self.line(format!("{t} = xor i1 {v}, true")),
-                    (UnOp::Invert, Ty::Int) => {
-                        self.line(format!("{t} = call i64 @pyrs_int_invert(i64 {v})"));
-                    }
+                    (UnOp::Invert, Ty::Int) => match self.int_fast("invert") {
+                        Some(sym) => self.line(format!("{t} = call i64 {sym}(i64 {v})")),
+                        None => self.line(format!("{t} = call i64 @pyrs_int_invert(i64 {v})")),
+                    },
                     other => unreachable!("bad unary op {other:?}"),
                 }
                 t
@@ -6261,14 +6296,21 @@ impl Emitter {
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul => {
                 if ty == Ty::Int {
-                    let callee = match op {
-                        BinOp::Add => "pyrs_int_add",
-                        BinOp::Sub => "pyrs_int_sub",
-                        BinOp::Mul => "pyrs_int_mul",
+                    let name = match op {
+                        BinOp::Add => "add",
+                        BinOp::Sub => "sub",
+                        BinOp::Mul => "mul",
                         _ => unreachable!(),
                     };
                     let t = self.tmp();
-                    self.line(format!("{t} = call i64 @{callee}(i64 {l}, i64 {r})"));
+                    match self.int_fast(name) {
+                        Some(sym) => {
+                            self.line(format!("{t} = call i64 {sym}(i64 {l}, i64 {r})"));
+                        }
+                        None => {
+                            self.line(format!("{t} = call i64 @pyrs_int_{name}(i64 {l}, i64 {r})"));
+                        }
+                    }
                     return t;
                 }
                 let instr = match (op, ty) {
@@ -6320,9 +6362,14 @@ impl Emitter {
             BinOp::FloorDiv => match ty {
                 Ty::Int => {
                     let t = self.tmp();
-                    self.line(format!(
-                        "{t} = call i64 @pyrs_int_floordiv(i64 {l}, i64 {r})"
-                    ));
+                    match self.int_fast("floordiv") {
+                        Some(sym) => {
+                            self.line(format!("{t} = call i64 {sym}(i64 {l}, i64 {r})"));
+                        }
+                        None => self.line(format!(
+                            "{t} = call i64 @pyrs_int_floordiv(i64 {l}, i64 {r})"
+                        )),
+                    }
                     t
                 }
                 Ty::Float => {
@@ -6339,7 +6386,14 @@ impl Emitter {
             BinOp::Mod => match ty {
                 Ty::Int => {
                     let t = self.tmp();
-                    self.line(format!("{t} = call i64 @pyrs_int_mod(i64 {l}, i64 {r})"));
+                    match self.int_fast("mod") {
+                        Some(sym) => {
+                            self.line(format!("{t} = call i64 {sym}(i64 {l}, i64 {r})"));
+                        }
+                        None => {
+                            self.line(format!("{t} = call i64 @pyrs_int_mod(i64 {l}, i64 {r})"));
+                        }
+                    }
                     t
                 }
                 Ty::Float => {
@@ -6356,8 +6410,26 @@ impl Emitter {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let t = self.tmp();
                 match ty {
+                    // Tagging is strictly increasing over the small range and
+                    // never wraps, so the fast path compares the raw tagged
+                    // words with no untagging at all. This is the hottest
+                    // single site in the compiler: `lower_for_range` desugars
+                    // every `for` loop into a `Lt` plus an `Add`, so before
+                    // this every loop iteration of every program made two
+                    // opaque runtime calls.
                     Ty::Int => {
-                        if matches!(op, BinOp::Eq | BinOp::Ne) {
+                        let name = match op {
+                            BinOp::Eq => "eq",
+                            BinOp::Ne => "ne",
+                            BinOp::Lt => "lt",
+                            BinOp::Le => "le",
+                            BinOp::Gt => "gt",
+                            BinOp::Ge => "ge",
+                            _ => unreachable!(),
+                        };
+                        if let Some(sym) = self.int_fast(name) {
+                            self.line(format!("{t} = call i1 {sym}(i64 {l}, i64 {r})"));
+                        } else if matches!(op, BinOp::Eq | BinOp::Ne) {
                             let c = self.tmp();
                             self.line(format!("{c} = call i32 @pyrs_int_eq(i64 {l}, i64 {r})"));
                             let eq = self.tmp();
@@ -6413,14 +6485,19 @@ impl Emitter {
             }
             BinOp::And | BinOp::Or => unreachable!("handled above"),
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                let callee = match op {
-                    BinOp::BitAnd => "pyrs_int_and",
-                    BinOp::BitOr => "pyrs_int_or",
-                    BinOp::BitXor => "pyrs_int_xor",
+                let name = match op {
+                    BinOp::BitAnd => "and",
+                    BinOp::BitOr => "or",
+                    BinOp::BitXor => "xor",
                     _ => unreachable!(),
                 };
                 let t = self.tmp();
-                self.line(format!("{t} = call i64 @{callee}(i64 {l}, i64 {r})"));
+                match self.int_fast(name) {
+                    Some(sym) => self.line(format!("{t} = call i64 {sym}(i64 {l}, i64 {r})")),
+                    None => {
+                        self.line(format!("{t} = call i64 @pyrs_int_{name}(i64 {l}, i64 {r})"));
+                    }
+                }
                 t
             }
             BinOp::LShift | BinOp::RShift => {
@@ -6731,10 +6808,19 @@ impl Emitter {
                 "false".to_string()
             }
             Ty::Int => {
-                let c = self.tmp();
-                self.line(format!("{c} = call i32 @pyrs_int_truth(i64 {v})"));
                 let t = self.tmp();
-                self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                if self.inline_int {
+                    // `int_from_sign_limbs` is the sole constructor of a heap
+                    // PyrsInt and returns a tagged small for zero, so no heap
+                    // int is ever zero-valued and no pointer is ever T(0) = 1.
+                    // The test is therefore total over every tagged int, small
+                    // or heap, and needs no guard and no branch.
+                    self.line(format!("{t} = icmp ne i64 {v}, 1"));
+                } else {
+                    let c = self.tmp();
+                    self.line(format!("{c} = call i32 @pyrs_int_truth(i64 {v})"));
+                    self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                }
                 t
             }
             Ty::Float => {

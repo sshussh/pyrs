@@ -223,6 +223,12 @@
       ],
       "native": "unsupported",
       "diagnostic": "No module named 'pandas'"
+    },
+    {
+      "id": "int-boundary",
+      "file": "cases/int_boundary.py",
+      "group": "core",
+      "native": "pass"
     }
   ]
 }

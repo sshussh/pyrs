@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.126.0 — Integer arithmetic is inlined; the corpus goes from 3.2x to 9.5x
+
+**Every `int` operation was an out-of-line call into the C runtime.** 0.125
+measured the consequence and named the cause: `primes` ran at **0.8x CPython**
+while the same trial division in floats ran at 21x. Arbitrary precision needs a
+tagged representation with an overflow check, and the runtime is linked as a
+separate object with no LTO, so LLVM saw an opaque call it had to assume could
+clobber memory and never return.
+
+Each operation now carries an inline fast path on the tagged words, emitted as
+an `alwaysinline` helper per module, with the original `pyrs_int_*` call kept
+on the cold edge for the bignum case. Covered: `+ - * // %`, all six
+comparisons, `& | ^`, unary `-` and `~`, truthiness, and the boxing and
+unboxing that sit on every `len()` and every subscript. `**` and the shifts
+stay as runtime calls — their fast paths need shift-count range analysis for a
+case that is rare in practice.
+
+| benchmark | 0.125 | 0.126 |
+|---|---:|---:|
+| nbody | 18.8x | **48.2x** |
+| mandelbrot | 21.5x | **37.0x** |
+| pipeline | 10.4x | 15.0x |
+| matmul | 5.4x | 13.1x |
+| fib | 4.1x | 12.8x |
+| **primes** | **0.8x** | **12.4x** |
+| iteration | 7.0x | 9.9x |
+| sort | 3.2x | 8.3x |
+| listcomp | 1.6x | 6.3x |
+| strings | 2.8x | 3.4x |
+| exceptions | 0.9x | 1.1x |
+| **total** | **3.2x** | **9.5x** |
+
+Every benchmark in the corpus is now faster than CPython.
+
+**The gain is larger than the calls it removed.** An opaque call in a loop also
+stops LICM and GVN for everything around it, so the float benchmarks — which
+never called the runtime for arithmetic, but did for their loop counters —
+roughly doubled too. `lower_for_range` desugars every `for` loop into a `Lt`
+plus an `Add`, so before this change every loop iteration of every PyRs program
+made two opaque runtime calls.
+
+`primes` fell from 457 ms to 31 ms. `perf` confirms the work is real and shows
+where the last of it went: 669M instructions at 5.2 IPC, with LLVM narrowing
+the 64-bit `srem` to a 32-bit `idiv` behind a range check once it could finally
+see the division. `%` and `//` had no small-int fast path in the runtime at
+all — every `n % d` did two `malloc`s, a general bignum divide and two `free`s.
+
+### Why the overflow checks are exact
+
+Tagging is `T(v) = 2v + 1`, so a fast path that computes `2s + 1` in one
+operation can use the signed-overflow flag as its range test, and that test is
+exact rather than conservative in both directions: `2s+1 >= -2^63` is
+`s >= -2^62 - 1/2`, and `s` is an integer. Comparisons need no untagging at all
+— `T` is strictly increasing and never wraps, so signed comparison of the raw
+tagged words is already the answer. `~` maps the small range onto itself, so it
+is a single `sub`. `%` can never leave the small range. `//` can, in exactly
+one case: `SMALL_MIN // -1`.
+
+The derivations, and the reason no `nsw`/`nuw` flag appears anywhere in the
+tagging arithmetic, are in [codegen/src/intfast.rs](codegen/src/intfast.rs) and
+[the plan](docs/superpowers/plans/2026-09-08-inline-int-arithmetic.md).
+
+### How it is checked
+
+`PYRS_INLINE_INT=0` reverts every site to the plain runtime call, so the same
+program compiled both ways isolates the new code with no CPython semantics in
+the way. `cli/tests/int_inline_parity.rs` requires the two to agree *and* both
+to agree with CPython, at -O0/-O2/-O3, over 900 pairs crossing every boundary
+of the representation and its immediate neighbours — so small x small,
+small x heap, heap x small and heap x heap reach every guard — plus a seeded
+sample by bit length. `compatibility/cases/int_boundary.py` runs the same cross
+in the compatibility corpus; regenerate it with `scripts/gen_int_boundary.py`.
+
+Division by zero routes to the runtime rather than trapping inline, so its
+exception type, message and catchability are unchanged by construction.
+
 ## 0.125.0 — An unpack target binds directly; the benchmark table is re-measured
 
 **`for a, b in zip(xs, ys)` allocated a heap tuple per element** and
