@@ -37,7 +37,7 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.128 |
+| Check | Result after 0.129 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
@@ -45,7 +45,7 @@ recorded in [the changelog](../CHANGELOG.md). The most recent run:
 | `cargo test --workspace` | 1606 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 6 skipped; compat 27 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.128.0` |
+| `pyrs --version` | `PyRs 0.129.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -463,11 +463,17 @@ documentation and the relevant gates.
       model and feature string join the program cache key so a shared cache
       cannot serve one machine another's instructions. Worth ~10% on a
       vectorizable float kernel and nothing on the scalar-bound corpus.
-- [ ] Replace the per-object `calloc` allocator. Every managed object is an
-      individual `calloc` on one global intrusive list, and every collection
-      walks all live objects and `qsort`s them before marking — O(n log n) per
-      GC just for setup, plus a binary search per conservative candidate word.
-      Measured 2026-09-08.
+- [x] Stop paying a call per list element in the mark phase (0.129). A heap
+      envelope rejects a non-pointer candidate in two compares, and contiguous
+      slot runs are handed to the collector in bulk rather than one at a time.
+      `listcomp` 6.3x -> 10.5x, `iteration` 9.9x -> 15.2x, `pipeline` 15.0x ->
+      20.7x. `benchmarks/objects.py` added for what the collector governs.
+- [ ] Replace the range table and the per-object `calloc` (`objects` at 0.7x).
+      Every collection walks all live objects and `qsort`s them before marking
+      — `compare_ranges` is 8% of `objects` — and every candidate that is a
+      real pointer costs a binary search over ~1M entries, another 19%. Every
+      managed object is also an individual `calloc` on one global intrusive
+      list. Measured 2026-09-08.
 - [ ] Declare the supported host/target matrix (initially Linux x86-64) and
       exercise each claimed platform in CI.
 - [ ] Reproducible release builds, checksums, install instructions,

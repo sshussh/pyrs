@@ -45,6 +45,13 @@ typedef struct {
     PyrsGcRange *items;
     size_t len;
     size_t cap;
+    /* Envelope of every range, so a candidate that cannot point into any
+     * object is rejected by two compares instead of a binary search. Almost
+     * every word offered to the collector is not a pointer: tagged small ints
+     * are odd and tiny, doubles bit-cast into list slots are enormous, and a
+     * `list[int]` of N elements offers N of them on every collection. */
+    uintptr_t lo;
+    uintptr_t hi;
 } PyrsGcRanges;
 
 typedef struct {
@@ -299,6 +306,12 @@ static void ranges_push(PyrsGcRanges *ranges, uintptr_t start, size_t size,
     ranges->items[ranges->len].start = start;
     ranges->items[ranges->len].end = end;
     ranges->items[ranges->len].owner = owner;
+    if (ranges->len == 0 || start < ranges->lo) {
+        ranges->lo = start;
+    }
+    if (ranges->len == 0 || end > ranges->hi) {
+        ranges->hi = end;
+    }
     ranges->len++;
 }
 
@@ -358,6 +371,12 @@ static void mark_owner(PyrsGcHeader *owner, PyrsGcMarkContext *context) {
 
 static void mark_candidate(uintptr_t candidate, void *opaque) {
     PyrsGcMarkContext *context = opaque;
+    /* Reject outside the heap envelope before searching it. This is the whole
+     * cost of tracing a large `list[int]` or `list[float]`, whose slots hold
+     * no pointers at all but are still offered one by one. */
+    if (candidate < context->ranges->lo || candidate > context->ranges->hi) {
+        return;
+    }
     size_t upper = range_upper_bound(context->ranges, candidate);
     if (upper == 0) {
         return;
@@ -375,6 +394,27 @@ static void mark_candidate(uintptr_t candidate, void *opaque) {
         if (candidate == previous->end) {
             mark_owner(previous->owner, context);
         }
+    }
+}
+
+/* Bulk candidate marking over a contiguous slot array.
+ *
+ * The envelope bounds are hoisted out of the loop and `mark_candidate` is a
+ * direct call here, so a slot that cannot be a pointer costs two compares
+ * rather than an indirect call into the runtime and back. */
+static void mark_slots(const long long *slots, size_t count, void *opaque) {
+    PyrsGcMarkContext *context = opaque;
+    if (slots == NULL) {
+        return;
+    }
+    uintptr_t lo = context->ranges->lo;
+    uintptr_t hi = context->ranges->hi;
+    for (size_t i = 0; i < count; i++) {
+        uintptr_t candidate = (uintptr_t)(unsigned long long)slots[i];
+        if (candidate < lo || candidate > hi) {
+            continue;
+        }
+        mark_candidate(candidate, context);
     }
 }
 
@@ -451,7 +491,8 @@ static void gc_collect_inner(uintptr_t stack_top, const void *registers,
     while (context.work_len > 0) {
         PyrsGcHeader *header = context.work[--context.work_len];
         pyrs_gc_trace_object((int)header->fields.kind, (void *)(header + 1),
-                             header->fields.size, mark_candidate, &context);
+                             header->fields.size, mark_candidate, mark_slots,
+                             &context);
     }
 
     free(work);

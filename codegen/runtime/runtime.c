@@ -8370,8 +8370,9 @@ static void gc_visit_slot(long long slot, PyrsGcVisitFn visit,
 }
 
 void pyrs_gc_trace_object(int kind, void *object, size_t size,
-                          PyrsGcVisitFn visit, void *context) {
-    if (object == NULL || visit == NULL) {
+                          PyrsGcVisitFn visit, PyrsGcVisitSlotsFn visit_slots,
+                          void *context) {
+    if (object == NULL || visit == NULL || visit_slots == NULL) {
         return;
     }
     switch (kind) {
@@ -8389,9 +8390,9 @@ void pyrs_gc_trace_object(int kind, void *object, size_t size,
         if (n < 0 || n > list->cap || list->data == NULL) {
             return;
         }
-        for (long long i = 0; i < n; i++) {
-            gc_visit_slot(list->data[i], visit, context);
-        }
+        /* One call for the whole run: the elements are contiguous, and for a
+         * list of scalars none of them is a pointer. */
+        visit_slots(list->data, (size_t)n, context);
         return;
     }
     case PYRS_GC_FILE: {
@@ -8404,9 +8405,7 @@ void pyrs_gc_trace_object(int kind, void *object, size_t size,
         if (tuple->len < 0 || tuple->data == NULL) {
             return;
         }
-        for (long long i = 0; i < tuple->len; i++) {
-            gc_visit_slot(tuple->data[i], visit, context);
-        }
+        visit_slots(tuple->data, (size_t)tuple->len, context);
         return;
     }
     case PYRS_GC_DICT: {

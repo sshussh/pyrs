@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.129.0 — The mark phase stops paying a call per list element
+
+Tracing a `list[int]` offered every element to the collector one at a time,
+through an indirect call into `mark_candidate`, which then **binary-searched
+the range table** to decide whether the value was a pointer. It never is: a
+tagged small int is odd and tiny, and a `float` bit-cast into a list slot is
+enormous. `listcomp` has **four live objects** and spent 49% of its runtime in
+`mark_candidate`.
+
+Two changes, neither touching what is reachable:
+
+**A heap envelope.** The range table now records the lowest and highest address
+it covers, and a candidate outside them is rejected by two compares instead of
+a search.
+
+**Bulk slot visiting.** `pyrs_gc_trace_object` gained a second visitor for a
+contiguous run of slots, so a list or tuple is handed over once rather than per
+element. The envelope bounds hoist out of that loop, and the per-candidate call
+is direct rather than through a function pointer into another translation unit.
+
+| benchmark | 0.128 | 0.129 |
+|---|---:|---:|
+| pipeline | 15.0x | **20.7x** |
+| iteration | 9.9x | **15.2x** |
+| listcomp | 6.3x | **10.5x** |
+
+Dicts and sets keep the per-slot form: their slots are strided, not contiguous.
+
+### A benchmark for what the collector actually governs
+
+`benchmarks/objects.py` builds 400k small live objects — 200k four-element
+lists and 200k strings. The rest of the corpus builds a handful of very large
+objects and so never exercised allocation or sweeping at all.
+
+It runs at **0.7x CPython**, and it is in the table at that number rather than
+left out. `mark_candidate` is 19% of it and `compare_ranges` — the `qsort` the
+collector runs over every live object before marking begins — is another 8%.
+Every managed object is also an individual `calloc` on one global intrusive
+list. That is the next milestone; the benchmark exists so it is measured
+against evidence rather than intuition.
+
 ## 0.128.0 — The backend learns the optimization level, and gets a `--target-cpu`
 
 Two knobs in `codegen/shim/src/lib.cc` had never been plumbed.

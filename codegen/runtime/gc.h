@@ -34,6 +34,11 @@ typedef struct PyrsGcRoot {
 } PyrsGcRoot;
 
 typedef void (*PyrsGcVisitFn)(uintptr_t candidate, void *context);
+/* Bulk form for a contiguous run of 8-byte slots. A `list[int]` of N elements
+ * offers N candidates on every collection, none of which is a pointer, and an
+ * indirect call each was the dominant cost of tracing it. */
+typedef void (*PyrsGcVisitSlotsFn)(const long long *slots, size_t count,
+                                   void *context);
 typedef void (*PyrsGcRangeFn)(void *start, size_t size, void *context);
 
 void pyrs_gc_init(void *stack_anchor);
@@ -48,7 +53,8 @@ void pyrs_gc_external_freed(void *owner, size_t size);
 
 /* Implemented by runtime.c, which owns the concrete payload layouts. */
 void pyrs_gc_trace_object(int kind, void *object, size_t size,
-                          PyrsGcVisitFn visit, void *context);
+                          PyrsGcVisitFn visit, PyrsGcVisitSlotsFn visit_slots,
+                          void *context);
 void pyrs_gc_visit_owned_ranges(int kind, void *object, size_t size,
                                 PyrsGcRangeFn visit, void *context);
 void pyrs_gc_destroy_object(int kind, void *object, size_t size);
