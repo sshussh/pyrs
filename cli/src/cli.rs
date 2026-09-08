@@ -190,6 +190,11 @@ pub struct TestCommand {
     #[arg(short = 'O', long = "opt-level", value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt_level: Option<u8>,
 
+    /// Target CPU: "generic" for a portable binary, "native" for this host's
+    /// model and ISA extensions, or a specific model name
+    #[arg(long, value_name = "CPU")]
+    pub target_cpu: Option<String>,
+
     /// Recompile from scratch, reusing and publishing nothing
     #[arg(long)]
     pub no_cache: bool,
@@ -351,6 +356,11 @@ pub struct CompileCommand {
     #[arg(short = 'O', long = "opt-level", value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt_level: Option<u8>,
 
+    /// Target CPU: "generic" for a portable binary, "native" for this host's
+    /// model and ISA extensions, or a specific model name
+    #[arg(long, value_name = "CPU")]
+    pub target_cpu: Option<String>,
+
     /// Also write the generated LLVM IR next to the output (<output>.ll)
     #[arg(long)]
     pub emit_llvm: bool,
@@ -397,6 +407,11 @@ pub struct RunCommand {
     /// Optimization level (0-3); defaults to the manifest, then 2
     #[arg(short = 'O', long = "opt-level", value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt_level: Option<u8>,
+
+    /// Target CPU: "generic" for a portable binary, "native" for this host's
+    /// model and ISA extensions, or a specific model name
+    #[arg(long, value_name = "CPU")]
+    pub target_cpu: Option<String>,
 
     /// Recompile from scratch, reusing and publishing nothing
     #[arg(long)]
@@ -445,4 +460,9 @@ pub struct ExtensionCommand {
     /// Optimization level (0–3)
     #[arg(short = 'O', long = "opt-level", default_value_t = 2, value_parser = clap::value_parser!(u8).range(0..=3))]
     pub opt_level: u8,
+
+    /// Target CPU: "generic" for a portable binary, "native" for this host's
+    /// model and ISA extensions, or a specific model name
+    #[arg(long, value_name = "CPU")]
+    pub target_cpu: Option<String>,
 }

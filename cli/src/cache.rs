@@ -322,13 +322,22 @@ pub fn runtime_objects(
 /// Covers every module in the resolved import graph — which the module
 /// resolver has already computed exactly, so the input set is a fact rather
 /// than a guess — plus everything else that changes the output bytes.
-pub fn program_key(sources: &[(String, String)], opt_level: u8, cc: &str) -> String {
+pub fn program_key(
+    sources: &[(String, String)],
+    opt_level: u8,
+    cc: &str,
+    target_cpu: &str,
+) -> String {
     let mut h = Sha256::new();
     h.field(&FORMAT.to_le_bytes());
     h.field(BUILD_FINGERPRINT.trim().as_bytes());
     h.field(&[opt_level]);
     h.field(toolchain_identity(cc).as_bytes());
     h.field(std::env::consts::ARCH.as_bytes());
+    // The *resolved* CPU and feature string, not the request: two hosts both
+    // asking for "native" resolve it differently, and a cache shared between
+    // them would otherwise hand one machine the other's illegal instructions.
+    h.field(codegen::target_identity(target_cpu).as_bytes());
     h.field(std::env::consts::OS.as_bytes());
     h.field(extra_flags("PYRS_CFLAGS").join(" ").as_bytes());
     h.field(extra_flags("PYRS_LDFLAGS").join(" ").as_bytes());

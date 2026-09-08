@@ -109,6 +109,9 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
         if cmd.opt_level.is_none() {
             cmd.opt_level = m.opt_level;
         }
+        if cmd.target_cpu.is_none() {
+            cmd.target_cpu = m.target_cpu.clone();
+        }
         // Declared, never inferred -- and `--no-compat` exists so a project
         // can test whether its program has become natively compilable
         // without editing the file.
@@ -181,9 +184,11 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
         )
     };
     let opt_level = cmd.opt_level.unwrap_or(2);
+    // The manifest was folded into `cmd` above, alongside -O.
+    let target_cpu = resolve_target_cpu(cmd.target_cpu.as_deref(), None, Purpose::ThisMachine);
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let key =
-        (!cmd.no_cache).then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc));
+    let key = (!cmd.no_cache)
+        .then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc, &target_cpu));
 
     // A hit skips analysis and code generation as well as the C compile:
     // the program is unchanged, so there is nothing left to decide about it.
@@ -206,26 +211,27 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     let module = analyze(loaded).map_err(|f| f.render(format))?;
     let workdir = temp_workdir()?;
     let exe = workdir.join("program");
-    let result = compile_module(&module, &exe, opt_level, false, !cmd.no_cache).and_then(|()| {
-        if let Some(key) = &key {
-            cache::program_store(key, &exe);
-            cache::maintain(fs::metadata(&exe).map(|m| m.len()).unwrap_or(0));
-        }
-        let mut process = process::Command::new(&exe);
-        process.args(&cmd.args);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            process.arg0(&argv0);
-        }
-        #[cfg(not(unix))]
-        let _ = argv0;
-        // Keep the parent alive to clean up the native executable afterwards.
-        process
-            .status()
-            .map(exit_code)
-            .map_err(|e| format!("failed to run compiled program: {e}"))
-    });
+    let result = compile_module(&module, &exe, opt_level, &target_cpu, false, !cmd.no_cache)
+        .and_then(|()| {
+            if let Some(key) = &key {
+                cache::program_store(key, &exe);
+                cache::maintain(fs::metadata(&exe).map(|m| m.len()).unwrap_or(0));
+            }
+            let mut process = process::Command::new(&exe);
+            process.args(&cmd.args);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                process.arg0(&argv0);
+            }
+            #[cfg(not(unix))]
+            let _ = argv0;
+            // Keep the parent alive to clean up the native executable afterwards.
+            process
+                .status()
+                .map(exit_code)
+                .map_err(|e| format!("failed to run compiled program: {e}"))
+        });
     drop(workdir);
     result
 }
@@ -293,6 +299,7 @@ fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
         .opt_level
         .or_else(|| m.as_ref().and_then(|m| m.opt_level))
         .unwrap_or(2);
+    let target_cpu = resolve_target_cpu(cmd.target_cpu.as_deref(), m.as_ref(), Purpose::Artifact);
 
     let started = std::time::Instant::now();
     let outcome = compile(
@@ -300,6 +307,7 @@ fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
         &output,
         m.as_ref().map(|m| m.root_path()),
         opt_level,
+        &target_cpu,
         cmd.emit_llvm,
         !cmd.no_cache,
         cmd.message_format,
@@ -345,6 +353,7 @@ fn compile(
     output: &Path,
     import_root: Option<PathBuf>,
     opt_level: u8,
+    target_cpu: &str,
     emit_llvm: bool,
     use_cache: bool,
     format: Format,
@@ -366,7 +375,7 @@ fn compile(
     // `--emit-llvm` asks for a side artifact the cache does not hold, so it
     // always rebuilds rather than silently not producing the .ll file.
     let key = (use_cache && !emit_llvm)
-        .then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc));
+        .then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc, target_cpu));
     if let Some(key) = &key
         && let Some(cached) = cache::program_lookup(key)
     {
@@ -375,7 +384,7 @@ fn compile(
         return Ok(Built::FromCache);
     }
     let module = analyze(loaded).map_err(|f| f.render(format))?;
-    compile_module(&module, output, opt_level, emit_llvm, use_cache)?;
+    compile_module(&module, output, opt_level, target_cpu, emit_llvm, use_cache)?;
     if let Some(key) = &key {
         cache::program_store(key, output);
         cache::maintain(fs::metadata(output).map(|m| m.len()).unwrap_or(0));
@@ -406,10 +415,44 @@ fn fail(failure: impl Into<Failure>, format: Format) -> String {
     failure.into().render(format)
 }
 
+/// What the binary being produced is for, which is what decides the default
+/// target CPU.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// `pyrs compile`: an artifact the user keeps and may move elsewhere.
+    Artifact,
+    /// `pyrs run` / `pyrs test`: built for this machine and thrown away.
+    ThisMachine,
+}
+
+/// Resolve the target CPU from the flag, then the manifest, then the purpose.
+///
+/// A binary built for `native` carries this host's ISA extensions and faults
+/// on an older machine with an illegal instruction rather than a diagnostic,
+/// so it is the default only where the binary never leaves this machine.
+/// `pyrs compile` stays on the portable baseline unless asked.
+fn resolve_target_cpu(
+    flag: Option<&str>,
+    manifest: Option<&manifest::Manifest>,
+    purpose: Purpose,
+) -> String {
+    if let Some(cpu) = flag {
+        return cpu.to_string();
+    }
+    if let Some(cpu) = manifest.and_then(|m| m.target_cpu.as_deref()) {
+        return cpu.to_string();
+    }
+    match purpose {
+        Purpose::Artifact => codegen::CPU_GENERIC.to_string(),
+        Purpose::ThisMachine => codegen::CPU_NATIVE.to_string(),
+    }
+}
+
 fn compile_module(
     module: &ir::Module,
     output: &Path,
     opt_level: u8,
+    target_cpu: &str,
     emit_llvm: bool,
     use_cache: bool,
 ) -> Result<(), String> {
@@ -425,7 +468,7 @@ fn compile_module(
     let result = (|| {
         // LLVM: optimize + emit the object file
         let object = workdir.join("program.o");
-        codegen::compile_ir_to_object(&llvm_ir, &object, opt_level)
+        codegen::compile_ir_to_object(&llvm_ir, &object, opt_level, target_cpu)
             .map_err(|e| format!("error[codegen]: {e}"))?;
 
         // The C runtime and collector are embedded in the compiler binary so
@@ -773,7 +816,9 @@ fn run_tests(cmd: cli::TestCommand) -> Result<i32, String> {
         .opt_level
         .or_else(|| m.as_ref().and_then(|m| m.opt_level))
         .unwrap_or(2);
-    compile_module(&ir, &exe, opt_level, false, !cmd.no_cache)?;
+    let target_cpu =
+        resolve_target_cpu(cmd.target_cpu.as_deref(), m.as_ref(), Purpose::ThisMachine);
+    compile_module(&ir, &exe, opt_level, &target_cpu, false, !cmd.no_cache)?;
 
     println!("running {total} test{}", if total == 1 { "" } else { "s" });
     let status = process::Command::new(&exe)

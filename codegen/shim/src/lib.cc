@@ -23,9 +23,14 @@
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include "llvm/ADT/StringMap.h"
+#include "llvm/TargetParser/SubtargetFeature.h"
+
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 
 // LLVM 21+ takes llvm::Triple for createTargetMachine / setTargetTriple.
 // LLVM 18–20 take StringRef (std::string converts). Bridge both for CI and
@@ -50,6 +55,57 @@ void set_error(char *buf, size_t len, const std::string &msg) {
     buf[len - 1] = '\0';
 }
 
+// The backend (instruction selection, scheduling, register allocation) has
+// its own level, distinct from the IR pipeline's. It defaulted to `Default`
+// whatever the user asked for, so -O3 never reached it and -O0 never got a
+// fast one.
+llvm::CodeGenOptLevel to_codegen_level(int level) {
+    switch (level) {
+    case 0:
+        return llvm::CodeGenOptLevel::None;
+    case 1:
+        return llvm::CodeGenOptLevel::Less;
+    case 3:
+        return llvm::CodeGenOptLevel::Aggressive;
+    default:
+        return llvm::CodeGenOptLevel::Default;
+    }
+}
+
+// Resolve a CPU request into (model, feature string).
+//
+// "native" is deliberately not the default for `pyrs compile`: it bakes this
+// host's ISA extensions into the artifact, which then fails on an older
+// machine with an illegal instruction rather than a diagnostic.
+std::pair<std::string, std::string> resolve_cpu(const char *cpu) {
+    std::string want = (cpu == nullptr) ? "" : cpu;
+    if (want.empty() || want == "generic") {
+        return {"generic", ""};
+    }
+    if (want != "native") {
+        return {want, ""};
+    }
+    std::string name = llvm::sys::getHostCPUName().str();
+    if (name.empty()) {
+        name = "generic";
+    }
+    llvm::SubtargetFeatures features;
+    // LLVM 19 dropped the out-parameter form in favour of a returned map.
+#if LLVM_VERSION_MAJOR >= 19
+    for (const auto &entry : llvm::sys::getHostCPUFeatures()) {
+        features.AddFeature(entry.first(), entry.second);
+    }
+#else
+    llvm::StringMap<bool> host;
+    if (llvm::sys::getHostCPUFeatures(host)) {
+        for (const auto &entry : host) {
+            features.AddFeature(entry.first(), entry.second);
+        }
+    }
+#endif
+    return {name, features.getString()};
+}
+
 llvm::OptimizationLevel to_opt_level(int level) {
     switch (level) {
     case 0:
@@ -67,9 +123,20 @@ llvm::OptimizationLevel to_opt_level(int level) {
 
 extern "C" {
 
+int pyrs_target_identity(const char *cpu, char *out, size_t out_len) {
+    if (out == nullptr || out_len == 0) {
+        return 1;
+    }
+    std::pair<std::string, std::string> resolved = resolve_cpu(cpu);
+    std::string identity = resolved.first + "|" + resolved.second;
+    std::strncpy(out, identity.c_str(), out_len - 1);
+    out[out_len - 1] = '\0';
+    return 0;
+}
+
 int pyrs_compile_ir(const uint8_t *ir_data, size_t ir_len,
-                    const char *out_path, int opt_level, char *err_buf,
-                    size_t err_buf_len) {
+                    const char *out_path, int opt_level, const char *cpu,
+                    char *err_buf, size_t err_buf_len) {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
     llvm::InitializeNativeTargetAsmParser();
@@ -103,9 +170,11 @@ int pyrs_compile_ir(const uint8_t *ir_data, size_t ir_len,
     }
 
     llvm::TargetOptions options;
+    std::pair<std::string, std::string> resolved = resolve_cpu(cpu);
     std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
-        PYRS_TM_TRIPLE_ARG(triple, triple_str), "generic", "", options,
-        llvm::Reloc::PIC_));
+        PYRS_TM_TRIPLE_ARG(triple, triple_str), resolved.first, resolved.second,
+        options, llvm::Reloc::PIC_, std::nullopt,
+        to_codegen_level(opt_level)));
     if (!tm) {
         set_error(err_buf, err_buf_len, "could not create target machine");
         return 2;

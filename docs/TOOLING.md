@@ -31,6 +31,7 @@ root = "src"                # import root; defaults to the manifest's directory
 target = "target"           # build output directory; what `pyrs clean` removes
 target = "target"           # build output directory
 opt-level = 2               # default -O
+target-cpu = "generic"      # or "native", or a model name like "x86-64-v3"
 execution = "native"        # or "compat"
 python = ".venv/bin/python" # interpreter for compat and extensions
 
@@ -171,7 +172,7 @@ program, and which interpreter will `--compat` use:
 
 ```console
 $ pyrs doctor
-pyrs 0.127.0
+pyrs 0.128.0
   target       x86_64-linux
   C compiler   cc (cc (GCC) 16.2.1)
   interpreter  python3 (python3 on PATH, Python 3.14)

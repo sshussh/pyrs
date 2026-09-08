@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.127 |
+| Check | Result after 0.128 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1599 passed; none failed or ignored |
+| `cargo test --workspace` | 1606 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 6 skipped; compat 27 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.127.0` |
+| `pyrs --version` | `PyRs 0.128.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -456,10 +456,13 @@ documentation and the relevant gates.
       round trip costs about 525ns against CPython's 228ns — a try frame push,
       a `setjmp`, and exception-object construction per iteration. Measured
       2026-09-08.
-- [ ] Plumb `CodeGenOptLevel` and the target CPU. `createTargetMachine` never
-      receives the opt level, so `-O3` never reaches instruction selection or
-      scheduling, and the CPU is `"generic"` with an empty feature string —
-      baseline x86-64-v1, no AVX2/BMI2/FMA. Measured 2026-09-08.
+- [x] Plumb `CodeGenOptLevel` and the target CPU (0.128). `-O` now reaches the
+      backend, and `--target-cpu generic|native|<model>` (also `target-cpu` in
+      the manifest) replaces the hardcoded baseline. `run`/`test` default to
+      `native`, `compile`/`build-extension` to `generic`, and the resolved
+      model and feature string join the program cache key so a shared cache
+      cannot serve one machine another's instructions. Worth ~10% on a
+      vectorizable float kernel and nothing on the scalar-bound corpus.
 - [ ] Replace the per-object `calloc` allocator. Every managed object is an
       individual `calloc` on one global intrusive list, and every collection
       walks all live objects and `qsort`s them before marking — O(n log n) per

@@ -345,6 +345,49 @@ fn the_manifest_supplies_the_optimization_level_and_the_flag_wins() {
     assert_eq!(programs, 2, "the -O flag did not override the manifest");
 }
 
+#[test]
+fn the_manifest_supplies_the_target_cpu_and_the_flag_wins() {
+    // `pyrs run` defaults to `native` because the binary is built for this
+    // machine and thrown away; `pyrs compile` defaults to `generic` because
+    // the artifact may be moved. A manifest sits between the two, so a project
+    // that ships binaries can pin the baseline for every command at once.
+    let (_d, root, cache) = project("target-cpu");
+    ok(&root, &cache, &["init", "--script", "."]);
+    write(&root.join("main.py"), "print(\"cpu\")\n");
+    let manifest = root.join("pyproject.toml");
+    let text = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("opt-level = 2", "opt-level = 2\ntarget-cpu = \"generic\"");
+    write(&manifest, &text);
+
+    assert_eq!(ok(&root, &cache, &["run"]), "cpu\n");
+    assert_eq!(
+        ok(&root, &cache, &["run", "--target-cpu", "native"]),
+        "cpu\n"
+    );
+    let programs = fs::read_dir(cache.join("programs")).unwrap().count();
+    assert_eq!(
+        programs, 2,
+        "the --target-cpu flag did not override the manifest"
+    );
+}
+
+#[test]
+fn an_unknown_target_cpu_key_value_is_rejected() {
+    let (_d, root, cache) = project("target-cpu-type");
+    ok(&root, &cache, &["init", "--script", "."]);
+    let manifest = root.join("pyproject.toml");
+    let text = fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("opt-level = 2", "target-cpu = 3");
+    write(&manifest, &text);
+    let message = err(&root, &cache, &["run"]);
+    assert!(
+        message.contains("'target-cpu' must be a string"),
+        "unhelpful message: {message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Import root
 // ---------------------------------------------------------------------------

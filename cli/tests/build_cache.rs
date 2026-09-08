@@ -142,6 +142,58 @@ fn each_optimization_level_gets_its_own_entry() {
     );
 }
 
+/// A binary built for `native` carries this host's ISA extensions, so it must
+/// never be served from a cache entry a `generic` build wrote — on a machine
+/// with a different CPU that is an illegal instruction rather than a
+/// diagnostic. The key holds the *resolved* model and feature string, not the
+/// request, which is what makes a cache shared across microarchitectures safe.
+#[test]
+fn each_target_cpu_gets_its_own_entry() {
+    let (_d, src, cache) = sandbox("target-cpu");
+    let prog = src.join("cpu.py");
+    write(&prog, "print(\"cpu\")\n");
+    for cpu in ["generic", "native"] {
+        assert_eq!(
+            stdout_of(
+                &cache,
+                &["run", "--target-cpu", cpu, "-i", prog.to_str().unwrap()]
+            ),
+            "cpu\n"
+        );
+    }
+    assert_eq!(
+        entries(&cache, "programs"),
+        2,
+        "generic and native must not share a program entry"
+    );
+}
+
+/// Asking for the same CPU twice is a hit, so the resolved identity has to be
+/// stable rather than, say, re-probing into a differently ordered feature
+/// string each time.
+#[test]
+fn the_same_target_cpu_hits_the_cache() {
+    let (_d, src, cache) = sandbox("target-cpu-stable");
+    let prog = src.join("cpu.py");
+    write(&prog, "print(\"stable\")\n");
+    for _ in 0..3 {
+        assert_eq!(
+            stdout_of(
+                &cache,
+                &[
+                    "run",
+                    "--target-cpu",
+                    "native",
+                    "-i",
+                    prog.to_str().unwrap()
+                ]
+            ),
+            "stable\n"
+        );
+    }
+    assert_eq!(entries(&cache, "programs"), 1);
+}
+
 #[test]
 fn two_programs_with_the_same_text_share_an_entry() {
     // The key is content, not path: identical inputs produce an identical

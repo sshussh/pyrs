@@ -73,20 +73,61 @@ unsafe extern "C" {
         ir_len: usize,
         out_path: *const c_char,
         opt_level: i32,
+        cpu: *const c_char,
         err_buf: *mut c_char,
         err_buf_len: usize,
     ) -> i32;
+
+    fn pyrs_target_identity(cpu: *const c_char, out: *mut c_char, out_len: usize) -> i32;
+}
+
+/// The portable baseline: whatever the target triple guarantees, with no
+/// optional ISA extensions. What `pyrs compile` produces unless asked
+/// otherwise, so an artifact runs wherever its architecture does.
+pub const CPU_GENERIC: &str = "generic";
+
+/// This host's own CPU model and features. Faster — the baseline has no AVX2,
+/// BMI2 or FMA — but the binary may fault on an older machine, so it is the
+/// default only for `pyrs run` and `pyrs test`, which build for this machine
+/// and throw the binary away.
+pub const CPU_NATIVE: &str = "native";
+
+/// The `<model>|<features>` a CPU request resolves to on this host.
+///
+/// Belongs in a compile cache key: two hosts both asking for `native` resolve
+/// it differently, and a cache shared between them would otherwise hand one
+/// machine the other's illegal instructions.
+pub fn target_identity(cpu: &str) -> String {
+    let Ok(c_cpu) = CString::new(cpu) else {
+        return cpu.to_string();
+    };
+    let mut buf = vec![0u8; 4096];
+    let rc =
+        unsafe { pyrs_target_identity(c_cpu.as_ptr(), buf.as_mut_ptr() as *mut c_char, buf.len()) };
+    if rc != 0 {
+        return cpu.to_string();
+    }
+    unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Compile LLVM IR text into a native object file at `out_path`.
 ///
-/// `opt_level` is clamped to 0..=3 (default pipeline levels O0–O3).
-pub fn compile_ir_to_object(ir_text: &str, out_path: &Path, opt_level: u8) -> Result<(), String> {
+/// `opt_level` is clamped to 0..=3 and reaches both the IR pass pipeline and
+/// the backend. `cpu` is [`CPU_GENERIC`], [`CPU_NATIVE`], or a model name.
+pub fn compile_ir_to_object(
+    ir_text: &str,
+    out_path: &Path,
+    opt_level: u8,
+    cpu: &str,
+) -> Result<(), String> {
     let path_str = out_path
         .to_str()
         .ok_or_else(|| "output path is not valid UTF-8".to_string())?;
     let c_path =
         CString::new(path_str).map_err(|_| "output path contains a NUL byte".to_string())?;
+    let c_cpu = CString::new(cpu).map_err(|_| "target CPU contains a NUL byte".to_string())?;
 
     let mut err_buf = vec![0u8; 4096];
     let rc = unsafe {
@@ -95,6 +136,7 @@ pub fn compile_ir_to_object(ir_text: &str, out_path: &Path, opt_level: u8) -> Re
             ir_text.len(),
             c_path.as_ptr(),
             opt_level.min(3) as i32,
+            c_cpu.as_ptr(),
             err_buf.as_mut_ptr() as *mut c_char,
             err_buf.len(),
         )
@@ -282,7 +324,7 @@ mod tests {
         let ll = lower("def sq(x: int) -> int:\n    return x * x\n\nprint(sq(12))\n");
         let dir = std::env::temp_dir();
         let obj = dir.join(format!("pyrs-test-{}.o", std::process::id()));
-        let result = compile_ir_to_object(&ll, &obj, 2);
+        let result = compile_ir_to_object(&ll, &obj, 2, CPU_GENERIC);
         assert!(result.is_ok(), "shim failed: {:?}", result.err());
         let meta = std::fs::metadata(&obj).expect("object file missing");
         assert!(meta.len() > 0, "object file is empty");
@@ -295,8 +337,47 @@ mod tests {
             "this is not llvm ir",
             &std::env::temp_dir().join("pyrs-test-invalid.o"),
             0,
+            CPU_GENERIC,
         )
         .expect_err("expected parse failure");
         assert!(!err.is_empty());
+    }
+
+    /// The identity goes into a compile cache key, so `generic` must be
+    /// stable, and `native` must differ from it on any host with optional ISA
+    /// extensions — otherwise a cache shared between two machines could serve
+    /// one of them the other's instructions.
+    #[test]
+    fn target_identity_separates_generic_from_native() {
+        let generic = target_identity(CPU_GENERIC);
+        assert_eq!(generic, target_identity(CPU_GENERIC), "generic is stable");
+        assert!(generic.starts_with("generic|"), "got {generic}");
+
+        let native = target_identity(CPU_NATIVE);
+        assert_eq!(native, target_identity(CPU_NATIVE), "native is stable");
+        assert!(
+            native.contains('|'),
+            "identity is <model>|<features>, got {native}"
+        );
+        assert_ne!(
+            native, generic,
+            "a host with no distinguishing model or features would make the \
+             cache key unable to tell the two apart"
+        );
+    }
+
+    /// An empty request is the portable baseline rather than an error, so a
+    /// caller that has nothing to say does not accidentally get `native`.
+    #[test]
+    fn an_empty_cpu_request_is_the_baseline() {
+        assert_eq!(target_identity(""), target_identity(CPU_GENERIC));
+    }
+
+    /// A named model is passed through, so `--target-cpu x86-64-v3` reaches
+    /// LLVM rather than being silently reinterpreted.
+    #[test]
+    fn a_named_model_is_passed_through() {
+        let named = target_identity("x86-64-v3");
+        assert!(named.starts_with("x86-64-v3|"), "got {named}");
     }
 }

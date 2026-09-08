@@ -45,6 +45,8 @@ pub struct Manifest {
     /// Build output directory, relative to `dir`.
     pub target: Option<PathBuf>,
     pub opt_level: Option<u8>,
+    /// Target CPU for the backend: "generic", "native", or a model name.
+    pub target_cpu: Option<String>,
     pub execution: Execution,
     /// Interpreter for `--compat` and `build-extension`.
     pub python: Option<PathBuf>,
@@ -178,6 +180,7 @@ pub fn load(path: &Path) -> Result<Manifest, String> {
         root: None,
         target: None,
         opt_level: None,
+        target_cpu: None,
         execution: Execution::Native,
         python: None,
         extension: None,
@@ -200,6 +203,9 @@ pub fn load(path: &Path) -> Result<Manifest, String> {
                     return Err(format!("{where_}: 'opt-level' must be 0-3, found {n}"));
                 }
                 manifest.opt_level = Some(n as u8);
+            }
+            "target-cpu" => {
+                manifest.target_cpu = Some(want_str(value, &where_, key)?.to_string());
             }
             "execution" => {
                 manifest.execution = match want_str(value, &where_, key)? {
@@ -244,6 +250,7 @@ pub fn load(path: &Path) -> Result<Manifest, String> {
                         "root",
                         "target",
                         "opt-level",
+                        "target-cpu",
                         "execution",
                         "python",
                         "extension",

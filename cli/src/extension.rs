@@ -17,6 +17,7 @@ pub struct Resolved {
     pub python: PathBuf,
     pub output: Option<PathBuf>,
     pub opt_level: u8,
+    pub target_cpu: Option<String>,
 }
 
 /// Fill the command from `[tool.pyrs.extension]` where flags were omitted.
@@ -61,6 +62,7 @@ fn resolve(cmd: ExtensionCommand) -> Result<Resolved, String> {
         python,
         output: cmd.output,
         opt_level: cmd.opt_level,
+        target_cpu: cmd.target_cpu,
     })
 }
 
@@ -172,8 +174,15 @@ print('\0'.join([sysconfig.get_path('include'), sysconfig.get_path('platinclude'
     }
     let dir = temp_workdir()?;
     let object = dir.join("kernels.o");
-    codegen::compile_ir_to_object(&codegen::emit_library_ir(&module), &object, cmd.opt_level)
-        .map_err(|e| format!("error[codegen]: {e}"))?;
+    codegen::compile_ir_to_object(
+        &codegen::emit_library_ir(&module),
+        &object,
+        cmd.opt_level,
+        // An extension is a shared library the user installs and may move, so
+        // it stays on the portable baseline unless asked otherwise.
+        cmd.target_cpu.as_deref().unwrap_or(codegen::CPU_GENERIC),
+    )
+    .map_err(|e| format!("error[codegen]: {e}"))?;
     fs::write(dir.join("runtime.c"), codegen::RUNTIME_C).map_err(|e| e.to_string())?;
     fs::write(dir.join("gc.c"), codegen::GC_C).map_err(|e| e.to_string())?;
     fs::write(dir.join("gc.h"), codegen::GC_H).map_err(|e| e.to_string())?;

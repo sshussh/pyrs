@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.128.0 — The backend learns the optimization level, and gets a `--target-cpu`
+
+Two knobs in `codegen/shim/src/lib.cc` had never been plumbed.
+
+**`CodeGenOptLevel` was never passed to `createTargetMachine`,** so instruction
+selection, scheduling and register allocation always ran at `Default`: `-O3`
+never reached the backend and `-O0` never got a fast one. It now follows `-O`.
+
+**The CPU was `"generic"` with an empty feature string** — baseline x86-64-v1,
+so no AVX2, BMI2 or FMA, and float loops never vectorized well. New flag:
+
+```console
+pyrs compile --target-cpu native -O3 -i kernel.py -o kernel
+```
+
+`generic` (the portable baseline), `native` (this host's model and features),
+or a model name such as `x86-64-v3`. Also `target-cpu` under `[tool.pyrs]`.
+
+**The default depends on what the binary is for.** `pyrs run` and `pyrs test`
+default to `native`: they build for this machine and throw the binary away.
+`pyrs compile` and `build-extension` default to `generic`, because the artifact
+may be moved and a binary built for the wrong host faults with an illegal
+instruction rather than a diagnostic.
+
+The **resolved** model and feature string — not the request — joins the program
+cache key. Two hosts both asking for `native` resolve it differently, and the
+key previously held only `std::env::consts::ARCH`, so a cache on shared or
+copied storage could have handed one machine the other's instructions.
+
+### What it is worth
+
+Honestly: not much on the current corpus, which is scalar-dependency-bound
+rather than vectorizable. `nbody`, `mandelbrot`, `primes` and `fib` are all
+within noise of `generic`, and `matmul` gains about 10% at `-O3 --target-cpu
+native`. On a kernel that does vectorize — a 200k-element dot product, 60
+passes — it is 26 ms to 23 ms, and the emitted code goes from zero AVX/FMA
+instructions to 21.
+
+Recorded as measured rather than as a headline: the flag is there for code that
+can use it, and the published benchmark table stays on `generic`, which is what
+`pyrs compile` actually produces.
+
 ## 0.127.0 — A `try` no longer pins every local in the function to memory
 
 **One `try` anywhere made every local in the function `volatile`**, which
