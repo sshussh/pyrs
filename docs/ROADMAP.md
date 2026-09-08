@@ -513,11 +513,17 @@ documentation and the relevant gates.
       themselves, one per live object per collection, which only a different
       heap layout removes. Retaining the buffers would also have pinned the
       high-water mark in resident memory, against the bounded-memory gate.
-- [ ] Replace the per-object `calloc` allocator. Every managed object is still
-      an individual `calloc` on one global intrusive list. Left alone
-      deliberately in 0.130: with the range table fixed, `objects` spends 25ms
-      of its 61ms in the collector, so the next measurement should decide
-      whether allocation or the remaining mark and sweep is worth attacking.
+- [ ] Replace the per-object `calloc` allocator. **The single largest remaining
+      item, and the only place PyRs is still behind CPython.** Every managed
+      object is an individual `calloc` on one global intrusive list, so the
+      collector walks a cache-cold pointer chain twice per pass and pushes one
+      range per live object. `objects` runs in 111ms with the collector and
+      47ms without; `dicts` 332ms against 255ms. Two cheaper fixes have been
+      tried and measured at nothing (scratch-buffer retention above; runtime
+      attributes and alias scopes below), so what is left is the heap layout
+      itself: size-classed blocks, aligned so a candidate's owner is a mask and
+      a divide rather than a table lookup, which also retires the range array
+      and the granule index. Measured 2026-09-08.
 - [x] Reduce the per-character cost of string iteration (0.132). `==` computed
       a full three-way `memcmp` ordering to answer a yes/no question about two
       single characters, and `s[i]` was an opaque call per character. Both now

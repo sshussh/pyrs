@@ -6,7 +6,7 @@ A Python compiler written in Rust, emitting native code through LLVM.
 
 PyRs compiles a **statically typed subset of Python** straight to machine
 code — no interpreter, no VM, no runtime dependency on CPython. Compute-bound
-code runs **7–46× faster than CPython**, 11.6× across the benchmark corpus
+code runs **6–41× faster than CPython**; allocation-heavy code is not yet ahead
 ([benchmarks](#benchmarks)).
 
 ```console
@@ -201,47 +201,58 @@ is byte-identical to `python3`'s, then reports best-of-5 wall times:
 
 | benchmark  | workload                                  | python3 |   PyRs | speedup |
 | ---------- | ----------------------------------------- | ------: | -----: | ------: |
-| nbody      | float + list, 5-body gravity, 100k steps  |  0.820s | 0.018s |   45.7× |
-| mandelbrot | float math, 500×500 escape iterations     |  0.605s | 0.017s |   34.8× |
-| pipeline   | lazy `map`/`filter` over 2M elements      |  0.319s | 0.019s |   17.1× |
-| strings    | per-char iteration, 2.6M comparisons      |  0.374s | 0.024s |   15.9× |
-| iteration  | `zip`/`enumerate`, 2M paired steps        |  0.339s | 0.024s |   14.1× |
-| primes     | int loops, trial division to 300k         |  0.432s | 0.032s |   13.4× |
-| fib        | recursion, 30M calls (`fib(35)`)          |  0.686s | 0.054s |   12.7× |
-| matmul     | nested lists, 250×250 matrix multiply     |  0.543s | 0.043s |   12.7× |
-| listcomp   | comprehensions, 3M-element map/filter     |  0.469s | 0.049s |    9.5× |
-| sort       | list indexing, bubble sort of 5000        |  0.654s | 0.078s |    8.4× |
-| exceptions | 400k calls, 171k raise/catch round trips  |  0.106s | 0.015s |    6.9× |
-| objects    | 400k small live objects, traced and swept |  0.091s | 0.096s |    0.9× |
-| **total**  |                                           |  5.437s | 0.468s |   11.6× |
+| nbody      | float + list, 5-body gravity, 100k steps  |  0.815s | 0.020s |   41.2× |
+| mandelbrot | float math, 500×500 escape iterations     |  0.604s | 0.018s |   33.6× |
+| pipeline   | lazy `map`/`filter` over 2M elements      |  0.332s | 0.017s |   19.6× |
+| strings    | per-char iteration, 2.6M comparisons      |  0.373s | 0.023s |   16.3× |
+| iteration  | `zip`/`enumerate`, 2M paired steps        |  0.340s | 0.022s |   15.7× |
+| primes     | int loops, trial division to 300k         |  0.430s | 0.031s |   14.0× |
+| matmul     | nested lists, 250×250 matrix multiply     |  0.552s | 0.042s |   13.0× |
+| fib        | recursion, 30M calls (`fib(35)`)          |  0.693s | 0.054s |   12.9× |
+| listcomp   | comprehensions, 3M-element map/filter     |  0.481s | 0.046s |   10.4× |
+| sort       | list indexing, bubble sort of 5000        |  0.664s | 0.079s |    8.4× |
+| exceptions | 400k calls, 171k raise/catch round trips  |  0.103s | 0.016s |    6.5× |
+| objects    | 400k small live objects, traced and swept |  0.106s | 0.111s |    1.0× |
+| dicts      | 1.2M dict/set operations, string keys     |  0.248s | 0.332s |    0.7× |
+| **total**  |                                           |  5.741s | 0.811s |    7.1× |
 
-**Integer arithmetic used to be the weak spot.** Every `int` operation was an
-out-of-line call into the runtime, because arbitrary precision needs a tagged
-representation with an overflow check and the runtime is linked as a separate
-object the optimizer cannot inline through. `primes` ran at 0.8×. Each
-operation now has an inline fast path on the tagged words, with the runtime
-call kept for the bignum edge — and the gain exceeded the calls removed,
-because one opaque call in a loop also blocks loop-invariant hoisting for
-everything around it.
+Compute-bound code is 6–41× faster. The two benchmarks at the bottom are the
+honest exception, and they are in the table for that reason: **allocation-heavy
+code is not yet faster than CPython.** `objects` and `dicts` both build hundreds
+of thousands of short-lived objects, and every managed object is an individual
+`calloc` on one global intrusive list. Turn the collector off and `objects`
+runs in 47 ms against 111 ms — the mutator is already twice CPython's speed and
+the collector is the whole gap.
 
-**The collector was the other half.** Marking answered "which object contains
-this address" by sorting every live range and binary searching it; a
-granule-keyed index built in one linear pass replaced both.
+Adding `dicts` is also why the aggregate reads 7.1× rather than the 11.6× of
+the twelve benchmarks before it. A benchmark that exposes a weakness lowers the
+average; leaving it out would not have made the compiler faster.
+
+### How it got here
+
+**Integer arithmetic** was the original weak spot — every `int` operation was
+an out-of-line call into the runtime, because arbitrary precision needs a
+tagged representation with an overflow check and the runtime is linked as a
+separate object the optimizer cannot inline through. `primes` ran at 0.8×. Each
+operation now has an inline fast path on the tagged words, and the gain exceeded
+the calls removed, because one opaque call in a loop also blocks loop-invariant
+hoisting for everything around it.
+
+**The collector's mark phase** answered "which object contains this address" by
+sorting every live range and binary searching it; a granule-keyed index built in
+one linear pass replaced both.
 
 **Then the per-operation calls that were left.** A `try` bound `@setjmp`, which
 on glibc saves the signal mask through a syscall — 85 ns a call against 1.8 ns
 for `_setjmp`. A caught exception built an object only a bound name or a bare
-`raise` ever reads. And `==` on `str` computed a full three-way `memcmp`
-ordering to answer a yes/no question about two single characters.
+`raise` ever reads. `==` on `str` computed a full three-way `memcmp` ordering to
+answer a yes/no question about two single characters. And a dict rehashed its
+key from scratch on every lookup.
 
-`objects` at 0.9× is what remains: every managed object is still an individual
-`calloc` on one global intrusive list, so allocation-heavy code pays where
-compute-bound code does not.
-
-(Linux, LLVM 22, CPython 3.14, best-of-7 at load 2.9/16 cores; run
+(Linux, LLVM 22, CPython 3.14, best-of-7 at load ~3/16 cores; run
 `./benchmarks/run.sh` to reproduce. Absolute times move with machine load —
-the speedup column is the comparable number, since both interpreters are
-timed in the same run.)
+the speedup column is the comparable number, since CPython and PyRs are timed
+in the same run.)
 
 ## Development
 
