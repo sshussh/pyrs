@@ -972,18 +972,12 @@ impl Parser {
             });
         }
         let (exc, exc_span) = self.parse_exc_type("after 'raise'")?;
-        // `raise E`, `raise E()` and `raise E("msg")` are all Python; the
-        // first two carry an empty message.
-        let empty = || Expr {
-            kind: ExprKind::Str(String::new()),
-            span: exc_span,
-        };
+        // `raise E`, `raise E()` and `raise E("msg")` are all Python. The
+        // first two supply no argument at all, which is not the same as an
+        // empty one: CPython reprs them `E()` and `E('')` respectively.
         if !self.eat(&Token::LParen) {
             return Ok(Stmt {
-                kind: StmtKind::Raise {
-                    exc,
-                    message: empty(),
-                },
+                kind: StmtKind::Raise { exc, message: None },
                 span: start.to(exc_span),
             });
         }
@@ -991,17 +985,17 @@ impl Parser {
             let close = self.peek_span();
             self.advance();
             return Ok(Stmt {
-                kind: StmtKind::Raise {
-                    exc,
-                    message: empty(),
-                },
+                kind: StmtKind::Raise { exc, message: None },
                 span: start.to(close).to(exc_span),
             });
         }
         let message = self.parse_expr()?;
         let close = self.expect(Token::RParen, "after raise argument")?;
         Ok(Stmt {
-            kind: StmtKind::Raise { exc, message },
+            kind: StmtKind::Raise {
+                exc,
+                message: Some(message),
+            },
             span: start.to(close).to(exc_span),
         })
     }

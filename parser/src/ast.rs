@@ -101,6 +101,12 @@ pub enum ExcType {
     PermissionError,
     IsADirectoryError,
     AssertionError,
+    AttributeError,
+    NotImplementedError,
+    ImportError,
+    ModuleNotFoundError,
+    LookupError,
+    ArithmeticError,
 }
 
 impl ExcType {
@@ -124,6 +130,12 @@ impl ExcType {
             ExcType::PermissionError => "PermissionError",
             ExcType::IsADirectoryError => "IsADirectoryError",
             ExcType::AssertionError => "AssertionError",
+            ExcType::AttributeError => "AttributeError",
+            ExcType::NotImplementedError => "NotImplementedError",
+            ExcType::ImportError => "ImportError",
+            ExcType::ModuleNotFoundError => "ModuleNotFoundError",
+            ExcType::LookupError => "LookupError",
+            ExcType::ArithmeticError => "ArithmeticError",
         }
     }
 
@@ -132,7 +144,9 @@ impl ExcType {
         "ValueError, KeyError, IndexError, ZeroDivisionError, TypeError, \
          RuntimeError, GeneratorExit, OverflowError, EOFError, FileNotFoundError, \
          OSError, NameError, UnboundLocalError, StopIteration, Exception, \
-         PermissionError, IsADirectoryError, AssertionError"
+         PermissionError, IsADirectoryError, AssertionError, AttributeError, \
+         NotImplementedError, ImportError, ModuleNotFoundError, LookupError, \
+         ArithmeticError"
     }
 }
 
@@ -326,7 +340,10 @@ pub enum StmtKind {
     /// `raise ExcType(msg)` — msg is a str expression.
     Raise {
         exc: ExcName,
-        message: Expr,
+        /// The single argument, when one was written. `raise E` and
+        /// `raise E()` carry `None`; `raise E("")` carries an empty string.
+        /// CPython's repr and `.args` distinguish them.
+        message: Option<Expr>,
     },
     /// Bare `raise` — re-raise the exception the enclosing handler caught.
     Reraise,

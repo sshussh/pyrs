@@ -142,6 +142,13 @@
       "reason": "zip advances inputs in lockstep; draining them first did not terminate on an infinite input"
     },
     {
+      "id": "exception-fidelity",
+      "group": "core",
+      "file": "cases/exception_fidelity.py",
+      "native": "pass",
+      "reason": "repr distinguishes a missing argument from an empty one; LookupError and ArithmeticError catch what CPython says they catch"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",

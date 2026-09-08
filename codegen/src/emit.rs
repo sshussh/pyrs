@@ -345,7 +345,9 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         | Stmt::ExprStmt(e)
         | Stmt::Return(Some(e))
         | Stmt::Yield(e)
-        | Stmt::Raise { message: e, .. }
+        | Stmt::Raise {
+            message: Some(e), ..
+        }
         | Stmt::RaiseExc { value: e }
         | Stmt::GenClose { generator: e }
         | Stmt::ListClear { list: e }
@@ -355,6 +357,8 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         | Stmt::SetClear { set: e }
         | Stmt::UnpackCheck { len: e, .. }
         | Stmt::UnpackCheckMin { len: e, .. } => max_try_depth_in_expr(e),
+        // `raise E` has no argument expression to walk.
+        Stmt::Raise { message: None, .. } => 0,
         Stmt::IndexAssign { base, index, value } => max_try_depth_in_expr(base)
             .max(max_try_depth_in_expr(index))
             .max(max_try_depth_in_expr(value)),
@@ -669,7 +673,9 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
         | Stmt::Assign { value: e, .. }
         | Stmt::GlobalAssign { value: e, .. }
         | Stmt::Return(Some(e))
-        | Stmt::Raise { message: e, .. }
+        | Stmt::Raise {
+            message: Some(e), ..
+        }
         | Stmt::RaiseExc { value: e }
         | Stmt::GenClose { generator: e }
         | Stmt::ListAppend { value: e, .. }
@@ -3470,12 +3476,21 @@ impl Emitter {
                 self.start_block(&cont_l);
             }
             Stmt::Raise { exc, message } => {
-                let m = self.emit_expr(message);
-                // pyrs_raise wants a C string: data pointer after the header
-                let data = self.tmp();
-                self.line(format!(
-                    "{data} = getelementptr inbounds i8, ptr {m}, i64 16"
-                ));
+                // A null argument pointer is `raise E`; the runtime uses it to
+                // tell `E()` from `E('')` in repr and `.args`.
+                let data = match message {
+                    Some(message) => {
+                        let m = self.emit_expr(message);
+                        // pyrs_raise wants a C string: the data pointer after
+                        // the header.
+                        let data = self.tmp();
+                        self.line(format!(
+                            "{data} = getelementptr inbounds i8, ptr {m}, i64 16"
+                        ));
+                        data
+                    }
+                    None => "null".to_string(),
+                };
                 // Uncaught raise in a generator (no active try) finishes it.
                 if self.gen_frame.is_some() && self.tries.is_empty() {
                     let frame = self.gen_frame.clone().unwrap();

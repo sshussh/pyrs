@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.121.0 — Exception fidelity; release gate 2's list is empty
+
+### An argument given is not an argument that is empty
+
+```python
+raise RuntimeError        # CPython: RuntimeError()   PyRs: RuntimeError()
+raise RuntimeError("")    # CPython: RuntimeError('')  PyRs: RuntimeError()  ← wrong
+```
+
+The exception object stored only its message, and an empty message was
+indistinguishable from no message. Recovering the difference means recording
+it: `PyrsExc` gained an `nargs` field, and — because the information has to
+survive from the source — `ast::StmtKind::Raise` and `ir::Stmt::Raise` took
+`message: Option<Expr>`. The parser had been synthesizing an empty string for
+`raise E` and `raise E()`, which is exactly where the distinction was lost.
+Codegen now passes a null argument pointer for the no-argument form, which the
+runtime already had to handle.
+
+`repr`, `[e]` and `len(e.args)` all follow the count, so `raise E("")` has one
+argument and `raise E` has none — as CPython does. `assert x` and
+`assert x, ""` follow the same rule.
+
+### Six exception types real code catches on
+
+`AttributeError`, `NotImplementedError`, `ImportError`, `ModuleNotFoundError`,
+`LookupError` and `ArithmeticError`, with their CPython hierarchy: `except
+LookupError` catches index and key misses, `except ArithmeticError` catches
+division by zero, `except RuntimeError` catches `NotImplementedError`, and
+`except ImportError` catches `ModuleNotFoundError`. A test pins the opposite
+direction too — `except IndexError` must not start catching `KeyError` just
+because both are `LookupError`s.
+
+### `e.args` shape: closed by decision, not by fix
+
+`e.args` is a `list` where CPython has a tuple. Recorded as an explicit scope
+decision under release gate 6, with the reasoning in
+[docs/ROADMAP.md](docs/ROADMAP.md) so it can be revisited rather than
+rediscovered: it is a display difference, the length and contents now match,
+and closing it properly needs variable-length tuples — a type-system change
+out of all proportion to the symptom. Printing a list as though it were a
+tuple would put a lie in the type system to fix a print.
+
+### Gate 2
+
+With those, **the measured-defect table has no open row.** That is not the
+same as the gate passing: it says "zero *known* silent miscompilations", and
+the table is only as good as the probing behind it. New probes append.
+
+12 differential tests in `cli/tests/exception_fidelity.rs` at `-O0`/`-O2`/`-O3`
+and an `exception-fidelity` compatibility probe under GC stress.
+
 ## 0.120.0 — A generator expression evaluates its outermost iterable at creation
 
 The second half of the paired defect closes, and release gate 2's list is

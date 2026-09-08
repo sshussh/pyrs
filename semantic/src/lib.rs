@@ -3994,7 +3994,9 @@ fn collect_param_constraints(
         match &st.kind {
             ast::StmtKind::Return(Some(e))
             | ast::StmtKind::ExprStmt(e)
-            | ast::StmtKind::Raise { message: e, .. } => {
+            | ast::StmtKind::Raise {
+                message: Some(e), ..
+            } => {
                 collect_param_constraints_expr(name, e, params, bare, out);
             }
             ast::StmtKind::Assign { value, .. } => {
@@ -4421,7 +4423,9 @@ fn collect_list_append_elem_hints_scoped(
         match &st.kind {
             ast::StmtKind::ExprStmt(e)
             | ast::StmtKind::Return(Some(e))
-            | ast::StmtKind::Raise { message: e, .. } => {
+            | ast::StmtKind::Raise {
+                message: Some(e), ..
+            } => {
                 collect_list_append_elem_hints_expr(e, env, out, shadowed);
             }
             ast::StmtKind::Assign { value, .. } => {
@@ -8821,7 +8825,10 @@ fn collect_called_func_names_in_stmt(st: &ast::Stmt, out: &mut HashSet<String>) 
         | ast::StmtKind::AugAssign { value, .. }
         | ast::StmtKind::ExprStmt(value)
         | ast::StmtKind::Return(Some(value))
-        | ast::StmtKind::Raise { message: value, .. } => {
+        | ast::StmtKind::Raise {
+            message: Some(value),
+            ..
+        } => {
             collect_called_func_names_in_expr(value, out);
         }
         ast::StmtKind::If { branches, orelse } => {
@@ -9057,7 +9064,10 @@ fn collect_used_names_in_stmt(st: &ast::Stmt, out: &mut HashSet<String>) {
             collect_used_names_in_stmts(body, out);
             collect_used_names_in_stmts(orelse, out);
         }
-        ast::StmtKind::Raise { message, .. } => {
+        ast::StmtKind::Raise {
+            message: Some(message),
+            ..
+        } => {
             collect_used_names_in_expr(message, out);
         }
         ast::StmtKind::Delete { target } => collect_used_names_in_target_read(target, out),
@@ -9631,8 +9641,13 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
         }
         ast::StmtKind::Delete { target } => lower_delete(target, stmt.span, ctx, out),
         ast::StmtKind::Raise { exc, message } => {
-            let msg = lower_expr(message, ctx)?;
-            let msg = coerce(msg, ir::Ty::Str, message.span, "raise message")?;
+            let msg = match message {
+                Some(m) => {
+                    let v = lower_expr(m, ctx)?;
+                    Some(coerce(v, ir::Ty::Str, m.span, "raise message")?)
+                }
+                None => None,
+            };
             out.push(ir::Stmt::Raise {
                 exc: resolve_exc_name(exc)?,
                 message: msg,
@@ -9649,18 +9664,18 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     operand: Box::new(cond),
                 },
             };
-            let message = if let Some(m) = msg {
-                let m_ir = lower_expr(m, ctx)?;
-                if m_ir.ty == ir::Ty::Str {
-                    m_ir
-                } else {
-                    lower_cast(ast::TypeName::Str, m_ir, m.span)?
+            // `assert x` raises `AssertionError()` with no argument;
+            // `assert x, ""` raises `AssertionError('')` with one.
+            let message = match msg {
+                Some(m) => {
+                    let m_ir = lower_expr(m, ctx)?;
+                    Some(if m_ir.ty == ir::Ty::Str {
+                        m_ir
+                    } else {
+                        lower_cast(ast::TypeName::Str, m_ir, m.span)?
+                    })
                 }
-            } else {
-                ir::Expr {
-                    ty: ir::Ty::Str,
-                    kind: ir::ExprKind::ConstStr(String::new()),
-                }
+                None => None,
             };
             out.push(ir::Stmt::If {
                 branches: vec![(
@@ -11600,6 +11615,12 @@ fn name_to_exc_type(name: &str, span: Span) -> SResult<ir::ExcType> {
         "Exception" => Ok(ir::ExcType::Exception),
         "PermissionError" => Ok(ir::ExcType::PermissionError),
         "IsADirectoryError" => Ok(ir::ExcType::IsADirectoryError),
+        "AttributeError" => Ok(ir::ExcType::AttributeError),
+        "NotImplementedError" => Ok(ir::ExcType::NotImplementedError),
+        "ImportError" => Ok(ir::ExcType::ImportError),
+        "ModuleNotFoundError" => Ok(ir::ExcType::ModuleNotFoundError),
+        "LookupError" => Ok(ir::ExcType::LookupError),
+        "ArithmeticError" => Ok(ir::ExcType::ArithmeticError),
         "AssertionError" => Ok(ir::ExcType::AssertionError),
         _ => Err(err(
             format!(
@@ -15192,10 +15213,9 @@ fn lower_builtin_next(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResu
                                 is_none,
                                 vec![ir::Stmt::Raise {
                                     exc: ir::ExcType::StopIteration,
-                                    message: ir::Expr {
-                                        ty: ir::Ty::Str,
-                                        kind: ir::ExprKind::ConstStr(String::new()),
-                                    },
+                                    // Generator exhaustion is `StopIteration()`
+                                    // with no argument, as CPython raises it.
+                                    message: None,
                                 }],
                             )],
                             orelse: vec![ir::Stmt::Assign {
@@ -24160,7 +24180,7 @@ fn lower_min_max_list_class(
     } else {
         vec![ir::Stmt::Raise {
             exc: ir::ExcType::ValueError,
-            message: const_str(empty_msg),
+            message: Some(const_str(empty_msg)),
         }]
     };
 
@@ -24455,7 +24475,7 @@ fn lower_min_max_list_key(
     } else {
         vec![ir::Stmt::Raise {
             exc: ir::ExcType::ValueError,
-            message: const_str(empty_msg),
+            message: Some(const_str(empty_msg)),
         }]
     };
 
@@ -27346,7 +27366,7 @@ fn lower_list_index_protocol(
                 bool_not(local_expr(found_t, ir::Ty::Bool)),
                 vec![ir::Stmt::Raise {
                     exc: ir::ExcType::ValueError,
-                    message: const_str(miss),
+                    message: Some(const_str(miss)),
                 }],
             )],
             orelse: vec![],
@@ -27458,7 +27478,7 @@ fn lower_list_remove_protocol(
                 bool_not(local_expr(found_t, ir::Ty::Bool)),
                 vec![ir::Stmt::Raise {
                     exc: ir::ExcType::ValueError,
-                    message: const_str("list.remove(x): x not in list"),
+                    message: Some(const_str("list.remove(x): x not in list")),
                 }],
             )],
             orelse: vec![],

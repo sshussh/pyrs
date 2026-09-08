@@ -59,6 +59,12 @@ static PyObject *bridge_exception(int type) {
     case PYRS_EXC_EXCEPTION: return PyExc_Exception;
     case PYRS_EXC_PERMISSION: return PyExc_PermissionError;
     case PYRS_EXC_ISADIR: return PyExc_IsADirectoryError;
+    case PYRS_EXC_ATTRIBUTE: return PyExc_AttributeError;
+    case PYRS_EXC_NOTIMPL: return PyExc_NotImplementedError;
+    case PYRS_EXC_IMPORT: return PyExc_ImportError;
+    case PYRS_EXC_MODULENOTFOUND: return PyExc_ModuleNotFoundError;
+    case PYRS_EXC_LOOKUP: return PyExc_LookupError;
+    case PYRS_EXC_ARITHMETIC: return PyExc_ArithmeticError;
     case PYRS_EXC_ASSERT: return PyExc_AssertionError;
     default: return PyExc_RuntimeError;
     }

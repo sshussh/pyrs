@@ -53,6 +53,12 @@
 #define PYRS_EXC_PERMISSION 16
 #define PYRS_EXC_ISADIR 17
 #define PYRS_EXC_ASSERT 18
+#define PYRS_EXC_ATTRIBUTE 19
+#define PYRS_EXC_NOTIMPL 20
+#define PYRS_EXC_IMPORT 21
+#define PYRS_EXC_MODULENOTFOUND 22
+#define PYRS_EXC_LOOKUP 23
+#define PYRS_EXC_ARITHMETIC 24
 #define PYRS_EXC_OTHER 99
 /* First tag for a user-defined `class E(Exception)`; must match
  * ir::USER_EXC_BASE. Builtins own 1..=18 and 99. */
@@ -220,6 +226,11 @@ typedef struct {
      * it, which is the one place the two differ, and which needs the
      * argument's type to get right (a str key quotes, an int key does not). */
     int args_tag;
+    /* How many arguments the raise supplied: 0 or 1. Distinct from an empty
+     * message, because CPython's repr distinguishes them —
+     * `RuntimeError()` from `RuntimeError('')` — and it cannot be recovered
+     * from `msg` alone, which is empty in both cases. */
+    int nargs;
 } PyrsExc;
 
 /* stable header; data grows by reallocation */
@@ -267,6 +278,8 @@ static int g_exc_type = 0;
 static char g_exc_msg[512];
 /* Tag of the pending exception's args[0]; see PyrsExc::args_tag. */
 static int g_exc_args_tag = TAG_STR;
+/* Argument count of the pending exception; see PyrsExc::nargs. */
+static int g_exc_nargs = 0;
 
 static void *xmalloc(size_t n);
 
@@ -358,6 +371,18 @@ static const char *exc_type_name(int ty) {
         return "IsADirectoryError";
     case PYRS_EXC_ASSERT:
         return "AssertionError";
+    case PYRS_EXC_ATTRIBUTE:
+        return "AttributeError";
+    case PYRS_EXC_NOTIMPL:
+        return "NotImplementedError";
+    case PYRS_EXC_IMPORT:
+        return "ImportError";
+    case PYRS_EXC_MODULENOTFOUND:
+        return "ModuleNotFoundError";
+    case PYRS_EXC_LOOKUP:
+        return "LookupError";
+    case PYRS_EXC_ARITHMETIC:
+        return "ArithmeticError";
     default:
         return "Exception";
     }
@@ -370,6 +395,24 @@ static int classify_exc_msg(const char *msg) {
     }
     if (strncmp(msg, "UnboundLocalError", 17) == 0) {
         return PYRS_EXC_UNBOUNDLOCAL;
+    }
+    if (strncmp(msg, "NotImplementedError", 19) == 0) {
+        return PYRS_EXC_NOTIMPL;
+    }
+    if (strncmp(msg, "ModuleNotFoundError", 19) == 0) {
+        return PYRS_EXC_MODULENOTFOUND;
+    }
+    if (strncmp(msg, "ArithmeticError", 15) == 0) {
+        return PYRS_EXC_ARITHMETIC;
+    }
+    if (strncmp(msg, "AttributeError", 14) == 0) {
+        return PYRS_EXC_ATTRIBUTE;
+    }
+    if (strncmp(msg, "ImportError", 11) == 0) {
+        return PYRS_EXC_IMPORT;
+    }
+    if (strncmp(msg, "LookupError", 11) == 0) {
+        return PYRS_EXC_LOOKUP;
     }
     if (strncmp(msg, "IsADirectoryError", 17) == 0) {
         return PYRS_EXC_ISADIR;
@@ -461,6 +504,20 @@ int pyrs_exc_matches(int filter, int actual) {
         return actual == PYRS_EXC_FILENOTFOUND || actual == PYRS_EXC_PERMISSION ||
                actual == PYRS_EXC_ISADIR;
     }
+    /* CPython's other builtin bases. Kept in step with
+     * ir::ExcType::matches_raised, which decides the same thing statically. */
+    if (filter == PYRS_EXC_LOOKUP) {
+        return actual == PYRS_EXC_INDEX || actual == PYRS_EXC_KEY;
+    }
+    if (filter == PYRS_EXC_ARITHMETIC) {
+        return actual == PYRS_EXC_ZERODIV || actual == PYRS_EXC_OVERFLOW;
+    }
+    if (filter == PYRS_EXC_RUNTIME) {
+        return actual == PYRS_EXC_NOTIMPL;
+    }
+    if (filter == PYRS_EXC_IMPORT) {
+        return actual == PYRS_EXC_MODULENOTFOUND;
+    }
     return 0;
 }
 
@@ -514,6 +571,9 @@ _Noreturn static void die_uncaught(const char *msg) {
 _Noreturn void pyrs_raise_tagged(int type, const char *msg, int args_tag) {
     g_exc_type = type;
     g_exc_args_tag = args_tag;
+    /* A null message is `raise E`; a non-null one is `raise E(x)`, even when
+     * x is the empty string. */
+    g_exc_nargs = msg != NULL ? 1 : 0;
     set_exc_msg(type, msg);
     if (g_exc_frames != NULL) {
         pyrs_jump_current();
@@ -536,6 +596,8 @@ _Noreturn void pyrs_raise(int type, const char *msg) {
 _Noreturn void pyrs_die(const char *msg) {
     int ty = classify_exc_msg(msg);
     g_exc_type = ty;
+    g_exc_args_tag = TAG_STR;
+    g_exc_nargs = 1;
     snprintf(g_exc_msg, sizeof g_exc_msg, "%s", msg);
     if (g_exc_frames != NULL) {
         pyrs_jump_current();
@@ -613,6 +675,7 @@ PyrsExc *pyrs_exc_object(void) {
     e->type_tag = g_exc_type;
     e->msg = pyrs_exc_message();
     e->args_tag = g_exc_args_tag;
+    e->nargs = g_exc_nargs;
     return e;
 }
 
@@ -644,7 +707,7 @@ PyrsStr *pyrs_str_from_exc(PyrsExc *e) {
 
 /* e.args as list[str] (empty or one message) — list ABI for variable length. */
 PyrsList *pyrs_exc_args(PyrsExc *e) {
-    if (e == NULL || e->msg == NULL || e->msg->len == 0) {
+    if (e == NULL || e->msg == NULL || e->nargs == 0) {
         return pyrs_list_new(0);
     }
     PyrsList *r = pyrs_list_new(1);
@@ -658,9 +721,9 @@ PyrsStr *pyrs_repr_from_exc(PyrsExc *e) {
     const char *body =
         (e && e->msg && e->msg->len > 0) ? e->msg->data : "";
     char buf[640];
-    if (body[0] == '\0') {
+    if (e == NULL || e->nargs == 0) {
         snprintf(buf, sizeof buf, "%s()", name);
-    } else if (e != NULL && e->args_tag != TAG_STR) {
+    } else if (e->args_tag != TAG_STR) {
         snprintf(buf, sizeof buf, "%s(%s)", name, body);
     } else {
         snprintf(buf, sizeof buf, "%s('%s')", name, body);
@@ -710,6 +773,8 @@ _Noreturn void pyrs_raise_exc(PyrsExc *e) {
         pyrs_raise(PYRS_EXC_RUNTIME, "unknown error");
     }
     g_exc_type = e->type_tag;
+    g_exc_args_tag = e->args_tag;
+    g_exc_nargs = e->nargs;
     /* `data` is a flexible array member, so it can never be null; testing it
      * was dead code and clang reports it as a tautological comparison. */
     const char *body = (e->msg != NULL) ? e->msg->data : "";
@@ -2729,8 +2794,16 @@ static void print_exc_repr(PyrsExc *e) {
     /* e->msg on the object is the body already; exc_msg_body is for the
      * global "Type: body" buffer. */
     const char *body = (e && e->msg && e->msg->len > 0) ? e->msg->data : "";
-    if (body[0] == '\0') {
+    /* Zero arguments prints `E()`; one argument prints `E('...')` even when
+     * that argument is the empty string. */
+    if (e == NULL || e->nargs == 0) {
         out_puts("()");
+        return;
+    }
+    if (e->args_tag != TAG_STR) {
+        out_puts("(");
+        out_puts(body);
+        out_puts(")");
         return;
     }
     out_puts("('");

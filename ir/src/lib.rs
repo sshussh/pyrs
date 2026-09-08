@@ -421,6 +421,12 @@ pub enum ExcType {
     PermissionError,
     IsADirectoryError,
     AssertionError,
+    AttributeError,
+    NotImplementedError,
+    ImportError,
+    ModuleNotFoundError,
+    LookupError,
+    ArithmeticError,
     /// A user-defined `class E(Exception)`. The payload is the runtime tag
     /// codegen assigns, always >= [`USER_EXC_BASE`], so it can never collide
     /// with a builtin discriminant. The class *name* and its parent live in
@@ -457,6 +463,12 @@ impl ExcType {
             ExcType::PermissionError => "PermissionError",
             ExcType::IsADirectoryError => "IsADirectoryError",
             ExcType::AssertionError => "AssertionError",
+            ExcType::AttributeError => "AttributeError",
+            ExcType::NotImplementedError => "NotImplementedError",
+            ExcType::ImportError => "ImportError",
+            ExcType::ModuleNotFoundError => "ModuleNotFoundError",
+            ExcType::LookupError => "LookupError",
+            ExcType::ArithmeticError => "ArithmeticError",
         }
     }
 
@@ -484,6 +496,12 @@ impl ExcType {
             ExcType::PermissionError => 16,
             ExcType::IsADirectoryError => 17,
             ExcType::AssertionError => 18,
+            ExcType::AttributeError => 19,
+            ExcType::NotImplementedError => 20,
+            ExcType::ImportError => 21,
+            ExcType::ModuleNotFoundError => 22,
+            ExcType::LookupError => 23,
+            ExcType::ArithmeticError => 24,
             ExcType::User(tag) => tag as i32,
         }
     }
@@ -511,6 +529,15 @@ impl ExcType {
                 raised,
                 ExcType::FileNotFoundError | ExcType::PermissionError | ExcType::IsADirectoryError
             ),
+            // CPython's other builtin bases. `LookupError` and
+            // `ArithmeticError` exist chiefly so `except LookupError` catches
+            // both index and key misses, which is how real code spells it.
+            ExcType::LookupError => matches!(raised, ExcType::IndexError | ExcType::KeyError),
+            ExcType::ArithmeticError => {
+                matches!(raised, ExcType::ZeroDivisionError | ExcType::OverflowError)
+            }
+            ExcType::RuntimeError => raised == ExcType::NotImplementedError,
+            ExcType::ImportError => raised == ExcType::ModuleNotFoundError,
             _ => false,
         }
     }
@@ -519,7 +546,9 @@ impl ExcType {
         "ValueError, KeyError, IndexError, ZeroDivisionError, TypeError, \
          RuntimeError, GeneratorExit, OverflowError, EOFError, FileNotFoundError, \
          OSError, NameError, UnboundLocalError, StopIteration, Exception, \
-         PermissionError, IsADirectoryError, AssertionError"
+         PermissionError, IsADirectoryError, AssertionError, AttributeError, \
+         NotImplementedError, ImportError, ModuleNotFoundError, LookupError, \
+         ArithmeticError"
     }
 }
 
@@ -729,7 +758,10 @@ pub enum Stmt {
     /// `raise ExcType(msg)` — msg is a str.
     Raise {
         exc: ExcType,
-        message: Expr,
+        /// The single argument, when one was written. `None` is `raise E`,
+        /// which reprs as `E()` with empty `.args`; `Some("")` is
+        /// `raise E("")`, which reprs as `E('')` with one argument.
+        message: Option<Expr>,
     },
     /// Re-raise a first-class exception object (e.g. after `__exit__` declines
     /// to suppress). Value must be `Ty::Exception`.

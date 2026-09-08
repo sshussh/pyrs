@@ -366,7 +366,8 @@ fn validate_body(body: &[ast::Stmt], names: &HashSet<String>) -> Result<(), Stri
             }
             S::While { cond, body, orelse } => { expression(cond, names)?; validate_body(body, names)?; validate_body(orelse, names)?; }
             S::For { target: t, iter, body, orelse } => { target(t)?; expression(iter, names)?; validate_body(body, names)?; validate_body(orelse, names)?; }
-            S::Raise { message, .. } => expression(message, names)?,
+            S::Raise { message: Some(message), .. } => expression(message, names)?,
+            S::Raise { message: None, .. } => {}
             S::Assert { test, msg } => { expression(test, names)?; if let Some(msg) = msg { expression(msg, names)?; } }
             S::Try { body, handlers, orelse, finally } => {
                 validate_body(body, names)?;

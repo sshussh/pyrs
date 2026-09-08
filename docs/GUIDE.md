@@ -1799,11 +1799,19 @@ Container notes:
 
 Exception notes: supported named types include OverflowError, EOFError,
 FileNotFoundError, OSError, PermissionError, IsADirectoryError, NameError,
-UnboundLocalError, StopIteration, Exception, and GeneratorExit.
-Hierarchy: OSError children and `except Exception` (not GeneratorExit).
+UnboundLocalError, StopIteration, Exception, GeneratorExit, AttributeError,
+NotImplementedError, ImportError, ModuleNotFoundError, LookupError and
+ArithmeticError. Hierarchy: `except Exception` (not GeneratorExit), OSError's
+children, `LookupError` over IndexError/KeyError, `ArithmeticError` over
+ZeroDivisionError/OverflowError, `RuntimeError` over NotImplementedError, and
+`ImportError` over ModuleNotFoundError.
 `except E as e` binds an exception object (`print`/`str`/`if`/`isinstance`);
 exceptions may be list/tuple elements; `e.args` is `list[str]`; `repr(e)` /
-`!r` via ExcRepr. Residual: CPython `args` is a tuple; dict/set of exceptions
+`!r` via ExcRepr. An argument that was *given* differs from one that is
+empty: `raise E` reprs `E()` with `len(e.args) == 0`, `raise E("")` reprs
+`E('')` with `len(e.args) == 1`. Residual: CPython's `args` is a tuple where
+this is a list — a documented divergence, since `args` holds 0 or 1 elements
+decided at run time and tuples here are fixed-arity; dict/set of exceptions
 not yet.
 
 Not implemented yet (clear compile errors): full class dynamism (see

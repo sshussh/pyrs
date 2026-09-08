@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.120 |
+| Check | Result after 0.121 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1526 passed; none failed or ignored |
+| `cargo test --workspace` | 1538 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
-| `make compatibility` | native 69 pass / 6 skipped; compat 23 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.120.0` |
+| `make compatibility` | native 72 pass / 6 skipped; compat 24 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
+| `pyrs --version` | `PyRs 0.121.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -102,14 +102,14 @@ why correctness rather than new capability sets the near-term order.
 | `e.args[0]` after `d["z"]` | `z` | `z` | **closed in review** |
 | `ascii(["é"])` | `['\xe9']` | `['\xe9']` | **closed in review** |
 | `f"{xs:}"` | `[1, 2]` | `[1, 2]` | **closed in review** |
-| `e.args` display | `('z',)` | `['z']` | open — see below |
+| `e.args` display | `('z',)` | `['z']` | **scope decision, 0.121** — see below |
 | `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | `(1, 2)`, `[1, 2]` | **closed in 0.108** |
 | `list(zip(infinite(), [1]))` | `[(0, 1)]` | `[(0, 1)]` | **closed in 0.119** |
 | `(x for x in range(bound()))` | `bound()` at creation | `bound()` at creation | **closed in 0.120** |
 | `"ΟΣ".lower()` | `ος` | `ος` | **closed in review** |
 | `"{0} {0}".format(side())` | one call | one call | **closed in review** |
 | `print([e])` for a caught `e` | `[ValueError('x')]` | `[ValueError('x')]` | **closed in review** |
-| `repr(RuntimeError(""))` | `RuntimeError('')` | `RuntimeError()` | open — see below |
+| `repr(RuntimeError(""))` | `RuntimeError('')` | `RuntimeError('')` | **closed in 0.121** |
 | `range(a(), b())` operand order | `a()` then `b()` | `a()` then `b()` | **closed in 0.119** |
 
 All seven rows measured on 2026-09-05 are closed; the four still open were
@@ -129,10 +129,34 @@ Storing the pre-quoted form, which is what the internal sites used to do, was
 also a wrong *value* and not merely wrong text: `e.args[0]` for `d["z"]` came
 back as three characters rather than one.
 
+### `e.args` shape: a recorded scope decision, not a fix
+
 What remains is the shape of `args`, not its contents: PyRs models it as a
 `list`, so it displays as `['z']` where CPython shows the tuple `('z',)`.
 Tuples here are fixed-arity, and `args` is 0-or-1 elements decided at runtime,
 so there is no tuple type to give it without variable-length tuples.
+
+**Closed by decision in 0.121**, under release gate 6's allowance for "an
+explicit owner-approved scope decision". The reasoning, so it can be revisited
+rather than rediscovered:
+
+- It is a *display* difference, not a wrong computation. `e.args[0]`,
+  `len(e.args)`, iteration and indexing all match CPython, and 0.121 made the
+  length match too — `raise E` gives 0 elements, `raise E("")` gives 1.
+- Closing it properly needs variable-length tuples, a type-system change out
+  of all proportion to the symptom, and one that would be driven by the
+  workload corpus rather than by this row.
+- The alternative — printing a list as though it were a tuple — would put a
+  lie in the type system to fix a print.
+
+Treated like set-iteration order below: documented, tested, and closed. It is
+recorded in [the guide](GUIDE.md#9-differences-from-cpython) as a known
+divergence, and reopens if variable-length tuples ever land.
+
+**With this and `repr(RuntimeError(""))`, release gate 2's outstanding list is
+empty.** That is not the same as the gate passing: the gate says "zero
+*known* silent miscompilations", and the table is only as good as the probing
+behind it. New probes append.
 
 `str()` and f-string interpolation rejected every container until 0.108, even
 though `print` formatted the same value correctly. The formatting logic was
@@ -323,7 +347,12 @@ documentation and the relevant gates.
       `map`/`filter`, `iter`/`next` defaults, `StopIteration.value`,
       `yield from` send/throw, generator cleanup.
 - [ ] Exception args as tuples, user exception classes, hierarchy, chaining,
-      re-raise, traceback locations, multiple context managers.
+      re-raise, traceback locations, multiple context managers. Partly closed
+      in 0.121: the builtin hierarchy gained `AttributeError`,
+      `NotImplementedError`, `ImportError`/`ModuleNotFoundError`,
+      `LookupError` and `ArithmeticError`, and an exception now records how
+      many arguments it was raised with. `args` as a *tuple* is a recorded
+      scope decision, not open work.
 - [ ] A native array type, which `@` needs; rejected with a specific
       diagnostic since 0.87.
 
