@@ -693,13 +693,6 @@ fn unsupported_feature(name: &str) -> Option<&'static str> {
 /// The module-level names that are Python's but not values here.
 fn unsupported_dunder(name: &str) -> Option<&'static str> {
     Some(match name {
-        "__name__" => {
-            "__name__ is not supported yet, so `if __name__ == \"__main__\":` \
-             cannot be written. A file whose top level is only definitions \
-             runs its zero-parameter `main()` automatically; otherwise put the \
-             code at the top level, which only runs when the file is the entry \
-             point"
-        }
         "__file__" | "__package__" | "__doc__" | "__spec__" => {
             "module attributes like __file__ and __package__ are not \
              supported yet: there is no module object at run time"
@@ -714,6 +707,28 @@ fn unsupported_dunder(name: &str) -> Option<&'static str> {
         }
         _ => return Option::None,
     })
+}
+
+/// `sys.stderr` / `sys.stdout` written as a `print(file=...)` destination.
+///
+/// Returns whether it is stderr. Neither is a value anywhere else: there is
+/// no file object behind them, and `print` is the only thing that can name
+/// one.
+fn stream_keyword(value: &ast::Expr, ctx: &FnCtx) -> Option<bool> {
+    let ast::ExprKind::Attribute { base, attr, .. } = &value.kind else {
+        return Option::None;
+    };
+    let ast::ExprKind::Name(alias) = &base.kind else {
+        return Option::None;
+    };
+    if !ctx.sys_alias(alias) {
+        return Option::None;
+    }
+    match attr.as_str() {
+        "stderr" => Some(true),
+        "stdout" => Some(false),
+        _ => Option::None,
+    }
 }
 
 fn set_synth_param_ty(name: &str, ty: ir::Ty) {
@@ -9873,6 +9888,39 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     e.span,
                 ));
             }
+            // `sys.exit(code)` is a statement: it never returns, so there is
+            // no value for an expression position to use.
+            if let ast::ExprKind::MethodCall {
+                base,
+                method,
+                args,
+                keywords,
+                kwargs,
+                method_span,
+            } = &e.kind
+                && method == "exit"
+                && matches!(&base.kind, ast::ExprKind::Name(a) if ctx.sys_alias(a))
+            {
+                if !keywords.is_empty() || kwargs.is_some() {
+                    return Err(err("sys.exit() takes no keyword arguments", *method_span));
+                }
+                let plain = require_plain_args(args, "sys.exit", e.span)?;
+                let code = match plain.len() {
+                    0 => int_const(0),
+                    1 => {
+                        let v = lower_expr(plain[0], ctx)?;
+                        coerce(v, ir::Ty::Int, plain[0].span, "sys.exit() status")?
+                    }
+                    n => {
+                        return Err(err(
+                            format!("sys.exit() takes at most one argument ({n} given)"),
+                            e.span,
+                        ));
+                    }
+                };
+                out.push(ir::Stmt::SysExit { code });
+                return Ok(());
+            }
             // print is a statement-level builtin
             if let ast::ExprKind::Call {
                 func,
@@ -9914,6 +9962,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 let mut sep = const_str_expr(" ");
                 let mut end = const_str_expr("\n");
                 let mut flush = const_bool_expr(false);
+                let mut to_stderr = false;
                 let mut seen_sep = false;
                 let mut seen_end = false;
                 let mut seen_flush = false;
@@ -9982,10 +10031,22 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                             };
                         }
                         "file" => {
-                            return Err(err(
-                                "print() keyword argument 'file=' is not supported yet",
-                                kw.name_span,
-                            ));
+                            // Only the two standard streams exist as
+                            // destinations, so this is a flag rather than a
+                            // file value. `file=sys.stdout` is the default
+                            // and accepted for symmetry.
+                            match stream_keyword(&kw.value, ctx) {
+                                Some(is_err) => to_stderr = is_err,
+                                Option::None => {
+                                    return Err(err(
+                                        "print(file=...) accepts only sys.stderr or \
+                                         sys.stdout: there is no general file \
+                                         destination for print yet. Use \
+                                         f.write(...) for a file opened with open()",
+                                        kw.value.span,
+                                    ));
+                                }
+                            }
                         }
                         other => {
                             return Err(err(
@@ -10000,6 +10061,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     sep,
                     end,
                     flush,
+                    to_stderr,
                 });
                 return Ok(());
             }
@@ -17312,6 +17374,16 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     format!("functions can only be called; add parentheses: '{name}(...)'"),
                     expr.span,
                 ))
+            } else if name == "__name__" {
+                // The one module attribute with a compile-time answer: the
+                // entry module is `__main__`, an imported one is its import
+                // name. Reached only after locals and globals, so a user
+                // binding of the same name still shadows it.
+                Ok(const_str(if ctx.mctx.is_root {
+                    ENTRY_NAME
+                } else {
+                    ctx.mctx.module
+                }))
             } else {
                 Err(err(
                     unsupported_dunder(name)
@@ -17461,8 +17533,24 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                             kind: ir::ExprKind::Argv,
                         });
                     }
+                    let note = match attr.as_str() {
+                        "stderr" | "stdout" => {
+                            "sys.stderr and sys.stdout are not values: there is \
+                             no file object behind them. `print(..., file=sys.stderr)` \
+                             is supported"
+                        }
+                        "exit" => "sys.exit is a call, not a value: write sys.exit(code)",
+                        _ => "",
+                    };
                     return Err(err(
-                        format!("'sys.{attr}' is not supported yet (only sys.argv)"),
+                        if note.is_empty() {
+                            format!(
+                                "'sys.{attr}' is not supported yet (sys.argv, \
+                                 sys.exit() and print(file=sys.stderr) are)"
+                            )
+                        } else {
+                            note.to_string()
+                        },
                         *attr_span,
                     ));
                 }
@@ -28413,6 +28501,7 @@ print(fib(10))
             sep,
             end,
             flush,
+            ..
         } = print
         else {
             panic!("{print:?}");
@@ -28467,13 +28556,28 @@ print(fib(10))
     }
 
     #[test]
-    fn print_file_kw_is_residual() {
+    fn print_file_kw_accepts_only_the_standard_streams() {
         let e = analyze_err("print(1, file=1)\n");
         assert!(
-            e.message.contains("file=") && e.message.contains("not supported yet"),
+            e.message.contains("sys.stderr") && e.message.contains("sys.stdout"),
             "{}",
             e.message
         );
+    }
+
+    #[test]
+    fn print_to_stderr_lowers_to_the_destination_flag() {
+        let m = analyze_ok("import sys\nprint(1, file=sys.stderr)\nprint(2)\n");
+        let prints: Vec<bool> = m.funcs[0]
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                ir::Stmt::Print { to_stderr, .. } => Some(*to_stderr),
+                _ => None,
+            })
+            .collect();
+        // One to each stream, and the flag does not carry over.
+        assert_eq!(prints, vec![true, false], "{prints:?}");
     }
 
     #[test]
@@ -32141,6 +32245,7 @@ except Exception:
                     sep,
                     end,
                     flush,
+                    ..
                 } => {
                     for a in args {
                         walk_expr(a, f);

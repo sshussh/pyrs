@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.123 |
+| Check | Result after 0.124 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1564 passed; none failed or ignored |
+| `cargo test --workspace` | 1575 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
-| `make compatibility` | native 75 pass / 6 skipped; compat 25 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.123.0` |
+| `make compatibility` | native 78 pass / 6 skipped; compat 26 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
+| `pyrs --version` | `PyRs 0.124.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -377,12 +377,17 @@ documentation and the relevant gates.
 - [ ] `bytes`/`bytearray`/`memoryview` as the corpus requires; encoding,
       binary and text files, newline handling, seek/tell, resource cleanup.
 - [ ] `sys` streams, `print(file=)`, environment, filesystem primitives,
-      path-like values, process invocation.
+      path-like values, process invocation. Partly closed in 0.124:
+      `print(file=sys.stderr|sys.stdout)` selects the stream and `sys.exit`
+      sets the status after flushing. There is still no file *object* behind
+      the streams, so no other `file=` destination.
 
 ### E. Imports and libraries
 
 - [ ] Module objects, `__name__`/`__file__`/`__package__`, initialization
-      ordering, cycles, package `__main__`, relative imports, import errors.
+      ordering, cycles, package `__main__`, relative imports, import errors. `__name__` closed in 0.124 —
+      it has a compile-time answer (`__main__` for the entry module, the
+      dotted import name otherwise), which the others do not.
 - [ ] Standard-library inventory driven by workload failures. Enumerate each
       module's supported public API; an importable stub is not compatibility.
 - [ ] Implement libraries in PyRs once their primitives exist; keep platform

@@ -136,6 +136,11 @@ typedef struct {
 } OutBuf;
 
 static _Thread_local OutBuf *g_capture = NULL;
+/* Where an uncaptured write goes. `print(file=sys.stderr)` swaps this for the
+ * duration of one call rather than threading a destination through every
+ * print routine — they all funnel into out_write, and a capture still wins,
+ * so `str()` of a value is unaffected either way. */
+static _Thread_local int g_out_err = 0;
 /* ascii() renders exactly like repr() except that non-ASCII escapes. Scoped
  * to a capture, so it reaches the nested elements the shared printer walks. */
 static _Thread_local int g_repr_ascii = 0;
@@ -143,7 +148,7 @@ static _Thread_local int g_repr_ascii = 0;
 static void out_write(const char *p, size_t n) {
     OutBuf *o = g_capture;
     if (o == NULL) {
-        fwrite(p, 1, n, stdout);
+        fwrite(p, 1, n, g_out_err ? stderr : stdout);
         return;
     }
     if (o->len + n + 1 > o->cap) {
@@ -163,6 +168,18 @@ static void out_write(const char *p, size_t n) {
 }
 
 static void out_puts(const char *s) { out_write(s, strlen(s)); }
+
+/* Select the destination for the print about to run. */
+void pyrs_out_to_stderr(long long on) { g_out_err = on != 0; }
+
+/* `sys.exit(n)`: flush what has been printed, then leave. CPython raises
+ * SystemExit, which a bare `except` could catch; there is no exception object
+ * for it here, so this exits directly and is documented as such. */
+_Noreturn void pyrs_sys_exit(long long code) {
+    fflush(stdout);
+    fflush(stderr);
+    exit((int)(code & 0xff));
+}
 
 static void out_putc(char c) { out_write(&c, 1); }
 

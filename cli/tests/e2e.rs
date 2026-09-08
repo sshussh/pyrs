@@ -598,9 +598,11 @@ fn print_sep_end_errors() {
         stderr.contains("end must be None or a string"),
         "stderr={stderr}"
     );
+    // `file=` now accepts the two standard streams; anything else names what
+    // it does accept rather than refusing the keyword outright.
     let (_, stderr) = run_program_expect_fail("print_file", "print(1, file=1)\n");
     assert!(
-        stderr.contains("file=") && stderr.contains("not supported yet"),
+        stderr.contains("sys.stderr") && stderr.contains("sys.stdout"),
         "stderr={stderr}"
     );
     let (_, stderr) = run_program_expect_fail("print_foo", "print(1, foo=1)\n");

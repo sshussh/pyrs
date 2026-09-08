@@ -1801,6 +1801,12 @@ Container notes:
   generator functions (including lists of gen functions) works;
   homogeneous capturing closures in containers too.
 
+`__name__` is the entry module's `"__main__"` or an imported module's dotted
+import name, so `if __name__ == "__main__":` works. `sys.exit(code)` flushes
+and leaves — it is not a catchable `SystemExit` here — and
+`print(..., file=sys.stderr)` / `file=sys.stdout` select the stream. No other
+`file=` destination exists; use `f.write(...)` on a file from `open()`.
+
 Exception notes: supported named types include OverflowError, EOFError,
 FileNotFoundError, OSError, PermissionError, IsADirectoryError, NameError,
 UnboundLocalError, StopIteration, Exception, GeneratorExit, AttributeError,

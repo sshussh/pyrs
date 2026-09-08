@@ -359,6 +359,7 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
         | Stmt::UnpackCheckMin { len: e, .. } => max_try_depth_in_expr(e),
         // `raise E` has no argument expression to walk.
         Stmt::Raise { message: None, .. } => 0,
+        Stmt::SysExit { code } => max_try_depth_in_expr(code),
         Stmt::IndexAssign { base, index, value } => max_try_depth_in_expr(base)
             .max(max_try_depth_in_expr(index))
             .max(max_try_depth_in_expr(value)),
@@ -398,6 +399,7 @@ fn max_try_depth_in_stmt(s: &Stmt) -> usize {
             sep,
             end,
             flush,
+            ..
         } => args
             .iter()
             .map(max_try_depth_in_expr)
@@ -663,6 +665,7 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
             sep,
             end,
             flush,
+            ..
         } => {
             args.iter().map(count_yields_in_expr).sum::<i64>()
                 + count_yields_in_expr(sep)
@@ -931,6 +934,8 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
+        out.push_str("declare void @pyrs_out_to_stderr(i64)\n");
+        out.push_str("declare void @pyrs_sys_exit(i64) noreturn\n");
         out.push_str("declare void @pyrs_raise(i32, ptr) noreturn\n");
         out.push_str("declare void @pyrs_raise_exc(ptr) noreturn\n");
         out.push_str("declare void @pyrs_reraise() noreturn\n");
@@ -3664,12 +3669,26 @@ impl Emitter {
                 // with phase=handler and runs finally.
                 self.emit_die(message);
             }
+            Stmt::SysExit { code } => {
+                let v = self.emit_expr(code);
+                let n = self.emit_unbox_i64(&v);
+                self.line(format!("call void @pyrs_sys_exit(i64 {n})"));
+                self.line("unreachable");
+                self.terminated = true;
+            }
             Stmt::Print {
                 args,
                 sep,
                 end,
                 flush,
+                to_stderr,
             } => {
+                // The destination is set for the duration of the call rather
+                // than passed to each print routine: they all funnel into one
+                // writer, and a capture (`str()` of a value) still wins.
+                if *to_stderr {
+                    self.line("call void @pyrs_out_to_stderr(i64 1)");
+                }
                 // Evaluate objects first (CPython), then sep/end/flush.
                 // Keyword side effects that must precede the other kw are
                 // already bound to temps in semantic.
@@ -3692,6 +3711,9 @@ impl Emitter {
                     let ext = self.tmp();
                     self.line(format!("{ext} = zext i1 {flush_v} to i32"));
                     self.line(format!("call void @pyrs_flush_if(i32 {ext})"));
+                }
+                if *to_stderr {
+                    self.line("call void @pyrs_out_to_stderr(i64 0)");
                 }
             }
             Stmt::Break => {

@@ -68,15 +68,6 @@ fn names(tag: &str, source: &str, expect: &[&str]) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_main_guard_explains_what_to_do_instead() {
-    names(
-        "main-guard",
-        "def main() -> None:\n    print(1)\n\n\nif __name__ == \"__main__\":\n    main()\n",
-        &["__name__", "main()"],
-    );
-}
-
-#[test]
 fn other_module_attributes_are_named_together() {
     names("file-attr", "print(__file__)\n", &["__file__", "module"]);
 }

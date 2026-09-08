@@ -741,6 +741,14 @@ pub enum Stmt {
         sep: Expr,
         end: Expr,
         flush: Expr,
+        /// `file=sys.stderr`. Only the two standard streams are expressible,
+        /// so this is a destination flag rather than a file value.
+        to_stderr: bool,
+    },
+    /// `sys.exit(code)` — flush and leave. Not an exception here, so it
+    /// cannot be caught.
+    SysExit {
+        code: Expr,
     },
     /// Abort with a runtime error message (exit code 1), or raise into a
     /// surrounding try frame when one is active.

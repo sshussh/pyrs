@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.124.0 — `__name__`, `sys.exit`, and `print(file=...)`
+
+```python
+import sys
+
+def main() -> None: ...
+
+if __name__ == "__main__":     # the most common idiom in Python
+    main()
+
+print("failed", file=sys.stderr)
+sys.exit(1)
+```
+
+None of that could be written before. `__name__` reported as an undefined
+name, and `sys` was `argv` and nothing else — so a program had no way to
+report failure on the right stream or with the right status.
+
+**`__name__` has a compile-time answer**, which is why it is the one module
+attribute that fits: the entry module is `"__main__"`, an imported one is its
+dotted import name. It resolves after locals and globals, so a user binding of
+the same name still shadows it — a test pins that.
+
+**`sys.exit(code)` flushes and leaves.** CPython raises `SystemExit`, which a
+bare `except` can catch; there is no exception object for it here, so this
+exits directly and the guide says so. The flush is not incidental: stdout is
+block-buffered when redirected, and exiting without one loses everything
+printed. A 200-line probe covers exactly that.
+
+**`print(file=sys.stderr)`** selects the stream. Only the two standard streams
+are expressible — there is no file object behind them — so this is a
+destination flag rather than a file value, and `file=f` for an `open()`ed file
+is refused with a message naming `f.write(...)` instead.
+
+The destination is set for the duration of one call rather than threaded
+through every print routine: they all funnel into a single writer, and a
+*capture* still wins, so `str()` and f-string interpolation of a value are
+unaffected. Two tests pin that — one that the flag does not leak into the next
+`print`, one that `str(xs)` is identical either way.
+
+11 differential tests in `cli/tests/module_and_streams.rs`, comparing stdout,
+stderr and exit status **separately** — a combined comparison would not test
+which stream anything went to. Plus a `module-and-streams` compatibility probe.
+
+One harness limitation found and recorded rather than worked around: the
+compatibility runner classifies a non-zero *oracle* exit as `oracle_error`, so
+a probe cannot assert a failing exit status. The probe exits 0 and the status
+itself is covered in the Rust suite.
+
 ## 0.123.0 — Unsupported features are named, not merely refused
 
 The guide has promised since it was written that "unsupported Python features

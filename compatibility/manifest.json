@@ -156,6 +156,13 @@
       "reason": "map and filter advance lazily on the cursor protocol; a filtered element is skipped, not paired"
     },
     {
+      "id": "module-and-streams",
+      "group": "core",
+      "file": "cases/module_and_streams.py",
+      "native": "pass",
+      "reason": "__name__ resolves, sys.exit sets the status after flushing, and print(file=) picks the stream"
+    },
+    {
       "id": "numpy-arrays",
       "file": "cases/numpy_arrays.py",
       "group": "science",
