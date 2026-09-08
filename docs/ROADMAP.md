@@ -505,6 +505,14 @@ documentation and the relevant gates.
       and made it slower — and string keys hash eight bytes at a time behind a
       `fmix64` finalizer, without which a word-at-a-time hash collides
       catastrophically on a `h & mask` bucket index. 314ms -> 282ms.
+- [ ] ~~Retain the collector's scratch buffers across passes.~~ **Tried and
+      reverted, 2026-09-08.** `ranges_push` is 15% of `objects`, and the array
+      does restart at capacity 64 and double its way to ~600k entries every
+      pass — but that is ~56 reallocations against 2.4M pushes, so removing the
+      regrowth measured at nothing (104ms vs 105ms A/B). The 15% is the pushes
+      themselves, one per live object per collection, which only a different
+      heap layout removes. Retaining the buffers would also have pinned the
+      high-water mark in resident memory, against the bounded-memory gate.
 - [ ] Replace the per-object `calloc` allocator. Every managed object is still
       an individual `calloc` on one global intrusive list. Left alone
       deliberately in 0.130: with the range table fixed, `objects` spends 25ms
