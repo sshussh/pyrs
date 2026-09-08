@@ -237,7 +237,7 @@ struct Emitter {
     /// Exception object of each active `except` handler, innermost last, so a
     /// bare `raise` re-raises the one its handler caught. Captured before
     /// `pyrs_exc_clear()`, which the handler prologue calls.
-    handler_exc: Vec<String>,
+    handler_exc: Vec<(String, bool)>,
     /// Current function return type (for try-return plumbing).
     fn_ret: Ty,
     /// Shared alloca for a pending return value while unwinding through finally.
@@ -966,7 +966,16 @@ impl Emitter {
         // setjmp must be called directly (not via a C wrapper): longjmp restores
         // to the setjmp call site. jmp_buf is the first field of PyrsExcFrame.
         // returns_twice is required so LLVM does not clobber the stack across longjmp.
-        out.push_str("declare i32 @setjmp(ptr) returns_twice\n");
+        //
+        // `_setjmp`, not `setjmp`. Naming a symbol in IR bypasses glibc's
+        // `#define setjmp(env) _setjmp(env)`, so the plain name binds to
+        // `__sigsetjmp(env, 1)` -- which saves the signal mask through an
+        // `rt_sigprocmask` syscall on entry and restores it on every longjmp.
+        // Measured on this machine: 85.0 ns/call against 1.8 ns for `_setjmp`.
+        // Nothing here wants the mask saved; the runtime pairs it with
+        // `_longjmp` so the save and restore forms match rather than relying
+        // on glibc's `__mask_was_saved` flag to bridge them.
+        out.push_str("declare i32 @_setjmp(ptr) returns_twice\n");
         out.push_str("declare void @pyrs_try_pop()\n");
         out.push_str("declare i32 @pyrs_exc_type()\n");
         out.push_str("declare ptr @pyrs_exc_message()\n");
@@ -1565,10 +1574,21 @@ impl Emitter {
         let pick_r = self.tmp();
         match left.ty {
             Ty::Int => {
-                let c = self.tmp();
-                self.line(format!("{c} = call i32 @pyrs_int_cmp(i64 {r}, i64 {l})"));
-                let pred = if is_max { "sgt" } else { "slt" };
-                self.line(format!("{pick_r} = icmp {pred} i32 {c}, 0"));
+                // `int_fast` keeps this one `call` line, so the caller's block
+                // and phi shape are unchanged -- which is what lets these
+                // hand-written loops use it at all.
+                let name = if is_max { "gt" } else { "lt" };
+                match self.int_fast(name) {
+                    Some(sym) => {
+                        self.line(format!("{pick_r} = call i1 {sym}(i64 {r}, i64 {l})"));
+                    }
+                    None => {
+                        let c = self.tmp();
+                        self.line(format!("{c} = call i32 @pyrs_int_cmp(i64 {r}, i64 {l})"));
+                        let pred = if is_max { "sgt" } else { "slt" };
+                        self.line(format!("{pick_r} = icmp {pred} i32 {c}, 0"));
+                    }
+                }
             }
             Ty::Float => {
                 // olt/ogt are false for NaN, so the left operand is kept
@@ -1660,11 +1680,18 @@ impl Emitter {
         let slot = self.tmp();
         self.line(format!("{slot} = load i64, ptr {addr}"));
         match (*elem, acc_ty) {
-            (Ty::Int, Ty::Int) => {
-                self.line(format!(
-                    "{acc_next} = call i64 @pyrs_int_add(i64 {acc}, i64 {slot})"
-                ));
-            }
+            (Ty::Int, Ty::Int) => match self.int_fast("add") {
+                Some(sym) => {
+                    self.line(format!(
+                        "{acc_next} = call i64 {sym}(i64 {acc}, i64 {slot})"
+                    ));
+                }
+                None => {
+                    self.line(format!(
+                        "{acc_next} = call i64 @pyrs_int_add(i64 {acc}, i64 {slot})"
+                    ));
+                }
+            },
             (Ty::Float, Ty::Float) => {
                 let v = self.tmp();
                 self.line(format!("{v} = bitcast i64 {slot} to double"));
@@ -1790,12 +1817,20 @@ impl Emitter {
         let pick = self.tmp();
         match *elem {
             Ty::Int => {
-                let c = self.tmp();
-                self.line(format!(
-                    "{c} = call i32 @pyrs_int_cmp(i64 {cur}, i64 {best})"
-                ));
-                let pred = if is_max { "sgt" } else { "slt" };
-                self.line(format!("{pick} = icmp {pred} i32 {c}, 0"));
+                let name = if is_max { "gt" } else { "lt" };
+                match self.int_fast(name) {
+                    Some(sym) => {
+                        self.line(format!("{pick} = call i1 {sym}(i64 {cur}, i64 {best})"));
+                    }
+                    None => {
+                        let c = self.tmp();
+                        self.line(format!(
+                            "{c} = call i32 @pyrs_int_cmp(i64 {cur}, i64 {best})"
+                        ));
+                        let pred = if is_max { "sgt" } else { "slt" };
+                        self.line(format!("{pick} = icmp {pred} i32 {c}, 0"));
+                    }
+                }
             }
             Ty::Float => {
                 let pred = if is_max { "ogt" } else { "olt" };
@@ -2951,7 +2986,7 @@ impl Emitter {
             .map(|(name, ty)| format!("{} %p.{name}", lty(*ty)))
             .collect::<Vec<_>>()
             .join(", ");
-        let emits_setjmp = self.body.contains("call i32 @setjmp(");
+        let emits_setjmp = self.body.contains("call i32 @_setjmp(");
         assert!(
             !emits_setjmp || try_depth > 0,
             "try-depth pre-scan missed an emitted setjmp"
@@ -3175,7 +3210,7 @@ impl Emitter {
             }
         }
         self.gen_frame = None;
-        let emits_setjmp = self.body.contains("call i32 @setjmp(");
+        let emits_setjmp = self.body.contains("call i32 @_setjmp(");
         assert!(
             !emits_setjmp || lexical_try_depth > 0,
             "generator try-depth pre-scan missed an emitted setjmp"
@@ -3465,7 +3500,7 @@ impl Emitter {
                     self.line(format!("{tframe} = call ptr @pyrs_try_push()"));
                     let jc = self.tmp();
                     self.line(format!(
-                        "{jc} = call i32 @setjmp(ptr {tframe}) returns_twice"
+                        "{jc} = call i32 @_setjmp(ptr {tframe}) returns_twice"
                     ));
                     let ok = self.tmp();
                     self.line(format!("{ok} = icmp eq i32 {jc}, 0"));
@@ -3591,11 +3626,12 @@ impl Emitter {
             Stmt::Reraise => {
                 // Semantic rejects a bare `raise` outside a handler, so the
                 // stack is non-empty here.
-                let obj = self
+                let handler = self
                     .handler_exc
-                    .last()
-                    .cloned()
+                    .last_mut()
                     .expect("bare raise outside an except handler");
+                handler.1 = true;
+                let obj = handler.0.clone();
                 if self.gen_frame.is_some() && self.tries.is_empty() {
                     let frame = self.gen_frame.clone().unwrap();
                     self.line(format!("call void @pyrs_gen_set_done(ptr {frame})"));
@@ -6099,7 +6135,7 @@ impl Emitter {
         let jc = self.tmp();
         // setjmp on the frame pointer — jmp_buf is the first field
         self.line(format!(
-            "{jc} = call i32 @setjmp(ptr {frame}) returns_twice"
+            "{jc} = call i32 @_setjmp(ptr {frame}) returns_twice"
         ));
         let ok = self.tmp();
         self.line(format!("{ok} = icmp eq i32 {jc}, 0"));
@@ -6197,13 +6233,22 @@ impl Emitter {
             self.start_block(&match_l);
             // Built before pyrs_exc_clear() below, which wipes the pending
             // exception: a bare `raise` in this handler re-raises this object.
+            //
+            // `pyrs_exc_object` allocates twice -- the object, and a PyrsStr
+            // rebuilt from the formatted message -- so a handler that neither
+            // binds a name nor re-raises should not pay for it. Rather than
+            // scanning the body for a bare `raise` (a traversal that could
+            // miss a statement kind), emit the call and let the body decide:
+            // if nothing reads it, the line is spliced back out below.
             let caught = self.tmp();
+            let caught_line = format!("  {caught} = call ptr @pyrs_exc_object()\n");
             self.line(format!("{caught} = call ptr @pyrs_exc_object()"));
-            self.handler_exc.push(caught);
+            self.handler_exc.push((caught.clone(), bind.is_some()));
             if let Some(name) = bind {
                 // Bind a first-class exception object (type tag + message).
-                let obj = self.tmp();
-                self.line(format!("{obj} = call ptr @pyrs_exc_object()"));
+                // The same one: a second call would allocate a second object
+                // with identical contents.
+                let obj = &caught;
                 // Generators store locals in the frame, not `%v.*` allocas.
                 if let (Some(frame), Some(idx)) = (
                     self.gen_frame.clone(),
@@ -6224,7 +6269,19 @@ impl Emitter {
             // Frame remains live so traps/raises in the handler longjmp here
             // with phase=1 and take hraise_l → finally.
             self.emit_block(hbody);
-            self.handler_exc.pop();
+            let (_, used) = self
+                .handler_exc
+                .pop()
+                .expect("handler_exc pushed on entry to this handler");
+            if !used {
+                // Nothing read the object. The temp is unique to this line, so
+                // removing it is exact.
+                let at = self
+                    .body
+                    .find(&caught_line)
+                    .expect("the emitted pyrs_exc_object line is still in the body");
+                self.body.replace_range(at..at + caught_line.len(), "");
+            }
             if !self.terminated {
                 self.emit_try_exit(TRY_EXIT_NORMAL, None);
             }

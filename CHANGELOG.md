@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.131.0 — A `try` stops making a syscall, and a caught exception stops allocating
+
+Four independent changes, each with a measurement behind it. `exceptions` goes
+**1.3x -> 6.3x**, and the corpus 9.4x -> **10.1x**.
+
+### Every `try` was making a syscall it never asked for
+
+The emitted IR declared `@setjmp`. Naming an ELF symbol in IR bypasses glibc's
+`#define setjmp(env) _setjmp(env)`, so it bound to `__sigsetjmp(env, 1)` — the
+variant that saves the signal mask through `rt_sigprocmask`, and whose
+`longjmp` pays a second syscall to restore it. Measured here, 400k calls each:
+
+```
+setjmp  (ELF, savemask=1):   33.99 ms    85.0 ns/call
+_setjmp (ELF, savemask=0):    0.73 ms     1.8 ns/call
+```
+
+The benchmark does 400k try entries and 171k longjmps, so ~33 ms of its 71 ms
+went to mask-saving alone. It now emits `@_setjmp`, and the runtime pairs it
+with `_longjmp` so the save and restore forms match rather than relying on
+glibc's `__mask_was_saved` to bridge them. **71 ms -> 31 ms.**
+
+### A caught exception built an object nobody read
+
+`pyrs_exc_object()` ran at *every* matched handler entry, and a second time when
+the handler bound a name. Each call GC-allocates twice — the object, and a
+`PyrsStr` rebuilt from the formatted message. Its only consumers are a bound
+name and a bare `raise`, so `except ValueError:` paid for two allocations it
+discarded, 171,429 times, and the resulting garbage forced ~19 collections.
+
+The emitter now writes the call speculatively and splices the line back out
+when the handler body never reads it, and binding reuses that one object rather
+than allocating a second. The decision is made by *actual use* rather than by
+scanning the body for a bare `raise` — a traversal over the statement enum
+could overlook a kind, and this cannot. **31 ms -> 14 ms**, and no collections
+at all.
+
+### `sum`, `min` and `max` were the last raw calls
+
+Four sites still emitted `pyrs_int_add` / `pyrs_int_cmp` directly, because they
+build their own loops with hand-written phi predecessors and predate 0.126.
+The inline helpers are one `call` line by design, so those phis stay valid.
+`sum`/`min`/`max` over 2M ints: 14 ms against CPython's 198 ms.
+
+### Comparing two ints allocated
+
+`int_read_mag` `xmalloc`'d a one-limb buffer **for a small operand**, so every
+mixed-operand compare, add, multiply and divide did two malloc/free pairs.
+`int_borrow_mag` writes that limb into a caller-supplied stack word instead.
+Eleven call sites converted; the two that hand the magnitude onward to
+something taking ownership — `to_twos`, and the negative branch of
+`pyrs_int_rshift`, where the transfer sits 25 lines below the read — now copy
+first. `int_read_mag` is deleted so no future caller picks up the allocating
+reader.
+
+Beyond the allocations, this is what makes `pyrs_int_cmp` and `pyrs_int_eq`
+provably non-allocating and non-trapping, which the next milestone needs before
+it can attribute them for LLVM.
+
 ## 0.130.0 — The collector stops sorting its heap on every pass
 
 `objects` ran at **0.7× CPython**. Turning the collector off with `PYRS_GC=none`

@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.130 |
+| Check | Result after 0.131 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1612 passed; none failed or ignored |
+| `cargo test --workspace` | 1621 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 6 skipped; compat 27 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.130.0` |
+| `pyrs --version` | `PyRs 0.131.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -452,9 +452,16 @@ documentation and the relevant gates.
       `longjmp`, so only a store inside a `try` now disqualifies one. A hot
       loop beside a cold validity check went 114ms -> 66ms. `exceptions` does
       not move, correctly: its loop body is inside the try.
-- [ ] Reduce the per-raise cost itself (`exceptions` at 1.1x). Each raise/catch
-      round trip costs about 525ns against CPython's 228ns — a try frame push,
-      a `setjmp`, and exception-object construction per iteration. Measured
+- [x] Reduce the per-raise cost (0.131). The emitted IR named `@setjmp`, which
+      bypasses glibc's `#define setjmp(env) _setjmp(env)` and bound to the
+      signal-mask-saving entry point — 85ns a call against 1.8ns, plus a
+      matching restore per longjmp. And `pyrs_exc_object()` ran at every
+      handler entry, allocating twice for a result only a bound name or a bare
+      `raise` reads. `exceptions` 1.3x -> 6.3x.
+- [ ] Reduce the remaining per-`try` cost. Each entry still `malloc`s a
+      240-byte `PyrsExcFrame`, pushes it onto two intrusive lists, and stores
+      four volatile control words; each raise `snprintf`s the message into a
+      static buffer that the caught path immediately strips again. Measured
       2026-09-08.
 - [x] Plumb `CodeGenOptLevel` and the target CPU (0.128). `-O` now reaches the
       backend, and `--target-cpu generic|native|<model>` (also `target-cpu` in

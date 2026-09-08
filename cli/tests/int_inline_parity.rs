@@ -220,6 +220,48 @@ fn boxing_round_trips_through_indexing() {
     );
 }
 
+/// Shifts and bitwise ops over the same boundary set.
+///
+/// These are not inlined — they are the check for `int_borrow_mag`, which
+/// replaced a reader that `xmalloc`'d a one-limb buffer even for a small
+/// operand. Two of its eleven call sites hand the borrowed magnitude onward
+/// to something that takes ownership (`to_twos`, and the negative branch of
+/// `pyrs_int_rshift` where the transfer sits 25 lines below the read), so
+/// they must copy first. Getting that wrong is a double free or a
+/// use-after-free, which is exactly what a bignum shift sweep surfaces.
+#[test]
+fn shifts_and_bitwise_across_the_small_boundary() {
+    parity(
+        "shifts",
+        "for i in range(n):\n\
+         \x20   a = vals[i]\n\
+         \x20   print(a, ~a, -a, a >> 1, a >> 64, a >> 200)\n\
+         \x20   for j in range(n):\n\
+         \x20       b = vals[j]\n\
+         \x20       print(a & b, a | b, a ^ b)\n\
+         \x20       if 0 <= b and b < 300:\n\
+         \x20           print(a << b, a >> b)\n",
+    );
+}
+
+/// `sum`, `min` and `max` build their own loops with hand-written phis, so
+/// they were the last sites still emitting raw `pyrs_int_add` / `pyrs_int_cmp`
+/// after 0.126 routed every other site through the inline helpers. The
+/// accumulator has to cross the small boundary correctly.
+#[test]
+fn aggregates_cross_the_small_boundary() {
+    parity(
+        "aggregate",
+        "print(sum(vals), min(vals), max(vals))\n\
+         acc: list[int] = []\n\
+         for i in range(n):\n\
+         \x20   acc.append(vals[i])\n\
+         \x20   print(sum(acc), min(acc), max(acc))\n\
+         \x20   for j in range(n):\n\
+         \x20       print(min(vals[i], vals[j]), max(vals[i], vals[j]))\n",
+    );
+}
+
 /// The fast paths must not change what the emitter does with block structure.
 /// `sum` and `min`/`max` build loop phis with hard-coded predecessors, and a
 /// generator keeps its locals in a heap frame; all three would produce invalid

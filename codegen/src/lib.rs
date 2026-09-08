@@ -286,7 +286,7 @@ mod tests {
             "generator synthesized try did not reserve the frame pointer: {ll}"
         );
         assert!(
-            ll.matches("call i32 @setjmp(").count() >= 2,
+            ll.matches("call i32 @_setjmp(").count() >= 2,
             "expected synthesized setjmp calls: {ll}"
         );
     }

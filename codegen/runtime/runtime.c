@@ -336,7 +336,12 @@ static void pyrs_run_cleanups(PyrsExcFrame *frame) {
 static _Noreturn void pyrs_jump_current(void) {
     PyrsExcFrame *frame = g_exc_frames;
     pyrs_run_cleanups(frame);
-    longjmp(frame->buf, 1);
+    /* `_longjmp`, matching the `_setjmp` the generated IR calls: neither saves
+     * nor restores the signal mask, which costs a syscall each way and which
+     * nothing here wants. Pairing them explicitly is also the POSIX-correct
+     * form -- glibc's `longjmp` would bridge the two via `__mask_was_saved`,
+     * but that is a glibc detail rather than a guarantee. */
+    _longjmp(frame->buf, 1);
 }
 
 static long long user_exc_index(int tag);
@@ -1103,28 +1108,42 @@ static long long int_from_sign_limbs(int sign, unsigned long long *limbs,
     return (long long)(uintptr_t)h;
 }
 
-/* Read magnitude; if *owned, caller frees the returned buffer. */
-static unsigned long long *int_read_mag(long long t, int *sign, long long *n,
-                                        int *owned) {
+/* Borrow the magnitude of `t` without allocating.
+ *
+ * A heap operand aliases its own limb array; a small operand's single limb is
+ * written into `scratch`, one word the *caller* owns. The returned pointer is
+ * therefore valid only for the caller's frame: any caller that hands it to
+ * something taking ownership (int_from_sign_limbs, to_twos' in-place negate)
+ * must int_copy_limbs first.
+ *
+ * The previous form xmalloc'd that one limb, so every mixed-operand compare,
+ * add, multiply and divide did two malloc/free pairs. Borrowing means a
+ * routine that only reads magnitudes cannot allocate, cannot collect and
+ * cannot fail -- which is also what makes pyrs_int_cmp safe to attribute.
+ *
+ * Zero is (*sign = 0, *n = 0, NULL): u_cmp never dereferences a zero-length
+ * side, and every caller tests sign before reading limbs. */
+static const unsigned long long *int_borrow_mag(long long t, int *sign,
+                                                long long *n,
+                                                unsigned long long *scratch) {
     if (pyrs_int_is_small(t)) {
         long long v = pyrs_int_small_val(t);
         if (v == 0) {
             *sign = 0;
             *n = 0;
-            *owned = 0;
             return NULL;
         }
         *sign = v < 0 ? -1 : 1;
         *n = 1;
-        *owned = 1;
-        unsigned long long *p = xmalloc(sizeof(unsigned long long));
-        p[0] = (unsigned long long)(v < 0 ? -v : v);
-        return p;
+        /* Negate in unsigned: |v| <= 2^62 today, and this stays correct if the
+         * small range ever widens to include LLONG_MIN. */
+        scratch[0] =
+            v < 0 ? 0ULL - (unsigned long long)v : (unsigned long long)v;
+        return scratch;
     }
-    PyrsInt *h = pyrs_int_heap_ptr(t);
+    const PyrsInt *h = pyrs_int_heap_ptr(t);
     *sign = h->sign;
     *n = h->nlimbs;
-    *owned = 0;
     return h->limbs;
 }
 
@@ -1658,26 +1677,20 @@ int pyrs_int_cmp(long long a, long long b) {
         long long bv = pyrs_int_small_val(b);
         return (av > bv) - (av < bv);
     }
-    int sa, sb, oa, ob;
+    /* Two scratch words: the operands must not share a slot. */
+    unsigned long long abuf, bbuf;
+    int sa, sb;
     long long na, nb;
-    unsigned long long *da = int_read_mag(a, &sa, &na, &oa);
-    unsigned long long *db = int_read_mag(b, &sb, &nb, &ob);
-    int r;
+    const unsigned long long *da = int_borrow_mag(a, &sa, &na, &abuf);
+    const unsigned long long *db = int_borrow_mag(b, &sb, &nb, &bbuf);
     if (sa != sb) {
-        r = sa < sb ? -1 : 1;
-    } else if (sa == 0) {
-        r = 0;
-    } else {
-        int uc = u_cmp(da, na, db, nb);
-        r = sa < 0 ? -uc : uc;
+        return sa < sb ? -1 : 1;
     }
-    if (oa) {
-        free(da);
+    if (sa == 0) {
+        return 0;
     }
-    if (ob) {
-        free(db);
-    }
-    return r;
+    int uc = u_cmp(da, na, db, nb);
+    return sa < 0 ? -uc : uc;
 }
 
 int pyrs_int_eq(long long a, long long b) {
@@ -1699,9 +1712,10 @@ int pyrs_int_float_cmp(long long integer, double value) {
     if (isinf(value)) {
         return value > 0 ? -1 : 1;
     }
-    int sign, owned;
+    unsigned long long dbuf;
+    int sign;
     long long n;
-    unsigned long long *digits = int_read_mag(integer, &sign, &n, &owned);
+    const unsigned long long *digits = int_borrow_mag(integer, &sign, &n, &dbuf);
     int float_sign = (value > 0) - (value < 0);
     int result;
     if (sign != float_sign) {
@@ -1742,9 +1756,6 @@ int pyrs_int_float_cmp(long long integer, double value) {
         if (sign < 0) {
             result = -result;
         }
-    }
-    if (owned) {
-        free(digits);
     }
     return result;
 }
@@ -1862,18 +1873,12 @@ long long pyrs_int_add(long long a, long long b) {
         }
         return pyrs_int_from_i64((long long)s); /* may still be in i64 */
     }
-    int sa, sb, oa, ob;
+    unsigned long long abuf, bbuf;
+    int sa, sb;
     long long na, nb;
-    unsigned long long *da = int_read_mag(a, &sa, &na, &oa);
-    unsigned long long *db = int_read_mag(b, &sb, &nb, &ob);
-    long long r = int_add_signed(sa, da, na, sb, db, nb);
-    if (oa) {
-        free(da);
-    }
-    if (ob) {
-        free(db);
-    }
-    return r;
+    const unsigned long long *da = int_borrow_mag(a, &sa, &na, &abuf);
+    const unsigned long long *db = int_borrow_mag(b, &sb, &nb, &bbuf);
+    return int_add_signed(sa, da, na, sb, db, nb);
 }
 
 long long pyrs_int_neg(long long a) {
@@ -1963,28 +1968,17 @@ long long pyrs_int_mul(long long a, long long b) {
         (void)mag;
         return int_from_sign_limbs(sign, limbs, n);
     }
-    int sa, sb, oa, ob;
+    unsigned long long abuf, bbuf;
+    int sa, sb;
     long long na, nb;
-    unsigned long long *da = int_read_mag(a, &sa, &na, &oa);
-    unsigned long long *db = int_read_mag(b, &sb, &nb, &ob);
+    const unsigned long long *da = int_borrow_mag(a, &sa, &na, &abuf);
+    const unsigned long long *db = int_borrow_mag(b, &sb, &nb, &bbuf);
     if (sa == 0 || sb == 0) {
-        if (oa) {
-            free(da);
-        }
-        if (ob) {
-            free(db);
-        }
         return pyrs_int_tag_small(0);
     }
     long long rn;
     unsigned long long *r = u_mul(da, na, db, nb, &rn);
     int sign = sa * sb;
-    if (oa) {
-        free(da);
-    }
-    if (ob) {
-        free(db);
-    }
     return int_from_sign_limbs(sign, r, rn);
 }
 
@@ -2104,19 +2098,15 @@ static void divmod_floor(long long a, long long b, long long *q_out,
     if (!pyrs_int_truth(b)) {
         pyrs_die("ZeroDivisionError: division by zero");
     }
-    int sa, sb, oa, ob;
+    /* Scratch lives to the end of the function: u_divmod reads through da/db. */
+    unsigned long long abuf, bbuf;
+    int sa, sb;
     long long na, nb;
-    unsigned long long *da = int_read_mag(a, &sa, &na, &oa);
-    unsigned long long *db = int_read_mag(b, &sb, &nb, &ob);
+    const unsigned long long *da = int_borrow_mag(a, &sa, &na, &abuf);
+    const unsigned long long *db = int_borrow_mag(b, &sb, &nb, &bbuf);
     if (sa == 0) {
         *q_out = pyrs_int_tag_small(0);
         *r_out = pyrs_int_tag_small(0);
-        if (oa) {
-            free(da);
-        }
-        if (ob) {
-            free(db);
-        }
         return;
     }
     unsigned long long *uq, *ur;
@@ -2145,12 +2135,6 @@ static void divmod_floor(long long a, long long b, long long *q_out,
     }
     *q_out = q;
     *r_out = r;
-    if (oa) {
-        free(da);
-    }
-    if (ob) {
-        free(db);
-    }
 }
 
 long long pyrs_int_floordiv(long long a, long long b) {
@@ -2205,13 +2189,11 @@ long long pyrs_int_pow(long long base, long long exp) {
             return pyrs_int_tag_small(1);
         }
         /* exp odd/even: look at low bit of exp */
-        int sa, oa;
+        unsigned long long dbuf;
+        int sa;
         long long na;
-        unsigned long long *d = int_read_mag(exp, &sa, &na, &oa);
+        const unsigned long long *d = int_borrow_mag(exp, &sa, &na, &dbuf);
         int odd = na > 0 && (d[0] & 1ULL);
-        if (oa) {
-            free(d);
-        }
         return odd ? pyrs_int_tag_small(-1) : pyrs_int_tag_small(1);
     }
     pyrs_die("ValueError: exponent too large");
@@ -2358,17 +2340,20 @@ static void to_twos(long long t, unsigned long long **limbs, long long *n,
                     int *neg_inf) {
     /* For bitwise, Python uses infinite two's complement.
      * Represent negative as bitwise not of (mag-1). */
-    int s, o;
+    /* The borrowed magnitude is handed onward and, for a negative, mutated in
+     * place -- so it is copied unconditionally rather than reused. */
+    unsigned long long mbuf;
+    int s;
     long long nn;
-    unsigned long long *mag = int_read_mag(t, &s, &nn, &o);
+    const unsigned long long *mag = int_borrow_mag(t, &s, &nn, &mbuf);
     if (s >= 0) {
-        *limbs = o ? mag : int_copy_limbs(mag, nn);
+        *limbs = int_copy_limbs(mag, nn);
         *n = nn;
         *neg_inf = 0;
         return;
     }
     /* negative: limbs = ~(mag - 1) = -mag in two's complement */
-    unsigned long long *m = o ? mag : int_copy_limbs(mag, nn);
+    unsigned long long *m = int_copy_limbs(mag, nn);
     /* m := m - 1 */
     unsigned long long borrow = 1;
     for (long long i = 0; i < nn; i++) {
@@ -2495,13 +2480,11 @@ long long pyrs_int_lshift(long long a, long long b) {
     if (sh == 0) {
         return a;
     }
-    int s, o;
+    unsigned long long mbuf;
+    int s;
     long long n;
-    unsigned long long *mag = int_read_mag(a, &s, &n, &o);
+    const unsigned long long *mag = int_borrow_mag(a, &s, &n, &mbuf);
     if (s == 0) {
-        if (o) {
-            free(mag);
-        }
         return pyrs_int_tag_small(0);
     }
     long long limb_shift = sh / 64;
@@ -2519,9 +2502,6 @@ long long pyrs_int_lshift(long long a, long long b) {
             carry = (unsigned long long)(v >> 64);
         }
         r[n + limb_shift] = carry;
-    }
-    if (o) {
-        free(mag);
     }
     return int_from_sign_limbs(s, r, rn);
 }
@@ -2546,16 +2526,14 @@ long long pyrs_int_rshift(long long a, long long b) {
         return pyrs_int_tag_small(v >> sh);
     }
     /* floor div by 2^sh for negatives */
-    int s, o;
+    unsigned long long mbuf;
+    int s;
     long long n;
-    unsigned long long *mag = int_read_mag(a, &s, &n, &o);
+    const unsigned long long *mag = int_borrow_mag(a, &s, &n, &mbuf);
     if (s >= 0) {
         long long limb_shift = sh / 64;
         int bit = (int)(sh % 64);
         if (limb_shift >= n) {
-            if (o) {
-                free(mag);
-            }
             return pyrs_int_tag_small(0);
         }
         long long rn = n - limb_shift;
@@ -2570,13 +2548,12 @@ long long pyrs_int_rshift(long long a, long long b) {
                 r[i] = (cur >> bit) | (next << (64 - bit));
             }
         }
-        if (o) {
-            free(mag);
-        }
         return int_from_sign_limbs(1, r, rn);
     }
-    /* negative: floor = -ceil(mag / 2^sh) = -( (mag + (2^sh - 1)) >> sh ) */
-    unsigned long long *mag_copy = o ? mag : int_copy_limbs(mag, n);
+    /* negative: floor = -ceil(mag / 2^sh) = -( (mag + (2^sh - 1)) >> sh ).
+     * int_from_sign_limbs takes ownership, so the borrowed magnitude is
+     * copied rather than handed over. */
+    unsigned long long *mag_copy = int_copy_limbs(mag, n);
     long long mag_t = int_from_sign_limbs(1, mag_copy, n);
     long long one = pyrs_int_lshift(pyrs_int_tag_small(1), b);
     long long adj = pyrs_int_sub(one, pyrs_int_tag_small(1));
@@ -2597,25 +2574,20 @@ static char *int_to_dec(long long t, long long *out_len) {
         *out_len = n;
         return s;
     }
-    int s, o;
+    unsigned long long mbuf;
+    int s;
     long long n;
-    unsigned long long *mag = int_read_mag(t, &s, &n, &o);
+    const unsigned long long *mag = int_borrow_mag(t, &s, &n, &mbuf);
     if (s == 0) {
         char *z = xmalloc(2);
         z[0] = '0';
         z[1] = '\0';
         *out_len = 1;
-        if (o) {
-            free(mag);
-        }
         return z;
     }
     /* repeated div by 10 */
     unsigned long long *tmp = int_copy_limbs(mag, n);
     long long tn = n;
-    if (o) {
-        free(mag);
-    }
     /* max digits: nlimbs * 20 + 2 */
     long long cap = tn * 20 + 4;
     char *digits = xmalloc((size_t)cap);
@@ -2650,24 +2622,19 @@ static char *int_to_base_str(long long t, int base, int upper, long long *out_le
     if (base == 10) {
         return int_to_dec(t, out_len);
     }
-    int s, o;
+    unsigned long long mbuf;
+    int s;
     long long n;
-    unsigned long long *mag = int_read_mag(t, &s, &n, &o);
+    const unsigned long long *mag = int_borrow_mag(t, &s, &n, &mbuf);
     if (s == 0) {
         char *z = xmalloc(2);
         z[0] = '0';
         z[1] = '\0';
         *out_len = 1;
-        if (o) {
-            free(mag);
-        }
         return z;
     }
     unsigned long long *tmp = int_copy_limbs(mag, n);
     long long tn = n;
-    if (o) {
-        free(mag);
-    }
     long long cap = tn * 64 + 4; /* worst: base 2 */
     char *digits = xmalloc((size_t)cap);
     long long nd = 0;
