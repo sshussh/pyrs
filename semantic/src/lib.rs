@@ -1535,6 +1535,98 @@ fn gen_exp_elem_ty(
     result
 }
 
+/// What a generator expression evaluates at creation, and how the body names
+/// it afterwards.
+struct GenExpHoist {
+    /// Parameters the synthesized generator function takes.
+    params: Vec<String>,
+    /// Temps in the enclosing scope holding each argument.
+    args: Vec<String>,
+    /// Statements binding those temps, emitted before the generator is made.
+    setup: Vec<ir::Stmt>,
+    /// The iterable as the body should write it, in terms of `params`.
+    iter: ast::Expr,
+}
+
+/// Evaluate a generator expression's outermost iterable at creation time.
+///
+/// Returns `None` only for an iterable that is neither a value nor a form
+/// this knows how to take apart; such an iterable stays in the body and is
+/// evaluated on first advance, which is the divergence this exists to avoid.
+fn hoist_genexp_iter(
+    iter: &ast::Expr,
+    iter_param: &str,
+    ctx: &mut FnCtx,
+) -> SResult<Option<GenExpHoist>> {
+    if let Ok(value) = lower_expr(iter, ctx) {
+        set_synth_param_ty(iter_param, value.ty);
+        let temp = ctx.fresh_temp("genexp.iter", value.ty);
+        return Ok(Some(GenExpHoist {
+            params: vec![iter_param.to_string()],
+            args: vec![temp.clone()],
+            setup: vec![ir::Stmt::Assign { name: temp, value }],
+            iter: ast::Expr {
+                kind: ast::ExprKind::Name(iter_param.to_string()),
+                span: iter.span,
+            },
+        }));
+    }
+
+    // `range(...)` is not a value, so hoist its operands and rebuild the call
+    // inside the body. Anything else is left where it is.
+    let ast::ExprKind::Call { func, args, .. } = &iter.kind else {
+        return Ok(Option::None);
+    };
+    if func != "range" || ctx.funcs().contains_key("range") {
+        return Ok(Option::None);
+    }
+    let Ok(plain) = require_plain_args(args, "range", iter.span) else {
+        return Ok(Option::None);
+    };
+    if plain.is_empty() || plain.len() > 3 {
+        return Ok(Option::None);
+    }
+
+    let mut hoist = GenExpHoist {
+        params: Vec::new(),
+        args: Vec::new(),
+        setup: Vec::new(),
+        iter: ast::Expr {
+            kind: ast::ExprKind::Name(String::new()),
+            span: iter.span,
+        },
+    };
+    let mut rebuilt = Vec::new();
+    for (i, arg) in plain.iter().enumerate() {
+        let value = lower_expr(arg, ctx)?;
+        let value = coerce(value, ir::Ty::Int, arg.span, "range() argument")?;
+        let param = format!("{iter_param}{i}");
+        set_synth_param_ty(&param, ir::Ty::Int);
+        let temp = ctx.fresh_temp("genexp.range", ir::Ty::Int);
+        hoist.setup.push(ir::Stmt::Assign {
+            name: temp.clone(),
+            value,
+        });
+        rebuilt.push(ast::PosArg::Pos(ast::Expr {
+            kind: ast::ExprKind::Name(param.clone()),
+            span: arg.span,
+        }));
+        hoist.params.push(param);
+        hoist.args.push(temp);
+    }
+    hoist.iter = ast::Expr {
+        kind: ast::ExprKind::Call {
+            func: "range".to_string(),
+            func_span: iter.span,
+            args: rebuilt,
+            keywords: Vec::new(),
+            kwargs: Option::None,
+        },
+        span: iter.span,
+    };
+    Ok(Some(hoist))
+}
+
 /// Lower `(elem for target in iter if cond ...)` to a synthesized nested
 /// generator function, then call it.
 ///
@@ -1575,24 +1667,18 @@ fn lower_gen_exp(
     let yield_ty = gen_exp_elem_ty(elem, generators, ctx)?;
     set_synth_yield_ty(&name, yield_ty);
 
-    // Not every iterable is a first-class value here -- `range(...)` is only
-    // legal as a `for` iterable, for one -- so try to lower it, and when that
-    // fails leave it inside the body where the loop handles it natively. The
-    // cost is that such an iterable is evaluated lazily rather than at
-    // creation; probing rather than enumerating keeps this correct as more
+    // CPython evaluates the *outermost* iterable when the generator
+    // expression is created, not on first advance. That is what this hoist
+    // is for, and it has two forms because not every iterable is a
+    // first-class value here.
+    //
+    // When it lowers, the whole thing becomes one argument. When it does not
+    // -- `range(...)` is the only such form left -- its **operands** are
+    // hoisted instead and the form is rebuilt inside the body from
+    // parameters, so `(x for x in range(bound()))` still calls `bound()` at
+    // creation. Probing rather than enumerating keeps this correct as more
     // iterables become values.
-    let hoisted: Option<(String, ir::Stmt)> = match lower_expr(&generators[0].iter, ctx) {
-        Ok(iter_ir) => {
-            set_synth_param_ty(&iter_param, iter_ir.ty);
-            let iter_t = ctx.fresh_temp("genexp.iter", iter_ir.ty);
-            let setup = ir::Stmt::Assign {
-                name: iter_t.clone(),
-                value: iter_ir,
-            };
-            Some((iter_t, setup))
-        }
-        Err(_) => Option::None,
-    };
+    let hoisted = hoist_genexp_iter(&generators[0].iter, &iter_param, ctx)?;
 
     // Innermost first: `yield elem`, wrapped by each clause's filters, then by
     // that clause's `for`, working outward.
@@ -1613,13 +1699,9 @@ fn lower_gen_exp(
                 span: cond.span,
             }];
         }
-        let iter = if i == 0 && hoisted.is_some() {
-            ast::Expr {
-                kind: ast::ExprKind::Name(iter_param.clone()),
-                span: clause.iter.span,
-            }
-        } else {
-            clause.iter.clone()
+        let iter = match (i, &hoisted) {
+            (0, Some(h)) => h.iter.clone(),
+            _ => clause.iter.clone(),
         };
         body = vec![ast::Stmt {
             kind: ast::StmtKind::For {
@@ -1634,16 +1716,16 @@ fn lower_gen_exp(
 
     let fd = ast::FuncDef {
         name: name.clone(),
-        params: if hoisted.is_some() {
-            vec![ast::Param {
-                name: iter_param,
+        params: hoisted
+            .iter()
+            .flat_map(|h| h.params.iter())
+            .map(|name| ast::Param {
+                name: name.clone(),
                 ty: Option::None,
                 span,
                 default: Option::None,
-            }]
-        } else {
-            Vec::new()
-        },
+            })
+            .collect(),
         vararg: Option::None,
         kwarg: Option::None,
         ret: Option::None,
@@ -1663,13 +1745,16 @@ fn lower_gen_exp(
             kind: ast::ExprKind::Call {
                 func: name,
                 func_span: span,
-                args: match &hoisted {
-                    Some((iter_t, _)) => vec![ast::PosArg::Pos(ast::Expr {
-                        kind: ast::ExprKind::Name(iter_t.clone()),
-                        span,
-                    })],
-                    Option::None => Vec::new(),
-                },
+                args: hoisted
+                    .iter()
+                    .flat_map(|h| h.args.iter())
+                    .map(|temp| {
+                        ast::PosArg::Pos(ast::Expr {
+                            kind: ast::ExprKind::Name(temp.clone()),
+                            span,
+                        })
+                    })
+                    .collect(),
                 keywords: Vec::new(),
                 kwargs: Option::None,
             },
@@ -1678,8 +1763,8 @@ fn lower_gen_exp(
         ctx,
     )?;
     let mut stmts = Vec::new();
-    if let Some((_, setup)) = hoisted {
-        stmts.push(setup);
+    if let Some(h) = hoisted {
+        stmts.extend(h.setup);
     }
     stmts.extend(inits);
     Ok(ir::Expr {

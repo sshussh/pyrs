@@ -344,3 +344,86 @@ fn enumerate_evaluates_the_iterable_before_the_start() {
          print(list(enumerate(seq(), start())))\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// A generator expression evaluates its outermost iterable at creation
+// ---------------------------------------------------------------------------
+//
+// The second half of the recorded defect. CPython calls `bound()` when the
+// genexp is *created*; PyRs left `range(bound())` inside the synthesized body
+// and called it on first advance. The iterable is now hoisted either whole
+// (when it is a value) or by its operands (when it is not, which today means
+// only `range`).
+
+#[test]
+fn a_generator_expression_evaluates_range_operands_at_creation() {
+    matches_python(
+        "genexp-creation",
+        "def bound() -> int:\n    print(\"bound\")\n    return 3\n\n\n\
+         g = (x for x in range(bound()))\n\
+         print(\"created\")\n\
+         print(list(g))\n",
+    );
+}
+
+#[test]
+fn every_range_operand_is_evaluated_once_and_in_order() {
+    matches_python(
+        "genexp-range-operands",
+        "def lo() -> int:\n    print(\"lo\")\n    return 1\n\n\n\
+         def hi() -> int:\n    print(\"hi\")\n    return 6\n\n\n\
+         def by() -> int:\n    print(\"by\")\n    return 2\n\n\n\
+         g = (x for x in range(lo(), hi(), by()))\n\
+         print(\"created\")\n\
+         print(list(g))\n",
+    );
+}
+
+#[test]
+fn a_genexp_that_is_never_advanced_still_evaluated_its_iterable() {
+    // The observable difference between "at creation" and "on first
+    // advance": nothing consumes the generator at all.
+    matches_python(
+        "genexp-unused",
+        "def bound() -> int:\n    print(\"bound\")\n    return 3\n\n\n\
+         g = (x for x in range(bound()))\n\
+         print(\"done\")\n",
+    );
+}
+
+#[test]
+fn a_value_iterable_is_still_hoisted_whole() {
+    // The pre-existing path must keep working: one parameter, bound to the
+    // whole iterable, evaluated once.
+    matches_python(
+        "genexp-value",
+        "def seq() -> list[int]:\n    print(\"seq\")\n    return [1, 2, 3]\n\n\n\
+         g = (x * 2 for x in seq())\n\
+         print(\"created\")\n\
+         print(list(g))\n",
+    );
+}
+
+#[test]
+fn a_nested_genexp_clause_is_still_evaluated_lazily() {
+    // Only the *outermost* iterable is eager; inner clauses are re-evaluated
+    // per outer element, as CPython does.
+    matches_python(
+        "genexp-inner",
+        "def inner(n: int) -> list[int]:\n    print(\"inner\", n)\n    return [n, n]\n\n\n\
+         g = (y for x in range(2) for y in inner(x))\n\
+         print(\"created\")\n\
+         print(list(g))\n",
+    );
+}
+
+#[test]
+fn a_genexp_over_range_is_still_lazy_in_its_elements() {
+    // Hoisting the operands must not make the range itself materialize: this
+    // would be a billion-element list if it did.
+    matches_python(
+        "genexp-lazy-elements",
+        "g = (x for x in range(1000000000))\n\
+         print(next(g), next(g), next(g))\n",
+    );
+}

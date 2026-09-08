@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.119 |
+| Check | Result after 0.120 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1520 passed; none failed or ignored |
+| `cargo test --workspace` | 1526 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
 | `make compatibility` | native 69 pass / 6 skipped; compat 23 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.119.0` |
+| `pyrs --version` | `PyRs 0.120.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -105,7 +105,7 @@ why correctness rather than new capability sets the near-term order.
 | `e.args` display | `('z',)` | `['z']` | open — see below |
 | `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | `(1, 2)`, `[1, 2]` | **closed in 0.108** |
 | `list(zip(infinite(), [1]))` | `[(0, 1)]` | `[(0, 1)]` | **closed in 0.119** |
-| `(x for x in range(bound()))` | `bound()` at creation | `bound()` at first iteration | open — see below |
+| `(x for x in range(bound()))` | `bound()` at creation | `bound()` at creation | **closed in 0.120** |
 | `"ΟΣ".lower()` | `ος` | `ος` | **closed in review** |
 | `"{0} {0}".format(side())` | one call | one call | **closed in review** |
 | `print([e])` for a caught `e` | `[ValueError('x')]` | `[ValueError('x')]` | **closed in review** |
@@ -198,10 +198,17 @@ element, test for whether one appeared)* — after which `zip` is those pairs
 nested inside each other, so component *k+1* is only advanced when component
 *k* produced. `for`, comprehensions and the eager consumers now share it.
 
-The second row needs `range` and `zip` to be **values**, not just iteration
-forms; the genexp hoist at `semantic/src/lib.rs` already prefers the eager
-path and falls back only when `lower_expr` fails, so reifying those calls
-closes it without touching the genexp lowering at all.
+**0.120 closed the second.** It needed less than expected. The hoist already
+preferred the eager path and fell back only when `lower_expr` failed, and by
+then `range(...)` was the only iterable still taking that branch. Rather than
+making `range` a first-class value — which needs a reified iterator — the
+hoist gained a second form: when the iterable is not a value, its *operands*
+are hoisted and the form is rebuilt inside the synthesized body from
+parameters. `(x for x in range(bound()))` now calls `bound()` at creation
+while the range itself stays lazy, so `range(1000000000)` still costs
+nothing.
+
+Iterators as values remain open, and are what `it = zip(a, b)` needs.
 
 ## Product contract
 

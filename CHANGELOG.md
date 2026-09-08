@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.120.0 — A generator expression evaluates its outermost iterable at creation
+
+The second half of the paired defect closes, and release gate 2's list is
+down to the two exception-display rows.
+
+```python
+g = (x for x in range(bound()))   # CPython calls bound() here
+print("created")                  # PyRs called it on the first advance
+```
+
+**How it was fixed, and why it was smaller than expected.** The hoist that
+makes the outermost iterable eager already existed: it lowers the iterable,
+binds it to a temp, and passes it to the synthesized generator function as a
+real argument. It fell back to leaving the iterable in the body only when
+`lower_expr` failed — and by 0.119 exactly one iterable still took that
+branch, `range(...)`, which is a loop form rather than a value.
+
+The obvious fix is to make `range` a first-class value, which needs a reified
+iterator object. The cheaper one is to notice that a `range` call has nothing
+to evaluate *except its operands*: constructing it has no other side effect.
+So the hoist gained a second form — when the iterable is not a value, hoist
+its **operands** and rebuild the call inside the body from parameters:
+
+```text
+(x for x in range(lo(), hi()))
+    setup:  t0 = lo(); t1 = hi()          # at creation, left to right
+    body:   def .genexp(p0, p1): for x in range(p0, p1): yield x
+    call:   .genexp(t0, t1)
+```
+
+The range itself stays lazy, so `(x for x in range(1000000000))` still costs
+nothing — a test asserts that by taking three elements from it. Only the
+outermost clause is eager; inner clauses are re-evaluated per outer element,
+as CPython does.
+
+[docs/GUIDE.md](docs/GUIDE.md) already stated this behaviour, so the
+documentation was correct and the implementation was not. No doc change; the
+claim is simply true now.
+
+Six more differential tests in `cli/tests/lazy_iteration.rs` (24 total),
+including the case nothing consumes — the only way to observe "at creation"
+versus "on first advance" directly — and the `lazy-iteration` compatibility
+probe covers both halves under GC stress.
+
 ## 0.119.0 — Lazy `zip` and `enumerate`, and the range operand order
 
 Two measured defects close. Both were silent wrong answers in the supported

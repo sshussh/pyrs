@@ -42,3 +42,17 @@ def hi() -> int:
 
 for i in range(lo(), hi()):
     print("i", i)
+
+
+# A generator expression evaluates its outermost iterable at creation.
+def edge() -> int:
+    print("edge")
+    return 3
+
+
+gen = (x for x in range(edge()))
+print("created")
+print(list(gen))
+
+unused = (x for x in range(edge()))
+print("unused made")
