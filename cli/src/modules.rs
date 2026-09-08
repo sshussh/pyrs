@@ -48,6 +48,41 @@ pub struct Loaded {
     pub deps: Vec<String>,
 }
 
+/// A standard-library module PyRs knows about and does not ship.
+///
+/// `No module named 're'` is indistinguishable from a typo, and reads as
+/// though the module might appear if something were installed. Naming the
+/// situation — and pointing at `--compat`, which does run these — is the
+/// difference between a dead end and a next step.
+fn unshipped_module(name: &str) -> Option<&'static str> {
+    // The top-level package decides: `os.path` ships, `collections.abc` is
+    // annotation-only, and `xml.etree` is as absent as `xml`.
+    let top = name.split('.').next().unwrap_or(name);
+    let note = match top {
+        "re" => "regular expressions",
+        "collections" => "collections (deque, Counter, defaultdict, namedtuple)",
+        "itertools" => "itertools",
+        "functools" => "functools (lru_cache, partial, reduce)",
+        "datetime" | "time" | "calendar" | "zoneinfo" => "dates and times",
+        "random" | "secrets" => "random number generation",
+        "dataclasses" | "enum" | "abc" => "class-generation helpers",
+        "pathlib" | "shutil" | "glob" | "tempfile" => "filesystem helpers beyond os.path",
+        "argparse" | "optparse" | "getopt" => "argument parsing (sys.argv is available)",
+        "csv" | "sqlite3" | "pickle" | "configparser" | "base64" => "data formats beyond json",
+        "logging" => "logging",
+        "subprocess" | "multiprocessing" | "threading" | "asyncio" | "socket" => {
+            "processes, threads and sockets"
+        }
+        "typing" | "dataclasses_json" => return Option::None,
+        "unittest" | "pytest" => "test frameworks (`pyrs test` runs test_*.py natively)",
+        "decimal" | "fractions" | "statistics" | "numpy" | "pandas" => {
+            "numeric libraries beyond math"
+        }
+        _ => return Option::None,
+    };
+    Some(note)
+}
+
 /// A load failure, rendered against the right file and — when it has a
 /// source position — still structured, so `--message-format=json` can give
 /// an editor a span rather than prose to parse.
@@ -354,11 +389,17 @@ impl LoadState {
                 }
                 None => {
                     let (display, source) = self.importer_context(importer);
-                    let d = Diagnostic::new(
-                        common::Phase::Load,
-                        format!("No module named '{name}'"),
-                        span,
-                    );
+                    let message = match unshipped_module(name) {
+                        Some(note) => format!(
+                            "No module named '{name}': PyRs ships a small \
+                             pure-PyRs standard library (os.path, math, a typed \
+                             json subset, sys.argv) and does not implement \
+                             {note} yet. `pyrs run --compat` runs the program \
+                             under CPython, where it is available"
+                        ),
+                        None => format!("No module named '{name}'"),
+                    };
+                    let d = Diagnostic::new(common::Phase::Load, message, span);
                     return Err(LoadError::at(&d, &display, &source));
                 }
             }

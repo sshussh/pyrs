@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.123.0 — Unsupported features are named, not merely refused
+
+The guide has promised since it was written that "unsupported Python features
+produce parse/semantic errors that name the feature". For the most common
+ones they did not:
+
+| Written | Reported before | Reported now |
+|---|---|---|
+| `if __name__ == "__main__":` | `name '__name__' is not defined` | names `__name__`, and points at the zero-parameter `main()` convention |
+| `eval("1")` | `function 'eval' is not defined` | says PyRs is closed-world and points at `--compat` |
+| `bytes([1])` | `function 'bytes' is not defined` | says `str` is UTF-8 text and there is no binary sequence type |
+| `type(x)` | `function 'type' is not defined` | says classes are not first-class, use `isinstance` |
+| `TypeVar("T")` | `function 'TypeVar' is not defined` | says generics have no meaning in a monomorphic subset |
+| `raise X from Y` | `expected end of line after statement, found 'from'` | names exception chaining and why `__cause__` is absent |
+| `async def f():` | `expected an expression, found 'async'` | names async/await and says it is not a compiler change alone |
+| `import re` | `No module named 're'` | names what is missing and that `--compat` runs it |
+
+`__name__` was the worst of them: the single most common idiom in Python,
+reported as though the name were a typo.
+
+Also covered: `exec`, `compile`, `__import__`, `getattr`/`setattr`/`hasattr`/
+`delattr`/`vars`/`dir`, `globals`/`locals`, `callable`/`issubclass`,
+`bytearray`/`memoryview`, `complex`, `frozenset`, `slice`, `id`/`hash`,
+`iter`, `ParamSpec`, `NamedTuple`/`TypedDict`/`dataclass`, `__file__`/
+`__package__`/`__doc__`, `__slots__`, `__dict__`, and every standard-library
+package PyRs does not ship — `collections`, `itertools`, `functools`,
+`datetime`, `random`, `pathlib`, `argparse`, `csv`, `logging`, `subprocess`,
+`threading`, `asyncio`, `decimal`, `unittest` and their submodules.
+
+**The half that matters more is that typos are still typos.** A table that
+swallowed real misspellings would be a worse compiler, not a better one, so
+five tests assert that `lenght(...)`, `xx`, `import nonexistent_thing` and
+`x: itn` still get the plain "is not defined" message — and that a
+missing-module typo is *not* advertised as a missing feature.
+
+18 tests in `cli/tests/feature_diagnostics.rs`. The README claim 0.118 had to
+soften is tightened back, because it is now true.
+
 ## 0.122.0 — `map` and `filter`
 
 Neither existed; both are among the most-missed absent builtins. They are

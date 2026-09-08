@@ -1818,6 +1818,12 @@ this is a list — a documented divergence, since `args` holds 0 or 1 elements
 decided at run time and tuples here are fixed-arity; dict/set of exceptions
 not yet.
 
+Each of these is reported by a diagnostic that names the feature and says
+what to use instead or that `--compat` runs it — `eval`, `bytes`, `type`,
+`getattr`, `TypeVar`, `__name__`, `__slots__`, `raise X from Y`,
+`async`/`await`, and every standard-library module PyRs does not ship. A
+genuine typo still gets the plain "is not defined" message.
+
 Not implemented yet (clear compile errors): full class dynamism (see
 [Classes](#classes) residuals), a moving generational/Immix GC backend,
 f-string debug form `{x=}` / grouping / types `n`/`c`, unparenthesized

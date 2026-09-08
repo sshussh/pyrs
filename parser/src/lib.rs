@@ -193,6 +193,16 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> PResult<Stmt> {
+        // The lexer produces `async` and `await`, but no rule consumes them, so
+        // without this they surface as "expected an expression, found 'async'"
+        // — a message about a token rather than about the feature.
+        if matches!(self.peek(), Token::Async | Token::Await) {
+            return Err(self.error(
+                "async and await are not supported: there is no event loop or \
+                 coroutine type here, and adding one is not a compiler change \
+                 alone. Write the function synchronously, or use --compat",
+            ));
+        }
         // Leading decorators: `@deco` lines then `def` (class methods / free funcs).
         if self.peek() == &Token::At {
             let decorators = self.parse_decorators()?;
@@ -962,6 +972,21 @@ impl Parser {
         })
     }
 
+    /// `raise X from Y` reported `expected end of line after statement, found
+    /// 'from'`, which names the token rather than the feature. Exception
+    /// chaining needs `__cause__` on the exception object, which does not
+    /// exist yet.
+    fn reject_raise_from(&mut self) -> PResult<()> {
+        if self.peek() == &Token::From {
+            return Err(self.error(
+                "exception chaining (`raise X from Y`) is not supported yet: \
+                 an exception carries its type and one argument, with no \
+                 __cause__ to attach. Raise X on its own",
+            ));
+        }
+        Ok(())
+    }
+
     fn parse_raise(&mut self) -> PResult<Stmt> {
         let start = self.expect(Token::Raise, "")?;
         // Bare `raise` re-raises whatever the enclosing handler caught.
@@ -976,6 +1001,7 @@ impl Parser {
         // first two supply no argument at all, which is not the same as an
         // empty one: CPython reprs them `E()` and `E('')` respectively.
         if !self.eat(&Token::LParen) {
+            self.reject_raise_from()?;
             return Ok(Stmt {
                 kind: StmtKind::Raise { exc, message: None },
                 span: start.to(exc_span),
@@ -984,6 +1010,7 @@ impl Parser {
         if self.peek() == &Token::RParen {
             let close = self.peek_span();
             self.advance();
+            self.reject_raise_from()?;
             return Ok(Stmt {
                 kind: StmtKind::Raise { exc, message: None },
                 span: start.to(close).to(exc_span),
@@ -991,6 +1018,7 @@ impl Parser {
         }
         let message = self.parse_expr()?;
         let close = self.expect(Token::RParen, "after raise argument")?;
+        self.reject_raise_from()?;
         Ok(Stmt {
             kind: StmtKind::Raise {
                 exc,
@@ -2498,6 +2526,13 @@ impl Parser {
             }
             Token::Lambda => self.parse_lambda(span),
             Token::Yield => self.parse_yield_expr(),
+            // `await` reaches here rather than the statement head when it
+            // appears mid-expression, e.g. `x = await g()`.
+            Token::Async | Token::Await => Err(self.error(
+                "async and await are not supported: there is no event loop or \
+                 coroutine type here, and adding one is not a compiler change \
+                 alone. Write the function synchronously, or use --compat",
+            )),
             other => Err(self.error(format!(
                 "expected an expression, found {}",
                 other.describe()

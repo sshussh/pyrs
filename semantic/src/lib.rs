@@ -611,6 +611,111 @@ thread_local! {
     static SYNTH_PARAM_TYS: RefCell<HashMap<String, ir::Ty>> = RefCell::new(HashMap::new());
 }
 
+/// A Python feature PyRs knows about and does not support.
+///
+/// [docs/GUIDE.md](../../docs/GUIDE.md) promises that "unsupported Python
+/// features produce parse/semantic errors that name the feature". For the
+/// most common ones they did not: `eval(x)` reported `function 'eval' is not
+/// defined`, indistinguishable from a typo, and
+/// `if __name__ == "__main__":` — the single most common idiom in Python —
+/// reported `name '__name__' is not defined`.
+///
+/// Each entry says what the feature is and what to do instead. The fallback
+/// messages stay for genuine typos, which is most of what they see.
+fn unsupported_feature(name: &str) -> Option<&'static str> {
+    Some(match name {
+        // Dynamism the closed-world model rules out entirely.
+        "eval" | "exec" => {
+            "eval() and exec() are not supported: PyRs is closed-world and \
+             compiles ahead of time, so there is no interpreter to run a \
+             string. Run the program with --compat if it needs one"
+        }
+        "compile" | "__import__" => {
+            "runtime compilation and dynamic import are not supported: PyRs \
+             resolves the whole import graph at compile time. Use --compat"
+        }
+        "getattr" | "setattr" | "hasattr" | "delattr" | "vars" | "dir" => {
+            "attribute reflection is not supported: instance fields are \
+             resolved statically, so an attribute named at run time cannot be \
+             looked up. Use a dict, or --compat"
+        }
+        "globals" | "locals" => {
+            "globals() and locals() are not supported: there is no name table \
+             at run time. Pass the values you need as arguments"
+        }
+        "type" => {
+            "type() is not supported: classes are not first-class values \
+             here. Use isinstance(x, C) to test, or a field for a tag"
+        }
+        "callable" | "issubclass" => {
+            "callable() and issubclass() are not supported: they need \
+             first-class class and function objects, which this subset does \
+             not have"
+        }
+        // Types with no representation yet.
+        "bytes" | "bytearray" | "memoryview" => {
+            "bytes, bytearray and memoryview are not supported yet: str is \
+             UTF-8 text and there is no binary sequence type. Text files and \
+             str cover most uses; otherwise --compat"
+        }
+        "complex" => "complex numbers are not supported yet: int and float only",
+        "frozenset" => {
+            "frozenset is not supported yet: use a set, which is not hashable \
+             here either, or a sorted tuple as a key"
+        }
+        "slice" => {
+            "slice objects are not supported: write the slice inline, as \
+             xs[a:b], rather than building one"
+        }
+        // Typing constructs that are annotation-only or absent.
+        "TypeVar" | "ParamSpec" | "TypeVarTuple" => {
+            "generics are not supported: TypeVar has no meaning in a \
+             monomorphic subset. A parameter's type is inferred from the body \
+             when it is unambiguous"
+        }
+        "NamedTuple" | "TypedDict" | "dataclass" => {
+            "NamedTuple, TypedDict and dataclasses are not supported yet: \
+             declare a class with annotated fields assigned in __init__"
+        }
+        "id" | "hash" => {
+            "id() and hash() are not supported: object identity is not \
+             stable here and there is no general hash protocol"
+        }
+        "iter" => {
+            "iter() is not supported yet: iterate directly with a for loop, \
+             or use next() on a generator"
+        }
+        "open_binary" | "breakpoint" | "help" | "input_raw" => return Option::None,
+        _ => return Option::None,
+    })
+}
+
+/// The module-level names that are Python's but not values here.
+fn unsupported_dunder(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__name__" => {
+            "__name__ is not supported yet, so `if __name__ == \"__main__\":` \
+             cannot be written. A file whose top level is only definitions \
+             runs its zero-parameter `main()` automatically; otherwise put the \
+             code at the top level, which only runs when the file is the entry \
+             point"
+        }
+        "__file__" | "__package__" | "__doc__" | "__spec__" => {
+            "module attributes like __file__ and __package__ are not \
+             supported yet: there is no module object at run time"
+        }
+        "__slots__" => {
+            "__slots__ is not supported: every class already has a fixed set \
+             of fields, declared by assignment in __init__"
+        }
+        "__dict__" => {
+            "__dict__ is not supported: instance fields are resolved \
+             statically and there is no attribute dictionary"
+        }
+        _ => return Option::None,
+    })
+}
+
 fn set_synth_param_ty(name: &str, ty: ir::Ty) {
     SYNTH_PARAM_TYS.with(|m| m.borrow_mut().insert(name.to_string(), ty));
 }
@@ -861,7 +966,11 @@ fn resolve_type_checked(ty: ast::TypeName, span: Span) -> SResult<ir::Ty> {
         ast::TypeName::Class(name) => {
             let Some(id) = lookup_class(name) else {
                 return Err(err(
-                    format!("unknown type '{name}' (not a builtin or defined class)"),
+                    unsupported_feature(name)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            format!("unknown type '{name}' (not a builtin or defined class)")
+                        }),
                     span,
                 ));
             };
@@ -2336,6 +2445,12 @@ fn collect_class_asts<'a>(modules: &'a [ModuleInput<'a>]) -> SResult<Vec<ClassAs
                                 )
                                 .with_file(i));
                             };
+                            // A dunder in a class body is a language feature
+                            // rather than a constant, so name it as one
+                            // whatever value it was given.
+                            if let Some(note) = unsupported_dunder(name) {
+                                return Err(err(note, value.span).with_file(i));
+                            }
                             let Some(ty) = class_const_literal_ty(value) else {
                                 return Err(err(
                                     format!(
@@ -14778,7 +14893,13 @@ fn lower_aug_assign(
                 match ctx.globals.get(name) {
                     Some(&t) => (t, true),
                     Option::None => {
-                        return Err(err(format!("name '{name}' is not defined"), *name_span));
+                        return Err(err(
+                            unsupported_dunder(name)
+                                .or_else(|| unsupported_feature(name))
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("name '{name}' is not defined")),
+                            *name_span,
+                        ));
                     }
                 }
             } else if ctx.globals.contains_key(name) {
@@ -14791,7 +14912,13 @@ fn lower_aug_assign(
                     *name_span,
                 ));
             } else {
-                return Err(err(format!("name '{name}' is not defined"), *name_span));
+                return Err(err(
+                    unsupported_dunder(name)
+                        .or_else(|| unsupported_feature(name))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("name '{name}' is not defined")),
+                    *name_span,
+                ));
             };
             let left = ir::Expr {
                 ty: current_ty,
@@ -17186,7 +17313,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     expr.span,
                 ))
             } else {
-                Err(err(format!("name '{name}' is not defined"), expr.span))
+                Err(err(
+                    unsupported_dunder(name)
+                        .or_else(|| unsupported_feature(name))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("name '{name}' is not defined")),
+                    expr.span,
+                ))
             }
         }
         ast::ExprKind::ListLit(items) => lower_list_lit(items, None, expr.span, ctx),
@@ -22352,7 +22485,12 @@ fn lower_call(
                     func_span,
                 ))
             }
-            _ => Err(err(format!("function '{func}' is not defined"), func_span)),
+            _ => Err(err(
+                unsupported_feature(func)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("function '{func}' is not defined")),
+                func_span,
+            )),
         }
     }
 }

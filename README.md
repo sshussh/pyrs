@@ -32,15 +32,15 @@ unmodified.
 **It is not a CPython replacement.** The subset is statically typed and
 closed-world. There is no `eval`, no monkey-patching, no metaclasses, and the
 standard library is a small pure-PyRs core rather than a port. Code outside
-the subset is rejected at compile time, before any of it runs, and is never
-silently mistranslated.
+the subset is rejected at compile time, before any of it runs, with a
+diagnostic naming the feature — never silently mistranslated.
 
 **It is pre-1.0 and under active development.** Version numbers advance by
 milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.122.0**.
+Current milestone: **v0.123.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -128,9 +128,8 @@ In outline, the subset covers:
 
 ## What it does not do
 
-Rejected at compile time — always before any user code runs, never
-mistranslated. Some are named by their diagnostic; the rest currently report
-as an undefined name or a parse error, and are being given named messages:
+Rejected at compile time, with a diagnostic naming the feature and saying
+what to do instead — always before any user code runs, never mistranslated:
 
 - **Dynamism** — `eval`/`exec`, monkey-patching, metaclasses, `__slots__`,
   `__new__`, open `__dict__`, class decorators, first-class class values
@@ -235,7 +234,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.122.0 && git push origin v0.122.0`.
+Release tags: `git tag v0.123.0 && git push origin v0.123.0`.
 
 ## Documentation
 
