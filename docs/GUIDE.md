@@ -1140,10 +1140,10 @@ print(isinstance(d, Animal))  # True
 - Class names as type annotations (`def f(p: Point)`)
 - **`__str__` / `__repr__`** (must return `str`): used by `print` and
   `str()` with virtual dispatch (per runtime class); fallback is still
-  `<Name object>`. **A container of instances does not reach them** —
-  `print([obj])` renders `<Name object>` per element, because container
-  elements are formatted from a numeric type tag with no hook back into
-  user code (see [§9](#9-differences-from-cpython))
+  `<Name object>`. A **container** of instances renders each element with
+  `__repr__` specifically, never `__str__` — `print([x])` where `x` has both
+  uses repr, matching CPython — through a per-class function-pointer table
+  the compiled program registers with the runtime
 - **Arithmetic, bitwise and unary operators** (0.135):
   `__add__ __sub__ __mul__ __matmul__ __truediv__ __floordiv__ __mod__
   __pow__`, `__and__ __or__ __xor__ __lshift__ __rshift__`,
@@ -1743,12 +1743,6 @@ deliberate exceptions:
    cleanup. See [Garbage collection](GC.md) for architecture and diagnostics.
 9a. **Default object print/str** is `<ClassName object>` without a
     memory address (CPython prints `<__main__.Name object at 0x…>`).
-9b. **A container of class instances ignores `__repr__`.** `print(obj)`
-    dispatches correctly, but `print([obj])`, `str((obj,))` and the like
-    render each element as `<Name object>`. Container elements are formatted
-    from a numeric type tag in the runtime, which has no way to call back
-    into a user method. Print the elements individually until this is
-    closed.
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
 11. **Narrowing is limited** — `if x is not None:` / `is None` / `not`,

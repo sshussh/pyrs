@@ -81,12 +81,21 @@ answer, and it is the reason the array type can be a library.
 where CPython returns the character count, so `f.write("héllo")` gave 6 instead
 of 5 — a silent parity break in already-supported surface. Now `cplen`.
 
-**A container of instances ignores `__repr__`.** `print(obj)` is correct, but
-`print([obj])` renders `<Name object>`: container elements are formatted from a
-numeric type tag with no hook back into user code. Pre-existing, and confirmed
-against 0.134 rather than assumed. Recorded in the README divergence list and
-pinned in `scripts/coverage_probe.py`; the fix is its own work, and it matters
-for the data path because printing a frame of rows hits it.
+**A container of instances ignored `__repr__`.** `print(obj)` was correct, but
+`print([obj])` rendered `<Name object>`: the runtime formats container elements
+from a numeric type tag and had no way back into user code. Pre-existing —
+confirmed against 0.134 rather than assumed — and **fixed here** rather than
+recorded, because printing a frame of rows hits it on every line of the data
+path this plan is building toward.
+
+The compiled program now registers a per-class `__repr__` function pointer
+table alongside the class-name table that produced the old fallback, and
+`pyrs_print_class_instance` calls through it. `__repr__` and not `__str__`:
+CPython renders `[Both()]` with repr even when `__str__` exists, and only a
+*top-level* print prefers `__str__`. A subclass without its own `__repr__`
+inherits through the chain, since `ClassInfo::methods` holds only a class's own
+methods. Arity is now checked when a str dunder is *defined* rather than only
+at a print site, because the table reaches it with no chance to diagnose.
 
 `docs/EXTENDING.md` also still documented the pre-0.90 single-word `PyrsStr`
 header with the payload at +8; it has carried `cplen` first since 0.90.
@@ -103,7 +112,12 @@ through a base-typed binding, the result keeping the dunder's return type,
 left-to-right evaluation under reflection, an operand that raises before any
 dispatch, in-place versus fallback identity, and the comparison path unchanged.
 
-Coverage went 141 to 145 of 204 probes (`make coverage`).
+`cli/tests/container_str.rs` gains three: repr-not-str for a class defining
+both, an inherited `__repr__` reaching elements through a base-typed list, and
+class elements nested inside every container kind, each of which has its own
+element-printing path in the runtime.
+
+Coverage went 141 to 146 of 204 probes (`make coverage`).
 
 ## 0.134.0 — Three reads and writes that did not agree with the ones beside them
 

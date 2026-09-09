@@ -101,6 +101,24 @@ fn gc_root_range_size(ty: Ty) -> Option<u64> {
     }
 }
 
+/// The `__repr__` a class inherits, walking the single-inheritance chain the
+/// way `resolve_method` does in semantic. `ClassInfo::methods` holds only a
+/// class's own methods, so a subclass with no `__repr__` of its own has to
+/// find its parent's.
+fn resolve_class_repr(classes: &[ir::ClassInfo], id: ir::ClassId) -> Option<String> {
+    let mut cur = Some(id);
+    // Bounded by the class count: a cycle would otherwise hang codegen, and
+    // the chain is at most as long as the table.
+    for _ in 0..=classes.len() {
+        let info = classes.get(cur? as usize)?;
+        if let Some((_, func)) = info.methods.iter().find(|(n, _)| n == "__repr__") {
+            return Some(func.clone());
+        }
+        cur = info.parent;
+    }
+    None
+}
+
 fn mangle(name: &str) -> String {
     format!("pyrs_{name}")
 }
@@ -1244,7 +1262,8 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_object(ptr)\n");
         out.push_str("declare void @pyrs_print_class_instance(ptr)\n");
         out.push_str("declare ptr @pyrs_str_from_object(ptr)\n");
-        out.push_str("declare void @pyrs_set_class_names(ptr, i64)\n\n");
+        out.push_str("declare void @pyrs_set_class_names(ptr, i64)\n");
+        out.push_str("declare void @pyrs_set_class_reprs(ptr, i64)\n\n");
         out.push_str("declare void @pyrs_set_exc_classes(ptr, ptr, i64)\n\n");
         // glibc pointer-mangles the frame-pointer slot in jmp_buf on x86-64.
         // Functions containing setjmp reserve that register as an actual frame
@@ -1312,6 +1331,25 @@ impl Emitter {
             }
             self.global_defs.push_str(&format!(
                 "@pyrs_class_name_ptrs = internal constant [{n} x ptr] [{name_ptrs}]\n"
+            ));
+            // `__repr__` per class id, so the runtime can render a container's
+            // elements: it formats them from a numeric type tag and otherwise
+            // has no way back into user code. `__repr__` and not `__str__` --
+            // CPython prints `[Both()]` with repr even when `__str__` exists.
+            let mut repr_ptrs = String::new();
+            for (i, c) in module.classes.iter().enumerate() {
+                if i > 0 {
+                    repr_ptrs.push_str(", ");
+                }
+                match resolve_class_repr(&module.classes, c.id) {
+                    Some(func) => {
+                        repr_ptrs.push_str(&format!("ptr @{}", mangle(&func)));
+                    }
+                    None => repr_ptrs.push_str("ptr null"),
+                }
+            }
+            self.global_defs.push_str(&format!(
+                "@pyrs_class_repr_ptrs = internal constant [{n} x ptr] [{repr_ptrs}]\n"
             ));
             // Also intern display forms for static ObjectDefaultStr paths.
             for c in &module.classes {
@@ -1391,8 +1429,9 @@ impl Emitter {
             String::new()
         } else {
             format!(
-                "  call void @pyrs_set_class_names(ptr @pyrs_class_name_ptrs, i64 {})\n",
-                module.classes.len()
+                "  call void @pyrs_set_class_names(ptr @pyrs_class_name_ptrs, i64 {n})\n\
+                 \x20 call void @pyrs_set_class_reprs(ptr @pyrs_class_repr_ptrs, i64 {n})\n",
+                n = module.classes.len()
             )
         };
         let exc_setup = if module.exc_classes.is_empty() {

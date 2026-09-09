@@ -3497,6 +3497,15 @@ fn method_func_sig(
         if ret != ir::Ty::Str {
             return Err(err(format!("{} must return str", f.name), f.span));
         }
+        // Arity is checked here, not only at a print site, because the
+        // container printer reaches `__repr__` through a function-pointer
+        // table with no chance to diagnose.
+        if params.len() != 1 {
+            return Err(err(
+                format!("{} must take only self (no extra parameters)", f.name),
+                f.span,
+            ));
+        }
     } else if f.ret.is_none() {
         // Pre-infer unannotated returns from body (same as free functions).
         let param_map: HashMap<String, ir::Ty> =

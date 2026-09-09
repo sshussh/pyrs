@@ -415,3 +415,89 @@ print(f"{5:}", f"{'s':}", f"{2.5:}")
 "#,
     );
 }
+
+// ---------------------------------------------------- class elements
+
+/// A container renders its elements with `__repr__`, never `__str__`.
+///
+/// `print(obj)` prefers `__str__` and always did; `print([obj])` rendered
+/// `<Name object>` until 0.135, because the runtime formats container
+/// elements from a numeric type tag and had no way back into user code. It
+/// now calls through a per-class function-pointer table the compiled program
+/// registers, alongside the class-name table that produced the old fallback.
+#[test]
+fn a_container_renders_elements_with_repr_not_str() {
+    matches_python(
+        "class-elem-repr",
+        r#"
+class Both:
+    def __str__(self) -> str:
+        return "S"
+    def __repr__(self) -> str:
+        return "R"
+
+b = Both()
+print(b)
+print([b])
+print((b, b))
+print({"k": b})
+print(str([b]), repr([b]))
+print(f"{[b]}")
+"#,
+    );
+}
+
+/// The table is indexed by runtime type id, so a subclass without its own
+/// `__repr__` must find its parent's — `ClassInfo::methods` holds only a
+/// class's own methods.
+#[test]
+fn an_inherited_repr_reaches_container_elements() {
+    matches_python(
+        "class-elem-inherited",
+        r#"
+class Base:
+    def __init__(self, v: int) -> None:
+        self.v: int = v
+    def __repr__(self) -> str:
+        return "Base(" + str(self.v) + ")"
+
+class Child(Base):
+    pass
+
+class Louder(Base):
+    def __repr__(self) -> str:
+        return "Louder(" + str(self.v) + ")"
+
+items: list[Base] = [Base(1), Child(2), Louder(3)]
+print(items)
+for it in items:
+    print(it)
+"#,
+    );
+}
+
+/// Nesting, and a class element inside every container kind, since each has
+/// its own element-printing path in the runtime.
+#[test]
+fn class_elements_render_through_every_container_kind() {
+    matches_python(
+        "class-elem-nested",
+        r#"
+class P:
+    def __init__(self, x: int, y: int) -> None:
+        self.x: int = x
+        self.y: int = y
+    def __repr__(self) -> str:
+        return "P(" + str(self.x) + ", " + str(self.y) + ")"
+
+print([[P(1, 2)], [P(3, 4)]])
+print([(P(1, 1), P(2, 2))])
+print({"a": [P(9, 9)]})
+print([{"k": P(0, 0)}])
+rows: list[list[P]] = []
+for i in range(3):
+    rows.append([P(i, i * 2)])
+print(rows)
+"#,
+    );
+}

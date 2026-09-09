@@ -91,6 +91,24 @@ void pyrs_set_class_names(const char **names, long long n) {
     g_class_n = n;
 }
 
+/* `__repr__` per class id, filled by compiled main; null where the class has
+ * none. A container prints its elements from a numeric type tag, so this is
+ * the only way back into user code from `print_slot` -- and it is `__repr__`
+ * specifically: CPython renders `[Both()]` with repr even when `__str__`
+ * exists, and only a *top-level* print prefers `__str__`. */
+/* `PyrsStr *` as `void *`: the struct is defined further down, and this
+ * table has to sit beside the names table it mirrors. `out_str_obj` does the
+ * field access once the layout is in scope. */
+typedef void *(*PyrsClassRepr)(void *);
+static PyrsClassRepr *g_class_reprs = NULL;
+static long long g_class_repr_n = 0;
+static void out_str_obj(const void *s);
+
+void pyrs_set_class_reprs(PyrsClassRepr *reprs, long long n) {
+    g_class_reprs = reprs;
+    g_class_repr_n = n;
+}
+
 /* User exception classes, filled by compiled main. Tags are contiguous from
  * PYRS_EXC_USER_BASE, so both tables are indexed by `tag - PYRS_EXC_USER_BASE`. */
 static const char **g_exc_names = NULL;
@@ -200,6 +218,14 @@ void pyrs_print_class_instance(void *obj) {
         return;
     }
     long long tid = *(long long *)obj;
+    if (g_class_reprs != NULL && tid >= 0 && tid < g_class_repr_n
+        && g_class_reprs[tid] != NULL) {
+        const void *s = g_class_reprs[tid](obj);
+        if (s != NULL) {
+            out_str_obj(s);
+            return;
+        }
+    }
     if (g_class_names != NULL && tid >= 0 && tid < g_class_n && g_class_names[tid] != NULL) {
         out_putc('<');
         out_puts(g_class_names[tid]);
@@ -2708,6 +2734,13 @@ void pyrs_print_bool(int v) {
 void pyrs_print_str(const PyrsStr *s) {
     check_ref(s);
     out_write(s->data, (size_t)s->len);
+}
+
+/* The deferred half of the class-repr table: writes a `PyrsStr` the compiled
+ * `__repr__` returned, from a call site that predates the struct. */
+static void out_str_obj(const void *s) {
+    const PyrsStr *p = (const PyrsStr *)s;
+    out_write(p->data, (size_t)p->len);
 }
 
 /* CPython repr of a str: single quotes unless the string contains a

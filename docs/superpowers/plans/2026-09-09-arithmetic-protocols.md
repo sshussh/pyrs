@@ -127,13 +127,22 @@ and the native-primitive framing would have been right after all.
 returns the character count, so `f.write("héllo")` gave 6 instead of 5. A
 silent parity break in already-supported surface, fixed to `cplen`.
 
-**A container of instances ignores `__repr__`.** `print(obj)` dispatches
-correctly; `print([obj])` renders `<Name object>` per element. The runtime
-formats container elements from a numeric type tag with no hook back into user
-code. Pre-existing — confirmed by running the case against 0.134 rather than
-assumed — and now recorded in the README divergence list, GUIDE §9b and
-`scripts/coverage_probe.py`, where a fix will fail the run as a stale record.
-It matters for the data path: printing a frame of rows hits it every time.
+**A container of instances ignored `__repr__`.** `print(obj)` dispatched
+correctly; `print([obj])` rendered `<Name object>` per element. Pre-existing —
+confirmed by running the case against 0.134 rather than assumed — and fixed
+here rather than recorded, because printing a frame of rows hits it on every
+line of the data path this plan builds toward.
+
+The runtime formats container elements from a numeric type tag, so the fix is
+a way back into user code: the compiled program registers a per-class
+`__repr__` function pointer table beside the class-name table that produced the
+old fallback, and `pyrs_print_class_instance` calls through it. Three details
+decide correctness. It is `__repr__` and never `__str__` — CPython renders
+`[Both()]` with repr even when `__str__` exists, and only a top-level print
+prefers `__str__`. A subclass without its own `__repr__` has to walk the parent
+chain, because `ClassInfo::methods` holds only a class's own methods. And str
+dunder *arity* is now checked at definition rather than only at a print site,
+since the table reaches the function with no chance to diagnose.
 
 ## How this is checked
 

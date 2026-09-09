@@ -56,10 +56,6 @@ KNOWN_DIVERGENCES: dict[str, str] = {
     # does; a module-level def re-evaluates it. Also pinned as a `mismatch`
     # in compatibility/cases/mutable_defaults.py.
     "mutable default (module level)": "module-level defaults are not frozen",
-    # `print(obj)` calls __repr__, but printing a *container* of instances
-    # renders each element as `<Name object>`. The runtime formats container
-    # elements from a numeric type tag with no hook back into user code.
-    "container of instances repr": "containers do not call element __repr__",
 }
 
 

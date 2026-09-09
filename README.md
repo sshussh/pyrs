@@ -159,9 +159,6 @@ Known behavioural divergences, each documented with its reason in the
   work — see [the guide](docs/GUIDE.md#9-differences-from-cpython)
 - An uncaught exception prints its type and message to stderr with exit
   status 1, but no `Traceback (most recent call last):` block or frame list
-- `print(obj)` uses a class's `__repr__`, but printing a **container** of
-  instances renders each element as `<Name object>`: container elements are
-  formatted from a numeric type tag with no hook back into user code
 
 ## Running Python that PyRs cannot compile
 

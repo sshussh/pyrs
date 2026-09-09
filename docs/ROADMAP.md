@@ -83,11 +83,6 @@ standard library, which it gates.
 Two behaviours are recorded rather than fixed, both now in the README
 divergence list:
 
-- **A container of class instances ignores `__repr__`.** `print(obj)` is
-  correct; `print([obj])` renders `<Name object>` per element, because the
-  runtime formats container elements from a numeric type tag with no hook back
-  into user code. Found in 0.135 and confirmed against 0.134. It matters for
-  the data path: printing a frame of rows hits it.
 - **Mutable defaults disagree with themselves.** A nested `def` and a lambda
   freeze each non-literal default once at definition time, as CPython does; a
   module-level `def` re-evaluates at every call. Closing it needs the default
