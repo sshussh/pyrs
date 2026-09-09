@@ -418,3 +418,52 @@ limit having been added since the last one. The growth trigger is not
 belt-and-braces: with only the daily check, the development cache reached
 3.6 GiB against a 2 GiB ceiling in the 46 minutes after a check found it
 compliant. A time interval keeps the walk rare; it does not bound a cache.
+
+## Releases
+
+Releases are produced by `.github/workflows/release.yml`, and never from a
+working copy. There are three ways in and one build path.
+
+| Trigger | What it publishes |
+|---|---|
+| CI passed on `main` | The rolling `nightly` prerelease, always. Plus a real `v<version>` release if that version has no tag yet. |
+| A `v*.*.*` tag pushed | That version's release. |
+| Manual dispatch | A build artifact, or a nightly/version publish if asked. |
+
+The push path hangs off `workflow_run` on the CI workflow rather than `push`,
+so a commit whose CI failed cannot publish anything. The version comes from
+`cli/Cargo.toml` — the same field `make hygiene` checks the other 18 sites
+against — and the release notes are the matching `CHANGELOG.md` section,
+because that file is already written per milestone and generated notes from
+commit subjects would be worse.
+
+**A milestone therefore releases itself.** Bump the version, land it on
+`main`, and the tag and release follow once CI is green. Nothing else to do.
+
+`nightly` is a moving tag: it is repointed at each green commit rather than
+accumulating, and is marked a prerelease so it never becomes "latest".
+
+### Platform status
+
+| Target | Runner | State |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | Released. The only target the project has ever built. |
+| `aarch64-apple-darwin` | `macos-14` | **Unproven.** Needs `brew install llvm@18` to provide `llvm-config` and the CMake package that `codegen/build.rs` compiles the C++ shim against. |
+| `x86_64-pc-windows-msvc` | `windows-2022` | **Unproven, and the most likely to need work.** |
+
+Both new targets carry `continue-on-error`, so a failure reports and is
+skipped instead of holding back the Linux release. Drop that flag for a
+platform once it has gone green.
+
+The runtime's POSIX surface is deliberately small — the working directory, one
+`fstat` that rejects opening a directory, the `stat` behind `os.path`, and the
+environment block — and those four are mapped to their Windows spellings in one
+block at the top of `codegen/runtime/runtime.c`. The collector's
+`/proc/self/maps` stack discovery was already guarded and falls back to the
+caller-supplied anchor elsewhere.
+
+What is *not* solved for Windows: the driver shells out to `cc` to compile each
+program's runtime, and LLVM development files (`llvm-config`, headers, the
+CMake package) are not reliably available from a Windows runner package. Those
+are the two things to expect to fail first. `os.path` is also POSIX-semantic
+by design, so paths would use forward slashes there.

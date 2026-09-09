@@ -1,23 +1,43 @@
-# Build and publish release assets when a version tag is pushed.
-# Tag format: v0.7.0 (leading v required)
+# Build and publish release assets.
+#
+# Three ways in, one build path:
+#
+#   * CI passed on main   -> refresh the rolling `nightly` prerelease, and, if
+#                            the version in Cargo.toml has no tag yet, create
+#                            that tag and cut the real release for it.
+#   * a v*.*.* tag pushed -> build that tag and cut its release.
+#   * manual dispatch     -> build a ref, optionally publishing.
+#
+# The push path hangs off `workflow_run` rather than `push` so nothing is ever
+# published from a commit whose CI did not pass.
 name: Release
 
 on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
   push:
     tags:
       - "v*.*.*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing tag to build (e.g. v0.7.0); empty builds current ref only as artifact
+      ref:
+        description: Ref to build (branch, tag or SHA). Empty = current ref.
         required: false
         default: ""
+      publish:
+        description: Publish assets, or just upload a build artifact
+        type: choice
+        options: [artifact-only, nightly, version]
+        default: artifact-only
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Nightly refreshes serialise; a tag build never waits on one.
+  group: release-${{ github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -25,63 +45,296 @@ env:
   CMAKE_BUILD_PARALLEL_LEVEL: 2
 
 jobs:
-  build-linux:
-    name: Build Linux x86_64
+  # ---------------------------------------------------------------- plan
+  # Decide what is being built and whether it gets published, once, so the
+  # build matrix and the publish jobs cannot disagree.
+  plan:
+    name: Decide what to build
     runs-on: ubuntu-24.04
+    # A failed or cancelled CI run publishes nothing.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      ref: ${{ steps.decide.outputs.ref }}
+      version: ${{ steps.decide.outputs.version }}
+      nightly: ${{ steps.decide.outputs.nightly }}
+      release_version: ${{ steps.decide.outputs.release_version }}
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # workflow_run starts from the default branch; check out the commit
+          # CI actually validated.
+          ref: >-
+            ${{ github.event.inputs.ref
+                || github.event.workflow_run.head_sha
+                || github.ref }}
+          fetch-depth: 0
 
-      - name: Setup PyRs toolchain
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          PUBLISH: ${{ github.event.inputs.publish }}
+        run: |
+          set -euo pipefail
+          ref="$(git rev-parse HEAD)"
+
+          # The single source of truth for the version, and the one `make
+          # hygiene` checks against the other 18 sites.
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -1)"
+          if [ -z "$version" ]; then
+            echo "could not read the version from cli/Cargo.toml" >&2
+            exit 1
+          fi
+
+          nightly=false
+          release_version=""
+
+          case "$EVENT" in
+            workflow_run)
+              nightly=true
+              # Cut a real release the first time a version appears untagged.
+              if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+                echo "v${version} is already tagged; nightly only"
+              else
+                release_version="$version"
+              fi
+              ;;
+            push)
+              # A tag was pushed: publish exactly that tag.
+              release_version="${GITHUB_REF_NAME#v}"
+              ;;
+            workflow_dispatch)
+              case "$PUBLISH" in
+                nightly) nightly=true ;;
+                version) release_version="$version" ;;
+                *) ;;
+              esac
+              ;;
+          esac
+
+          {
+            echo "ref=${ref}"
+            echo "version=${version}"
+            echo "nightly=${nightly}"
+            echo "release_version=${release_version}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "ref=${ref} version=${version} nightly=${nightly} release=${release_version:-none}"
+
+  # --------------------------------------------------------------- build
+  build:
+    name: Build ${{ matrix.target }}
+    needs: plan
+    # macOS and Windows are new here and unproven: neither has ever built this
+    # project. They must not be able to hold back a Linux release, so a
+    # failure on them is reported and skipped rather than fatal. Remove
+    # `continue-on-error` for a platform once it has gone green.
+    continue-on-error: ${{ matrix.experimental }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-24.04
+            experimental: false
+          - target: aarch64-apple-darwin
+            runs-on: macos-14
+            experimental: true
+          - target: x86_64-pc-windows-msvc
+            runs-on: windows-2022
+            experimental: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+
+      # ---- toolchain, per platform -------------------------------------
+      - name: Setup PyRs toolchain (Linux)
+        if: runner.os == 'Linux'
         uses: ./.github/actions/setup-pyrs
         with:
           llvm-version: "18"
 
-      - name: Build release
+      - name: Setup toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install llvm@18 cmake ninja
+          prefix="$(brew --prefix llvm@18)"
+          {
+            echo "${prefix}/bin"
+          } >> "$GITHUB_PATH"
+          {
+            echo "LLVM_DIR=${prefix}/lib/cmake/llvm"
+            echo "Clang_DIR=${prefix}/lib/cmake/clang"
+            echo "CC=${prefix}/bin/clang"
+            echo "CXX=${prefix}/bin/clang++"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The build needs LLVM *development* files: llvm-config, the headers
+          # and the CMake package, because codegen/build.rs compiles a C++
+          # shim against them. The plain clang installer does not carry those,
+          # which is the thing most likely to fail here.
+          choco install --no-progress -y llvm --version=18.1.8
+          choco install --no-progress -y ninja
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          @(
+            "CC=clang"
+            "CXX=clang++"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Python (macOS/Windows)
+        if: runner.os != 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Rust (macOS/Windows)
+        if: runner.os != 'Linux'
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      # ---- build and check ---------------------------------------------
+      - name: Build
         run: cargo build --release -p pyrs
 
       - name: Smoke-test the binary
+        shell: bash
         run: |
           set -euo pipefail
-          ./target/release/pyrs -V
-          ./target/release/pyrs run -i examples/fib.py | tee /tmp/fib.out
-          test "$(cat /tmp/fib.out)" = "$(python3 examples/fib.py)"
+          bin="target/release/pyrs"
+          [ "${RUNNER_OS}" = "Windows" ] && bin="target/release/pyrs.exe"
+          "$bin" -V
+          # Compiling and running a program exercises the whole pipeline --
+          # LLVM, the C runtime and the linker -- which merely building the
+          # compiler does not.
+          "$bin" run -i examples/fib.py > got.txt
+          python3 examples/fib.py > want.txt
+          diff got.txt want.txt
 
       - name: Package
         id: pack
+        shell: bash
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF_NAME}"
-          if [[ "$ver" != v* ]]; then
-            ver="git-${GITHUB_SHA::8}"
-          fi
-          stage="pyrs-${ver}-x86_64-unknown-linux-gnu"
+          ver="${{ needs.plan.outputs.version }}"
+          stage="pyrs-v${ver}-${{ matrix.target }}"
           mkdir -p "dist/${stage}"
-          cp target/release/pyrs "dist/${stage}/"
-          cp README.md LICENSE "dist/${stage}/" 2>/dev/null || cp README.md "dist/${stage}/"
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            cp target/release/pyrs.exe "dist/${stage}/"
+          else
+            cp target/release/pyrs "dist/${stage}/"
+          fi
+          cp README.md "dist/${stage}/"
+          [ -f LICENSE ] && cp LICENSE "dist/${stage}/" || true
           tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
-          (cd dist && sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
-          echo "asset=${stage}.tar.gz" >> "${GITHUB_OUTPUT}"
-          echo "version=${ver}" >> "${GITHUB_OUTPUT}"
+          if command -v sha256sum >/dev/null; then
+            (cd dist && sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+          fi
           ls -la dist/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v5
         with:
-          name: ${{ steps.pack.outputs.asset }}
+          name: pyrs-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
+          if-no-files-found: error
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+  # ------------------------------------------------------------- nightly
+  # One prerelease, tagged `nightly`, always holding the tip of main that last
+  # passed CI. The tag is moved rather than accumulated.
+  publish-nightly:
+    name: Refresh the nightly prerelease
+    needs: [plan, build]
+    if: needs.plan.outputs.nightly == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: incoming
+          merge-multiple: true
+
+      - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: nightly
+          target_commitish: ${{ needs.plan.outputs.ref }}
+          name: "Nightly (${{ needs.plan.outputs.version }})"
+          body: |
+            Built from `main` at ${{ needs.plan.outputs.ref }}, after CI passed.
+
+            This release is **moved on every green push to main**. For a fixed
+            build, use a versioned release instead.
+
+            Version in tree: `${{ needs.plan.outputs.version }}`.
+          prerelease: true
+          # A rolling tag has to be allowed to move.
+          make_latest: false
           files: |
-            dist/*.tar.gz
-            dist/*.sha256
-          generate_release_notes: true
+            incoming/*.tar.gz
+            incoming/*.sha256
           fail_on_unmatched_files: true
+
+  # ------------------------------------------------------------- version
+  # A real release, cut the first time a version reaches main untagged, or
+  # when its tag is pushed directly.
+  publish-version:
+    name: Release v${{ needs.plan.outputs.release_version }}
+    needs: [plan, build]
+    if: needs.plan.outputs.release_version != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: incoming
+          merge-multiple: true
+
+      - name: Release notes from the changelog
+        id: notes
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          # The section for this version, up to the next `## ` heading. The
+          # changelog is written per milestone, so it is already the release
+          # note; generating one from commit subjects would be worse.
+          awk -v want="## ${VERSION}" '
+            index($0, want) == 1 { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "No changelog entry for ${VERSION}." > notes.md
+          fi
+          head -5 notes.md
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.plan.outputs.release_version }}
+          target_commitish: ${{ needs.plan.outputs.ref }}
+          name: v${{ needs.plan.outputs.release_version }}
+          body_path: notes.md
+          files: |
+            incoming/*.tar.gz
+            incoming/*.sha256
+          fail_on_unmatched_files: true

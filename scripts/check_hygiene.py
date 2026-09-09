@@ -45,7 +45,9 @@ VERSION_SITES: tuple[tuple[str, str, str], ...] = (
     # a chronological feature list that has since moved to the changelog. One
     # explicit line is enough to catch drift and does not invite the list back.
     ("README.md", "milestone line", r"^Current milestone: \*\*v([0-9]+\.[0-9]+\.[0-9]+)\*\*"),
-    ("README.md", "release tag example", r"^Release tags: `git tag v([0-9]+\.[0-9]+\.[0-9]+)"),
+    # Releases are cut by CI now; the hand-tag example remains as the escape
+    # hatch, and is still the second place the version has to stay current.
+    ("README.md", "release tag example", r"`git tag v([0-9]+\.[0-9]+\.[0-9]+)"),
     (
         "docs/SPECIFICATIONS.md",
         "version line",

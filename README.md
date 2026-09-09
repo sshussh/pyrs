@@ -285,9 +285,25 @@ Failing integration tests retain their inputs under `target/tmp`, which is
 what CI uploads, so a CI-only failure can be reproduced from the artifact.
 
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
-benchmarks and a tagged release workflow.
+benchmarks and a release workflow.
 
-Release tags: `git tag v0.141.0 && git push origin v0.141.0`.
+**Releases are cut from CI, not by hand.** When CI passes on `main`:
+
+- the rolling `nightly` prerelease is rebuilt and its tag moved to that
+  commit, so it always holds the last green tip;
+- if the version in `cli/Cargo.toml` has no `v<version>` tag yet, that tag is
+  created and a real release is cut for it, with the matching `CHANGELOG.md`
+  section as its notes. So a milestone releases itself once its version bump
+  lands.
+
+Pushing a tag by hand still works and takes the same path — `git tag v0.141.0
+&& git push origin v0.141.0`. Nothing is ever published from a commit whose CI
+did not pass.
+
+Linux x86_64 is the released build. macOS arm64 and Windows x86_64 are in the
+matrix but **unproven** — neither has built this project yet — so they are
+non-blocking until they go green. See
+[docs/TOOLING.md](docs/TOOLING.md#releases) for what each still needs.
 
 ## Documentation
 
