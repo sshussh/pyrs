@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.141.0 — what a command-line program needs
+
+Written the way 0.139 and 0.140 were: build the thing, and fix what stops it
+compiling. An argument parser and a subcommand program were written first, and
+every gap below is one that work hit.
+
+### The canonical CLI shape did not compile
+
+Four separate things blocked it, and none of them was about argument parsing:
+
+**A module-level dispatch table was invisible inside functions.** The shape
+every subcommand program has —
+
+```python
+COMMANDS = {"build": cmd_build, "test": cmd_test}
+
+def main(argv: list[str]) -> int:
+    handler = COMMANDS[argv[1]]      # name 'COMMANDS' is not defined
+    return handler(argv[2:])
+```
+
+Module globals are seeded before any expression is typed, so the seeder had no
+way to know that `cmd_build` names a function; a global it could not type was
+left unseeded and the name simply did not exist inside any function. It now
+records the module's own functions first, so a function *value* — bare, in a
+list, or in a dict — seeds as the capture-free closure it lowers to.
+
+**`Callable[[A, B], R]` did not parse**, so a handler could not be annotated
+as a dict value, a field, or a parameter. It resolves to a capture-free
+closure, which is exactly what a module-level function or a non-capturing
+lambda becomes in value position — and the coercion that accepts one into such
+a slot already existed. `Callable[..., R]` is refused with its own message: a
+call site needs the parameter types in order to pass them.
+
+**`self.handler(x)` never looked for a field.** Python has one attribute
+namespace, so a field holding a function is called like a method; here the two
+are separate, and the field was not consulted. It is now, and a field that is
+*not* callable gets a message naming it and its type rather than a bare
+"has no method".
+
+**`str()` of a dynamic value was refused.** Parsed options are heterogeneous —
+strings, flags, `None` in one table — and printing them is most of what a
+parser does. `str` and `repr` now render a dynamic value exactly as the
+matching `print` writes it, which makes nested containers agree with CPython
+for free; they differ only in that `repr` quotes a top-level string.
+
+### The OS surface a program is not usable without
+
+**The standard streams are file objects.** `sys.stdin`, `sys.stdout` and
+`sys.stderr` are `File` values, so the whole existing file surface applies —
+`read`, `readline`, `readlines`, `write`, iteration, `with`. They are
+singletons, so `sys.stdout is sys.stdout`. `flush()` is new, and works on any
+file. This replaced a bespoke rejection ("there is no file object behind
+them") with the type that was already there.
+
+**`print(..., file=f)` reaches any open file**, not only the two standard
+streams. The destination is set for the duration of the one statement, so a
+`str()` of a value inside it still captures rather than escaping to the file.
+
+**`os.environ` and `os.getenv`.** `environ` is a `dict[str, str]` snapshot
+taken when the module initialises, so `in`, `[]`, `.get` and iteration all
+behave; `getenv` is ordinary PyRs on top of it.
+
+**`os.path` gained `exists`, `isfile`, `isdir`, `splitext`, `isabs`,
+`normpath`, `abspath` and `expanduser`** — all pure PyRs over one new
+primitive that answers what is at a path. They match CPython's `posixpath`
+including the parts that are easy to get wrong: a leading dot is not an
+extension, so `.bashrc` splits to `('.bashrc', '')`, and a leading `//` is
+preserved.
+
+### Two deliberate differences
+
+`sys.stdout.close()` raises `ValueError: cannot close a standard stream`.
+CPython allows it; here it would break every later print with no way back, and
+a compiled program has no reason to want it. The collector will not close one
+either.
+
+`os.environ` is a snapshot, not a live mapping: assigning into it changes the
+dict and not the process environment. There is no subprocess surface here for
+the difference to reach.
+
+### Checked by
+
+`examples/cli.py` — a real argument parser (long and short flags, inline
+`--opt=value`, clustered short flags, values from the next token, `--`,
+positionals, required options, generated help) and a subcommand program on a
+`Callable`-typed dispatch table. `make examples` holds it byte-identical to
+CPython at every optimization level.
+
+`cli/tests/cli_surface.rs` — 10 tests, differential at -O0/-O2/-O3 and under
+`PYRS_GC_STRESS=1`.
+
 ## 0.140.0 — `json.dumps`, written in PyRs, and reading a container you cannot name
 
 0.139 moved `json.loads` into PyRs and left `dumps` behind in C, with the

@@ -1018,6 +1018,24 @@ def clamp(x: float, lo: float, hi: float) -> float:
   accepts it and tests only `A` — `or` yields its first truthy operand and a
   type object is always truthy — so this is a divergence on purpose. Write the
   tuple, `isinstance(x, (A, B))`, which works here and means what it says.
+- **A dispatch table of functions works at module scope** (0.141):
+  `COMMANDS = {"build": cmd_build}` is visible inside functions, not only at
+  module level, and `Callable[[A, B], R]` annotates a function value stored in
+  a dict, a field or a parameter. It means a *capture-free* function — a
+  module-level `def` or a non-capturing lambda — because a caller reads
+  captures by static type and an annotation cannot know them.
+- **A function-valued field is called like a method** (0.141): `self.run(x)`
+  where `run` is a field holding a function. A field that is not callable
+  gets a message naming it and its type.
+- **`str()` and `repr()` render a dynamic value** (0.141), exactly as the
+  matching `print` writes it, so nested containers agree with CPython.
+  `repr` differs only in quoting a top-level string; `ascii()` is still
+  refused.
+- **The standard streams are file objects** (0.141): `sys.stdin`,
+  `sys.stdout` and `sys.stderr` support `read`, `readline`, `readlines`,
+  `write`, `flush`, iteration and `with`, and are singletons. `print(...,
+  file=f)` reaches any open file. Closing a standard stream raises — CPython
+  allows it, but here it would break every later print with no way back.
 - **A dynamic container reads without narrowing** (0.140). `len(v)`, `v[i]`,
   `v[k]`, `v.keys()` and `for x in v` work on an `object` whose contents are
   only known at run time, reading it through the tag it already carries — so
@@ -1471,8 +1489,8 @@ compiler build time. Prefer real package imports — only `sys` is special-cased
 | Module | Surface | Notes |
 |--------|---------|-------|
 | `sys` | `sys.argv` | Special-cased (not a `.py` file) |
-| `os` | `getcwd() -> str` | C runtime (`pyrs_os_getcwd`); package re-exports `path` |
-| `os.path` | `join(a, *parts)`, `dirname`, `basename` | Pure PyRs; **POSIX** only |
+| `os` | `getcwd()`, `environ`, `getenv()` | `getcwd`/`environ` are C primitives; `getenv` is PyRs over `environ`; package re-exports `path` |
+| `os.path` | `join`, `dirname`, `basename`, `exists`, `isfile`, `isdir`, `splitext`, `isabs`, `normpath`, `abspath`, `expanduser` | Pure PyRs over one stat primitive; **POSIX** only |
 | `math` | `pi`/`e` + unary float ops | Compiler intrinsics / libm |
 | `json` | `loads`, `dumps`, typed `loads_*` | Pure PyRs (`stdlib/json.py`); see below |
 
@@ -1976,8 +1994,10 @@ Container notes:
 `__name__` is the entry module's `"__main__"` or an imported module's dotted
 import name, so `if __name__ == "__main__":` works. `sys.exit(code)` flushes
 and leaves — it is not a catchable `SystemExit` here — and
-`print(..., file=sys.stderr)` / `file=sys.stdout` select the stream. No other
-`file=` destination exists; use `f.write(...)` on a file from `open()`.
+`print(..., file=f)` takes any file: `sys.stderr`, `sys.stdout`, or one from
+`open()`. `sys.stdin` / `sys.stdout` / `sys.stderr` are themselves file
+objects, so `read`, `readline`, `readlines`, `write`, `flush`, iteration and
+`with` all work on them; they are singletons, and closing one raises.
 
 Exception notes: supported named types include OverflowError, EOFError,
 FileNotFoundError, OSError, PermissionError, IsADirectoryError, NameError,

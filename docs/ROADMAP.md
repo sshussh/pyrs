@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.140 |
+| Check | Result after 0.141 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1739 passed; none failed or ignored |
-| `make examples` | All 14 example entry points matched CPython |
+| `cargo test --workspace` | 1751 passed; none failed or ignored |
+| `make examples` | All 15 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.140.0` |
+| `pyrs --version` | `PyRs 0.141.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -421,6 +421,19 @@ documentation and the relevant gates.
       so definition order is free. `NoReturn` / `Never` accepted as
       annotations. Found by writing `stdlib/json.py`, which otherwise needed
       an unreachable `return` after every error helper.
+- [x] The command-line surface (0.141), found by writing an argument parser
+      and a subcommand program: a module-level dispatch table is visible
+      inside functions (global seeding could not give a name a closure type,
+      so the table existed only at module scope); `Callable[[A, B], R]`
+      annotates a function value in a dict, a field or a parameter; a
+      function-valued field is called like a method; `str()`/`repr()` render
+      a dynamic value; the standard streams are file objects and
+      `print(file=...)` takes any file; `os.environ` / `os.getenv`; and
+      `os.path` gained `exists`, `isfile`, `isdir`, `splitext`, `isabs`,
+      `normpath`, `abspath`, `expanduser`.
+- [ ] `os.get_terminal_size()`, so help text can wrap to the terminal. Needs
+      an `ioctl`; noted while writing `examples/cli.py`, which pads to a fixed
+      width instead.
 - [ ] Callable metadata, decorator factories, stacked decorators. Also: a
       container of functions with *differing* signatures, which needs a union
       of closure types and runtime dispatch through it; and functions with

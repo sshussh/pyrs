@@ -580,6 +580,38 @@ p(
     "import json\ntry:\n    json.loads('{')\nexcept ValueError as e:\n    print(e)",
 )
 p(
+    "semantics",
+    "module dispatch table in a function",
+    "def a(x: int) -> int:\n    return x + 1\nT = {'a': a}\n"
+    "def run() -> int:\n    f = T['a']\n    return f(1)\nprint(run())",
+)
+p(
+    "semantics",
+    "Callable annotation",
+    "from typing import Callable\ndef inc(x: int) -> int:\n    return x + 1\n"
+    "f: Callable[[int], int] = inc\nprint(f(1))",
+)
+p(
+    "semantics",
+    "str() of a dynamic value",
+    "v: object = ['a', 1, None]\nprint(str(v), repr(v))",
+)
+p(
+    "stdlib",
+    "sys.stdout as a file",
+    "import sys\nsys.stdout.write('x\\n')\nsys.stdout.flush()",
+)
+p(
+    "stdlib",
+    "os.environ / getenv",
+    "import os\nprint(os.getenv('PATH', '') != '', 'PATH' in os.environ)",
+)
+p(
+    "stdlib",
+    "os.path predicates",
+    "import os.path\nprint(os.path.isdir('/tmp'), os.path.splitext('a.txt'))",
+)
+p(
     "stdlib",
     "json.dumps (dynamic value)",
     "import json\nprint(json.dumps(json.loads('{\"a\": [1, 2.5, true, null]}')))",
