@@ -194,8 +194,8 @@ optional model).
 
 | Phase | Stdlib stance | Explanation |
 |-------|---------------|-------------|
-| **Now (core-first)** | Freeze stdlib surface | No new modules; no expanding `math` / `json` / `os` via stubs |
-| **Interim (shipped)** | Small `stdlib/` + some special cases | `os.path` pure; `math` / `json` / `getcwd` may use kit stubs — rewrite pure later |
+| **Now (core-first)** | Freeze stdlib *surface*; convert stubs to pure PyRs as the language allows | No new modules. Replacing a stub with a real PyRs body is not growth and is encouraged — it is the exit criterion arriving, module by module. `json` made that move in v0.139 |
+| **Interim (shipped)** | Small `stdlib/` + some special cases | `os.path` and `json` pure; `math` / `getcwd` may use kit stubs — rewrite pure later |
 | **Steady state** | Most modules in **PyRs** | Call builtins/methods + thin `_pyrs` / `_posix` for leftovers |
 | **New C for stdlib?** | Only new **primitive families** | e.g. regex engine, not `pathlib` or JSON grammar in C |
 
@@ -205,8 +205,8 @@ optional model).
 |--------------|----------------|-------------|
 | `os.path.join` / `dirname` / `basename` | **Pure PyRs** in `stdlib/os/path.py` | Model for later libs; `join(a, *parts)` |
 | `math.sin` / `sqrt` | LLVM / libm via kit (interim) | True primitive; thin pure wrappers later if desired |
-| `json.dumps` / typed `loads_*` | C + stubs (interim) | Prefer pure PyRs once typing/dynamism allows |
-| `json.loads` (dynamic) | **Later, pure PyRs** | Needs optional/union/`Any` or a value model — language first |
+| `json.loads` (dynamic) + typed `loads_*` | **Pure PyRs** in `stdlib/json.py` (v0.139) | The condition below was met: `object`/`Any`, `isinstance` narrowing and classes carry a recursive-descent parser. The C parser and its IR node were deleted rather than kept alongside |
+| `json.dumps` | C + compiler dispatch | Stays: it dispatches on the argument's **static** type, which is what serialises a `list[int]`. A pure body could only take `object`, and a concrete `list[int]` boxed into `object` has a different runtime tag than the `list[object]` it would read back |
 | `os.getcwd` | C primitive (interim) | OS family is a legitimate thin C edge |
 | `sys.argv` | Kit special-case today | Migrate toward real module when ready |
 

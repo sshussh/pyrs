@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.138 |
+| Check | Result after 0.139 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1714 passed; none failed or ignored |
+| `cargo test --workspace` | 1723 passed; none failed or ignored |
 | `make examples` | All 14 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.138.2` |
+| `pyrs --version` | `PyRs 0.139.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -373,6 +373,9 @@ documentation and the relevant gates.
       `float`/`bool`/`frozenset` keys; dict views. Dict *keys* and set
       elements deliberately stayed restricted when 0.137 let container
       *values* infer a union, because a key must be hashable.
+- [ ] Parenthesized import lists — `from x import (a, b, c)` is not parsed.
+      Ordinary Python and common for long lists; found while writing
+      `stdlib/json.py` in 0.139.
 - [ ] **Operators and conversions on a union value**, measured and documented
       in [GUIDE section 9](GUIDE.md#9-differences-from-cpython) as of 0.137.
       What works without narrowing: `print`, truthiness (`if x:` / `bool(x)`),
@@ -479,8 +482,18 @@ documentation and the relevant gates.
       dotted import name otherwise), which the others do not.
 - [ ] Standard-library inventory driven by workload failures. Enumerate each
       module's supported public API; an importable stub is not compatibility.
-- [ ] Implement libraries in PyRs once their primitives exist; keep platform
-      operations in the runtime. Reuse upstream tests with provenance.
+- [x] First library implemented in PyRs (0.139): `json.loads` is a real
+      recursive-descent parser compiled from `stdlib/json.py`, and the C
+      parser plus its IR node were deleted rather than kept alongside. 48/48
+      values and 41/44 error messages match CPython; the three differences are
+      lone surrogates, which a well-formed-UTF-8 `str` cannot hold. `dumps`
+      stays compiler-lowered because it dispatches on the argument's *static*
+      type. Measured 1.8x faster than CPython on the same source and 6.8x
+      slower than CPython's C module — the workload is `Any` boxing, not
+      arithmetic.
+- [ ] Implement the remaining libraries in PyRs once their primitives exist;
+      keep platform operations in the runtime. Reuse upstream tests with
+      provenance.
 - [ ] Dependency discovery from virtual environments and installed
       distributions; record unsupported C extensions as compatibility
       dependencies.

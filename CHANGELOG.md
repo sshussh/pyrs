@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.139.0 — `json.loads`, written in PyRs
+
+The stdlib `json` module was stubs. Every `loads_*` body was replaced by the
+compiler with a call into a JSON parser written in C, and there was no dynamic
+`loads` at all — a document's shape had to be known in advance and named in
+the function you called (`loads_dict_str_int`, `loads_list_bool`, …).
+
+`stdlib/json.py` is now a **real recursive-descent parser compiled from PyRs
+source**, returning `object`. The typed helpers are ordinary PyRs written on
+top of it. The C parser, its `ir::ExprKind::JsonLoads` node, its
+`JsonLoadsKind` enum, the emit arms and the ~340 lines of `runtime.c` that
+implemented it are **deleted** — two JSON implementations in one project would
+have drifted.
+
+### Why now
+
+`docs/PRIMITIVES.md` §9 freezes the stdlib "until the core language is far
+enough along that libraries can be written in **pure PyRs**", and named this
+exact module as the test: *"`json.loads` (dynamic) — Later, pure PyRs — needs
+optional/union/`Any` or a value model — language first."*
+
+That condition is met. `object`/`Any` (0.138.2), `isinstance` narrowing on
+`Any` (0.136), the expected-type hint reaching container slots (0.136) and
+closed-world classes carry the parser without a single compiler special case.
+The policy table now distinguishes *growing* the stdlib surface, still frozen,
+from *converting a stub to a real PyRs body*, which is the exit criterion
+arriving one module at a time.
+
+### Parity
+
+Measured against CPython's `json` over a corpus of 48 valid documents and 44
+malformed ones:
+
+- **48 of 48 values identical** — every scalar, nesting, whitespace between
+  tokens, bignums, astral escapes, `\u` surrogate pairs.
+- **41 of 44 error messages byte-identical**, including position:
+  `Expecting ',' delimiter: line 1 column 8 (char 7)`. `loads` computes line
+  and column the way CPython does, so a failure reads the same from either
+  engine. `JSONDecodeError` subclasses `ValueError`, as CPython's does, so
+  `except ValueError` catches it.
+- `NaN`, `Infinity` and `-Infinity` are accepted, matching CPython's decoder
+  rather than the JSON grammar.
+
+The three deliberate differences are all one thing: a **lone surrogate escape**
+(`"\ud800"` with no low half) is an error here, where CPython yields a lone
+surrogate. A PyRs `str` is well-formed UTF-8 and cannot hold one. A surrogate
+*pair* decodes to its astral code point, as CPython does.
+
+Nesting is capped at 200, turning an adversarial document into a
+`JSONDecodeError` rather than a native stack overflow.
+
+### Speed, both numbers
+
+```
+20 x 2000-object document
+  vs CPython running the same PyRs source   1.8x faster
+  vs CPython's C json module                6.8x slower
+```
+
+Both are worth stating. The first is what compiling this module buys; the
+second is what a C extension buys, and it is honest that a pure-PyRs parser
+does not beat one. 1.8× is low against the corpus's 7.1× because the work here
+is `Any` boxing — one heap box per parsed value — and hash-table inserts, not
+arithmetic.
+
+### `dumps` stays compiler-lowered, deliberately
+
+It dispatches on the **static** type of its argument, which is what makes
+`dumps([1, 2, 3])` serialise a `list[int]`. A body written in PyRs could only
+take `object`, and a concrete `list[int]` boxed into `object` carries a
+different runtime tag than the `list[object]` such a body would read it back
+as — so it would refuse exactly the calls that matter. The reason is recorded
+in the module and in `docs/PRIMITIVES.md` rather than left as an inconsistency.
+
+### How this is checked
+
+`cli/tests/json_module.rs` — 9 tests at -O0/-O2/-O3 and under
+`PYRS_GC_STRESS=1`. Values, escapes and the non-standard constants are
+differential against CPython; so are the error messages, which is the half
+that would otherwise rot. The typed helpers are asserted against recorded
+output, because CPython's `json` has no such names to be an oracle for them.
+
+`make coverage` gains probes for dynamic `loads` and for error parity; stdlib
+coverage goes 3 to 5 of 14, total 158 to 160 of 214.
+
 ## 0.138.2 — `object` is an annotation
 
 Reported from a 325-line recursive-descent JSON parser, which failed to
