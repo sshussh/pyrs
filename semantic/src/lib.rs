@@ -2775,6 +2775,9 @@ fn collect_self_fields(
                     }
                     And | Or => Some(join_types(l, r)),
                     Div => Some(ir::Ty::Float),
+                    // `a @ b` is whatever the class's `__matmul__` returns,
+                    // which this shallow pass cannot see.
+                    MatMul => None,
                     Add | Sub | Mul | FloorDiv | Mod | BitAnd | BitOr | BitXor | LShift
                     | RShift | Pow => {
                         let l_num = matches!(l, ir::Ty::Bool | ir::Ty::Int | ir::Ty::Float);
@@ -3961,6 +3964,8 @@ fn try_type_ast_expr(
             use ast::BinOp::*;
             match op {
                 Eq | NotEq | Lt | LtEq | Gt | GtEq | Is | IsNot | In | NotIn => Some(ir::Ty::Bool),
+                // `a @ b` is whatever the class's `__matmul__` returns.
+                MatMul => None,
                 // `and`/`or` yield an operand (join), not always bool.
                 And | Or => {
                     let l = try_type_ast_expr(left, params, known_rets)?;
@@ -13608,8 +13613,98 @@ fn ty_can_pass_as(src: ir::Ty, dst: ir::Ty) -> bool {
     }
 }
 
-/// Reflected equality/inequality is used only when the left type is assignable to
-/// `other` — otherwise identity (both classes) or a type error (mixed).
+/// A type as a *user* should see it in a diagnostic.
+///
+/// `ir::Ty`'s `Display` prints a class as `class#0`, an internal id that means
+/// nothing to the reader of an error message. Everything else already prints
+/// the way Python spells it.
+fn display_ty(ty: ir::Ty) -> String {
+    match ty {
+        ir::Ty::Class(id) => class_info(id).map_or_else(|| ty.to_string(), |c| c.name),
+        _ => ty.to_string(),
+    }
+}
+
+/// The dunder an arithmetic/bitwise operator dispatches to on a class.
+///
+/// Separate from [`class_reflected_method`] because the two families reflect
+/// differently: a comparison swaps the *operator* (`a < b` → `b.__gt__(a)`),
+/// while arithmetic swaps the *name* (`a + b` → `b.__radd__(a)`).
+fn class_arith_method(op: ast::BinOp) -> Option<&'static str> {
+    Some(match op {
+        ast::BinOp::Add => "__add__",
+        ast::BinOp::Sub => "__sub__",
+        ast::BinOp::Mul => "__mul__",
+        ast::BinOp::MatMul => "__matmul__",
+        ast::BinOp::Div => "__truediv__",
+        ast::BinOp::FloorDiv => "__floordiv__",
+        ast::BinOp::Mod => "__mod__",
+        ast::BinOp::Pow => "__pow__",
+        ast::BinOp::BitAnd => "__and__",
+        ast::BinOp::BitOr => "__or__",
+        ast::BinOp::BitXor => "__xor__",
+        ast::BinOp::LShift => "__lshift__",
+        ast::BinOp::RShift => "__rshift__",
+        _ => return Option::None,
+    })
+}
+
+/// The reflected form, tried on the right operand: `a + b` → `b.__radd__(a)`.
+fn class_reflected_arith_method(op: ast::BinOp) -> Option<&'static str> {
+    Some(match op {
+        ast::BinOp::Add => "__radd__",
+        ast::BinOp::Sub => "__rsub__",
+        ast::BinOp::Mul => "__rmul__",
+        ast::BinOp::MatMul => "__rmatmul__",
+        ast::BinOp::Div => "__rtruediv__",
+        ast::BinOp::FloorDiv => "__rfloordiv__",
+        ast::BinOp::Mod => "__rmod__",
+        ast::BinOp::Pow => "__rpow__",
+        ast::BinOp::BitAnd => "__rand__",
+        ast::BinOp::BitOr => "__ror__",
+        ast::BinOp::BitXor => "__rxor__",
+        ast::BinOp::LShift => "__rlshift__",
+        ast::BinOp::RShift => "__rrshift__",
+        _ => return Option::None,
+    })
+}
+
+/// The in-place form. CPython falls back to the plain form when it is absent,
+/// which is why `v += w` works on a class defining only `__add__`.
+fn class_inplace_arith_method(op: ast::BinOp) -> Option<&'static str> {
+    Some(match op {
+        ast::BinOp::Add => "__iadd__",
+        ast::BinOp::Sub => "__isub__",
+        ast::BinOp::Mul => "__imul__",
+        ast::BinOp::MatMul => "__imatmul__",
+        ast::BinOp::Div => "__itruediv__",
+        ast::BinOp::FloorDiv => "__ifloordiv__",
+        ast::BinOp::Mod => "__imod__",
+        ast::BinOp::Pow => "__ipow__",
+        ast::BinOp::BitAnd => "__iand__",
+        ast::BinOp::BitOr => "__ior__",
+        ast::BinOp::BitXor => "__ixor__",
+        ast::BinOp::LShift => "__ilshift__",
+        ast::BinOp::RShift => "__irshift__",
+        _ => return Option::None,
+    })
+}
+
+/// The dunder a unary operator dispatches to on a class.
+fn class_unary_method(op: ast::UnaryOp) -> Option<&'static str> {
+    Some(match op {
+        ast::UnaryOp::Neg => "__neg__",
+        ast::UnaryOp::Pos => "__pos__",
+        ast::UnaryOp::Invert => "__invert__",
+        ast::UnaryOp::Not => return Option::None,
+    })
+}
+
+/// Whether a dunder on `class_id` accepts `arg_ty` as its argument.
+///
+/// Used to decide whether a slot is *usable* before committing to it, so that
+/// `2.0 * vec` can fall through `float`'s absent `__mul__` to `vec.__rmul__`
+/// rather than reporting a mismatch inside the call.
 fn class_equality_accepts(
     class_id: ir::ClassId,
     method: &str,
@@ -14749,7 +14844,7 @@ fn lower_class_aug_index(
         ctx,
     )?;
     let right = lower_expr(value, ctx)?;
-    let combined = lower_binary(op, current, right, span, ctx)?;
+    let combined = lower_aug_binary(op, current, right, span, ctx)?;
     lower_class_setitem(base_local, class_id, &idx_name, combined, span, ctx, out)
 }
 
@@ -15049,7 +15144,7 @@ fn lower_aug_assign(
                 });
                 return Ok(());
             }
-            let combined = lower_binary(op, left, right, span, ctx)?;
+            let combined = lower_aug_binary(op, left, right, span, ctx)?;
             // And the store is the same store a plain assignment performs —
             // `bind_name` is the only place that writes through a cell.
             out.push(bind_name(
@@ -15097,7 +15192,7 @@ fn lower_aug_assign(
                 },
             };
             let right = lower_expr(value, ctx)?;
-            let combined = lower_binary(op, current, right, span, ctx)?;
+            let combined = lower_aug_binary(op, current, right, span, ctx)?;
             let combined = coerce(combined, elem, span, "item assignment").map_err(|e| {
                 Diagnostic::new(
                     Phase::Semantic,
@@ -15158,7 +15253,7 @@ fn lower_aug_assign(
                 },
             };
             let right = lower_expr(value, ctx)?;
-            let combined = lower_binary(op, current, right, span, ctx)?;
+            let combined = lower_aug_binary(op, current, right, span, ctx)?;
             let combined = coerce(combined, field_ty, span, "attribute assignment")?;
             out.push(ir::Stmt::SetField {
                 object: base_local,
@@ -16282,9 +16377,10 @@ fn coerce_assign(value: ir::Expr, target: ir::Ty, name: &str, span: Span) -> SRe
         Diagnostic::new(
             Phase::Semantic,
             format!(
-                "{}; variable '{name}' has storage type {target} (join of its assignments \
+                "{}; variable '{name}' has storage type {} (join of its assignments \
                  and annotation)",
-                e.message
+                e.message,
+                display_ty(target)
             ),
             e.span,
         )
@@ -16449,8 +16545,9 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
         }
         return Err(err(
             format!(
-                "type mismatch in {what}: expected {target}, found {}",
-                value.ty
+                "type mismatch in {what}: expected {}, found {}",
+                display_ty(target),
+                display_ty(value.ty)
             ),
             span,
         ));
@@ -16507,8 +16604,9 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
     // None → only ok for None target (handled by equality) or unions (above)
     Err(err(
         format!(
-            "type mismatch in {what}: expected {target}, found {}",
-            value.ty
+            "type mismatch in {what}: expected {}, found {}",
+            display_ty(target),
+            display_ty(value.ty)
         ),
         span,
     ))
@@ -18244,7 +18342,15 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         }
         ast::ExprKind::Unary { op, operand } => {
             let value = lower_expr(operand, ctx)?;
+            // A class instance dispatches to its dunder; `not` never does,
+            // because Python's `not` is truthiness and has no `__not__`.
+            if matches!(value.ty, ir::Ty::Class(_)) && class_unary_method(*op).is_some() {
+                return lower_class_unary(*op, value, expr.span, ctx);
+            }
             match op {
+                // `+x` is identity on a number. It is not a no-op in general,
+                // which is why the parser records it: CPython rejects `+"a"`.
+                ast::UnaryOp::Pos => unary_numeric(value, "+", operand.span),
                 ast::UnaryOp::Not => {
                     let value = to_bool(value, operand.span, ctx)?;
                     Ok(ir::Expr {
@@ -18256,7 +18362,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     })
                 }
                 ast::UnaryOp::Neg => {
-                    let value = promote_numeric(value, operand.span, "unary '-'")?;
+                    let value = unary_numeric(value, "-", operand.span)?;
                     // fold negated literals into constants so negative range
                     // steps and exponents are statically visible
                     if let ir::ExprKind::ConstInt(v) = value.kind {
@@ -26681,7 +26787,10 @@ fn promote_numeric(value: ir::Expr, span: Span, what: &str) -> SResult<ir::Expr>
             ))
         }
         other => Err(err(
-            format!("{what} is not supported for values of type {other}"),
+            format!(
+                "{what} is not supported for values of type {}",
+                display_ty(other)
+            ),
             span,
         )),
     }
@@ -26964,7 +27073,7 @@ fn lower_binary(
     if matches!(l.ty, ir::Ty::Tuple(_)) || matches!(r.ty, ir::Ty::Tuple(_)) {
         return lower_tuple_binary(op, l, r, span, ctx);
     }
-    // ---- class == / != / ordering (identity or matching dunder) ----
+    // ---- class operators (identity or matching dunder) ----
     if matches!(l.ty, ir::Ty::Class(_)) || matches!(r.ty, ir::Ty::Class(_)) {
         match op {
             ast::BinOp::Eq
@@ -26975,11 +27084,29 @@ fn lower_binary(
             | ast::BinOp::GtEq => {
                 return lower_class_compare(op, l, r, span, ctx);
             }
+            // Arithmetic and bitwise, when either side offers a slot. When
+            // neither does, fall through so a mixed operand still gets the
+            // numeric path's wording rather than a dunder hint.
+            _ if class_arith_method(op).is_some() && class_arith_slot_exists(op, l.ty, r.ty) => {
+                return lower_class_arith(op, l, r, span, ctx);
+            }
             _ => {}
         }
     }
 
     match op {
+        // Reached only when neither operand offered `__matmul__`: no builtin
+        // type implements `@`, so there is no numeric path to fall back to.
+        ast::BinOp::MatMul => Err(err(
+            format!(
+                "operator '@' is not supported between {} and {}: no builtin type \
+                 implements matrix multiplication, so an operand must be a class \
+                 defining __matmul__",
+                display_ty(l.ty),
+                display_ty(r.ty)
+            ),
+            span,
+        )),
         ast::BinOp::Add
         | ast::BinOp::Sub
         | ast::BinOp::Mul
@@ -27286,14 +27413,24 @@ fn lower_class_compare(
     ))
 }
 
-fn lower_class_cmp_call(
+/// A dunder call with both operands already spilled to temps.
+///
+/// The spill is the whole point: source order is left-then-right whichever
+/// operand ends up the receiver, and a reflected dispatch would otherwise
+/// evaluate the right one first. `cli/tests/protocol_order.rs` pins that.
+struct SpilledBinopCall {
+    stmts: Vec<ir::Stmt>,
+    call: ir::Expr,
+}
+
+fn lower_class_binop_call(
     left: ir::Expr,
     right: ir::Expr,
-    method: ClassComparisonMethod,
+    method: &'static str,
     reflected: bool,
     span: Span,
     ctx: &mut FnCtx,
-) -> SResult<ir::Expr> {
+) -> SResult<SpilledBinopCall> {
     let left_t = ctx.fresh_temp("cmp.l", left.ty);
     let right_t = ctx.fresh_temp("cmp.r", right.ty);
     let (receiver, argument) = if reflected {
@@ -27302,18 +27439,43 @@ fn lower_class_cmp_call(
         (local_expr(left_t.clone(), left.ty), right_t.clone())
     };
     let ir::Ty::Class(class_id) = receiver.ty else {
-        unreachable!("class comparison receiver must be a class instance");
+        unreachable!("class operator receiver must be a class instance");
     };
     let argument_name = ast::Expr {
         kind: ast::ExprKind::Name(argument),
         span,
     };
-    let call =
-        lower_instance_method_call(receiver, class_id, method.name, span, &[argument_name], ctx)?;
-    let call = if call.ty == ir::Ty::Bool {
-        call
+    let call = lower_instance_method_call(receiver, class_id, method, span, &[argument_name], ctx)?;
+    Ok(SpilledBinopCall {
+        // Source order: evaluate left, then right, then dispatch.
+        stmts: vec![
+            ir::Stmt::Assign {
+                name: left_t,
+                value: left,
+            },
+            ir::Stmt::Assign {
+                name: right_t,
+                value: right,
+            },
+        ],
+        call,
+    })
+}
+
+fn lower_class_cmp_call(
+    left: ir::Expr,
+    right: ir::Expr,
+    method: ClassComparisonMethod,
+    reflected: bool,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let spilled = lower_class_binop_call(left, right, method.name, reflected, span, ctx)?;
+    // A comparison answers yes or no whatever the dunder returned.
+    let call = if spilled.call.ty == ir::Ty::Bool {
+        spilled.call
     } else {
-        to_bool(call, span, ctx)?
+        to_bool(spilled.call, span, ctx)?
     };
     let result = if method.invert {
         ir::Expr {
@@ -27329,20 +27491,156 @@ fn lower_class_cmp_call(
     Ok(ir::Expr {
         ty: ir::Ty::Bool,
         kind: ir::ExprKind::Block {
-            // Source order: evaluate left, then right, then dispatch.
-            stmts: vec![
-                ir::Stmt::Assign {
-                    name: left_t,
-                    value: left,
-                },
-                ir::Stmt::Assign {
-                    name: right_t,
-                    value: right,
-                },
-            ],
+            stmts: spilled.stmts,
             result: Box::new(result),
         },
     })
+}
+
+/// Whether either operand offers a slot for `op`, so the guard can decline
+/// and leave a mixed `Point + 1` to the numeric path's own wording.
+fn class_arith_slot_exists(op: ast::BinOp, l: ir::Ty, r: ir::Ty) -> bool {
+    let direct = class_arith_method(op)
+        .is_some_and(|m| matches!(l, ir::Ty::Class(id) if resolve_method(id, m).is_some()));
+    let reflected = class_reflected_arith_method(op)
+        .is_some_and(|m| matches!(r, ir::Ty::Class(id) if resolve_method(id, m).is_some()));
+    direct || reflected
+}
+
+/// `a <op> b` where at least one side is a class instance.
+///
+/// Resolution follows CPython's order, and unlike a comparison the result
+/// keeps the dunder's own return type — `V.__add__ -> V` yields a `V`.
+fn lower_class_arith(
+    op: ast::BinOp,
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let method = class_arith_method(op).expect("caller filtered to arithmetic operators");
+    let reflected = class_reflected_arith_method(op);
+
+    let finish = |spilled: SpilledBinopCall| {
+        Ok(ir::Expr {
+            ty: spilled.call.ty,
+            kind: ir::ExprKind::Block {
+                stmts: spilled.stmts,
+                result: Box::new(spilled.call),
+            },
+        })
+    };
+
+    // CPython: a proper subclass on the right gets the first attempt, so a
+    // subclass can override its base's arithmetic from either side.
+    if let (ir::Ty::Class(lid), ir::Ty::Class(rid), Some(refl)) = (l.ty, r.ty, reflected)
+        && lid != rid
+        && class_is_subclass(rid, lid)
+        && resolve_method(rid, refl).is_some()
+        && class_equality_accepts(rid, refl, l.ty, ctx)
+    {
+        return finish(lower_class_binop_call(l, r, refl, true, span, ctx)?);
+    }
+
+    if let ir::Ty::Class(id) = l.ty
+        && resolve_method(id, method).is_some()
+        && class_equality_accepts(id, method, r.ty, ctx)
+    {
+        return finish(lower_class_binop_call(l, r, method, false, span, ctx)?);
+    }
+
+    // `2.0 * vec`: the left operand has no slot to offer, so the right one's
+    // reflected form is the answer.
+    if let (ir::Ty::Class(id), Some(refl)) = (r.ty, reflected)
+        && resolve_method(id, refl).is_some()
+        && class_equality_accepts(id, refl, l.ty, ctx)
+    {
+        return finish(lower_class_binop_call(l, r, refl, true, span, ctx)?);
+    }
+
+    let hint = match reflected {
+        Some(refl) => format!("define {method} on the left operand or {refl} on the right"),
+        Option::None => format!("define {method}"),
+    };
+    Err(err(
+        format!(
+            "operator '{op}' is not supported between {} and {} ({hint})",
+            display_ty(l.ty),
+            display_ty(r.ty)
+        ),
+        span,
+    ))
+}
+
+/// `x <op>= y`, which prefers the in-place dunder and otherwise is `x <op> y`.
+///
+/// CPython rebinds the result either way, so `__iadd__` returning `self` is
+/// what makes the mutation visible; a class defining only `__add__` still
+/// works, and gets a new object.
+fn lower_aug_binary(
+    op: ast::BinOp,
+    left: ir::Expr,
+    right: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if let ir::Ty::Class(id) = left.ty
+        && let Some(inplace) = class_inplace_arith_method(op)
+        && resolve_method(id, inplace).is_some()
+        && class_equality_accepts(id, inplace, right.ty, ctx)
+    {
+        let spilled = lower_class_binop_call(left, right, inplace, false, span, ctx)?;
+        return Ok(ir::Expr {
+            ty: spilled.call.ty,
+            kind: ir::ExprKind::Block {
+                stmts: spilled.stmts,
+                result: Box::new(spilled.call),
+            },
+        });
+    }
+    lower_binary(op, left, right, span, ctx)
+}
+
+/// `-x` / `+x` on a number, with CPython's wording when it is not one.
+fn unary_numeric(value: ir::Expr, sym: &str, span: Span) -> SResult<ir::Expr> {
+    if matches!(value.ty, ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool) {
+        return promote_numeric(value, span, &format!("unary '{sym}'"));
+    }
+    Err(err(
+        format!(
+            "bad operand type for unary {sym}: '{}'",
+            display_ty(value.ty)
+        ),
+        span,
+    ))
+}
+
+/// `-x` / `+x` / `~x` where `x` is a class instance.
+fn lower_class_unary(
+    op: ast::UnaryOp,
+    value: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let method = class_unary_method(op).expect("caller filtered to unary operators");
+    let ir::Ty::Class(id) = value.ty else {
+        unreachable!("class unary receiver must be a class instance");
+    };
+    if resolve_method(id, method).is_none() {
+        let sym = match op {
+            ast::UnaryOp::Neg => "-",
+            ast::UnaryOp::Pos => "+",
+            _ => "~",
+        };
+        return Err(err(
+            format!(
+                "bad operand type for unary {sym}: '{}' (define {method})",
+                display_ty(value.ty)
+            ),
+            span,
+        ));
+    }
+    lower_instance_method_call(value, id, method, span, &[], ctx)
 }
 
 fn comparison_ir_op(op: ast::BinOp) -> ir::BinOp {
