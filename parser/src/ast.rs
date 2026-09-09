@@ -190,6 +190,16 @@ pub struct Decorator {
 pub struct FuncDef {
     pub name: String,
     pub params: Vec<Param>,
+    /// Number of leading parameters that are positional-only — the index of
+    /// the `/` marker. 0 when there is none.
+    pub posonly_end: usize,
+    /// Index at which keyword-only parameters begin — the position of the `*`
+    /// or `*args` marker, or `None` when the signature has neither.
+    ///
+    /// An `Option` rather than `params.len()` on purpose: the natural default
+    /// for a synthesized signature is `0`, and with a plain index that would
+    /// silently mean *every* parameter is keyword-only.
+    pub kwonly_start: Option<usize>,
     /// `*args: T` — remaining positionals as `list[T]`.
     pub vararg: Option<Param>,
     /// `**kwargs: T` — remaining keywords as `dict[str, T]`.

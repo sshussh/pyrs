@@ -1189,6 +1189,14 @@ impl Parser {
         let mut params: Vec<Param> = Vec::new();
         let mut vararg: Option<Param> = None;
         let mut kwarg: Option<Param> = None;
+        // `/` and `*` split `params` into three runs: positional-only,
+        // positional-or-keyword, keyword-only. `kwonly_start` is `None` until
+        // a `*` or `*args` is seen, which is also how "are we still in the
+        // positional section" is answered below.
+        let mut posonly_end = 0usize;
+        let mut posonly_span: Option<Span> = None;
+        let mut kwonly_start: Option<usize> = None;
+        let mut star_span: Option<Span> = None;
         if self.peek() != &Token::RParen {
             loop {
                 if self.peek() == &Token::DoubleStar {
@@ -1214,38 +1222,71 @@ impl Parser {
                     }
                     break;
                 }
-                if self.peek() == &Token::Star {
-                    if vararg.is_some() {
-                        return Err(self.error("duplicate *args parameter"));
+                // `/`: everything before it is positional-only.
+                if self.peek() == &Token::Slash {
+                    let span = self.peek_span();
+                    if posonly_span.is_some() {
+                        return Err(self.error("duplicate '/' in parameter list"));
                     }
-                    if kwarg.is_some() {
-                        return Err(self.error("*args cannot follow **kwargs"));
+                    if kwonly_start.is_some() {
+                        return Err(self.error("'/' must appear before '*'"));
+                    }
+                    if params.is_empty() {
+                        return Err(
+                            self.error("at least one parameter must precede '/' in a signature")
+                        );
                     }
                     self.advance();
-                    let (pname, pspan) = self.expect_ident("after '*'")?;
-                    let ty = if self.eat(&Token::Colon) {
-                        Some(self.parse_type_name("in *args annotation")?)
-                    } else {
-                        None
-                    };
-                    vararg = Some(Param {
-                        name: pname,
-                        ty,
-                        span: pspan,
-                        default: None,
-                    });
+                    posonly_end = params.len();
+                    posonly_span = Some(span);
                     if !self.eat(&Token::Comma) {
                         break;
                     }
                     if self.peek() == &Token::RParen {
                         break;
                     }
-                    // only **kwargs may follow *args
+                    continue;
+                }
+                if self.peek() == &Token::Star {
+                    let span = self.peek_span();
+                    if kwonly_start.is_some() {
+                        return Err(self.error("duplicate '*' in parameter list"));
+                    }
+                    if kwarg.is_some() {
+                        return Err(self.error("*args cannot follow **kwargs"));
+                    }
+                    self.advance();
+                    // A bare `*` only marks the boundary; `*args` also binds
+                    // the remaining positionals. Either way what follows is
+                    // keyword-only.
+                    let bare = matches!(self.peek(), Token::Comma | Token::RParen);
+                    if !bare {
+                        let (pname, pspan) = self.expect_ident("after '*'")?;
+                        let ty = if self.eat(&Token::Colon) {
+                            Some(self.parse_type_name("in *args annotation")?)
+                        } else {
+                            None
+                        };
+                        vararg = Some(Param {
+                            name: pname,
+                            ty,
+                            span: pspan,
+                            default: None,
+                        });
+                    }
+                    kwonly_start = Some(params.len());
+                    star_span = Some(span);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                    if self.peek() == &Token::RParen {
+                        break;
+                    }
                     continue;
                 }
 
-                if vararg.is_some() || kwarg.is_some() {
-                    return Err(self.error("positional parameter cannot follow *args or **kwargs"));
+                if kwarg.is_some() {
+                    return Err(self.error("parameter cannot follow **kwargs"));
                 }
 
                 let (pname, pspan) = self.expect_ident("in parameter list")?;
@@ -1259,8 +1300,13 @@ impl Parser {
                 } else {
                     None
                 };
-                // no non-default after default
-                if default.is_none() && params.iter().any(|p| p.default.is_some()) {
+                // No non-default after a default — but only within the
+                // positional run. `def f(*, a=1, b)` is legal Python, because
+                // a keyword-only argument is supplied by name.
+                if kwonly_start.is_none()
+                    && default.is_none()
+                    && params.iter().any(|p| p.default.is_some())
+                {
                     return Err(Diagnostic::new(
                         Phase::Parse,
                         format!("non-default argument '{pname}' follows default argument"),
@@ -1282,6 +1328,16 @@ impl Parser {
                 }
             }
         }
+        // A bare `*` exists only to introduce keyword-only parameters.
+        if let (Some(start), None, Some(span)) = (kwonly_start, &vararg, star_span)
+            && start == params.len()
+        {
+            return Err(Diagnostic::new(
+                Phase::Parse,
+                "named parameters must follow a bare '*'".to_string(),
+                span,
+            ));
+        }
         let close = self.expect(Token::RParen, "after parameter list")?;
 
         let ret = if self.eat(&Token::Arrow) {
@@ -1296,6 +1352,8 @@ impl Parser {
             kind: StmtKind::FuncDef(FuncDef {
                 name,
                 params,
+                posonly_end,
+                kwonly_start,
                 vararg,
                 kwarg,
                 ret,
