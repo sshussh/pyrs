@@ -14949,7 +14949,12 @@ fn lower_aug_assign(
             name,
             span: name_span,
         } => {
-            let (current_ty, is_global) = if let Some(&t) = ctx.locals.get(name) {
+            // Storage type. `cell_locals` has to be probed the same way
+            // `bind_name` probes it: a `nonlocal` name keeps its type there
+            // under the user name, and `locals` holds only `.cell.<name>`.
+            let (current_ty, _is_global) = if let Some(&t) = ctx.locals.get(name) {
+                (t, false)
+            } else if let Some(&t) = ctx.cell_locals.get(name) {
                 (t, false)
             } else if ctx.binds_global(name) {
                 match ctx.globals.get(name) {
@@ -14982,14 +14987,17 @@ fn lower_aug_assign(
                     *name_span,
                 ));
             };
-            let left = ir::Expr {
-                ty: current_ty,
-                kind: if is_global {
-                    ir::ExprKind::GlobalLoad(ctx.own_global(name))
-                } else {
-                    ir::ExprKind::Local(name.clone())
+            // `x op= v` is `x = x op v`, so the load must be *the same load*
+            // the expression path performs. Only that one knows about cell
+            // bindings, narrowing refinements and comprehension renames; a
+            // hand-rolled `Local(name)` here silently missed all three.
+            let left = lower_expr(
+                &ast::Expr {
+                    kind: ast::ExprKind::Name(name.clone()),
+                    span: *name_span,
                 },
-            };
+                ctx,
+            )?;
             let right = lower_expr(value, ctx)?;
             // set |= other → in-place update (not a new set assign).
             if matches!(current_ty, ir::Ty::Set(_)) && op == ast::BinOp::BitOr {
@@ -15042,18 +15050,16 @@ fn lower_aug_assign(
                 return Ok(());
             }
             let combined = lower_binary(op, left, right, span, ctx)?;
-            let combined = coerce_assign(combined, current_ty, name, span)?;
-            out.push(if is_global {
-                ir::Stmt::GlobalAssign {
-                    name: ctx.own_global(name),
-                    value: combined,
-                }
-            } else {
-                ir::Stmt::Assign {
-                    name: name.clone(),
-                    value: combined,
-                }
-            });
+            // And the store is the same store a plain assignment performs —
+            // `bind_name` is the only place that writes through a cell.
+            out.push(bind_name(
+                name,
+                *name_span,
+                Option::None,
+                combined,
+                span,
+                ctx,
+            )?);
             Ok(())
         }
         // `xs[i] op= v`: evaluate base and index once via temps
