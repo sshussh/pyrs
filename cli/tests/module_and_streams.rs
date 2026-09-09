@@ -228,13 +228,31 @@ fn str_of_a_value_is_unaffected_by_the_destination() {
     parity("capture", &dir, "prog.py");
 }
 
+/// `print(..., file=f)` reaches any open file, not just the two standard
+/// streams. The destination is set for the duration of the one statement, so
+/// a `str()` of a value inside it still captures rather than escaping to the
+/// file.
 #[test]
-fn a_file_destination_that_is_not_a_standard_stream_is_refused() {
-    let dir = workspace("bad-file");
+fn print_writes_to_an_opened_file() {
+    let dir = workspace("print-to-open-file");
     write(
         &dir.0.join("prog.py"),
-        "f = open(\"out.txt\", \"w\")\nprint(1, file=f)\n",
+        "f = open(\"out.txt\", \"w\")\n\
+         print(\"a\", 1, [2, 3], sep=\"|\", file=f)\n\
+         print(\"second\", file=f)\n\
+         f.close()\n\
+         print(open(\"out.txt\").read(), end=\"\")\n\
+         print(\"back on stdout\")\n",
     );
+    parity("print-to-open-file", &dir, "prog.py");
+}
+
+/// A destination that is not a file is still refused, and the message says
+/// what one looks like.
+#[test]
+fn a_print_destination_must_be_a_file() {
+    let dir = workspace("bad-file");
+    write(&dir.0.join("prog.py"), "print(1, file=\"out.txt\")\n");
     let out = Command::new(PYRS)
         .args(["check", "-i", "prog.py"])
         .current_dir(&dir.0)
@@ -242,6 +260,6 @@ fn a_file_destination_that_is_not_a_standard_stream_is_refused() {
         .unwrap();
     assert!(!out.status.success());
     let message = String::from_utf8_lossy(&out.stderr);
-    assert!(message.contains("sys.stderr"), "{message}");
-    assert!(message.contains("f.write"), "{message}");
+    assert!(message.contains("needs a file"), "{message}");
+    assert!(message.contains("open()"), "{message}");
 }
