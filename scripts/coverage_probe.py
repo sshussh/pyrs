@@ -570,6 +570,16 @@ p(
 )
 p("semantics", "untyped params (inference)", "def f(x):\n    return x + 1\nprint(f(1))")
 p(
+    "stdlib",
+    "json.loads (dynamic)",
+    "import json\nv = json.loads('{\"a\": [1, true, null]}')\nprint(v)",
+)
+p(
+    "stdlib",
+    "json.loads error parity",
+    "import json\ntry:\n    json.loads('{')\nexcept ValueError as e:\n    print(e)",
+)
+p(
     "semantics",
     "object annotation",
     "def f(v: object) -> str:\n    if isinstance(v, int):\n        return str(v + 1)\n"
