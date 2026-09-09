@@ -45,6 +45,9 @@ fn main() {
     emit_flags(&sys);
 
     // C++ runtime
+    #[cfg(target_os = "macos")]
+    println!("cargo:rustc-link-lib=dylib=c++");
+    #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=dylib=stdc++");
 
     println!("cargo:rerun-if-changed=shim/src/lib.cc");
