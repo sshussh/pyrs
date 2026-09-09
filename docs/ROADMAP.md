@@ -37,7 +37,7 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.139 |
+| Check | Result after 0.140 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
@@ -45,7 +45,7 @@ recorded in [the changelog](../CHANGELOG.md). The most recent run:
 | `cargo test --workspace` | 1723 passed; none failed or ignored |
 | `make examples` | All 14 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.139.0` |
+| `pyrs --version` | `PyRs 0.140.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -373,15 +373,20 @@ documentation and the relevant gates.
       `float`/`bool`/`frozenset` keys; dict views. Dict *keys* and set
       elements deliberately stayed restricted when 0.137 let container
       *values* infer a union, because a key must be hashable.
-- [ ] One canonical container encoding inside `Any`. `Any` can hold a
-      `list[int]` (element tag 4) or a `list[Any]` (tag 68), `isinstance(v,
-      list)` is true for both, and nothing static chooses between them — so
-      `isinstance` cannot narrow to a container and a body must write
-      `items: list[Any] = v`, which is checked. Narrowing was attempted in
-      0.139 and reverted: it turned `print(v)` on a concretely-typed list into
-      a trap. Canonicalising needs the aliasing answer from the
+- [x] Reading a container inside `Any` without naming its encoding (0.140).
+      `Any` can hold a `list[int]` (element tag 4) or a `list[Any]` (tag 68)
+      and `isinstance(v, list)` is true for both, so narrowing to a container
+      cannot choose between them — attempted in 0.139 and reverted, because it
+      turned `print(v)` on a concretely-typed list into a trap. `len(v)`,
+      `v[i]`, `v[k]` (by `str` or by another dynamic value), `v.keys()` and
+      `for x in v` instead read the value *through* the tag it already
+      carries, which needs no peel and no copy, so aliasing is untouched. A
+      tuple reads element by element, since it carries a tag per slot.
+- [ ] One canonical container encoding inside `Any`, so that narrowing works
+      too and not only reading. Still needs the aliasing answer from the
       `list[T1]` -> `list[T2]` item above, since the conversion is an O(n)
-      re-box.
+      re-box. Lower priority now that the reads above cover the case the
+      libraries actually hit.
 - [ ] Parenthesized import lists — `from x import (a, b, c)` is not parsed.
       Ordinary Python and common for long lists; found while writing
       `stdlib/json.py` in 0.139.
@@ -496,15 +501,17 @@ documentation and the relevant gates.
       dotted import name otherwise), which the others do not.
 - [ ] Standard-library inventory driven by workload failures. Enumerate each
       module's supported public API; an importable stub is not compatibility.
-- [x] First library implemented in PyRs (0.139): `json.loads` is a real
-      recursive-descent parser compiled from `stdlib/json.py`, and the C
-      parser plus its IR node were deleted rather than kept alongside. 48/48
-      values and 41/44 error messages match CPython; the three differences are
-      lone surrogates, which a well-formed-UTF-8 `str` cannot hold. `dumps`
-      stays compiler-lowered because it dispatches on the argument's *static*
-      type. Measured 1.8x faster than CPython on the same source and 6.8x
-      slower than CPython's C module — the workload is `Any` boxing, not
-      arithmetic.
+- [x] First library implemented in PyRs (0.139, completed 0.140): the whole
+      of `json` is compiled from `stdlib/json.py`, and the C parser, the C
+      serialiser and both IR nodes were deleted rather than kept alongside.
+      `loads` matches CPython on 48/48 values and 41/44 error messages; the
+      three differences are lone surrogates, which a well-formed-UTF-8 `str`
+      cannot hold. `dumps` gained `None`, tuples-as-arrays, non-`str` key
+      coercion and dynamic values, none of which its static dispatch could
+      express; its one difference is that `type(x).__name__` has no spelling,
+      so the `TypeError` does not name the type. Measured 1.8x/1.9x faster
+      than CPython on the same source and 6.8x/3.8x slower than CPython's C
+      module — the workload is `Any` boxing and GC, not arithmetic.
 - [ ] Implement the remaining libraries in PyRs once their primitives exist;
       keep platform operations in the runtime. Reuse upstream tests with
       provenance.

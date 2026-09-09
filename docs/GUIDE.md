@@ -1014,6 +1014,17 @@ def clamp(x: float, lo: float, hi: float) -> float:
   only *sometimes* raises does not count. `NoReturn` (and `Never`) are
   accepted as annotations for compatibility with type-checked Python, but the
   inference is what carries the meaning.
+- **`isinstance(x, A or B)` is rejected, with the fix named** (0.140). CPython
+  accepts it and tests only `A` — `or` yields its first truthy operand and a
+  type object is always truthy — so this is a divergence on purpose. Write the
+  tuple, `isinstance(x, (A, B))`, which works here and means what it says.
+- **A dynamic container reads without narrowing** (0.140). `len(v)`, `v[i]`,
+  `v[k]`, `v.keys()` and `for x in v` work on an `object` whose contents are
+  only known at run time, reading it through the tag it already carries — so
+  a `list[int]` and a `list[object]` are both readable through one parameter,
+  with no copy and no aliasing break. A tuple reads element by element,
+  because it carries a tag per slot. This is what lets `json.dumps` be
+  ordinary PyRs.
 - **A module-level function is a value** (0.138), like a nested `def` or a
   lambda: `apply(double, 1)`, `sorted(xs, key=by_len)`, `map(square, xs)`,
   and a dispatch table `{"build": cmd_build, "test": cmd_test}`. Two
@@ -1463,7 +1474,7 @@ compiler build time. Prefer real package imports — only `sys` is special-cased
 | `os` | `getcwd() -> str` | C runtime (`pyrs_os_getcwd`); package re-exports `path` |
 | `os.path` | `join(a, *parts)`, `dirname`, `basename` | Pure PyRs; **POSIX** only |
 | `math` | `pi`/`e` + unary float ops | Compiler intrinsics / libm |
-| `json` | `dumps(x)`, typed `loads_*` | See below; no dynamic `loads` |
+| `json` | `loads`, `dumps`, typed `loads_*` | Pure PyRs (`stdlib/json.py`); see below |
 
 ```python
 from os.path import join, dirname, basename
@@ -1494,18 +1505,40 @@ Supported: `pi`, `e`, `sqrt`, `sin`, `cos`, `tan`, `log`, `log10`,
 `exp`, `floor`/`ceil` (return `int` like CPython), `fabs`. No
 `math.pow`, `isfinite`, multi-arg `log`, etc. yet.
 
-**`json`** (embedded) supports:
+**`json`** is written in PyRs — `stdlib/json.py`, compiled like any other
+module rather than lowered by the compiler. It supports:
 
-- `json.dumps(x)` for `int`, `float`, `bool`, `str`, homogeneous
-  `list[...]` of those, and `dict[str, ...]` of those (nested lists/dicts
-  allowed when elements are json-able). Spacing matches CPython defaults.
-- Typed loaders (not CPython names): `loads_int`, `loads_float`,
-  `loads_bool`, `loads_str`, `loads_list_int` / `_float` / `_str` /
-  `_bool`, `loads_dict_str_int` / `_float` / `_str` / `_bool`.
-- There is **no** dynamic `json.loads` (no object model for mixed values).
+- `json.loads(text) -> object`, a recursive-descent parser returning nested
+  `dict[str, object]` / `list[object]` / scalars. Values match CPython's
+  `json` exactly, and so do the error messages, position included:
+  `Expecting ',' delimiter: line 1 column 8 (char 7)`. `JSONDecodeError`
+  subclasses `ValueError`, so `except ValueError` catches it. `NaN`,
+  `Infinity` and `-Infinity` are accepted, as CPython's decoder does.
+- `json.dumps(value) -> str` for `None`, `bool`, `int`, `float`, `str`,
+  `list`, `tuple` (serialised as an array) and `dict`, nested to any depth,
+  including a value whose shape is only known at run time. Non-`str` keys are
+  coerced (`{1: "a"}` → `{"1": "a"}`). Escaping follows CPython's
+  `ensure_ascii=True` default, so non-ASCII becomes `\uXXXX` and an astral
+  code point becomes a surrogate pair. Spacing matches CPython defaults.
+- Typed loaders (not CPython names), ordinary PyRs over `loads`: `loads_int`,
+  `loads_float`, `loads_bool`, `loads_str`, `loads_list_int` / `_float` /
+  `_str` / `_bool`, `loads_dict_str_int` / `_float` / `_str` / `_bool`. They
+  raise rather than mistranslate a document of the wrong shape.
+
+Two deliberate differences from CPython. A **lone surrogate escape** —
+`"\ud800"` with no low half — is an error, because a PyRs `str` is
+well-formed UTF-8 and cannot hold one; a surrogate *pair* decodes normally.
+And `dumps` of an unserialisable value says `Object of this type is not JSON
+serializable` where CPython names the type, because `type(x).__name__` has no
+spelling here. Nesting is capped at 200 in both directions, so an adversarial
+document raises rather than overflowing the native stack.
 
 ```python
 import json
+
+value: object = json.loads('{"a": [1, 2.5, true, null]}')
+print(value["a"][1])                  # 2.5
+print(json.dumps(value))              # {"a": [1, 2.5, true, null]}
 print(json.dumps([1, 2, 3]))          # [1, 2, 3]
 print(json.loads_list_int("[1, 2]"))  # [1, 2]
 ```
@@ -1894,7 +1927,15 @@ Container notes:
   `Any` can hold a `list[int]` as well as a `list[Any]` — different element
   encodings — and `isinstance(v, list)` is true for both, so nothing static
   chooses between them. Write `items: list[Any] = v`, which says which
-  encoding is expected and is checked at run time. `bool(x)` /
+  encoding is expected and is checked at run time — **or do not narrow at
+  all**: as of 0.140 a container can be *read* through the tag it already
+  carries, with no peel and no copy. `len(v)`, `v[i]` (list or tuple), `v[k]`
+  (dict, by a `str` key or by another dynamic value), `v.keys()` (dict with
+  `str` keys) and `for x in v` all work directly on an `object`, and each
+  element comes back as an `object` in turn. A tuple reads element by element,
+  since it carries a tag per slot. Iteration is not indexing: `for x in v`
+  over a dict yields keys, while `v[0]` looks up the key `0`. This is how
+  `json.dumps` walks a value whose shape it does not know. `bool(x)` /
   `if x:` use runtime truthiness for all container tags (empty `list[Any]`
   / `list[str]` / … are falsy). `list[Any]` equality treats `True == 1`
   like CPython. Not full gradual typing: no open setattr, no method
@@ -1966,7 +2007,7 @@ Not implemented yet (clear compile errors): full class dynamism (see
 f-string debug form `{x=}` / grouping / types `n`/`c`, unparenthesized
 multi-line expressions inside f-string `{...}` (parenthesize instead),
 same-delimiter triple quotes nested inside an f-string expression,
-`__doc__` attribute access, dynamic `json.loads`, multi-path split
+`__doc__` attribute access, multi-path split
 namespace packages, `from sys import *`, and most remaining methods on
 dict/set (tuples have `count`/`index`). Generator exhaustion is **Optional None** (not raised
 `StopIteration`) by design for this subset.

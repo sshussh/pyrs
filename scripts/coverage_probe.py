@@ -580,6 +580,16 @@ p(
     "import json\ntry:\n    json.loads('{')\nexcept ValueError as e:\n    print(e)",
 )
 p(
+    "stdlib",
+    "json.dumps (dynamic value)",
+    "import json\nprint(json.dumps(json.loads('{\"a\": [1, 2.5, true, null]}')))",
+)
+p(
+    "stdlib",
+    "json.dumps escaping",
+    "import json\nprint(json.dumps({'k\\u00e9y': '\\U0001F642'}))",
+)
+p(
     "semantics",
     "object annotation",
     "def f(v: object) -> str:\n    if isinstance(v, int):\n        return str(v + 1)\n"

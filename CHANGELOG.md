@@ -1,5 +1,124 @@
 # Changelog
 
+## 0.140.0 — `json.dumps`, written in PyRs, and reading a container you cannot name
+
+0.139 moved `json.loads` into PyRs and left `dumps` behind in C, with the
+reason written down: it dispatched on the **static** type of its argument,
+which is what made `dumps([1, 2, 3])` serialise a `list[int]`, and a PyRs body
+could only take `object`. A `list[int]` boxed into `object` carries tag 4
+where a `list[object]` carries 68, so such a body would have refused exactly
+the calls that mattered.
+
+That was true, and it was a compiler gap rather than a fact about the library.
+This release closes it. **`stdlib/json.py` is now the whole module** — the C
+serialiser, `ir::ExprKind::JsonDumps`, the emit arm and the three call-site
+special cases in semantic are deleted. No part of `json` is compiler-lowered
+any more.
+
+### Reading a dynamic container
+
+Narrowing `object` to a container type was tried in 0.139 and reverted:
+`isinstance(v, list)` is true for both encodings, so peeling to one of them
+breaks the other at every read. These operations take the other route — they
+read the value **through the tag it already carries**, so there is no peel, no
+copy, and nothing to break aliasing:
+
+| | |
+|---|---|
+| `len(v)` | list, tuple, dict, set, str |
+| `v[i]` | list and tuple, by position |
+| `v[k]` | dict, by a `str` key or by another dynamic value |
+| `v.keys()` | dict with `str` keys, in insertion order |
+| `for x in v` | a list's elements, a dict's keys, a str's characters |
+
+Iteration is a separate operation from indexing, because `d[0]` on a dict
+looks up the key `0` rather than the first entry.
+
+**A tuple reads element by element.** It carries a tag per slot, so a
+heterogeneous tuple comes back exactly typed — something a list, with one tag
+for the whole container, could only manage by boxing every element.
+
+**A dynamic key indexes a dynamic dict.** The key's own box says which hash
+and comparison the lookup uses, so a dict can be walked without knowing its
+key type in advance.
+
+### What `dumps` gained by being written in PyRs
+
+The C version dispatched on a static type, and so could not express values
+that have no single static type. Four CPython behaviours it lacked now work:
+
+- `dumps(None)` → `null`
+- a **tuple** serialises as an array, as CPython's encoder does
+- a **non-`str` key** is coerced to its JSON spelling — `{1: "a"}` →
+  `{"1": "a"}`
+- a value whose shape is only known at run time, which is the ordinary case
+  for anything that came back from `loads`
+
+Escaping follows CPython's `ensure_ascii=True` default: `"` and `\`, short
+forms for `\b \f \n \r \t`, and every other control character *and all
+non-ASCII* as `\uXXXX`, with a surrogate pair for a code point outside the
+BMP. Floats format through `str`, which already matches CPython exactly
+(`1e+30`, `1e-07`, `-0.0`).
+
+A container that contains itself raises `ValueError: Circular reference
+detected` at the same nesting cap `loads` enforces, rather than overflowing
+the native stack.
+
+**One message differs.** CPython says `Object of type Point is not JSON
+serializable`; this says `Object of this type is not JSON serializable`.
+Naming the type needs `type(x).__name__`, and `type()` is deliberately
+unsupported — classes are not first-class values in a closed-world model. The
+exception type and the behaviour match; only the noun is missing.
+
+### Two memory-safety fixes in the 0.139 helpers
+
+`.keys()` on a dynamic dict built a `list[str]` from whatever slots it found.
+Handed a dict keyed by `int`, it read an integer back as a `PyrsStr *` — a
+segfault, reachable from ordinary source. Both `.keys()` and the `str`-keyed
+subscript now check the dict's key tag and raise `TypeError` instead. The
+spelling that works for such a dict is to iterate it, which tags each key.
+
+### `isinstance(x, A or B)` is named for what it is
+
+Writing the tuple branch of `dumps` turned this up. CPython **accepts**
+`isinstance(v, list or tuple)` and it does not mean what it looks like: `or`
+yields its first truthy operand and a type object is always truthy, so
+`list or tuple` is `list` and the second type is never tested. PyRs already
+rejected it, but with the general "not a variable or expression" message,
+which reads as *PyRs cannot test multiple types* — when it can, with the tuple
+form. The message now names the trap and gives the spelling:
+
+```
+isinstance() second argument cannot use 'or'/'and': write a tuple,
+isinstance(x, (list, tuple)). CPython accepts this spelling but it tests only
+the first type — 'A or B' evaluates to 'A', because a type object is always
+truthy
+```
+
+Rejecting the `or` form is a deliberate divergence: accepting it would mean
+reproducing a bug. Pointing at the wrong fix was the defect.
+
+### Speed
+
+```
+20 x 2000-object document, serialised
+  vs CPython running the same PyRs source   1.9x faster
+  vs CPython's C json module                3.8x slower
+```
+
+The same shape as `loads` (1.8x / 6.8x), and the same reason: the workload is
+`Any` boxing and GC pressure — 30% of cycles are in `pyrs_gc_collect` — not
+arithmetic, so the optimisation passes that take `nbody` to 41x do not reach
+it. Replacing a C serialiser with PyRs costs speed against the C encoder and
+buys one implementation instead of two. Both numbers belong in the record.
+
+### Checked by
+
+`cli/tests/dynamic_containers.rs` (8 tests) for the operations and
+`cli/tests/json_module.rs` (13, up from 9) for the module, both differential
+against CPython at -O0/-O2/-O3 and under `PYRS_GC_STRESS=1` — every read of a
+dynamic element allocates a box, so a mis-rooted one is a use-after-free.
+
 ## 0.139.0 — `json.loads`, written in PyRs
 
 The stdlib `json` module was stubs. Every `loads_*` body was replaced by the

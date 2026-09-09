@@ -41,7 +41,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.139.0**.
+Current milestone: **v0.140.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -126,8 +126,9 @@ In outline, the subset covers:
 - **Modules** — `import` and `from` in their usual forms, regular and PEP 420
   namespace packages, relative imports, cycles reported at compile time
 - **Standard library** — a deliberately small pure-PyRs core: `os.path`,
-  `math`, `json` (`loads` is a real recursive-descent parser written in PyRs,
-  with CPython's error messages), `sys.argv`/`sys.exit`, `__name__` and the
+  `math`, `json` (a recursive-descent parser and an encoder, both written in
+  PyRs, with CPython's values, escaping and error messages),
+  `sys.argv`/`sys.exit`, `__name__` and the
   `if __name__ == "__main__":` guard
 
 ## What it does not do
@@ -285,7 +286,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.139.0 && git push origin v0.139.0`.
+Release tags: `git tag v0.140.0 && git push origin v0.140.0`.
 
 ## Documentation
 

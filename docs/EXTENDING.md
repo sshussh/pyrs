@@ -151,7 +151,7 @@ Before adding something large, decide *which layer* it belongs to
 | Builtin / type method | `len`, `abs`, `str.find`, `list.append` | Compiler + IR and/or C kit |
 | Hot path | list index, `len`, `abs` | Prefer **LLVM IR / intrinsics** |
 | Cold / OS / layouts | `str.split`, `open`, slot mutators | **`runtime.c`** |
-| High-level library | `os.path` (pure); interim `math`/`json` stubs | **Later: pure PyRs** under `stdlib/` — not unbounded C |
+| High-level library | `os.path` and `json` (pure PyRs); interim `math` stubs | **Later: pure PyRs** under `stdlib/` — not unbounded C |
 
 Do **not** grow the stdlib while the core language is still the priority
 (owner policy: language first, then pure-PyRs libraries). **Classes**
