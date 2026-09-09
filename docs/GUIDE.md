@@ -1216,8 +1216,12 @@ nested classes, class decorators, stacked custom decorators, two-arg
 `super()`, class-body attributes, dotted bases (`class D(pkg.C)` —
 import the base first), first-class class objects as values (use as
 constructor/type only).
-Mixed non-numeric **list literals** still error unless annotated
-(`xs: list[Dog | Cat] = [Dog(), Cat()]`). Empty `xs = []` plus later
+Mixed **container literals** infer a union of the element types as of
+0.137 (`[1, "a"]` is `list[int | str]`), so an annotation is no longer
+required; each element keeps its own type. A `file` element still errors,
+because a union member is a tagged slot and there is no tag for a file
+handle. Dict *keys* and set elements are unaffected: they must be hashable,
+so `{1: "a", "b": 2}` is still refused. Empty `xs = []` plus later
 appends join element types; unannotated empty lists with no append/insert
 default to `list[Any]`. Fields shared across a class union are readable;
 exclusive subclass-only fields after a multi-class peel use a runtime
@@ -1704,8 +1708,10 @@ deliberate exceptions:
    non-numeric pairs typed as a union (e.g. `0 or "x"` → `int | str`).
    Same-type / both-numeric operands keep the previous unify rules.
 3. **Static types with join.** Multi-assign joins storage types (unions /
-   numeric promote); lists are homogeneous (mixed numeric literals coerce
-   to the joined type — `[1, 2.5]` becomes `[1.0, 2.5]`); bare parameters
+   numeric promote); a **container literal keeps each element's own type**,
+   inferring a union when they differ — `[1, 2.5]` stays `[1, 2.5]` and is
+   `list[int | float]` (0.89), and `[1, "a"]` is `list[int | str]` (0.137),
+   while a homogeneous literal keeps its unboxed storage; bare parameters
    may be body-inferred when monomorphic (defaults may infer; also
    single-type `isinstance` / methods / indexing — multi-type
    `isinstance(x, (int, float))` or container `isinstance(x, list)` still

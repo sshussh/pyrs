@@ -526,6 +526,16 @@ p("container", "str encode", "print('a'.encode())")
 p("container", "heterogeneous list", "xs = [1, 'a', 2.5]\nprint(xs)")
 p(
     "container",
+    "bare heterogeneous literal in for",
+    "for v in [1, 'ab', 2.5]:\n    print(v)",
+)
+p(
+    "container",
+    "heterogeneous dict values",
+    "d = {'a': 1, 'b': 'two'}\nprint(d)",
+)
+p(
+    "container",
     "list of objects sort by key",
     "class P:\n    def __init__(self, v: int) -> None:\n        self.v: int = v\n"
     "ps = [P(2), P(1)]\nps.sort(key=lambda q: q.v)\nprint([q.v for q in ps])",

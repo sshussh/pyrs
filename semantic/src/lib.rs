@@ -20772,6 +20772,28 @@ fn join_elem_types(a: ir::Ty, b: ir::Ty) -> Option<ir::Ty> {
         {
             Some(join_types(a, b))
         }
+        // An empty `[]` is a *provisional* `list[Any]` and must yield to a
+        // concrete `list[T]` rather than union with it: `{"x": [1], "y": []}`
+        // is a `dict[str, list[int]]`, not a dict of two different list
+        // types. `join_types` already owns that rule.
+        (ir::Ty::List(e), ir::Ty::List(f)) if *e == ir::Ty::Any || *f == ir::Ty::Any => {
+            Some(join_types(a, b))
+        }
+        // Two unrelated concrete types: the same union the numeric pairs
+        // above produce, for the same reason — a container keeps each
+        // element's own type, and `[1, "a"]` is a list in CPython. 0.89 built
+        // this for numerics and scoped the rest out; nothing about the
+        // representation was in the way, and `xs: list[int | str] = [1, "a"]`
+        // has worked since unions existed.
+        //
+        // `File` and `Cell` are the exceptions, and they are not a policy
+        // choice: a union member is stored as a tagged slot, and `elem_tag`
+        // has no tag to give those two.
+        _ if can_box_as_any(a) && can_box_as_any(b) => {
+            let mut members = ir::flatten_union_members(a);
+            members.extend(ir::flatten_union_members(b));
+            Some(ir::union_of(&members))
+        }
         _ => Option::None,
     }
 }
@@ -31418,8 +31440,27 @@ print(f(1, b=3))
     }
 
     #[test]
-    fn heterogeneous_list_is_error() {
-        let e = analyze_err("xs = [1, \"a\"]\n");
+    fn heterogeneous_list_infers_a_union() {
+        // Was an error before 0.137. A container keeps each element's own
+        // type, so this is `list[int | str]` — the same shape the annotated
+        // spelling has always produced, and the same rule 0.89 built for
+        // mixed numerics.
+        let m = analyze_ok("xs = [1, \"a\"]\nprint(xs)\n");
+        let ty = m
+            .globals
+            .iter()
+            .find(|(n, _)| n == "xs")
+            .map(|(_, t)| *t)
+            .expect("xs should be a module global");
+        assert_eq!(ty, ir::list_of(ir::union_of(&[ir::Ty::Int, ir::Ty::Str])));
+    }
+
+    #[test]
+    fn a_file_element_still_has_no_union_to_join_into() {
+        // `File` has no print tag, so it cannot be a tagged container slot.
+        // That is a representation limit, not a policy choice, and it is the
+        // one pair the union fallback declines.
+        let e = analyze_err("f = open(\"x\", \"w\")\nxs = [f, 1]\n");
         assert!(e.message.contains("share one type"), "{}", e.message);
     }
 

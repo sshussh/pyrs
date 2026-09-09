@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.136 |
+| Check | Result after 0.137 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1685 passed; none failed or ignored |
+| `cargo test --workspace` | 1694 passed; none failed or ignored |
 | `make examples` | All 14 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.136.0` |
+| `pyrs --version` | `PyRs 0.137.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -370,7 +370,15 @@ documentation and the relevant gates.
       `Any`, container patterns (no element type is recoverable from the tag)
       and multi-pattern peels (no member index exists in the box's tag space).
 - [ ] Dynamic-length heterogeneous tuples; general hash/equality protocol;
-      `float`/`bool`/`frozenset` keys; dict views.
+      `float`/`bool`/`frozenset` keys; dict views. Dict *keys* and set
+      elements deliberately stayed restricted when 0.137 let container
+      *values* infer a union, because a key must be hashable.
+- [ ] Operators on a union value. `v == 1` where `v` is `int | str` is
+      refused, and 0.137 made more programs reach it by inferring unions for
+      mixed literals — narrowing first (`isinstance`) is the working idiom.
+      Part of the same runtime-operations item as `Any` above. Note a
+      multi-member peel keeps storage by design, so `isinstance(v, int)` over
+      a union containing both `bool` and `int` does not narrow.
 - [x] Tuple keys (0.107): dict keys and set elements may be tuples of
       hashable things, nested arbitrarily, which also unblocked the `a[i, j]`
       subscript rejected with a specific diagnostic since 0.87. `bool` stays

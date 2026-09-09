@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.137.0 — A container literal keeps each element's own type
+
+`[1, "a"]` was `list elements must share one type; found int and str`, while
+`xs: list[int | str] = [1, "a"]` compiled and ran correctly — printing,
+indexing, slicing, iteration, classes, nesting, all of it. **The
+representation was never the obstacle.**
+
+0.89 built exactly this rule for mixed *numeric* literals: `[1, 2.5]` is
+`list[int | float]`, keeping each element's own type so that printing and
+`==` match CPython rather than collapsing to `[1.0, 2.5]`. Its plan doc
+records the rest as scoped out, not as blocked. The inference now covers any
+pair of types that can be a tagged slot, which is every type except two.
+
+That leaves the last shape an annotation could not reach:
+
+```python
+for v in [1, "ab", 2.5]:   # no target, so no place to write list[int | str | float]
+    print(v)
+```
+
+### Two boundaries, both real
+
+**`File` declines.** A union member is stored as a tagged slot and `elem_tag`
+has no tag for a file handle — it is `unreachable!` for exactly `File` and
+`Cell`. A representation limit, not a policy choice, and `[f, 1]` still says
+`share one type; found file and int`.
+
+**An empty `[]` still yields.** It is a *provisional* `list[Any]`, so
+`{"x": [1], "y": []}` has to stay a `dict[str, list[int]]` rather than
+becoming a dict of two different list types. `join_types` already owned that
+rule; `join_elem_types` now defers to it before reaching the union fallback.
+This was a genuine regression the first version of the change introduced, and
+it is what the existing `module_globals` and graph-traversal tests caught.
+
+Dict **values** join the same way. Dict **keys** and set elements do not, and
+must not: a key has to be hashable, and `{1: "a", "b": 2}` is still refused by
+name (`dict keys/elements of type int | str are not supported yet`).
+
+### Unchanged
+
+Storage is still fixed by the literal. `xs = [1, "a"]` then `xs.append(2.5)`
+is refused, exactly as `xs = [1]` then `xs.append("a")` always was — the
+empty-`[]`-plus-appends pre-pass still grows a type, and an annotation still
+widens one. Homogeneous literals keep their optimized unboxed storage.
+
+### The gap this makes more visible
+
+`v == 1` where `v` is a union is still refused. That is pre-existing — it
+fails for an annotated `list[int | str]` too — but more programs now reach it,
+since more programs now compile to a union. Narrowing first works
+(`if isinstance(v, int): ...`), and general runtime operations on unions and
+`Any` remain a roadmap item. Note a multi-member peel still keeps storage by
+design, so `isinstance(v, int)` over a union containing both `bool` and `int`
+does not narrow.
+
+### How this is checked
+
+`cli/tests/heterogeneous_literals.rs` — 8 differential tests at -O0/-O2/-O3
+and under `PYRS_GC_STRESS=1`, since each element of a union-typed container is
+a heap box and a mis-rooted one is a use-after-free rather than a wrong value.
+The bare literal in a `for` iterable; every element operation the annotated
+spelling supported; elements keeping their own types; nested containers,
+classes and tuples as elements; dict values joining while keys stay
+restricted; the `File` refusal; the provisional empty list; and storage
+staying fixed by the literal.
+
+Coverage went 148 to 151 of 208 probes.
+
 ## 0.136.0 — Getting a value into `Any`, and getting it back out
 
 `Any` already worked as a scalar dynamic box with a runtime-checked
