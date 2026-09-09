@@ -17123,8 +17123,26 @@ fn lower_if_exp(
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     let cond = lower_condition(test, ctx)?;
+
+    // `test` narrows its arms exactly as an `if` statement narrows its bodies:
+    // in `x if x is not None else 0` the then-arm sees the peeled type. Without
+    // this the arms join back to the union and `coerce` rejects the result with
+    // "use 'is None' check" — advice the author had already taken. Same
+    // save / splice / restore the `and` / `or` arm of `lower_expr` performs.
+    let saved = ctx.type_refinements.clone();
+    let (then_ref, else_ref) = narrowing_from_condition(test, ctx);
+
+    for (k, v) in then_ref {
+        ctx.type_refinements.insert(k, v);
+    }
     let then_val = lower_expr(body, ctx)?;
+
+    ctx.type_refinements = saved.clone();
+    for (k, v) in else_ref {
+        ctx.type_refinements.insert(k, v);
+    }
     let else_val = lower_expr(orelse, ctx)?;
+    ctx.type_refinements = saved;
 
     // A conditional expression yields one value, so a union of the two branch
     // types is exactly its type. `join_elem_types` gives the numeric pairs the
