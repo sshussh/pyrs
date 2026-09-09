@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use ir::{
-    BinOp, ClassInfo, Expr, ExprKind, FileFn, Function, JsonLoadsKind, MathOp, Module, SetUpdateOp,
-    Stmt, StrFn, Ty, UnOp,
+    BinOp, ClassInfo, Expr, ExprKind, FileFn, Function, MathOp, Module, SetUpdateOp, Stmt, StrFn,
+    Ty, UnOp,
 };
 
 pub fn emit_llvm_ir(module: &Module) -> String {
@@ -516,7 +516,6 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | MinList(operand)
         | MaxList(operand)
         | JsonDumps(operand)
-        | JsonLoads { arg: operand, .. }
         | MathCall { arg: operand, .. }
         | ClosureCap {
             closure: operand, ..
@@ -817,7 +816,6 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | MinList(operand)
         | MaxList(operand)
         | JsonDumps(operand)
-        | JsonLoads { arg: operand, .. }
         | MathCall { arg: operand, .. } => count_yields_in_expr(operand),
         Sum { list, start } => count_yields_in_expr(list) + count_yields_in_expr(start),
         Round {
@@ -1245,18 +1243,6 @@ impl Emitter {
         out.push_str("declare double @tan(double)\n");
         out.push_str("declare ptr @pyrs_os_getcwd()\n");
         out.push_str("declare ptr @pyrs_json_dumps(i64, i32)\n");
-        out.push_str("declare i64 @pyrs_json_loads_int(ptr)\n");
-        out.push_str("declare double @pyrs_json_loads_float(ptr)\n");
-        out.push_str("declare i32 @pyrs_json_loads_bool(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_str(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_list_int(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_list_float(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_list_str(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_list_bool(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_dict_str_int(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_dict_str_float(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_dict_str_str(ptr)\n");
-        out.push_str("declare ptr @pyrs_json_loads_dict_str_bool(ptr)\n");
         out.push_str("declare ptr @pyrs_object_new(i64, i64)\n");
         out.push_str("declare i32 @pyrs_isinstance_class(ptr, i64, ptr, i64)\n");
         out.push_str("declare void @pyrs_print_object(ptr)\n");
@@ -4866,63 +4852,6 @@ impl Emitter {
                 self.line(format!(
                     "{t} = call ptr @pyrs_json_dumps(i64 {slot}, i32 {tag})"
                 ));
-                t
-            }
-            ExprKind::JsonLoads { kind, arg } => {
-                let s = self.emit_expr(arg);
-                let t = self.tmp();
-                match kind {
-                    JsonLoadsKind::Int => {
-                        self.line(format!("{t} = call i64 @pyrs_json_loads_int(ptr {s})"));
-                    }
-                    JsonLoadsKind::Float => {
-                        self.line(format!("{t} = call double @pyrs_json_loads_float(ptr {s})"));
-                    }
-                    JsonLoadsKind::Bool => {
-                        let i = self.tmp();
-                        self.line(format!("{i} = call i32 @pyrs_json_loads_bool(ptr {s})"));
-                        self.line(format!("{t} = trunc i32 {i} to i1"));
-                    }
-                    JsonLoadsKind::Str => {
-                        self.line(format!("{t} = call ptr @pyrs_json_loads_str(ptr {s})"));
-                    }
-                    JsonLoadsKind::ListInt => {
-                        self.line(format!("{t} = call ptr @pyrs_json_loads_list_int(ptr {s})"));
-                    }
-                    JsonLoadsKind::ListFloat => {
-                        self.line(format!(
-                            "{t} = call ptr @pyrs_json_loads_list_float(ptr {s})"
-                        ));
-                    }
-                    JsonLoadsKind::ListStr => {
-                        self.line(format!("{t} = call ptr @pyrs_json_loads_list_str(ptr {s})"));
-                    }
-                    JsonLoadsKind::ListBool => {
-                        self.line(format!(
-                            "{t} = call ptr @pyrs_json_loads_list_bool(ptr {s})"
-                        ));
-                    }
-                    JsonLoadsKind::DictStrInt => {
-                        self.line(format!(
-                            "{t} = call ptr @pyrs_json_loads_dict_str_int(ptr {s})"
-                        ));
-                    }
-                    JsonLoadsKind::DictStrFloat => {
-                        self.line(format!(
-                            "{t} = call ptr @pyrs_json_loads_dict_str_float(ptr {s})"
-                        ));
-                    }
-                    JsonLoadsKind::DictStrStr => {
-                        self.line(format!(
-                            "{t} = call ptr @pyrs_json_loads_dict_str_str(ptr {s})"
-                        ));
-                    }
-                    JsonLoadsKind::DictStrBool => {
-                        self.line(format!(
-                            "{t} = call ptr @pyrs_json_loads_dict_str_bool(ptr {s})"
-                        ));
-                    }
-                }
                 t
             }
             ExprKind::IntToFloat(inner) => {

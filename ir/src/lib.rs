@@ -1158,11 +1158,6 @@ pub enum ExprKind {
     OsGetcwd,
     /// `json.dumps(x)` for a json-able value (type on the arg).
     JsonDumps(Box<Expr>),
-    /// Scalar / container `json.loads_*` helpers (type is the result).
-    JsonLoads {
-        kind: JsonLoadsKind,
-        arg: Box<Expr>,
-    },
     /// int → float (sitofp)
     IntToFloat(Box<Expr>),
     /// float → int, truncating toward zero (Python's `int()`)
@@ -1375,42 +1370,6 @@ impl MathOp {
             MathOp::Floor => "floor",
             MathOp::Ceil => "ceil",
             MathOp::Fabs => "fabs",
-        }
-    }
-}
-
-/// Typed `json.loads_*` forms (full dynamic `json.loads` is not supported).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JsonLoadsKind {
-    Int,
-    Float,
-    Bool,
-    Str,
-    ListInt,
-    ListFloat,
-    ListStr,
-    ListBool,
-    DictStrInt,
-    DictStrFloat,
-    DictStrStr,
-    DictStrBool,
-}
-
-impl JsonLoadsKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            JsonLoadsKind::Int => "loads_int",
-            JsonLoadsKind::Float => "loads_float",
-            JsonLoadsKind::Bool => "loads_bool",
-            JsonLoadsKind::Str => "loads_str",
-            JsonLoadsKind::ListInt => "loads_list_int",
-            JsonLoadsKind::ListFloat => "loads_list_float",
-            JsonLoadsKind::ListStr => "loads_list_str",
-            JsonLoadsKind::ListBool => "loads_list_bool",
-            JsonLoadsKind::DictStrInt => "loads_dict_str_int",
-            JsonLoadsKind::DictStrFloat => "loads_dict_str_float",
-            JsonLoadsKind::DictStrStr => "loads_dict_str_str",
-            JsonLoadsKind::DictStrBool => "loads_dict_str_bool",
         }
     }
 }

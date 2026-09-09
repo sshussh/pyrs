@@ -7412,36 +7412,6 @@ fn lower_function_inner(
             ty: ir::Ty::Str,
             kind: ir::ExprKind::OsGetcwd,
         }))]
-    } else if mctx.module == "json"
-        && let Some(kind) = json_loads_kind(&f.name)
-    {
-        if params.len() != 1 || params[0].1 != ir::Ty::Str {
-            return Err(err(
-                format!("json.{} must take a single str parameter", f.name),
-                f.span,
-            ));
-        }
-        let expected_ret = json_loads_ret(kind);
-        if ctx.ret != expected_ret {
-            return Err(err(
-                format!(
-                    "json.{} must be declared to return {expected_ret} (found {})",
-                    f.name, ctx.ret
-                ),
-                f.span,
-            ));
-        }
-        let arg = ir::Expr {
-            ty: ir::Ty::Str,
-            kind: ir::ExprKind::Local(params[0].0.clone()),
-        };
-        vec![ir::Stmt::Return(Some(ir::Expr {
-            ty: expected_ret,
-            kind: ir::ExprKind::JsonLoads {
-                kind,
-                arg: Box::new(arg),
-            },
-        }))]
     } else if mctx.module == "json" && f.name == "dumps" {
         // Polymorphic: body never used; calls are special-cased. Keep a
         // trivial body so the function still exists for signature lookup.
@@ -7658,41 +7628,6 @@ fn expr_has_yield(e: &ast::Expr) -> bool {
             items.iter().any(expr_has_yield)
         }
         _ => false,
-    }
-}
-
-fn json_loads_kind(name: &str) -> Option<ir::JsonLoadsKind> {
-    Some(match name {
-        "loads_int" => ir::JsonLoadsKind::Int,
-        "loads_float" => ir::JsonLoadsKind::Float,
-        "loads_bool" => ir::JsonLoadsKind::Bool,
-        "loads_str" => ir::JsonLoadsKind::Str,
-        "loads_list_int" => ir::JsonLoadsKind::ListInt,
-        "loads_list_float" => ir::JsonLoadsKind::ListFloat,
-        "loads_list_str" => ir::JsonLoadsKind::ListStr,
-        "loads_list_bool" => ir::JsonLoadsKind::ListBool,
-        "loads_dict_str_int" => ir::JsonLoadsKind::DictStrInt,
-        "loads_dict_str_float" => ir::JsonLoadsKind::DictStrFloat,
-        "loads_dict_str_str" => ir::JsonLoadsKind::DictStrStr,
-        "loads_dict_str_bool" => ir::JsonLoadsKind::DictStrBool,
-        _ => return None,
-    })
-}
-
-fn json_loads_ret(kind: ir::JsonLoadsKind) -> ir::Ty {
-    match kind {
-        ir::JsonLoadsKind::Int => ir::Ty::Int,
-        ir::JsonLoadsKind::Float => ir::Ty::Float,
-        ir::JsonLoadsKind::Bool => ir::Ty::Bool,
-        ir::JsonLoadsKind::Str => ir::Ty::Str,
-        ir::JsonLoadsKind::ListInt => ir::list_of(ir::Ty::Int),
-        ir::JsonLoadsKind::ListFloat => ir::list_of(ir::Ty::Float),
-        ir::JsonLoadsKind::ListStr => ir::list_of(ir::Ty::Str),
-        ir::JsonLoadsKind::ListBool => ir::list_of(ir::Ty::Bool),
-        ir::JsonLoadsKind::DictStrInt => ir::dict_of(ir::Ty::Str, ir::Ty::Int),
-        ir::JsonLoadsKind::DictStrFloat => ir::dict_of(ir::Ty::Str, ir::Ty::Float),
-        ir::JsonLoadsKind::DictStrStr => ir::dict_of(ir::Ty::Str, ir::Ty::Str),
-        ir::JsonLoadsKind::DictStrBool => ir::dict_of(ir::Ty::Str, ir::Ty::Bool),
     }
 }
 
