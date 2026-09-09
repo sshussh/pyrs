@@ -533,6 +533,19 @@ p(
 
 # -------------------------------------------------------------- semantics
 
+p(
+    "semantics",
+    "heterogeneous column into a slot",
+    "from typing import Any\nclass F:\n    def __init__(self) -> None:\n"
+    "        self.cols: dict[str, list[Any]] = {}\nf = F()\nf.cols['a'] = ['x', 1]\n"
+    "print(f.cols['a'])",
+)
+p(
+    "semantics",
+    "isinstance narrows Any",
+    "from typing import Any\ndef f(x: Any) -> int:\n    if isinstance(x, int):\n"
+    "        return x + 1\n    return 0\nprint(f(41), f('no'))",
+)
 p("semantics", "untyped params (inference)", "def f(x):\n    return x + 1\nprint(f(1))")
 p("semantics", "duck-typed function", "def f(x):\n    return len(x)\nprint(f([1, 2]), f('abc'))")
 p("semantics", "int/float mixing", "print(1 + 2.5, 3 / 2, 7 // 2.0)")
