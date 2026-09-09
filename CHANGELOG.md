@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.135.0 — Numeric types can be written in PyRs
+
+`class V: def __add__(self, o: 'V') -> 'V'` was rejected with
+`operator '+' is not supported for values of type class#0`. There was no
+`__add__` string anywhere in the compiler — unimplemented, not half-wired — so
+no vector, matrix, money, unit or interval type could be written at all. This
+is the milestone that makes a data/scientific library writable, and the first
+one whose acceptance test is a Python file rather than a compiler behaviour.
+
+### The dunders
+
+`__add__ __sub__ __mul__ __matmul__ __truediv__ __floordiv__ __mod__ __pow__`,
+`__and__ __or__ __xor__ __lshift__ __rshift__`, the unary
+`__neg__ __pos__ __invert__`, every reflected form (`__radd__` …) and every
+in-place form (`__iadd__` …).
+
+Resolution follows CPython's order: a proper subclass on the right gets the
+first attempt, then the left operand's slot, then the right operand's reflected
+one. `v * 2.0` finds `__mul__`; `2.0 * v` has no float implementation to find
+and reflects onto `__rmul__`.
+
+The comparison dunders already dispatched correctly, and this extends that path
+rather than adding a second one. Two things had to change in it. It hard-coded
+`ir::Ty::Bool` and coerced any other return through `to_bool`, which is right
+for a comparison and wrong for arithmetic — `V.__add__ -> V` has to yield a `V`.
+And the two families reflect differently: a comparison swaps the *operator*
+(`a < b` → `b.__gt__(a)`) while arithmetic swaps the *name* (`a + b` →
+`b.__radd__(a)`), so it is a sibling table, not a reuse. What is shared is the
+operand spilling, which is the part that matters: both operands are evaluated
+into temps *before* dispatch, so source order holds even when a reflected call
+makes the right operand the receiver.
+
+`+=` prefers `__iadd__` and falls back to `__add__`, as CPython does. The
+difference is observable and both halves are tested: `__iadd__` mutates and
+returns self, so an alias sees the change and `is` stays true; the fallback
+builds a new object and the alias does not move.
+
+### `@` is an operator now
+
+It was rejected in the *parser* — "PyRs has no array type for it to operate
+on". That reason stopped being true the moment `__matmul__` existed: `a @ b` is
+a method call like any other operator, and an array type is a library, not a
+compiler primitive. `@` and `@=` parse, and on two builtins the message now
+names both operands and the dunder instead of an absent array type.
+
+### Unary `+` was silently discarded
+
+The parser dropped it — `Token::Plus => { self.advance(); self.parse_unary() }`
+— which made `+x` a no-op. That was already wrong for `+"a"`, which CPython
+rejects, and it would have made `__pos__` a silent no-op. `UnaryOp::Pos` is now
+recorded and semantic decides: identity on a number, `__pos__` on a class,
+`bad operand type for unary +: 'str'` otherwise.
+
+### Diagnostics stop leaking internal ids
+
+`class#0` is an index into the class table and means nothing to the reader of
+an error message. `display_ty` prints the class's name, and the four messages
+users actually hit — the operator mismatch, both `coerce` type mismatches, and
+the storage-type note — go through it.
+
+### What it costs
+
+`examples/vectors.py` is `Vec3` and a dense `Matrix` written in ordinary
+Python, byte-identical under both engines. A 120×120 class-based matmul:
+
+```
+class-based (a @ b)        6.5 ms   vs CPython 90.2 ms    13.9x
+free function matmul(a, b) 6.1 ms   vs CPython 84.2 ms    13.9x
+```
+
+**Operator overloading is free.** Dispatch is resolved statically and the loop
+body is identical; the 6% gap is the wrapper object's allocation and field
+loads, not the operator. That was the open question this milestone existed to
+answer, and it is the reason the array type can be a library.
+
+### Two defects found on the way
+
+**`f.write()` returned the wrong number.** It returned the UTF-8 byte count
+where CPython returns the character count, so `f.write("héllo")` gave 6 instead
+of 5 — a silent parity break in already-supported surface. Now `cplen`.
+
+**A container of instances ignores `__repr__`.** `print(obj)` is correct, but
+`print([obj])` renders `<Name object>`: container elements are formatted from a
+numeric type tag with no hook back into user code. Pre-existing, and confirmed
+against 0.134 rather than assumed. Recorded in the README divergence list and
+pinned in `scripts/coverage_probe.py`; the fix is its own work, and it matters
+for the data path because printing a frame of rows hits it.
+
+`docs/EXTENDING.md` also still documented the pre-0.90 single-word `PyrsStr`
+header with the payload at +8; it has carried `cplen` first since 0.90.
+
+### How these are checked
+
+`cli/tests/arithmetic_protocols.rs` — 17 differential tests at -O0/-O2/-O3 and
+under `PYRS_GC_STRESS=1`, since every one of these operators allocates its
+result and a mis-rooted temporary is a use-after-free rather than a wrong
+number. The whole binary and bitwise families, unary dispatch, `@` beside a
+decorator so the two uses of the token stay distinguishable, reflected
+dispatch from a scalar, a subclass winning the first attempt, virtual dispatch
+through a base-typed binding, the result keeping the dunder's return type,
+left-to-right evaluation under reflection, an operand that raises before any
+dispatch, in-place versus fallback identity, and the comparison path unchanged.
+
+Coverage went 141 to 145 of 204 probes (`make coverage`).
+
 ## 0.134.0 — Three reads and writes that did not agree with the ones beside them
 
 No new syntax. This closes three defects found by a coverage audit that

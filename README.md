@@ -41,7 +41,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.134.0**.
+Current milestone: **v0.135.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -121,7 +121,8 @@ In outline, the subset covers:
   generators with `send`/`throw`/`close`
 - **Classes** — closed-world with virtual methods, inheritance, properties,
   static and class methods, context managers, iterator and comparison
-  protocols, user-defined exceptions
+  protocols, arithmetic/bitwise/unary operator overloading including
+  reflected and in-place forms and `@`, user-defined exceptions
 - **Modules** — `import` and `from` in their usual forms, regular and PEP 420
   namespace packages, relative imports, cycles reported at compile time
 - **Standard library** — a deliberately small pure-PyRs core: `os.path`,
@@ -158,6 +159,9 @@ Known behavioural divergences, each documented with its reason in the
   work — see [the guide](docs/GUIDE.md#9-differences-from-cpython)
 - An uncaught exception prints its type and message to stderr with exit
   status 1, but no `Traceback (most recent call last):` block or frame list
+- `print(obj)` uses a class's `__repr__`, but printing a **container** of
+  instances renders each element as `<Name object>`: container elements are
+  formatted from a numeric type tag with no hook back into user code
 
 ## Running Python that PyRs cannot compile
 
@@ -283,7 +287,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.134.0 && git push origin v0.134.0`.
+Release tags: `git tag v0.135.0 && git push origin v0.135.0`.
 
 ## Documentation
 

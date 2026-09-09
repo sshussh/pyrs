@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.134 |
+| Check | Result after 0.135 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1656 passed; none failed or ignored |
-| `make examples` | All 13 example entry points matched CPython |
+| `cargo test --workspace` | 1673 passed; none failed or ignored |
+| `make examples` | All 14 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.134.0` |
+| `pyrs --version` | `PyRs 0.135.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -83,6 +83,11 @@ standard library, which it gates.
 Two behaviours are recorded rather than fixed, both now in the README
 divergence list:
 
+- **A container of class instances ignores `__repr__`.** `print(obj)` is
+  correct; `print([obj])` renders `<Name object>` per element, because the
+  runtime formats container elements from a numeric type tag with no hook back
+  into user code. Found in 0.135 and confirmed against 0.134. It matters for
+  the data path: printing a frame of rows hits it.
 - **Mutable defaults disagree with themselves.** A nested `def` and a lambda
   freeze each non-literal default once at definition time, as CPython does; a
   module-level `def` re-evaluates at every call. Closing it needs the default
@@ -397,8 +402,16 @@ documentation and the relevant gates.
       `LookupError` and `ArithmeticError`, and an exception now records how
       many arguments it was raised with. `args` as a *tuple* is a recorded
       scope decision, not open work.
-- [ ] A native array type, which `@` needs; rejected with a specific
-      diagnostic since 0.87.
+- [x] Arithmetic, bitwise and unary dunders including reflected and in-place
+      forms (0.135), which is what `@` actually needed: `a @ b` dispatches to
+      `__matmul__` like any other operator, so an array type is a *library*
+      rather than a compiler primitive. Still open: `NotImplemented` as a
+      fallback value, and `__hash__` / `__call__`.
+- [ ] A native array type covering shapes, strides, dtypes, views and
+      zero-copy NumPy buffers. Reframed by 0.135 as a *performance and
+      interop* item (see [interop gate 5](INTEROPERABILITY.md)) rather than a
+      prerequisite for writing an array library, which pure PyRs can now
+      express.
 
 ### D. Unicode, bytes and I/O
 

@@ -1140,7 +1140,25 @@ print(isinstance(d, Animal))  # True
 - Class names as type annotations (`def f(p: Point)`)
 - **`__str__` / `__repr__`** (must return `str`): used by `print` and
   `str()` with virtual dispatch (per runtime class); fallback is still
-  `<Name object>`
+  `<Name object>`. **A container of instances does not reach them** —
+  `print([obj])` renders `<Name object>` per element, because container
+  elements are formatted from a numeric type tag with no hook back into
+  user code (see [§9](#9-differences-from-cpython))
+- **Arithmetic, bitwise and unary operators** (0.135):
+  `__add__ __sub__ __mul__ __matmul__ __truediv__ __floordiv__ __mod__
+  __pow__`, `__and__ __or__ __xor__ __lshift__ __rshift__`,
+  `__neg__ __pos__ __invert__`, every reflected form (`__radd__`, …) and
+  every in-place form (`__iadd__`, …). Resolution follows CPython: a proper
+  subclass on the right is tried first, then the left operand's slot, then
+  the right operand's reflected one, so `2.0 * vec` finds `__rmul__`. Both
+  operands are evaluated before dispatch, so source order holds even when a
+  reflected call makes the right operand the receiver. `+=` prefers the
+  in-place form and falls back to the plain one, so `__iadd__` returning
+  `self` mutates in place while a class defining only `__add__` rebinds to a
+  new object. `@` is an ordinary operator dispatching to `__matmul__`; no
+  builtin type implements it. There is no `NotImplemented` value, so a slot
+  that cannot handle its argument is a compile-time error rather than a
+  fallback
 - **Zero-arg `super().method(...)`** including `super().__init__(…)`
   (static call of the parent implementation with the same `self`)
 - **`@staticmethod` / `@classmethod` / read-only `@property`**
@@ -1725,6 +1743,12 @@ deliberate exceptions:
    cleanup. See [Garbage collection](GC.md) for architecture and diagnostics.
 9a. **Default object print/str** is `<ClassName object>` without a
     memory address (CPython prints `<__main__.Name object at 0x…>`).
+9b. **A container of class instances ignores `__repr__`.** `print(obj)`
+    dispatches correctly, but `print([obj])`, `str((obj,))` and the like
+    render each element as `<Name object>`. Container elements are formatted
+    from a numeric type tag in the runtime, which has no way to call back
+    into a user method. Print the elements individually until this is
+    closed.
 10. **`float ** float` with a negative base and fractional exponent**
     gives `nan` (Python returns a complex number).
 11. **Narrowing is limited** — `if x is not None:` / `is None` / `not`,
