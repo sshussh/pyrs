@@ -42,7 +42,7 @@ recorded in [the changelog](../CHANGELOG.md). The most recent run:
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1723 passed; none failed or ignored |
+| `cargo test --workspace` | 1739 passed; none failed or ignored |
 | `make examples` | All 14 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
 | `pyrs --version` | `PyRs 0.140.0` |
