@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.138.2 — `object` is an annotation
+
+Reported from a 325-line recursive-descent JSON parser, which failed to
+compile on one thing:
+
+```
+error[semantic]: unknown type 'object' (not a builtin or defined class)
+```
+
+`object` is Python's top type and a common way to annotate "any value" —
+`def loads(s: str) -> object`. This subset's `Any` is exactly what it means
+here, so the annotation is now accepted as a spelling of it.
+
+The mapping is closer than the name suggests. `Any` in a type checker accepts
+any operation; `object` requires narrowing before use. PyRs's `Any` requires
+narrowing before use, so it implements `object`'s semantics rather than
+`Any`'s — `isinstance` peeling (0.136) is exactly how you consume one.
+
+With that one arm, the reported file compiles and runs **byte-identical to
+CPython at -O0, -O2, -O3 and under GC stress**, unmodified. It exercises a
+good deal of the surface at once: closed-world classes, a user exception
+hierarchy, `int | float` unions, `dict[str, object]` and `list[object]`,
+f-strings with `!r`, slicing, `int(s, 16)`, `chr`, `ord` and `str.startswith`
+with a start offset.
+
+`cli/tests/object_annotation.rs` — 3 differential tests at -O0/-O2/-O3 and
+under `PYRS_GC_STRESS=1`: `object` in every annotation position, `object` and
+`Any` interoperating in both directions, and a parser returning `object` with
+narrowing on the way out.
+
 ## 0.138.1 — The builtin type names are usable as identifiers
 
 Reported from real code:

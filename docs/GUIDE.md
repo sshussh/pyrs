@@ -1868,7 +1868,9 @@ Container notes:
   tracked with the `Any` runtime-operations work in the
   [roadmap](ROADMAP.md).
 
-- **Any (limited):** annotation `Any` / `list[Any]` etc. Values are
+- **Any (limited):** annotation `Any` or **`object`** (0.138.2 — Python's top
+  type means the same thing here, and this subset's narrow-before-use rule is
+  `object`'s semantics rather than `Any`'s), `list[Any]` etc. Values are
   heap-boxed print-tag + payload (same as container union slots).
   Concrete → Any and Any → concrete coerce at the boundary (runtime
   TypeError on wrong tag; class targets accept subclasses). A container

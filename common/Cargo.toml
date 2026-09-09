@@ -1,4 +1,4 @@
 [package]
 name="common"
-version = "0.138.1"
+version = "0.138.2"
 edition="2024"

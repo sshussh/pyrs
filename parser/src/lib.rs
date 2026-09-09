@@ -881,7 +881,14 @@ impl Parser {
                 )))
             }
             // Limited dynamic type (`Any`).
-            Token::Ident(name) if name == "Any" => {
+            // `object` is Python's top type, and this subset's `Any` is what
+            // it means here: a value of unknown type that must be narrowed
+            // before it is used. That narrowing requirement is `object`'s
+            // semantics under a type checker, not `Any`'s, so the mapping is
+            // closer than the name suggests. `-> object` is a common way to
+            // annotate "any value", and rejecting it turned working Python
+            // away for no representational reason.
+            Token::Ident(name) if name == "Any" || name == "object" => {
                 self.advance();
                 Ok(TypeName::Any)
             }

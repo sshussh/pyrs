@@ -571,6 +571,12 @@ p(
 p("semantics", "untyped params (inference)", "def f(x):\n    return x + 1\nprint(f(1))")
 p(
     "semantics",
+    "object annotation",
+    "def f(v: object) -> str:\n    if isinstance(v, int):\n        return str(v + 1)\n"
+    "    return '?'\nprint(f(41), f('x'))",
+)
+p(
+    "semantics",
     "type name as an identifier",
     "with open('/etc/hostname') as file:\n    print(len(file.read()) >= 0)",
 )
