@@ -26,7 +26,42 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+/* Portability shims. The POSIX surface this runtime needs is small -- the
+ * working directory, one fstat to reject opening a directory, the stat that
+ * backs os.path, and the environment block -- so the Windows spellings are
+ * mapped here rather than threaded through the call sites. The collector's
+ * /proc/self/maps stack discovery is already guarded and falls back to the
+ * caller-supplied anchor everywhere else. */
+#if defined(_WIN32)
+#include <direct.h>
+#include <io.h>
+#define pyrs_getcwd _getcwd
+#define pyrs_fileno _fileno
+#define pyrs_environ _environ
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#ifndef PATH_MAX
+#define PATH_MAX _MAX_PATH
+#endif
+extern char **_environ;
+#else
 #include <unistd.h>
+#define pyrs_getcwd getcwd
+#define pyrs_fileno fileno
+#if defined(__APPLE__)
+/* Apple gives a main executable `environ` only through this header. */
+#include <crt_externs.h>
+#define pyrs_environ (*_NSGetEnviron())
+#else
+extern char **environ;
+#define pyrs_environ environ
+#endif
+#endif
 
 #include "gc.h"
 #include "unicode_data.h"
@@ -5888,7 +5923,7 @@ PyrsFile *pyrs_open(const PyrsStr *path, const PyrsStr *mode) {
     /* Linux fopen("dir", "r") succeeds; Python raises at open() */
     if (readable) {
         struct stat st;
-        if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (fstat(pyrs_fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
             fclose(fp);
             die_os_error(EISDIR, path);
         }
@@ -5940,11 +5975,9 @@ long long pyrs_os_stat_kind(const PyrsStr *path) {
 /* `os.environ` as a dict[str, str]. A snapshot taken when the module
  * initialises: there is no subprocess surface here for a live mapping to
  * matter to, and a plain dict gets `in`, `[]`, `.get` and iteration for free. */
-extern char **environ;
-
 PyrsDict *pyrs_os_environ(void) {
     PyrsDict *d = pyrs_dict_new();
-    for (char **e = environ; e != NULL && *e != NULL; e++) {
+    for (char **e = pyrs_environ; e != NULL && *e != NULL; e++) {
         const char *entry = *e;
         const char *eq = strchr(entry, '=');
         if (eq == NULL) {
@@ -7654,7 +7687,7 @@ PyrsDict *pyrs_dict_from_pairs(const PyrsList *pairs, int key_tag, int val_tag) 
 
 PyrsStr *pyrs_os_getcwd(void) {
     char buf[PATH_MAX];
-    if (getcwd(buf, sizeof(buf)) == NULL) {
+    if (pyrs_getcwd(buf, sizeof(buf)) == NULL) {
         pyrs_die("OSError: getcwd failed");
     }
     return str_from_cstr(buf);
