@@ -569,6 +569,11 @@ p(
     "        return x + 1\n    return 0\nprint(f(41), f('no'))",
 )
 p("semantics", "untyped params (inference)", "def f(x):\n    return x + 1\nprint(f(1))")
+p(
+    "semantics",
+    "type name as an identifier",
+    "with open('/etc/hostname') as file:\n    print(len(file.read()) >= 0)",
+)
 p("semantics", "duck-typed function", "def f(x):\n    return len(x)\nprint(f([1, 2]), f('abc'))")
 p("semantics", "int/float mixing", "print(1 + 2.5, 3 / 2, 7 // 2.0)")
 p("semantics", "bool is int", "print(True + True, isinstance(True, int))")

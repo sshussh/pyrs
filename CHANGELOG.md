@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.138.1 — The builtin type names are usable as identifiers
+
+Reported from real code:
+
+```python
+with open(path, "r", encoding=encoding) as file:
+# error[parse]: expected identifier after 'as', found 'file'
+```
+
+`int`, `float`, `bool`, `str`, `file`, `list`, `tuple`, `dict` and `set` are
+reserved words in the lexer so that annotations and casts parse without
+lookahead. **They are not keywords in Python.** Eight are shadowable
+builtins, and `file` is not even that — it was a Python 2 builtin, removed in
+Python 3, and the `file` *annotation* is this compiler's own invention. So
+`file` is the obvious name for a file handle and there was no way to write it.
+
+The reservation had leaked into every position that names something. Eleven
+of fourteen were broken: `as` targets in `with` / `except` / `import` /
+`from ... import`, parameter names, `def` and `class` names, attribute names
+after `.`, keyword-argument names, lambda parameters, and `global`
+declarations. Assignment and `for` targets happened to work only because they
+do not go through `expect_ident`.
+
+Every caller of `expect_ident` introduces or refers to a name and never a
+type, so it now accepts the spelling through the `type_token_ident` table
+that `peek_kwarg_name` already used. One change, all eleven positions.
+
+`file` also stops being a cast in call position. `file(x)` is not valid in any
+Python, so a call can only be to a name the user bound — `from io import x as
+file` then `file(...)` — and treating it as a conversion refused a name that
+is theirs. The other eight keep the cast, so shadowing `list` and then calling
+it is still not possible; that is a genuine ambiguity this compiler resolves
+in favour of the cast.
+
+Annotations and casts are unaffected: `x: int`, `xs: list[int]`,
+`def takes(h: file)`, `int("4")`, `list("ab")` all parse as before.
+
+`cli/tests/reserved_type_names.rs` — 4 differential tests: the reported case,
+all eleven naming positions in one program, `file` in call position both as
+an alias and as a `def`, and the annotations and casts the reservation exists
+for.
+
 ## 0.138.0 — Signatures a library can publish, and functions as values
 
 M3 of the library-enablement plan. Three things were missing, and the one

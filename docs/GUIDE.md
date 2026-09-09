@@ -985,6 +985,16 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - `*args: T` packs extra positionals into `list[T]`; `**kwargs: T` packs
   extra keywords into `dict[str, T]`. Call-site unpacking `f(1, *xs)` and
   `f(**d)` works for homogeneous `list` / `dict[str, …]` values.
+- **The builtin type names are usable as identifiers** (0.138.1). `int`,
+  `float`, `bool`, `str`, `file`, `list`, `tuple`, `dict` and `set` are
+  reserved words in the lexer so annotations and casts parse without
+  lookahead, but they are not keywords in Python, and they bind normally
+  anywhere a name is introduced or referred to: `with open(p) as file:`, a
+  parameter, a `def`/`class` name, an attribute, an `as` alias, a `global`
+  declaration, a lambda parameter. In *call* position the eight real builtins
+  still mean the cast (`list(x)`, `int(s)`), so shadowing one and then calling
+  it is not possible; `file` has no conversion in any Python, so `file(...)`
+  is an ordinary call.
 - **`/` and `*` markers** (0.138). `def f(a, /, b, *, c)` makes `a`
   positional-only and `c` keyword-only, with CPython's rules: a keyword may
   not name a positional-only parameter (it lands in `**kwargs` instead when

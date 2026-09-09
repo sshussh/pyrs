@@ -642,7 +642,23 @@ impl Parser {
         }
     }
 
+    /// An identifier in a *binding* position — a name being introduced or
+    /// referred to, never a type.
+    ///
+    /// The builtin type names are reserved words in this lexer so that
+    /// annotations and casts parse without lookahead, but they are ordinary
+    /// identifiers in Python: `list` is a shadowable builtin, and `file` is
+    /// not even that (it was a Python 2 builtin, and the `file` *annotation*
+    /// is this compiler's own invention). Every caller of this function names
+    /// something — an `as` target, a parameter, a `def`/`class` name, an
+    /// attribute, a `global` declaration — so a type can never appear here and
+    /// accepting the spelling is unambiguous. `with open(p) as file:` is the
+    /// case that made this obvious.
     fn expect_ident(&mut self, context: &str) -> PResult<(String, Span)> {
+        if let Some(name) = Self::type_token_ident(self.peek()) {
+            let (_, span) = self.advance();
+            return Ok((name.to_string(), span));
+        }
         match self.advance() {
             (Token::Ident(name), span) => Ok((name, span)),
             (other, span) => Err(Diagnostic::new(
@@ -2253,8 +2269,16 @@ impl Parser {
                     Token::File => "file",
                     _ => unreachable!(),
                 };
+                // `file` is the one type name with no conversion: `file(x)` is
+                // not Python at all, and the annotation is this compiler's own.
+                // So a call here can only be to something the user bound —
+                // `from io import x as file` then `file(...)` — and treating it
+                // as a cast would refuse a name that is theirs to use.
+                let is_call_of_a_bound_name = matches!(self.peek(), Token::File);
                 // Peek ahead: only consume type keyword after deciding cast vs bare name.
-                if self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen) {
+                if !is_call_of_a_bound_name
+                    && self.tokens.get(self.pos + 1).map(|t| &t.0) == Some(&Token::LParen)
+                {
                     let ty = self.parse_type_name("")?;
                     self.expect(Token::LParen, &format!("after '{ty}' (cast)"))?;
                     // `int()` / `int(x, base)` / `float()` need call-style args.
