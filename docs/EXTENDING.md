@@ -589,9 +589,18 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 ### Layouts (shared with codegen)
 
 ```c
-PyrsStr  { long long len; char data[]; }   // payload at +8, NUL-terminated
+PyrsStr  { long long cplen; long long len; char data[]; }  // payload at +16
 PyrsList { long long len; long long cap; long long *data; }
 ```
+
+`cplen` is the code-point count and `len` the UTF-8 byte count, with
+`cplen <= len` and `cplen == len` exactly when the string is ASCII
+(`STR_IS_ASCII`). **`cplen` is first because `emit_len` loads the i64 at
+offset 0 for every sized object**, and `len(s)` must be Python's answer.
+Byte-oriented operations — `memcmp`, `memcpy`, `fwrite`, the substring
+searches — keep using `len`. A producer that allocates with `str_alloc`
+must finish with `str_done_ascii` / `str_done_cplen` / `str_done_scan`;
+`cplen` starts at `-1` so a missed site is loud rather than silent.
 
 ### Tags
 

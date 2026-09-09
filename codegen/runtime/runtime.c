@@ -5920,7 +5920,10 @@ long long pyrs_file_write(PyrsFile *f, const PyrsStr *s) {
     check_ref(s);
     fwrite(s->data, 1, (size_t)s->len, f->fp);
     fflush(f->fp);
-    return s->len;
+    /* The count of *characters* written, which is what a text-mode write
+     * returns in Python -- `len` is the UTF-8 byte count and differs for
+     * every non-ASCII string ("héllo" wrote 6 bytes and 5 characters). */
+    return s->cplen;
 }
 
 /* idempotent, like Python */
