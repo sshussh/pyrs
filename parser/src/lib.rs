@@ -385,6 +385,7 @@ impl Parser {
             Token::CaretEq => Some(BinOp::BitXor),
             Token::LShiftEq => Some(BinOp::LShift),
             Token::RShiftEq => Some(BinOp::RShift),
+            Token::AtEq => Some(BinOp::MatMul),
             _ => None,
         };
 
@@ -1808,20 +1809,14 @@ impl Parser {
     fn parse_term(&mut self) -> PResult<Expr> {
         let mut left = self.parse_unary()?;
         loop {
-            // `@` binds at this precedence in Python. PyRs has no array type to
-            // multiply, so say that plainly instead of letting the enclosing
-            // construct report a misleading "expected ')'".
-            if self.peek() == &Token::At {
-                return Err(self.error(
-                    "the matrix multiplication operator '@' is not supported; \
-                     PyRs has no array type for it to operate on",
-                ));
-            }
+            // `@` binds at this precedence in Python. No builtin type
+            // implements it; semantic dispatches it to `__matmul__`.
             let op = match self.peek() {
                 Token::Star => BinOp::Mul,
                 Token::Slash => BinOp::Div,
                 Token::DoubleSlash => BinOp::FloorDiv,
                 Token::Percent => BinOp::Mod,
+                Token::At => BinOp::MatMul,
                 _ => break,
             };
             self.advance();
@@ -1854,10 +1849,20 @@ impl Parser {
                     span,
                 })
             }
-            // unary plus is a no-op on numbers
+            // Identity on numbers, but not a no-op in general: a class may
+            // define `__pos__`, and CPython rejects `+"a"`. Semantic decides.
             Token::Plus => {
+                let start = self.peek_span();
                 self.advance();
-                self.parse_unary()
+                let operand = self.parse_unary()?;
+                let span = start.to(operand.span);
+                Ok(Expr {
+                    kind: ExprKind::Unary {
+                        op: UnaryOp::Pos,
+                        operand: Box::new(operand),
+                    },
+                    span,
+                })
             }
             Token::Tilde => {
                 let start = self.peek_span();

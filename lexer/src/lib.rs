@@ -604,6 +604,8 @@ pub enum Token {
     LShiftEq,
     #[token(">>=")]
     RShiftEq,
+    #[token("@=")]
+    AtEq,
 
     // bitwise operators (longer forms before shorter where needed)
     #[token("<<")]
@@ -764,6 +766,7 @@ fn token_text(token: &Token) -> &'static str {
         Token::Comma => ",",
         Token::Dot => ".",
         Token::At => "@",
+        Token::AtEq => "@=",
         Token::Arrow => "->",
         Token::Pipe => "|",
         _ => "?",

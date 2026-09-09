@@ -456,6 +456,9 @@ pub enum BinOp {
     FloorDiv,
     /// `%` — Python modulo (result takes the sign of the divisor)
     Mod,
+    /// `@` — matrix multiplication. No builtin type implements it; it is
+    /// dispatched to `__matmul__` on a user class like any other operator.
+    MatMul,
     /// `**` — power, right-associative
     Pow,
     Eq,
@@ -495,6 +498,7 @@ impl std::fmt::Display for BinOp {
             BinOp::Div => "/",
             BinOp::FloorDiv => "//",
             BinOp::Mod => "%",
+            BinOp::MatMul => "@",
             BinOp::Pow => "**",
             BinOp::Eq => "==",
             BinOp::NotEq => "!=",
@@ -522,6 +526,10 @@ impl std::fmt::Display for BinOp {
 pub enum UnaryOp {
     /// `-x`
     Neg,
+    /// `+x`. Identity on numbers, but not a no-op in general: a class may
+    /// define `__pos__`, and CPython rejects it on `str`, so the parser
+    /// records it rather than discarding it.
+    Pos,
     /// `not x`
     Not,
     /// `~x` bitwise invert (ints / bools as int).
