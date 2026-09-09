@@ -198,7 +198,7 @@ jobs:
 
       - name: Install Rust (macOS/Windows)
         if: runner.os != 'Linux'
-        uses: dtolnay/rust-toolchain@1.96.1
+        uses: dtolnay/rust-toolchain@1.120.0
 
       # ---- build and check ---------------------------------------------
       - name: Build
