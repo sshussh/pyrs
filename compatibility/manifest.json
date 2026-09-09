@@ -229,6 +229,14 @@
       "file": "cases/int_boundary.py",
       "group": "core",
       "native": "pass"
+    },
+    {
+      "id": "mutable-defaults",
+      "file": "cases/mutable_defaults.py",
+      "group": "core",
+      "native": "mismatch",
+      "native_stdout": "module-level: 1 1 1\nnested:       1 2 3\nliteral:      6 15\n",
+      "reason": "A module-level def re-evaluates a mutable default at every call; a nested def and a lambda freeze it once, as CPython does. The two disagree. Closing it needs the default stored as a module global evaluated in def source order, not as a frame temp."
     }
   ]
 }

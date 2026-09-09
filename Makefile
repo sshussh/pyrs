@@ -159,6 +159,10 @@ sanitizers: asan ubsan ## Both sanitizer runs
 bench: release ## Benchmark suite vs CPython (best of N runs; set RUNS=N)
 	RUNS=$(RUNS) PYRS=$(abspath $(PYRS)) ./benchmarks/run.sh
 
+.PHONY: coverage
+coverage: release ## Language-surface coverage vs CPython (see scripts/coverage_probe.py)
+	python3 scripts/coverage_probe.py --pyrs $(PYRS) --fail-on-diverge
+
 .PHONY: watch
 watch: ## Re-run the tests on every change (needs cargo-watch)
 	@command -v cargo-watch >/dev/null \
