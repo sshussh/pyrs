@@ -17199,6 +17199,25 @@ fn to_bool_default(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
     }
 }
 
+/// `lower_cast`, plus the one conversion that has to call a user method.
+///
+/// `bool(x)` on a class instance must consult `__bool__` (then `__len__`)
+/// exactly as `if x:` and `not x` do. `lower_cast` is deliberately ctx-free —
+/// it lowers representations, and only `str()` gets a class arm because
+/// `lower_class_to_str` needs no context — so its `Bool` arm folded every
+/// instance to a constant `true`, silently, with no diagnostic.
+fn lower_cast_ctx(
+    ty: ast::TypeName,
+    value: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if matches!(ty, ast::TypeName::Bool) && matches!(value.ty, ir::Ty::Class(_)) {
+        return to_bool(value, span, ctx);
+    }
+    lower_cast(ty, value, span)
+}
+
 fn to_bool(value: ir::Expr, span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
     match value.ty {
         ir::Ty::Bool => Ok(value),
@@ -18203,7 +18222,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
         ),
         ast::ExprKind::Cast { ty, arg } => {
             let value = lower_expr(arg, ctx)?;
-            lower_cast(*ty, value, arg.span)
+            lower_cast_ctx(*ty, value, arg.span, ctx)
         }
         ast::ExprKind::Unary { op, operand } => {
             let value = lower_expr(operand, ctx)?;
@@ -23956,7 +23975,7 @@ fn call_builtin_sort_key(
         }
         BuiltinKey::CastInt => lower_cast(ast::TypeName::Int, arg, span),
         BuiltinKey::CastFloat => lower_cast(ast::TypeName::Float, arg, span),
-        BuiltinKey::CastBool => lower_cast(ast::TypeName::Bool, arg, span),
+        BuiltinKey::CastBool => lower_cast_ctx(ast::TypeName::Bool, arg, span, ctx),
         BuiltinKey::CastStr => lower_cast(ast::TypeName::Str, arg, span),
     }
 }
