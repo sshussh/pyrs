@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.141.1 — link the C++ runtime by its platform's name
+
+The 0.141.0 release workflow built Linux and skipped macOS, which failed at
+the final link:
+
+```
+ld: library 'stdc++' not found
+```
+
+`codegen/build.rs` links the C++ standard library for the shim it compiles
+against LLVM, and named it `stdc++` unconditionally. That is the GNU
+spelling; macOS ships libc++ and calls it `c++`. Each platform now links the
+one it has, and platforms with neither named — Windows, where MSVC links its
+own — get no such flag.
+
+Everything before this point on macOS already worked: Homebrew's LLVM 18,
+the CMake package, and the C++ shim all built. This was the last step.
+
+Nothing else changed, and Linux is unaffected — it still links `stdc++`.
+
 ## 0.141.0 — what a command-line program needs
 
 Written the way 0.139 and 0.140 were: build the thing, and fix what stops it
