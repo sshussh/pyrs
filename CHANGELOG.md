@@ -74,7 +74,48 @@ different runtime tag than the `list[object]` such a body would read it back
 as — so it would refuse exactly the calls that matter. The reason is recorded
 in the module and in `docs/PRIMITIVES.md` rather than left as an inconsistency.
 
+### A compiler feature, rather than a workaround
+
+The first draft of the parser had to say two things Python would not. One was
+a missing feature and was added; the other turned out to be a representation
+limit, and the honest answer was to leave the code explicit and say why.
+
+**A call to a function that always raises now terminates.** A helper like
+`def fail(m: str): raise ValueError(m)` used to force every caller to write an
+unreachable `return` after calling it, purely to satisfy "every path through a
+value-returning function must return". Whether a function never returns is
+inferred from its body on the AST, before anything is lowered, so the helper
+may be defined after its callers. A function that only *sometimes* raises does
+not count, so the missing-return check keeps its teeth. `NoReturn` and `Never`
+are accepted as annotations for type-checked Python, but the inference is what
+carries the meaning.
+
+**Narrowing `object` to a container was tried and reverted.** `isinstance(v,
+list)` tested correctly but did not narrow, so a body had to restate
+`items: list[object] = v`. Peeling to `list[object]` looked right — 0.136 had
+declined it for a reason that only holds for static union members — but it
+regressed working code: `object` can hold a `list[int]` as well as a
+`list[object]`, `isinstance` is true for both, and the checked extraction
+turned `print(v)` on the former into a `TypeError`. Caught by probing the
+change rather than by a test, and reverted.
+
+The annotation stays, and the module and `docs/GUIDE.md` now say what it is:
+not a restatement the compiler could infer away, but the program choosing
+between two runtime encodings that `isinstance` cannot distinguish. Making
+`Any` hold one canonical container encoding would fix it properly, and that
+needs the aliasing question from 0.137 answered first.
+
+The rule this milestone followed: when a library written in PyRs has to say
+something Python would not, that is a compiler gap — unless the reason is a
+representation the language genuinely has, in which case the code stays
+explicit and the reason gets written down.
+
 ### How this is checked
+
+`cli/tests/never_returns.rs` — 4 tests: a free function, a method, and a
+helper defined *after* its caller; every shape the analysis accepts; the two
+that must **not** count (a conditional raise, and a `while True` that breaks
+and falls through); and the `NoReturn` annotation.
 
 `cli/tests/json_module.rs` — 9 tests at -O0/-O2/-O3 and under
 `PYRS_GC_STRESS=1`. Values, escapes and the non-standard constants are

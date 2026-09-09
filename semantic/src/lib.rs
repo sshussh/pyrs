@@ -3099,6 +3099,7 @@ fn register_class_consts(classes: &[ClassAst<'_>]) -> SResult<()> {
 
 /// Pass A: assign ClassIds only (no base resolution yet).
 fn register_class_ids(classes: &[ClassAst<'_>]) -> SResult<()> {
+    clear_no_return();
     clear_class_env();
     with_class_env_mut(|env| {
         for c in classes {
@@ -3245,6 +3246,118 @@ fn pre_infer_method_ret(f: &ast::FuncDef) -> Option<ir::Ty> {
         }
     }
     try_infer_ret_from_ast_body(&f.body, &params, &HashMap::new()).filter(|t| *t != ir::Ty::None)
+}
+
+// Functions that never return, by fully-qualified IR name.
+//
+// A call to one terminates control flow, so it satisfies "every path returns"
+// the same way a `raise` does. Without this a helper like
+// `def fail(msg): raise ValueError(msg)` forces every caller to write an
+// unreachable `return` after calling it, purely to satisfy the check.
+thread_local! {
+    static NO_RETURN: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn register_no_return(name: String) {
+    NO_RETURN.with(|n| n.borrow_mut().insert(name));
+}
+
+fn is_no_return(name: &str) -> bool {
+    NO_RETURN.with(|n| n.borrow().contains(name))
+}
+
+fn clear_no_return() {
+    NO_RETURN.with(|n| n.borrow_mut().clear());
+}
+
+/// Whether every path through these statements raises.
+///
+/// Computed on the AST, before any body is lowered, so a helper may be
+/// defined after its callers. Deliberately conservative: it answers "yes"
+/// only for shapes where falling through is impossible.
+fn ast_block_always_raises(stmts: &[ast::Stmt]) -> bool {
+    stmts.iter().any(ast_stmt_always_raises)
+}
+
+fn ast_stmt_always_raises(stmt: &ast::Stmt) -> bool {
+    match &stmt.kind {
+        ast::StmtKind::Raise { .. } | ast::StmtKind::Reraise => true,
+        ast::StmtKind::If { branches, orelse } => {
+            !orelse.is_empty()
+                && branches.iter().all(|(_, b)| ast_block_always_raises(b))
+                && ast_block_always_raises(orelse)
+        }
+        ast::StmtKind::With { body, .. } => ast_block_always_raises(body),
+        // `while True:` with no `break` never falls through.
+        ast::StmtKind::While { cond, body, .. } => {
+            matches!(cond.kind, ast::ExprKind::Bool(true)) && !ast_block_breaks(body)
+        }
+        _ => false,
+    }
+}
+
+fn ast_block_breaks(stmts: &[ast::Stmt]) -> bool {
+    stmts.iter().any(ast_stmt_breaks)
+}
+
+fn ast_stmt_breaks(stmt: &ast::Stmt) -> bool {
+    match &stmt.kind {
+        ast::StmtKind::Break => true,
+        ast::StmtKind::If { branches, orelse } => {
+            branches.iter().any(|(_, b)| ast_block_breaks(b)) || ast_block_breaks(orelse)
+        }
+        ast::StmtKind::With { body, .. } => ast_block_breaks(body),
+        ast::StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finally,
+        } => {
+            ast_block_breaks(body)
+                || handlers.iter().any(|h| ast_block_breaks(&h.body))
+                || ast_block_breaks(orelse)
+                || ast_block_breaks(finally)
+        }
+        // A nested loop's own `break` binds to it, not to the outer one.
+        _ => false,
+    }
+}
+
+/// Record every function and method whose body always raises, before any of
+/// them is lowered, so definition order does not matter.
+fn pre_register_no_return(modules: &[ModuleInput<'_>]) {
+    for m in modules {
+        let qualify = |name: &str| -> Vec<String> {
+            if m.name == ENTRY_NAME {
+                vec![name.to_string()]
+            } else {
+                vec![name.to_string(), format!("{}.{}", m.name, name)]
+            }
+        };
+        for stmt in &m.ast.body {
+            match &stmt.kind {
+                ast::StmtKind::FuncDef(f) if ast_block_always_raises(&f.body) => {
+                    for n in qualify(&f.name) {
+                        register_no_return(n);
+                    }
+                }
+                ast::StmtKind::ClassDef(c) => {
+                    for member in &c.body {
+                        let ast::StmtKind::FuncDef(f) = &member.kind else {
+                            continue;
+                        };
+                        if ast_block_always_raises(&f.body) {
+                            for n in qualify(&format!("{}.{}", c.name, f.name)) {
+                                register_no_return(n);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Scan top-level free `def` returns for field-RHS `self.x = make()` typing.
@@ -6156,6 +6269,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     // depends on what its ancestors already provide.
     synthesize_default_ne_methods(&mut class_asts);
     let class_asts = class_asts;
+    pre_register_no_return(modules);
     let free_func_rets = pre_infer_free_func_rets(modules);
     finalize_class_layouts(&class_asts, &free_func_rets)?;
 
@@ -28975,6 +29089,13 @@ fn block_returns(stmts: &[ir::Stmt]) -> bool {
 fn stmt_returns(stmt: &ir::Stmt) -> bool {
     match stmt {
         ir::Stmt::Return(_) => true,
+        // A call to a function that always raises transfers control just as
+        // a `raise` here would.
+        ir::Stmt::ExprStmt(e) => match &e.kind {
+            ir::ExprKind::Call { func, .. } => is_no_return(func),
+            ir::ExprKind::CallMethod { direct_func, .. } => is_no_return(direct_func),
+            _ => false,
+        },
         // Die / Raise exit the process or transfer; cannot fall through
         ir::Stmt::Die(_)
         | ir::Stmt::Raise { .. }

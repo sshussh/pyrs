@@ -1006,6 +1006,14 @@ def clamp(x: float, lo: float, hi: float) -> float:
   `@classmethod` and through virtual dispatch. Builtin type methods
   (`s.startswith(...)`, `xs.sort(...)`) take positional arguments only,
   except `sort`'s documented `key=` / `reverse=`.
+- **A function that always raises never returns** (0.139). A call to one
+  satisfies "every path returns", so a helper like
+  `def fail(m: str): raise ValueError(m)` needs no unreachable `return` after
+  each call site. It is inferred from the body on the AST, before anything is
+  lowered, so the helper may be defined after its callers; a function that
+  only *sometimes* raises does not count. `NoReturn` (and `Never`) are
+  accepted as annotations for compatibility with type-checked Python, but the
+  inference is what carries the meaning.
 - **A module-level function is a value** (0.138), like a nested `def` or a
   lambda: `apply(double, 1)`, `sorted(xs, key=by_len)`, `map(square, xs)`,
   and a dispatch table `{"build": cmd_build, "test": cmd_test}`. Two
@@ -1881,7 +1889,12 @@ Container notes:
   list type is not converted: that would be an O(n) re-box into a fresh list
   and would break aliasing. `isinstance(x, T)` narrows an `Any` for a single
   non-container `T` (0.136), so the guarded body uses the value directly;
-  container and multi-pattern tests leave it `Any`. `bool(x)` /
+  container and multi-pattern tests leave it `Any`. A container pattern
+  cannot peel, and this is a representation limit rather than an omission:
+  `Any` can hold a `list[int]` as well as a `list[Any]` — different element
+  encodings — and `isinstance(v, list)` is true for both, so nothing static
+  chooses between them. Write `items: list[Any] = v`, which says which
+  encoding is expected and is checked at run time. `bool(x)` /
   `if x:` use runtime truthiness for all container tags (empty `list[Any]`
   / `list[str]` / … are falsy). `list[Any]` equality treats `True == 1`
   like CPython. Not full gradual typing: no open setattr, no method

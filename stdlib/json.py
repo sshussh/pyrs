@@ -6,6 +6,17 @@
 # with `isinstance` narrowing, or through the typed `loads_*` helpers below,
 # which are themselves ordinary PyRs written on top of `loads`.
 #
+# The first draft needed an unreachable `return` after every call to a helper
+# that always raises. That was a missing feature, and v0.139 added it: a call
+# to a never-returning function terminates, inferred from the body.
+#
+# The two `items: list[object] = value` lines below are not that. `object` can
+# hold a `list[int]` as well as a `list[object]` — different runtime encodings
+# — and `isinstance(v, list)` is true for both, so nothing static can choose
+# between them. The annotation says which one is expected and is checked at
+# run time. Making it implicit was tried and reverted: it turned `print(v)` on
+# a concretely-typed list into a trap.
+#
 # `dumps` is the one function here the compiler still lowers itself, and
 # deliberately: it dispatches on the *static* type of its argument, which is
 # what lets `dumps([1, 2, 3])` work on a `list[int]`. A version written here
@@ -20,6 +31,8 @@
 #     decoded to the astral code point it denotes, as CPython does.
 #   * Nesting is capped at `MAX_DEPTH` to turn a deeply nested document into
 #     an exception rather than a native stack overflow.
+
+from typing import NoReturn
 
 MAX_DEPTH: int = 200
 
@@ -41,7 +54,7 @@ class _Decoder:
     # Matching it is what makes an error from this module readable next to
     # one from CPython's.
 
-    def fail(self, message: str, position: int) -> None:
+    def fail(self, message: str, position: int) -> NoReturn:
         line: int = 1
         column: int = 1
         index: int = 0
@@ -70,8 +83,7 @@ class _Decoder:
 
     def skip_whitespace(self) -> None:
         while self.position < self.length:
-            character: str = self.source[self.position]
-            if character != " " and character != "\t" and character != "\n" and character != "\r":
+            if self.source[self.position] not in " \t\n\r":
                 break
             self.position += 1
 
@@ -135,7 +147,6 @@ class _Decoder:
             return float("inf")
 
         self.fail("Expecting value", self.position)
-        return None
 
     def enter(self) -> None:
         self.depth += 1
@@ -253,7 +264,6 @@ class _Decoder:
             self.position += 1
 
         self.fail("Unterminated string starting at", start)
-        return ""
 
     def escape(self) -> str:
         if self.at_end():
@@ -282,7 +292,6 @@ class _Decoder:
             return self.unicode_escape()
 
         self.fail("Invalid \\escape", self.position - 2)
-        return ""
 
     def hex4(self) -> int:
         if self.position + 4 > self.length:
@@ -396,7 +405,7 @@ def loads(source: str) -> object:
 # `list[object]` and a `list[int]` are different runtime encodings.
 
 
-def _wrong(expected: str) -> None:
+def _wrong(expected: str) -> NoReturn:
     raise TypeError(f"JSON value is not {expected}")
 
 
@@ -407,7 +416,6 @@ def loads_int(s: str) -> int:
     if isinstance(value, int):
         return value
     _wrong("an int")
-    return 0
 
 
 def loads_float(s: str) -> float:
@@ -419,7 +427,6 @@ def loads_float(s: str) -> float:
     if isinstance(value, int):
         return float(value)
     _wrong("a float")
-    return 0.0
 
 
 def loads_bool(s: str) -> bool:
@@ -427,7 +434,6 @@ def loads_bool(s: str) -> bool:
     if isinstance(value, bool):
         return value
     _wrong("a bool")
-    return False
 
 
 def loads_str(s: str) -> str:
@@ -435,17 +441,17 @@ def loads_str(s: str) -> str:
     if isinstance(value, str):
         return value
     _wrong("a str")
-    return ""
 
 
 def _elements(s: str, expected: str) -> list[object]:
     value: object = loads(s)
     if isinstance(value, list):
+        # Not a restatement the compiler could infer away: `object` can hold
+        # a `list[int]` as well as a `list[object]`, and `isinstance` is true
+        # for both. This says which encoding is expected, and is checked.
         items: list[object] = value
         return items
     _wrong(expected)
-    unreachable: list[object] = []
-    return unreachable
 
 
 def loads_list_int(s: str) -> list[int]:
@@ -500,8 +506,6 @@ def _entries(s: str, expected: str) -> dict[str, object]:
         table: dict[str, object] = value
         return table
     _wrong(expected)
-    unreachable: dict[str, object] = {}
-    return unreachable
 
 
 def loads_dict_str_int(s: str) -> dict[str, int]:

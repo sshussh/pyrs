@@ -892,6 +892,15 @@ impl Parser {
                 self.advance();
                 Ok(TypeName::Any)
             }
+            // `NoReturn` is a promise about control flow, not a value type —
+            // such a function returns nothing because it never returns at
+            // all. Whether a call to it terminates is *inferred* from the
+            // body, so this annotation is accepted for compatibility with
+            // type-checked Python rather than being what carries the meaning.
+            Token::Ident(name) if name == "NoReturn" || name == "Never" => {
+                self.advance();
+                Ok(TypeName::None)
+            }
             // User class type annotation (`Point`, `Animal`, …).
             Token::Ident(name) => {
                 let name = name.clone();

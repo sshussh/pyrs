@@ -373,6 +373,15 @@ documentation and the relevant gates.
       `float`/`bool`/`frozenset` keys; dict views. Dict *keys* and set
       elements deliberately stayed restricted when 0.137 let container
       *values* infer a union, because a key must be hashable.
+- [ ] One canonical container encoding inside `Any`. `Any` can hold a
+      `list[int]` (element tag 4) or a `list[Any]` (tag 68), `isinstance(v,
+      list)` is true for both, and nothing static chooses between them — so
+      `isinstance` cannot narrow to a container and a body must write
+      `items: list[Any] = v`, which is checked. Narrowing was attempted in
+      0.139 and reverted: it turned `print(v)` on a concretely-typed list into
+      a trap. Canonicalising needs the aliasing answer from the
+      `list[T1]` -> `list[T2]` item above, since the conversion is an O(n)
+      re-box.
 - [ ] Parenthesized import lists — `from x import (a, b, c)` is not parsed.
       Ordinary Python and common for long lists; found while writing
       `stdlib/json.py` in 0.139.
@@ -402,6 +411,11 @@ documentation and the relevant gates.
       were refused for *any* method before, which made every
       `df.sort_values(by=...)`-shaped API unreachable), and module-level
       functions as first-class values including dispatch tables.
+- [x] A call to a never-returning function terminates (0.139): a helper whose
+      body always raises satisfies "every path returns", inferred on the AST
+      so definition order is free. `NoReturn` / `Never` accepted as
+      annotations. Found by writing `stdlib/json.py`, which otherwise needed
+      an unreachable `return` after every error helper.
 - [ ] Callable metadata, decorator factories, stacked decorators. Also: a
       container of functions with *differing* signatures, which needs a union
       of closure types and runtime dispatch through it; and functions with

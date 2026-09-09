@@ -130,6 +130,55 @@ easy to get wrong.
 `make coverage` gains a dynamic-`loads` probe and an error-parity probe;
 stdlib coverage goes 3 to 5 of 14.
 
+## What the module needed from the compiler
+
+The first draft said two things Python would not. One was a missing feature.
+The other was not, and finding that out was worth more.
+
+**A call to a function that always raises terminates.** `def fail(m): raise
+ValueError(m)` forced every caller to write an unreachable `return` after it,
+to satisfy "every path through a value-returning function must return". The
+analysis (`block_returns` / `stmt_returns`) works on IR, so the fix is a
+pre-pass — `pre_register_no_return` walks the AST before anything is lowered
+and records every function and method whose body always raises. Doing it on
+the AST is what makes definition order irrelevant, the same reason
+`pre_infer_free_func_rets` exists. A conditional raise does not count, so the
+missing-return check keeps its teeth.
+
+**Narrowing `object` to a container was tried and reverted**, and the reason
+is the more useful half of this milestone. 0.136 had declined it, recording
+that "no element type is recoverable from the tag". That reasoning only holds
+for a *static union member*, so it looked like an omission — peel to the fully
+dynamic container, let `FromAny`'s tag check catch a mismatch.
+
+It regressed working code. `object` can hold a `list[int]` (tag 4) as well as
+a `list[object]` (tag 68), `isinstance(v, list)` is true for both, and the
+peel is applied at every *read* of the narrowed name. So this, which printed
+fine before, started raising:
+
+```python
+xs: list[int] = [1, 2]
+a: object = xs
+if isinstance(a, list):
+    print(a)          # TypeError: expected list[Any], got incompatible dynamic value
+```
+
+Caught by probing the change against a case the tests did not cover, not by
+the tests. Reverted, and the annotation the module carries is now documented
+for what it is: not a restatement the compiler could infer away, but the
+program choosing between two runtime encodings that `isinstance` cannot
+distinguish, checked at run time.
+
+Fixing it properly means making `Any` hold one canonical container encoding,
+which requires answering the aliasing question 0.137 recorded — converting a
+`list[int]` to a `list[object]` is an O(n) re-box, and the copy breaks
+aliasing.
+
+The rule this milestone followed: when a library written in PyRs has to say
+something Python would not, that is a compiler gap — **unless** the reason is
+a representation the language genuinely has, in which case the code stays
+explicit and the reason gets written down.
+
 ## Noticed while writing it
 
 `from json import (a, b, c)` — a parenthesized import list — is not parsed.
