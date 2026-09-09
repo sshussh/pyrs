@@ -1187,6 +1187,18 @@ fn apply_type_refinement(base: ir::Expr, storage: ir::Ty, nty: ir::Ty) -> ir::Ex
     if nty == storage {
         return base;
     }
+    // `Any` narrowed by isinstance: unwrap the box. `FromAny` re-checks the
+    // tag, which is redundant under the guard that produced the refinement and
+    // cheap — and it means a refinement that is ever wrong traps rather than
+    // reinterpreting the payload as the wrong type.
+    if storage == ir::Ty::Any && nty != ir::Ty::Any && can_box_as_any(nty) {
+        return ir::Expr {
+            ty: nty,
+            kind: ir::ExprKind::FromAny {
+                value: Box::new(base),
+            },
+        };
+    }
     // Class base → more specific subclass (isinstance).
     if let (ir::Ty::Class(src), ir::Ty::Class(dst)) = (storage, nty)
         && class_is_subclass(dst, src)
@@ -1346,6 +1358,25 @@ fn isinstance_peel_member(m: ir::Ty, pats: &[IsInstancePat]) -> (Option<ir::Ty>,
         }
         // Unrelated class patterns.
         return (None, Some(m));
+    }
+
+    // `Any` is a tagged box, so an isinstance test genuinely narrows it: the
+    // then-arm takes the tested type, and the else-arm stays `Any` because
+    // ruling out one tag says nothing about the rest.
+    //
+    // One pattern only, and no containers. `isinstance(x, list)` cannot peel
+    // to a concrete `list[T]` — the element type is not recoverable from the
+    // tag — and a multi-pattern peel would need a union whose member indices
+    // do not exist in the box's global tag space. Both decline rather than
+    // guess, leaving `Any` on both arms as before.
+    if m == ir::Ty::Any {
+        if let [pat] = pats
+            && let Some(want) = isinstance_pat_to_ty(*pat)
+            && can_box_as_any(want)
+        {
+            return (Some(want), Some(m));
+        }
+        return (Some(m), Some(m));
     }
 
     // All exception instances share Ty::Exception — cannot peel subtypes.
@@ -11451,8 +11482,11 @@ fn lower_method_stmt(
                         method_span,
                     ));
                 }
-                let value = lower_expr(&args[0], ctx)?;
-                let value = coerce(value, *elem, args[0].span, "append() argument")?;
+                // `lower_arg_expr`, not `lower_expr` + `coerce`: it steers a
+                // container literal with the element type, so
+                // `rows.append(["a", 1])` into a `list[list[Any]]` boxes at
+                // construction instead of demanding one element type.
+                let value = lower_arg_expr(&args[0], *elem, "append() argument", ctx)?;
                 Ok(ir::Stmt::ListAppend {
                     list: base_ir,
                     value,
@@ -11467,8 +11501,7 @@ fn lower_method_stmt(
                 }
                 let index = lower_expr(&args[0], ctx)?;
                 let index = coerce(index, ir::Ty::Int, args[0].span, "insert() index")?;
-                let value = lower_expr(&args[1], ctx)?;
-                let value = coerce(value, *elem, args[1].span, "insert() argument")?;
+                let value = lower_arg_expr(&args[1], *elem, "insert() argument", ctx)?;
                 Ok(ir::Stmt::ListInsert {
                     list: base_ir,
                     index,
@@ -14086,6 +14119,69 @@ fn lower_tuple_count(
     })
 }
 
+/// The static type an expression has, for the shapes that need no lowering:
+/// a name, and attribute/index chains over one.
+///
+/// Deliberately partial. It exists to supply an *expected type* to a
+/// container literal on the right of an assignment, and returning `None` only
+/// costs the hint — so anything with a call, an operator or a comprehension in
+/// it declines rather than guessing. Lowering the base twice to learn its type
+/// would duplicate side effects.
+fn probe_expr_ty(e: &ast::Expr, ctx: &FnCtx) -> Option<ir::Ty> {
+    match &e.kind {
+        ast::ExprKind::Name(n) => ctx
+            .cell_locals
+            .get(n)
+            .copied()
+            .or_else(|| ctx.locals.get(n).copied())
+            .or_else(|| ctx.globals.get(n).copied()),
+        ast::ExprKind::Attribute { base, attr, .. } => {
+            let ir::Ty::Class(id) = probe_expr_ty(base, ctx)? else {
+                return Option::None;
+            };
+            class_field_ty(id, attr)
+        }
+        ast::ExprKind::Index { base, .. } => match probe_expr_ty(base, ctx)? {
+            ir::Ty::List(elem) => Some(*elem),
+            ir::Ty::Dict { value, .. } => Some(*value),
+            _ => Option::None,
+        },
+        _ => Option::None,
+    }
+}
+
+fn class_field_ty(id: ir::ClassId, attr: &str) -> Option<ir::Ty> {
+    class_info(id)?
+        .fields
+        .iter()
+        .find(|(n, _)| n == attr)
+        .map(|(_, t)| *t)
+}
+
+/// The declared type of the slot a non-`Name` assignment target writes into.
+///
+/// Unlike the multi-assign storage hint this is *exact* — a container's
+/// element type or a class field's type, both declared — so it can steer a
+/// non-empty literal too. `f.cols["name"] = ["a", "b"]` into a
+/// `dict[str, list[Any]]` boxes each element at construction, which is what
+/// `xs: list[Any] = ["a", "b"]` has always done at a `Name` target.
+fn probe_target_slot_ty(target: &ast::AssignTarget, ctx: &FnCtx) -> Option<ir::Ty> {
+    match target {
+        ast::AssignTarget::Index { base, .. } => match probe_expr_ty(base, ctx)? {
+            ir::Ty::List(elem) => Some(*elem),
+            ir::Ty::Dict { value, .. } => Some(*value),
+            _ => Option::None,
+        },
+        ast::AssignTarget::Attr { base, attr, .. } => {
+            let ir::Ty::Class(id) = probe_expr_ty(base, ctx)? else {
+                return Option::None;
+            };
+            class_field_ty(id, attr)
+        }
+        _ => Option::None,
+    }
+}
+
 fn lower_assign(
     target: &ast::AssignTarget,
     annotation: Option<ast::TypeName>,
@@ -14117,25 +14213,29 @@ fn lower_assign(
     } else {
         None
     };
-    let expected = ann_ty.or(storage_hint);
+    // The declared slot type of a non-`Name` target. Exact rather than a
+    // join guess, so it steers non-empty literals as an annotation does.
+    let slot_hint = if ann_ty.is_none() {
+        probe_target_slot_ty(target, ctx)
+    } else {
+        None
+    };
+    let exact = ann_ty.is_some() || slot_hint.is_some();
+    let expected = ann_ty.or(slot_hint).or(storage_hint);
     // Propagate expected types into empty / annotated container literals
     let lowered = match (&value.kind, expected) {
-        (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem)))
-            if ann_ty.is_some() || items.is_empty() =>
-        {
+        (ast::ExprKind::ListLit(items), Some(ir::Ty::List(elem))) if exact || items.is_empty() => {
             lower_list_lit(items, Some(*elem), value.span, ctx)?
         }
         (ast::ExprKind::DictLit(items), Some(ir::Ty::Dict { key, value: val }))
-            if ann_ty.is_some() || items.is_empty() =>
+            if exact || items.is_empty() =>
         {
             lower_dict_lit(items, Some((*key, *val)), value.span, ctx)?
         }
-        (ast::ExprKind::SetLit(items), Some(ir::Ty::Set(elem)))
-            if ann_ty.is_some() || items.is_empty() =>
-        {
+        (ast::ExprKind::SetLit(items), Some(ir::Ty::Set(elem))) if exact || items.is_empty() => {
             lower_set_lit(items, Some(*elem), value.span, ctx)?
         }
-        (ast::ExprKind::TupleLit(items), Some(ir::Ty::Tuple(elems))) if ann_ty.is_some() => {
+        (ast::ExprKind::TupleLit(items), Some(ir::Ty::Tuple(elems))) if exact => {
             lower_tuple_lit(items, Some(elems), value.span, ctx)?
         }
         (
