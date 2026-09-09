@@ -536,6 +536,15 @@ fn resolve_type(ty: ast::TypeName) -> ir::Ty {
         ast::TypeName::File => ir::Ty::File,
         ast::TypeName::Any => ir::Ty::Any,
         ast::TypeName::Iterator(t) => ir::generator_of(resolve_type(*t)),
+        // A capture-free closure: the shape a module-level function or a
+        // non-capturing lambda takes in value position. Captures live in the
+        // closure object and a caller reads them by static type, so an
+        // annotation — which cannot know them — describes exactly the
+        // capture-free case, and `coerce` checks that.
+        ast::TypeName::Callable { params, ret } => {
+            let ps: Vec<ir::Ty> = params.iter().copied().map(resolve_type).collect();
+            ir::closure_of(&ps, resolve_type(*ret))
+        }
         ast::TypeName::List(e) => ir::list_of(resolve_type(*e)),
         ast::TypeName::Tuple(elems) => {
             let ts: Vec<ir::Ty> = elems.iter().copied().map(resolve_type).collect();
@@ -6393,7 +6402,9 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
 
         // Pre-seed globals from simple top-level assigns so functions can
         // reference them before init runs (order: functions then init).
+        set_seed_funcs(funcs, &mctx.prefix());
         seed_globals_from_script(&script, &mut globals, &mut globals_order, is_root, &m.name);
+        clear_seed_funcs();
 
         // Lower top-level functions first so inferred return types (e.g.
         // returning a nested closure) are available when lowering the
@@ -6811,6 +6822,47 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     })
 }
 
+thread_local! {
+    // Bare name -> closure type, for the module whose globals are being
+    // seeded. Seeding runs before any expression is typed, so it cannot ask
+    // the usual machinery what `cmd_build` is; this is the same shape as the
+    // class environment it already consults for `Point(1, 2)`.
+    static SEED_FUNCS: std::cell::RefCell<HashMap<String, ir::Ty>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Record the module-level functions that may appear as *values* in a global
+/// initializer. A function taking `*args`/`**kwargs`, carrying defaults, or
+/// generating is skipped: those cannot be closure values, and leaving them out
+/// means the global is simply unseeded, which is the pre-existing behaviour.
+fn set_seed_funcs(funcs: &HashMap<String, FuncSig>, prefix: &str) {
+    let mut map = HashMap::new();
+    for (name, sig) in funcs {
+        if sig.vararg.is_some()
+            || sig.kwarg.is_some()
+            || sig.is_generator
+            || sig.params.iter().any(|p| p.default.is_some())
+        {
+            continue;
+        }
+        let params: Vec<ir::Ty> = sig.params.iter().map(|p| p.ty).collect();
+        let ir_name = format!("{prefix}{name}");
+        map.insert(
+            name.clone(),
+            ir::closure_of_full(&params, sig.ret, &[], &ir_name),
+        );
+    }
+    SEED_FUNCS.with(|f| *f.borrow_mut() = map);
+}
+
+fn clear_seed_funcs() {
+    SEED_FUNCS.with(|f| f.borrow_mut().clear());
+}
+
+fn seed_func_ty(name: &str) -> Option<ir::Ty> {
+    SEED_FUNCS.with(|f| f.borrow().get(name).copied())
+}
+
 /// Seed module globals from top-level assignments (literals / names), joining
 /// multiple assignment types so bare multi-assign yields a union storage type.
 /// Explicit annotations fix storage and are never widened by later bare assigns.
@@ -6970,6 +7022,11 @@ fn seed_ty_from_expr(e: &ast::Expr) -> Option<ir::Ty> {
             op: ast::UnaryOp::Neg | ast::UnaryOp::Invert,
             operand,
         } => seed_ty_from_expr(operand),
+        // A module-level function used as a value: `HANDLER = run`, or one
+        // inside a table. Without this the global is unseeded and the name is
+        // invisible inside every function — which is exactly where a command
+        // dispatch table gets read.
+        ast::ExprKind::Name(n) => seed_func_ty(n),
         // Class construction: `Point(1, 2)` → Class type for multi-assign join.
         ast::ExprKind::Call { func, .. } => lookup_class(func).map(ir::Ty::Class),
         ast::ExprKind::MethodCall { base, method, .. } => {
@@ -7525,6 +7582,46 @@ fn lower_function_inner(
         vec![ir::Stmt::Return(Some(ir::Expr {
             ty: ir::Ty::Str,
             kind: ir::ExprKind::OsGetcwd,
+        }))]
+    } else if mctx.module == "os.path" && f.name == "_stat_kind" {
+        if params.len() != 1 || params[0].1 != ir::Ty::Str || ctx.ret != ir::Ty::Int {
+            return Err(err(
+                "os.path._stat_kind must take one str and return int".to_string(),
+                f.span,
+            ));
+        }
+        let arg = ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::Local(params[0].0.clone()),
+        };
+        vec![ir::Stmt::Return(Some(ir::Expr {
+            ty: ir::Ty::Int,
+            kind: ir::ExprKind::OsStatKind(Box::new(arg)),
+        }))]
+    } else if mctx.module == "os.path" && f.name == "_getcwd" {
+        // Same primitive as `os.getcwd`; `os.path` cannot import `os`, which
+        // imports it.
+        if !params.is_empty() || ctx.ret != ir::Ty::Str {
+            return Err(err(
+                "os.path._getcwd must take no parameters and return str".to_string(),
+                f.span,
+            ));
+        }
+        vec![ir::Stmt::Return(Some(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::OsGetcwd,
+        }))]
+    } else if (mctx.module == "os" || mctx.module == "os.path") && f.name == "_environ" {
+        let want = ir::dict_of(ir::Ty::Str, ir::Ty::Str);
+        if !params.is_empty() || ctx.ret != want {
+            return Err(err(
+                "os._environ must take no parameters and return dict[str, str]".to_string(),
+                f.span,
+            ));
+        }
+        vec![ir::Stmt::Return(Some(ir::Expr {
+            ty: want,
+            kind: ir::ExprKind::OsEnviron,
         }))]
     } else {
         lower_block(&f.body, &mut ctx)?
@@ -10067,6 +10164,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                 let mut end = const_str_expr("\n");
                 let mut flush = const_bool_expr(false);
                 let mut to_stderr = false;
+                let mut to_file: Option<Box<ir::Expr>> = Option::None;
                 let mut seen_sep = false;
                 let mut seen_end = false;
                 let mut seen_flush = false;
@@ -10135,20 +10233,26 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                             };
                         }
                         "file" => {
-                            // Only the two standard streams exist as
-                            // destinations, so this is a flag rather than a
-                            // file value. `file=sys.stdout` is the default
-                            // and accepted for symmetry.
+                            // The standard streams stay a flag: they funnel
+                            // into the same writer and need no file object.
+                            // Anything else must be an open file, and the
+                            // print is bracketed by a redirect.
                             match stream_keyword(&kw.value, ctx) {
                                 Some(is_err) => to_stderr = is_err,
                                 Option::None => {
-                                    return Err(err(
-                                        "print(file=...) accepts only sys.stderr or \
-                                         sys.stdout: there is no general file \
-                                         destination for print yet. Use \
-                                         f.write(...) for a file opened with open()",
-                                        kw.value.span,
-                                    ));
+                                    let f = lower_expr(&kw.value, ctx)?;
+                                    if f.ty != ir::Ty::File {
+                                        return Err(err(
+                                            format!(
+                                                "print(file=...) needs a file, found {}; \
+                                                 pass one of sys.stdout / sys.stderr or \
+                                                 a file from open()",
+                                                display_ty(f.ty)
+                                            ),
+                                            kw.value.span,
+                                        ));
+                                    }
+                                    to_file = Some(Box::new(f));
                                 }
                             }
                         }
@@ -10166,6 +10270,7 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     end,
                     flush,
                     to_stderr,
+                    to_file,
                 });
                 return Ok(());
             }
@@ -12658,11 +12763,12 @@ fn lower_file_method(
         "readlines" => (ReadLines, ir::list_of(ir::Ty::Str), false),
         "write" => (Write, ir::Ty::Int, true),
         "close" => (Close, ir::Ty::None, false),
+        "flush" => (Flush, ir::Ty::None, false),
         _ => {
             return Err(err(
                 format!(
                     "file method '{method}' is not supported yet (supported: \
-                     read, readline, readlines, write, close)"
+                     read, readline, readlines, write, close, flush)"
                 ),
                 method_span,
             ));
@@ -17218,10 +17324,73 @@ fn lower_instance_method_call_kw(
             method_span,
         ));
     }
+    // `self.handler(x)` where `handler` is a *field* holding a function value,
+    // not a method. Python looks the attribute up and calls whatever it finds;
+    // here the two live in different namespaces, so a field has to be tried
+    // before reporting a missing method.
+    if resolve_method(class_id, method).is_none()
+        && let Some((fidx, fty)) = field_index(class_id, method)
+        && let ir::Ty::Closure {
+            params,
+            ret,
+            capture_tys,
+            func,
+        } = fty
+    {
+        if !keywords.is_empty() {
+            return Err(err(
+                format!(
+                    "'{method}' is a function-valued field, and a closure value \
+                     carries no parameter names, so it cannot take keyword arguments"
+                ),
+                method_span,
+            ));
+        }
+        if args.len() != params.len() {
+            return Err(err(
+                format!(
+                    "'{method}' takes {} argument(s) but {} were given",
+                    params.len(),
+                    args.len()
+                ),
+                method_span,
+            ));
+        }
+        let field = ir::Expr {
+            ty: fty,
+            kind: ir::ExprKind::GetField {
+                object: Box::new(base_ir),
+                class_id,
+                field_index: fidx,
+            },
+        };
+        let mut lowered = Vec::with_capacity(args.len());
+        for (a, want) in args.iter().zip(params.iter()) {
+            let v = lower_expr(a, ctx)?;
+            lowered.push(coerce(v, *want, a.span, "argument")?);
+        }
+        return Ok(ir::Expr {
+            ty: *ret,
+            kind: ir::ExprKind::CallClosure {
+                closure: Box::new(field),
+                args: lowered,
+                capture_tys: capture_tys.to_vec(),
+                func: func.to_string(),
+            },
+        });
+    }
     let direct = resolve_method(class_id, method).ok_or_else(|| {
+        let hint = match class_field_ty(class_id, method) {
+            Some(t) => format!(
+                " (there is a field '{method}' of type {}, but only a function-valued \
+                 field can be called)",
+                display_ty(t)
+            ),
+            Option::None => String::new(),
+        };
         err(
             format!(
-                "'{}' object has no method '{method}'",
+                "'{}' object has no method '{method}'{hint}",
                 class_info(class_id)
                     .map(|c| c.name)
                     .unwrap_or_else(|| format!("class#{class_id}"))
@@ -18005,12 +18174,22 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                             kind: ir::ExprKind::Argv,
                         });
                     }
+                    // The three standard streams are file objects, so the
+                    // whole file surface -- read, readline, readlines, write,
+                    // iteration, `with` -- applies to them. They are
+                    // singletons: `sys.stdout is sys.stdout`.
+                    if let Some(which) = match attr.as_str() {
+                        "stdin" => Some(0u8),
+                        "stdout" => Some(1),
+                        "stderr" => Some(2),
+                        _ => Option::None,
+                    } {
+                        return Ok(ir::Expr {
+                            ty: ir::Ty::File,
+                            kind: ir::ExprKind::StdStream(which),
+                        });
+                    }
                     let note = match attr.as_str() {
-                        "stderr" | "stdout" => {
-                            "sys.stderr and sys.stdout are not values: there is \
-                             no file object behind them. `print(..., file=sys.stderr)` \
-                             is supported"
-                        }
                         "exit" => "sys.exit is a call, not a value: write sys.exit(code)",
                         _ => "",
                     };
@@ -18018,7 +18197,8 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         if note.is_empty() {
                             format!(
                                 "'sys.{attr}' is not supported yet (sys.argv, \
-                                 sys.exit() and print(file=sys.stderr) are)"
+                                 sys.exit(), and sys.stdin / sys.stdout / sys.stderr \
+                                 as file objects are)"
                             )
                         } else {
                             note.to_string()
@@ -26538,6 +26718,16 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
                     kind: ir::ExprKind::ContainerRepr(Box::new(value)),
                 })
             }
+            // A dynamic value renders as `print` writes it, which is what
+            // `str` means -- and it is what a library taking `object` needs to
+            // report what it was handed.
+            ir::Ty::Any => Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::AnyToStr {
+                    value: Box::new(value),
+                    repr: false,
+                },
+            }),
             other => Err(err(format!("str() cannot convert {other} yet"), span)),
         },
         // Cast form `list[T](x)` is not supported; use call form `list(x)`.
@@ -26564,6 +26754,10 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
         ast::TypeName::None => Err(err("None is not a conversion", span)),
         ast::TypeName::Iterator(_) => Err(err(
             "Iterator[...] is an annotation, not a conversion",
+            span,
+        )),
+        ast::TypeName::Callable { .. } => Err(err(
+            "Callable[...] is an annotation, not a conversion",
             span,
         )),
         ast::TypeName::Union(_) => Err(err("union types are not a conversion", span)),
@@ -27126,6 +27320,17 @@ fn lower_repr_like(value: ir::Expr, ascii: bool, span: Span) -> SResult<ir::Expr
                 ir::ExprKind::ContainerAscii(Box::new(value))
             } else {
                 ir::ExprKind::ContainerRepr(Box::new(value))
+            },
+        }),
+        // `repr` of a dynamic value quotes a top-level str, where `str`
+        // leaves it bare; everything else renders the same. `ascii` would
+        // need the escape flag pushed through the box, which the shared
+        // printer does not carry yet.
+        ir::Ty::Any if !ascii => Ok(ir::Expr {
+            ty: ir::Ty::Str,
+            kind: ir::ExprKind::AnyToStr {
+                value: Box::new(value),
+                repr: true,
             },
         }),
         other => Err(err(

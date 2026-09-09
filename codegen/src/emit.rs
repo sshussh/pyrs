@@ -519,6 +519,8 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | SetFromStr(operand)
         | MinList(operand)
         | MaxList(operand)
+        | OsStatKind(operand)
+        | AnyToStr { value: operand, .. }
         | MathCall { arg: operand, .. }
         | ClosureCap {
             closure: operand, ..
@@ -666,7 +668,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         Open { path, mode } => max_try_depth_in_expr(path).max(max_try_depth_in_expr(mode)),
         ConstInt(_) | ConstIntDigits(_) | ConstFloat(_) | ConstBool(_) | ConstStr(_)
         | ConstNone | Local(_) | GlobalLoad(_) | Argv | DictNew | SetNew | OsGetcwd
-        | CellNewUnbound => 0,
+        | StdStream(_) | OsEnviron | CellNewUnbound => 0,
     }
 }
 
@@ -819,6 +821,8 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | SetFromStr(operand)
         | MinList(operand)
         | MaxList(operand)
+        | OsStatKind(operand)
+        | AnyToStr { value: operand, .. }
         | MathCall { arg: operand, .. } => count_yields_in_expr(operand),
         Sum { list, start } => count_yields_in_expr(list) + count_yields_in_expr(start),
         Round {
@@ -979,6 +983,13 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
         out.push_str("declare void @pyrs_out_to_stderr(i64)\n");
+        out.push_str("declare void @pyrs_out_to_file(ptr)\n");
+        out.push_str("declare void @pyrs_out_reset()\n");
+        out.push_str("declare ptr @pyrs_std_stream(i64)\n");
+        out.push_str("declare ptr @pyrs_os_environ()\n");
+        out.push_str("declare i64 @pyrs_os_stat_kind(ptr)\n");
+        out.push_str("declare ptr @pyrs_str_any(i64)\n");
+        out.push_str("declare ptr @pyrs_repr_any(i64)\n");
         out.push_str("declare void @pyrs_sys_exit(i64) noreturn\n");
         out.push_str("declare void @pyrs_raise(i32, ptr) noreturn\n");
         out.push_str("declare void @pyrs_raise_exc(ptr) noreturn\n");
@@ -1198,6 +1209,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_file_readlines(ptr)\n");
         out.push_str("declare i64 @pyrs_file_write(ptr, ptr)\n");
         out.push_str("declare void @pyrs_file_close(ptr)\n");
+        out.push_str("declare void @pyrs_file_flush(ptr)\n");
         out.push_str("declare i64 @pyrs_ipow(i64, i64)\n");
         out.push_str("declare i64 @pyrs_int_from_i64(i64)\n");
         out.push_str("declare i64 @pyrs_int_from_str(ptr, i64)\n");
@@ -3854,11 +3866,15 @@ impl Emitter {
                 end,
                 flush,
                 to_stderr,
+                to_file,
             } => {
                 // The destination is set for the duration of the call rather
                 // than passed to each print routine: they all funnel into one
                 // writer, and a capture (`str()` of a value) still wins.
-                if *to_stderr {
+                if let Some(f) = to_file {
+                    let fv = self.emit_expr(f);
+                    self.line(format!("call void @pyrs_out_to_file(ptr {fv})"));
+                } else if *to_stderr {
                     self.line("call void @pyrs_out_to_stderr(i64 1)");
                 }
                 // Evaluate objects first (CPython), then sep/end/flush.
@@ -3884,7 +3900,9 @@ impl Emitter {
                     self.line(format!("{ext} = zext i1 {flush_v} to i32"));
                     self.line(format!("call void @pyrs_flush_if(i32 {ext})"));
                 }
-                if *to_stderr {
+                if to_file.is_some() {
+                    self.line("call void @pyrs_out_reset()");
+                } else if *to_stderr {
                     self.line("call void @pyrs_out_to_stderr(i64 0)");
                 }
             }
@@ -4091,6 +4109,10 @@ impl Emitter {
                     }
                     FileFn::Close => {
                         self.line(format!("call void @pyrs_file_close({args_str})"));
+                        String::new()
+                    }
+                    FileFn::Flush => {
+                        self.line(format!("call void @pyrs_file_flush({args_str})"));
                         String::new()
                     }
                 }
@@ -4894,6 +4916,36 @@ impl Emitter {
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_os_getcwd()"));
                 t
+            }
+            ExprKind::StdStream(which) => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_std_stream(i64 {which})"));
+                t
+            }
+            ExprKind::OsEnviron => {
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_os_environ()"));
+                t
+            }
+            ExprKind::AnyToStr { value, repr } => {
+                let v = self.emit_expr(value);
+                let callee = if *repr {
+                    "pyrs_repr_any"
+                } else {
+                    "pyrs_str_any"
+                };
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @{callee}(i64 {v})"));
+                t
+            }
+            ExprKind::OsStatKind(path) => {
+                let p = self.emit_expr(path);
+                let t = self.tmp();
+                self.line(format!("{t} = call i64 @pyrs_os_stat_kind(ptr {p})"));
+                // A raw C i64 is not yet an `int` value: small integers carry
+                // a tag, and comparing an untagged one reads it as a bignum
+                // pointer.
+                self.emit_box_i64(&t)
             }
             ExprKind::IntToFloat(inner) => {
                 let v = self.emit_expr(inner);

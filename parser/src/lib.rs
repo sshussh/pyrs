@@ -868,6 +868,51 @@ impl Parser {
                 let _ = which;
                 Ok(TypeName::Iterator(Box::leak(Box::new(inner))))
             }
+            // `Callable[[A, B], R]` — a function value. Resolves to a
+            // capture-free closure, which is what a module-level function or
+            // a non-capturing lambda becomes in value position.
+            Token::Ident(name) if name == "Callable" => {
+                self.advance();
+                self.expect(
+                    Token::LBracket,
+                    "after 'Callable' (e.g. 'Callable[[int], str]')",
+                )?;
+                // `Callable[..., R]` means "any arguments", which has no
+                // representation here: a call site needs the parameter types
+                // to pass them.
+                if self.peek() == &Token::Dot {
+                    return Err(self.error(
+                        "Callable[..., R] is not supported: the parameter types are \
+                         needed at the call site. Write them out, as \
+                         'Callable[[int, str], R]'",
+                    ));
+                }
+                self.expect(
+                    Token::LBracket,
+                    "after 'Callable[' — the parameter list is itself a list, as \
+                     'Callable[[int], str]'",
+                )?;
+                let mut params = Vec::new();
+                if self.peek() != &Token::RBracket {
+                    loop {
+                        params.push(self.parse_type_name("inside 'Callable[[...]]'")?);
+                        if !self.eat(&Token::Comma) {
+                            break;
+                        }
+                        if self.peek() == &Token::RBracket {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Token::RBracket, "to close the Callable parameter list")?;
+                self.expect(Token::Comma, "between the parameters and the return type")?;
+                let ret = self.parse_type_name("as the Callable return type")?;
+                self.expect(Token::RBracket, "to close 'Callable[...]'")?;
+                Ok(TypeName::Callable {
+                    params: Box::leak(params.into_boxed_slice()),
+                    ret: Box::leak(Box::new(ret)),
+                })
+            }
             // `Iterable[T]` / `Sequence[T]` cover both a list and a
             // generator, which are different types here, so there is no one
             // thing to resolve them to. Say which to pick rather than failing

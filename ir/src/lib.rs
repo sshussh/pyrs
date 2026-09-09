@@ -744,6 +744,9 @@ pub enum Stmt {
         /// `file=sys.stderr`. Only the two standard streams are expressible,
         /// so this is a destination flag rather than a file value.
         to_stderr: bool,
+        /// `print(..., file=f)` for a file that is not one of the standard
+        /// streams. Codegen brackets the print with a redirect.
+        to_file: Option<Box<Expr>>,
     },
     /// `sys.exit(code)` — flush and leave. Not an exception here, so it
     /// cannot be caught.
@@ -1166,6 +1169,19 @@ pub enum ExprKind {
     },
     /// `os.getcwd()` → str (POSIX getcwd via runtime).
     OsGetcwd,
+    /// `sys.stdin` / `sys.stdout` / `sys.stderr` as a `File`. 0/1/2. The three
+    /// are singletons, so identity and repeated access both behave.
+    StdStream(u8),
+    /// The process environment as a `dict[str, str]`, snapshotted.
+    OsEnviron,
+    /// What is at a path: 0 nothing, 1 file, 2 directory, 3 other.
+    OsStatKind(Box<Expr>),
+    /// `str(v)` / `repr(v)` where `v` is dynamic. Renders what the matching
+    /// print writes, so nested containers agree with CPython for free.
+    AnyToStr {
+        value: Box<Expr>,
+        repr: bool,
+    },
     /// int → float (sitofp)
     IntToFloat(Box<Expr>),
     /// float → int, truncating toward zero (Python's `int()`)
@@ -1443,6 +1459,8 @@ pub enum FileFn {
     Write,
     /// `f.close()` → None (idempotent)
     Close,
+    /// `f.flush()` → None
+    Flush,
 }
 
 /// String methods implemented by the C runtime. ASCII-only case and

@@ -159,6 +159,9 @@ static _Thread_local OutBuf *g_capture = NULL;
  * print routine — they all funnel into out_write, and a capture still wins,
  * so `str()` of a value is unaffected either way. */
 static _Thread_local int g_out_err = 0;
+/* When set, one print goes here instead of stdout/stderr. Cleared by the
+ * same emitted code that sets it, so it never outlives a single statement. */
+static _Thread_local FILE *g_out_file = NULL;
 /* ascii() renders exactly like repr() except that non-ASCII escapes. Scoped
  * to a capture, so it reaches the nested elements the shared printer walks. */
 static _Thread_local int g_repr_ascii = 0;
@@ -166,7 +169,11 @@ static _Thread_local int g_repr_ascii = 0;
 static void out_write(const char *p, size_t n) {
     OutBuf *o = g_capture;
     if (o == NULL) {
-        fwrite(p, 1, n, g_out_err ? stderr : stdout);
+        FILE *dest = g_out_file;
+        if (dest == NULL) {
+            dest = g_out_err ? stderr : stdout;
+        }
+        fwrite(p, 1, n, dest);
         return;
     }
     if (o->len + n + 1 > o->cap) {
@@ -3057,6 +3064,33 @@ PyrsStr *pyrs_repr_list(const PyrsList *l, int tag) {
     return capture_end(&buf, prev);
 }
 
+/* `str(v)` and `repr(v)` for a dynamic value. Both render exactly what the
+ * corresponding print writes, which is what makes them agree with CPython on
+ * nested containers for free; they differ only for a *top-level* str, which
+ * `str` leaves bare and `repr` quotes. */
+PyrsStr *pyrs_str_any(long long slot) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    pyrs_print_any(slot);
+    return capture_end(&buf, prev);
+}
+
+PyrsStr *pyrs_repr_any(long long slot) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    if (slot == 0) {
+        out_puts("None");
+    } else {
+        const PyrsUnionBox *u = (const PyrsUnionBox *)(uintptr_t)slot;
+        if (u->print_tag < 0) {
+            out_puts("None");
+        } else {
+            print_slot(u->payload, u->print_tag);
+        }
+    }
+    return capture_end(&buf, prev);
+}
+
 PyrsStr *pyrs_repr_tuple(const PyrsTuple *t) {
     OutBuf buf;
     OutBuf *prev = capture_begin(&buf);
@@ -5796,6 +5830,9 @@ typedef struct {
     int readable;
     int writable;
     int closed;
+    /* One of the process's own streams. The collector must not fclose it, and
+     * `close()` refuses rather than silently breaking every later print. */
+    int is_std;
 } PyrsFile;
 
 /* uncaught-exception message matching what CPython's traceback ends with */
@@ -5863,8 +5900,107 @@ PyrsFile *pyrs_open(const PyrsStr *path, const PyrsStr *mode) {
     f->readable = readable;
     f->writable = writable;
     f->closed = 0;
+    f->is_std = 0;
     return f;
 }
+
+/* `sys.stdin` / `sys.stdout` / `sys.stderr` as file objects, so the whole of
+ * the file surface -- read, readline, readlines, write, iteration -- applies
+ * to them without a parallel set of stream builtins.
+ *
+ * The three are singletons: `sys.stdout is sys.stdout`, and repeated access
+ * allocates nothing. They are held in a rooted static so the collector traces
+ * them; without that they would look unreachable between statements. */
+static PyrsStr *str_from_cstr(const char *c);
+typedef struct PyrsDict PyrsDict;
+PyrsDict *pyrs_dict_new(void);
+void pyrs_dict_set(PyrsDict *d, long long key, int key_tag, long long val, int val_tag);
+
+static PyrsFile *g_std_files[3] = {NULL, NULL, NULL};
+static int g_std_rooted = 0;
+
+/* What is at `path`: 0 nothing (or unreadable), 1 a regular file, 2 a
+ * directory, 3 something else. One primitive carries exists/isfile/isdir,
+ * which are then ordinary PyRs. Follows symlinks, as CPython's do. */
+long long pyrs_os_stat_kind(const PyrsStr *path) {
+    check_ref(path);
+    struct stat st;
+    if (stat(path->data, &st) != 0) {
+        return 0;
+    }
+    if (S_ISREG(st.st_mode)) {
+        return 1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        return 2;
+    }
+    return 3;
+}
+
+/* `os.environ` as a dict[str, str]. A snapshot taken when the module
+ * initialises: there is no subprocess surface here for a live mapping to
+ * matter to, and a plain dict gets `in`, `[]`, `.get` and iteration for free. */
+extern char **environ;
+
+PyrsDict *pyrs_os_environ(void) {
+    PyrsDict *d = pyrs_dict_new();
+    for (char **e = environ; e != NULL && *e != NULL; e++) {
+        const char *entry = *e;
+        const char *eq = strchr(entry, '=');
+        if (eq == NULL) {
+            continue;
+        }
+        size_t klen = (size_t)(eq - entry);
+        char *key = malloc(klen + 1);
+        if (key == NULL) {
+            pyrs_die("MemoryError: out of memory reading the environment");
+        }
+        memcpy(key, entry, klen);
+        key[klen] = 0;
+        PyrsStr *k = str_from_cstr(key);
+        free(key);
+        PyrsStr *v = str_from_cstr(eq + 1);
+        pyrs_dict_set(d, (long long)(uintptr_t)k, TAG_STR, (long long)(uintptr_t)v, TAG_STR);
+    }
+    return d;
+}
+
+PyrsFile *pyrs_std_stream(long long which) {
+    if (which < 0 || which > 2) {
+        pyrs_die("ValueError: unknown standard stream");
+    }
+    if (!g_std_rooted) {
+        pyrs_gc_add_root_range(g_std_files, sizeof(g_std_files));
+        g_std_rooted = 1;
+    }
+    if (g_std_files[which] == NULL) {
+        static const char *names[3] = {"<stdin>", "<stdout>", "<stderr>"};
+        PyrsFile *f = pyrs_gc_alloc(sizeof(PyrsFile), PYRS_GC_FILE);
+        f->fp = which == 0 ? stdin : (which == 1 ? stdout : stderr);
+        f->name = str_from_cstr(names[which]);
+        f->readable = which == 0;
+        f->writable = which != 0;
+        f->closed = 0;
+        f->is_std = 1;
+        g_std_files[which] = f;
+    }
+    return g_std_files[which];
+}
+
+/* Send one print to an arbitrary open file; `pyrs_out_reset` restores the
+ * default. Emitted as a bracket around the print, so it cannot leak. */
+void pyrs_out_to_file(PyrsFile *f) {
+    check_ref(f);
+    if (f->closed) {
+        pyrs_die("ValueError: I/O operation on closed file");
+    }
+    if (!f->writable) {
+        pyrs_die("io.UnsupportedOperation: not writable");
+    }
+    g_out_file = f->fp;
+}
+
+void pyrs_out_reset(void) { g_out_file = NULL; }
 
 static void file_check_open(const PyrsFile *f) {
     check_ref(f);
@@ -5960,7 +6096,23 @@ long long pyrs_file_write(PyrsFile *f, const PyrsStr *s) {
 }
 
 /* idempotent, like Python */
+void pyrs_file_flush(PyrsFile *f) {
+    check_ref(f);
+    if (f->closed) {
+        pyrs_die("ValueError: I/O operation on closed file");
+    }
+    if (f->fp != NULL) {
+        fflush(f->fp);
+    }
+}
+
 void pyrs_file_close(PyrsFile *f) {
+    check_ref(f);
+    if (f->is_std) {
+        /* CPython allows this; here it would break every later print with no
+         * way back, and a compiled program has no reason to want it. */
+        pyrs_die("ValueError: cannot close a standard stream");
+    }
     check_ref(f);
     if (!f->closed) {
         fclose(f->fp);
@@ -8318,7 +8470,7 @@ void pyrs_gc_destroy_object(int kind, void *object, size_t size) {
         return;
     case PYRS_GC_FILE: {
         PyrsFile *file = object;
-        if (!file->closed && file->fp != NULL) {
+        if (!file->is_std && !file->closed && file->fp != NULL) {
             fclose(file->fp);
             file->closed = 1;
         }

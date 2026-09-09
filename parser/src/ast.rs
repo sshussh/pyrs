@@ -35,6 +35,13 @@ pub enum TypeName {
     /// `Iterator[T]` / `Generator[T, ...]` — a generator yielding `T`.
     /// Spelled the way Python spells it so the annotation is valid there too.
     Iterator(&'static TypeName),
+    /// `Callable[[A, B], R]` — a function value taking `A, B` and returning
+    /// `R`. Resolves to a capture-free closure type, which is what a module
+    /// function or a non-capturing lambda becomes in value position.
+    Callable {
+        params: &'static [TypeName],
+        ret: &'static TypeName,
+    },
 }
 
 impl std::fmt::Display for TypeName {
@@ -74,6 +81,16 @@ impl std::fmt::Display for TypeName {
             TypeName::Class(name) => write!(f, "{name}"),
             TypeName::Any => write!(f, "Any"),
             TypeName::Iterator(t) => write!(f, "Iterator[{t}]"),
+            TypeName::Callable { params, ret } => {
+                write!(f, "Callable[[")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{p}")?;
+                }
+                write!(f, "], {ret}]")
+            }
         }
     }
 }
