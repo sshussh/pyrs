@@ -970,9 +970,18 @@ def clamp(x: float, lo: float, hi: float) -> float:
   compiler infers a concrete return type from `return` statements when
   possible; otherwise the function is treated as returning nothing.
 - Default values and keyword arguments work (`def f(a: int, b: int = 1)`
-  and `f(1, b=2)`). Defaults are re-evaluated at each call that needs
-  them (so `def f(xs: list[int] = [])` does not share one list across
-  calls — a deliberate deviation from CPython).
+  and `f(1, b=2)`). **When a default is evaluated depends on where the
+  function is defined, and only the nested case matches CPython.** A
+  nested `def` or a lambda freezes each non-literal default once at
+  definition time, as CPython does, so `def f(xs: list[int] = [])` inside
+  another function shares one list across calls. A **module-level** `def`
+  or a method re-evaluates its defaults at every call that needs them, so
+  the same signature at module level gets a fresh list each time. Literal
+  defaults (`int`, `float`, `bool`, `str`, `None`) are indistinguishable
+  either way. Closing this is scheduled work: a module-level freeze needs
+  the default stored as a module global evaluated in `def` source order,
+  not as a frame temp. Until then, do not rely on a mutable default as
+  accumulated state.
 - `*args: T` packs extra positionals into `list[T]`; `**kwargs: T` packs
   extra keywords into `dict[str, T]`. Call-site unpacking `f(1, *xs)` and
   `f(**d)` works for homogeneous `list` / `dict[str, …]` values.

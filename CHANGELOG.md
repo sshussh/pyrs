@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.134.0 — Three reads and writes that did not agree with the ones beside them
+
+No new syntax. This closes three defects found by a coverage audit that
+compiled 280 probes and diffed each against CPython 3.14.7 on stdout, stderr
+and exit status. All three had the same shape: a construct that already worked
+in one spelling silently failed, or silently lied, in another — because the
+compiler had grown a second implementation of something it already knew how to
+do.
+
+### `bool(x)` ignored `__bool__`
+
+```python
+class C:
+    def __bool__(self) -> bool: return False
+print(bool(C()))     # CPython: False      PyRs: True
+```
+
+`if x:` and `not x` were correct: both go through `to_bool`, which consults
+`__bool__`, then `__len__ != 0`, then defaults to true. The **cast** did not,
+and there was no diagnostic — `emit_truthiness` folded every class instance to
+a literal `true`.
+
+The cause is that `lower_cast` takes no `FnCtx`. It lowers representations, and
+every dunder call needs a context to lower into; `str()` gets a class arm only
+because `lower_class_to_str` happens to need none. So the `Bool` arm had no way
+to dispatch even in principle, and lumped `Ty::Class(_)` in with the scalars.
+
+`bool()` on a class now routes to `to_bool`, which also restores `__len__`
+truthiness — a class with `__len__` and no `__bool__` was equally wrong.
+
+### `nonlocal n; n += 1` reported `name 'n' is not defined`
+
+While `n = n + 1`, in the same position, compiled and ran correctly. The
+canonical closure counter did not work.
+
+`x op= v` is `x = x op v`, but the augmented-assignment arm hand-rolled its own
+name lookup, load and store rather than using the ones an assignment uses. Its
+lookup probed `locals`, `binds_global` and `globals` — never `cell_locals`,
+which is where a `nonlocal` name's type actually lives, `locals` holding only
+the mangled `.cell.<name>`. Its load could build a `Local` or a `GlobalLoad`
+but not a `CellLoad`, and its store an `Assign` or a `GlobalAssign` but not a
+`CellStore`. Three defects, all from the same duplication.
+
+It now performs the same load the expression path performs and the same store
+`bind_name` performs, which fixes two more cases the duplication had also been
+missing:
+
+- **A narrowed local.** `x += 1` where `x` is `int | None` peeled to `int`
+  reported `operator '+' is not supported for values of type None | int`,
+  because the load used the storage type and ignored the refinement.
+- **A comprehension rename**, for the same reason.
+
+### A conditional expression did not narrow its arms
+
+```python
+def f(x: int | None) -> int:
+    return 0 if x is None else x
+# error: cannot use None | int as int in return value;
+#        use 'is None' check or provide a default with 'or'
+```
+
+The advice was to do what the author had already done. `lower_if_exp` lowered
+`test` for its value and discarded its narrowing content, so both arms lowered
+under the ambient refinements and joined back to the union. The `and` / `or`
+arm of `lower_expr` already had the save / splice / restore this needed.
+
+`isinstance` peels and `and`-chains compose inside a conditional expression the
+same way they do in an `if`, and the refinement does not leak past the
+expression.
+
+### Mutable defaults: the documentation was wrong, and stays a gap
+
+`docs/GUIDE.md` recorded non-shared mutable defaults as a deliberate deviation.
+The compiler does not implement that deviation consistently: a nested `def` and
+a lambda freeze each non-literal default once at definition time, exactly as
+CPython does, and only a **module-level** `def` re-evaluates. So the two halves
+of one program disagree.
+
+Not fixed here, and the reason is recorded rather than hidden: a module-level
+freeze needs the default stored as a module global evaluated in `def` source
+order, not as a frame temp, and the sig rewrite has to happen before any body
+is lowered while the store lands in module init. That is a milestone, not a
+commit. The guide now says what actually happens, the README divergence list
+gained the entry it was missing, and `compatibility/cases/mutable_defaults.py`
+pins both halves as a recorded `mismatch`, so the fix will flip it to
+`unexpected_pass` and force the update.
+
+The README also gained the uncaught-exception entry it was missing: the type
+and message match CPython exactly and the exit status is 1, but there is no
+`Traceback (most recent call last):` block, so stderr never matches on a crash.
+
+### How these are checked
+
+`cli/tests/read_write_parity.rs` — 15 differential tests at -O0/-O2/-O3 and
+under `PYRS_GC_STRESS=1` (a cell is a heap allocation, so a store through the
+wrong slot is a use-after-free, not a wrong number). Each pairs the
+previously-broken spelling with the one that already worked, so a fix that
+regresses the working half fails too: every augmented operator through a cell,
+the longhand beside it, `global` and module-level augmented assignment, set
+in-place updates, `bool()` against `if`/`not` with `__bool__`, with `__len__`,
+with neither, and through virtual dispatch, and conditional-expression
+narrowing including composition, restoration and `isinstance`.
+
+None of these four behaviours had a test anywhere in the repository.
+
 ## 0.133.0 — Dicts and sets, which nothing was measuring
 
 Nothing in the corpus touched a dict, so `hash_key` recomputing FNV-1a

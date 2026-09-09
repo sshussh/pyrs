@@ -41,7 +41,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.133.0**.
+Current milestone: **v0.134.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -152,6 +152,12 @@ Known behavioural divergences, each documented with its reason in the
   match CPython
 - No `is` interning for equal integers, and `nan in [nan]` is `False`
 - Indexing a non-ASCII string is amortised rather than exactly O(1)
+- A **module-level** `def` re-evaluates a mutable default on every call, so
+  `def f(xs=[])` does not accumulate; a nested `def` or lambda freezes it
+  once, as CPython does. The two disagree, and closing that is scheduled
+  work — see [the guide](docs/GUIDE.md#9-differences-from-cpython)
+- An uncaught exception prints its type and message to stderr with exit
+  status 1, but no `Traceback (most recent call last):` block or frame list
 
 ## Running Python that PyRs cannot compile
 
@@ -277,7 +283,7 @@ what CI uploads, so a CI-only failure can be reproduced from the artifact.
 CI runs the same gate on Ubuntu with LLVM 18 and CPython 3.14, plus weekly
 benchmarks and a tagged release workflow.
 
-Release tags: `git tag v0.133.0 && git push origin v0.133.0`.
+Release tags: `git tag v0.134.0 && git push origin v0.134.0`.
 
 ## Documentation
 

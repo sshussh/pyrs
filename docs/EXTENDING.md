@@ -287,6 +287,13 @@ features.
    parity). `make examples` globs `examples/*.py`,
    `examples/modules/*.py`, and `examples/packages/main.py`, plus
    `examples/risksim/main.py` with the bundled balanced scenario.
+6. **Surface coverage:** `make coverage` runs
+   [`scripts/coverage_probe.py`](../scripts/coverage_probe.py), ~200 probes
+   diffed against CPython. It is not in `make ci` (it compiles every probe),
+   but run it after any milestone that widens the language surface. A probe
+   that compiles and then disagrees with CPython fails the run unless it is
+   listed in `KNOWN_DIVERGENCES` — and a listed one that starts *agreeing*
+   fails too, so the README divergence list cannot go stale.
 
 ---
 

@@ -37,20 +37,64 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.133 |
+| Check | Result after 0.134 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1641 passed; none failed or ignored |
+| `cargo test --workspace` | 1656 passed; none failed or ignored |
 | `make examples` | All 13 example entry points matched CPython |
-| `make compatibility` | native 81 pass / 6 skipped; compat 27 pass / 6 skipped. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.133.0` |
+| `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
+| `pyrs --version` | `PyRs 0.134.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
 clean-machine release portability or complete Python compatibility** --
 that is what the release gates below are for.
+
+## Language surface, measured
+
+A coverage audit on 2026-09-08 compiled 280 probes and diffed each against
+CPython 3.14.7 on stdout, stderr and exit status. It is the input to the
+breadth-first feature ordering, and it found three defects rather than three
+missing features -- closed in 0.134, see
+[the audit](superpowers/plans/2026-09-09-coverage-audit-and-tier-zero.md).
+
+| Surface | PyRs | CPython |
+|---|---:|---:|
+| Keywords, full support | 30 | 35 |
+| `list` / `dict` / `set` / `tuple` methods | 41 | 41 |
+| `str` methods | 46 | 47 |
+| Builtin functions | 41 | 69 |
+| Exception types | 24 | 71 |
+| Stdlib modules | 4 | 297 |
+
+Syntax is not the gap and neither is the container library. What fails, fails
+on a type rule or a missing literal form. Ranked by frequency over cost, the
+open language items are: string prefixes (`r`, `R`, `u`, `F`, raw-f) and
+adjacent string concatenation; `...`; keyword-only (`*,`) and positional-only
+(`/`) parameters; module-level functions as values; arithmetic dunders; class
+decorators and `@dataclass`; multiple context managers in one `with`; `{**d}`
+in a dict display; `match`/`case` as identifiers (they are hard keywords here,
+so `match = 5` is a syntax error); `del name` / `del obj.attr`; and
+`raise X from Y`. `bytes` is excluded from that ordering and grouped with the
+standard library, which it gates.
+
+Two behaviours are recorded rather than fixed, both now in the README
+divergence list:
+
+- **Mutable defaults disagree with themselves.** A nested `def` and a lambda
+  freeze each non-literal default once at definition time, as CPython does; a
+  module-level `def` re-evaluates at every call. Closing it needs the default
+  stored as a module global evaluated in `def` source order rather than as a
+  frame temp, and the signature rewrite has to precede body lowering while the
+  store lands in module init. Pinned as a `mismatch` in
+  `compatibility/cases/mutable_defaults.py`, so the fix will fail the run as
+  `unexpected_pass` until the record is updated.
+- **An uncaught exception prints no traceback.** Type, message and exit status
+  match CPython exactly; the `Traceback (most recent call last):` block and
+  frame list are absent, so stderr never matches on a crash. Frame fidelity
+  needs call-site line tracking.
 
 ## Confirmed remaining gaps
 
