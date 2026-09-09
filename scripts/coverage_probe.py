@@ -284,6 +284,18 @@ p(
 p("expression", "*args", "def f(*args: int) -> int:\n    return sum(args)\nprint(f(1, 2, 3))")
 p(
     "expression",
+    "method keyword argument",
+    "class C:\n    def m(self, a: int, b: int = 2) -> int:\n        return a + b\n"
+    "print(C().m(1, b=3))",
+)
+p(
+    "expression",
+    "function dispatch table",
+    "def a(xs: list[str]) -> int:\n    return 1\ndef b(xs: list[str]) -> int:\n    return 2\n"
+    "t = {'a': a, 'b': b}\nprint(t['a']([]), t['b']([]))",
+)
+p(
+    "expression",
     "**kwargs",
     "def f(**kw: int) -> int:\n    return sum(kw.values())\nprint(f(a=1, b=2))",
 )
