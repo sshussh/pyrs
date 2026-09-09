@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.136.0 — Getting a value into `Any`, and getting it back out
+
+`Any` already worked as a scalar dynamic box with a runtime-checked
+extraction. Two gaps made it impractical for the shape that actually wants it
+— a table with columns of different types — and both are closed here.
+
+### The expected type reaches a non-name target
+
+```python
+class Frame:
+    def __init__(self) -> None:
+        self.cols: dict[str, list[Any]] = {}
+f.cols["name"] = ["a", "b"]
+# error: type mismatch in item assignment: expected list[Any], found list[str]
+```
+
+The identical literal at a *name* target always worked: `xs: list[Any] =
+["a", "b"]` propagates the expected element type into the literal and boxes
+each element at construction. `lower_assign` computed that hint only for
+`AssignTarget::Name` and dropped it for an index or attribute, so the literal
+inferred `list[str]` — a different runtime encoding, since a `list[Any]` slot
+holds a box wrapping the string rather than the string.
+
+`probe_target_slot_ty` supplies it, walking the target's base **without
+lowering anything**: a name, and attribute or index chains over one. Anything
+with a call, an operator or a comprehension in it declines rather than
+guessing, because lowering the base twice to learn its type would duplicate
+side effects, and a missing hint costs only the hint.
+
+The hint is *exact* — a declared container element type or class field type,
+not the multi-assign join guess — so unlike that guess it also steers a
+**non-empty** literal. `list.append` and `list.insert` route through
+`lower_arg_expr` for the same reason, so `rows.append(["a", 1])` into a
+`list[list[Any]]` boxes at construction too.
+
+**What is deliberately still refused:** assigning an already-typed
+`list[str]` into a `list[Any]` slot. Every list slot is 8 bytes for every
+element type, so nothing in the layout forbids it — but a `list[str]` slot
+holds a `PyrsStr *` and a `list[Any]` slot a `PyrsUnionBox *` wrapping it, so
+the conversion is an O(n) re-box into a fresh list. **That copy breaks Python
+aliasing**: after `f.cols["k"] = xs`, an `xs.append(...)` would no longer be
+visible through the frame. The aliasing consequence is the reason, not the
+slot width, and `docs/ROADMAP.md` now records it that way.
+
+### `isinstance` narrows an `Any`
+
+The *test* already compiled to a runtime tag check, but the *narrowing* did
+not fire — `isinstance_pat_matches(Ty::Any, ...)` is false — so `x` stayed
+`Any` inside `if isinstance(x, int):` and every use needed an explicit
+`y: int = x`. The peel now takes the tested type on the then-arm and keeps
+`Any` on the else-arm, since ruling out one tag says nothing about the rest,
+and `apply_type_refinement` unwraps the box with `FromAny`.
+
+One pattern, and no containers. `isinstance(x, list)` cannot peel to a
+concrete `list[T]` — the element type is not recoverable from the tag — and a
+multi-pattern peel would need a union whose member indices do not exist in
+the box's global tag space. Both decline and leave `Any` in place, so the
+explicit restatement still works.
+
+`FromAny` re-checks the tag, which is redundant under the guard that produced
+the refinement. It is kept because it is cheap and because a refinement that
+is ever wrong then traps rather than reinterpreting the payload as the wrong
+type.
+
+This composes with what is already there: a conditional expression (0.134),
+an `and` chain, and a complementary `else` arm all narrow an `Any` now.
+`bool` narrows as an `int`, matching CPython's subtype relation.
+
+### How these are checked
+
+`cli/tests/any_ergonomics.rs` — 9 differential tests at -O0/-O2/-O3 and under
+`PYRS_GC_STRESS=1`, since boxing allocates one `PyrsUnionBox` per element and
+a mis-rooted box is a use-after-free rather than a wrong number. A frame with
+four columns of different types; the hint at attribute, local-dict and
+`append`/`insert` targets; a concrete `list[int]` slot still rejecting a `str`
+element, so the exact hint does not loosen ordinary inference; the re-box
+staying refused; narrowing driving a column reduction; composition with the
+other refinement positions; `bool` as an `int`; and the declined shapes
+leaving `Any` alone.
+
+Coverage went 146 to 148 of 206 probes.
+
 ## 0.135.0 — Numeric types can be written in PyRs
 
 `class V: def __add__(self, o: 'V') -> 'V'` was rejected with

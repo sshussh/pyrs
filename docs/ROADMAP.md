@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.135 |
+| Check | Result after 0.136 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1673 passed; none failed or ignored |
+| `cargo test --workspace` | 1685 passed; none failed or ignored |
 | `make examples` | All 14 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.135.0` |
+| `pyrs --version` | `PyRs 0.136.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -364,7 +364,11 @@ documentation and the relevant gates.
       generator expression must evaluate its outermost iterable at creation
       as CPython does. One protocol closes both.
 - [ ] Runtime operations for `Any` and mixed containers; call-site inference
-      for unannotated functions and lambdas.
+      for unannotated functions and lambdas. Partly closed in 0.136:
+      `isinstance` narrows an `Any` for a single non-container pattern, so a
+      guarded body uses the value directly. Still open: method calls on a bare
+      `Any`, container patterns (no element type is recoverable from the tag)
+      and multi-pattern peels (no member index exists in the box's tag space).
 - [ ] Dynamic-length heterogeneous tuples; general hash/equality protocol;
       `float`/`bool`/`frozenset` keys; dict views.
 - [x] Tuple keys (0.107): dict keys and set elements may be tuples of
@@ -385,8 +389,14 @@ documentation and the relevant gates.
 - [ ] General `list[T1]` -> `list[T2]` element-wise re-coercion (and into a
       union), needed for e.g. `fs: list[float] = xs` from `list[int]`, and
       for comparing/joining two independently-typed numeric lists. Mixed
-      numeric list *literals* already keep exact per-element types (0.89);
-      this item is about values that already have a narrower list type.
+      numeric list *literals* already keep exact per-element types (0.89), and
+      0.136 made an *expected type* reach a literal at an index or attribute
+      target, which covers construction. **The obstacle for values is aliasing,
+      not layout**: every list slot is 8 bytes whatever the element type, but a
+      `list[str]` slot holds the string pointer and a `list[Any]` slot a box
+      wrapping it, so the conversion is an O(n) re-box into a fresh list — and
+      after `f.cols["k"] = xs`, an `xs.append(...)` would no longer be visible
+      through the frame. Any design has to answer that first.
 - [ ] Complete iterator protocol: lazy `range`/`enumerate`/`zip`/`reversed`/
       `map`/`filter`, `iter`/`next` defaults, `StopIteration.value`,
       `yield from` send/throw, generator cleanup.

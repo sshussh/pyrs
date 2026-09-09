@@ -1793,11 +1793,22 @@ Container notes:
 - **Any (limited):** annotation `Any` / `list[Any]` etc. Values are
   heap-boxed print-tag + payload (same as container union slots).
   Concrete → Any and Any → concrete coerce at the boundary (runtime
-  TypeError on wrong tag; class targets accept subclasses). `bool(x)` /
+  TypeError on wrong tag; class targets accept subclasses). A container
+  **literal** takes an expected element type from the slot it is assigned
+  into, including an index or attribute target and an `append`/`insert`
+  argument (0.136), so `f.cols["k"] = ["a", 1]` into a `dict[str, list[Any]]`
+  boxes each element at construction. A value that *already* has a narrower
+  list type is not converted: that would be an O(n) re-box into a fresh list
+  and would break aliasing. `isinstance(x, T)` narrows an `Any` for a single
+  non-container `T` (0.136), so the guarded body uses the value directly;
+  container and multi-pattern tests leave it `Any`. `bool(x)` /
   `if x:` use runtime truthiness for all container tags (empty `list[Any]`
   / `list[str]` / … are falsy). `list[Any]` equality treats `True == 1`
   like CPython. Not full gradual typing: no open setattr, no method
-  calls on bare Any, no `isinstance` peel from pure Any yet.
+  calls on bare Any. `isinstance` **does** peel a pure `Any` as of 0.136,
+  for a single non-container pattern; container and multi-pattern tests
+  leave it `Any`, because no element type is recoverable from the tag and a
+  union's member indices do not exist in the box's global tag space.
 - **kit builtins:** `isinstance(x, T)` / `isinstance(x, (T1, T2))` with
   `T` in `{int, float, bool, str, list, tuple, dict, set, None}` plus
   class and exception type names (`isinstance(True, int)` is True); peels
