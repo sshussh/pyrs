@@ -1082,6 +1082,12 @@ struct ParamSig {
 #[derive(Debug, Clone)]
 struct FuncSig {
     params: Vec<ParamSig>,
+    /// Number of leading params that may only be passed positionally (`/`).
+    posonly_end: usize,
+    /// Index at which keyword-only params begin (`*` / `*args`), or `None`
+    /// when the signature has neither. See `ast::FuncDef::kwonly_start` for
+    /// why this is an `Option` and not an index with a `0` default.
+    kwonly_start: Option<usize>,
     /// `*args: T` — element type `T`; IR param is `list[T]`.
     vararg: Option<ParamSig>,
     /// `**kwargs: T` — value type `T`; IR param is `dict[str, T]`.
@@ -1881,6 +1887,9 @@ fn lower_gen_exp(
                 default: Option::None,
             })
             .collect(),
+        // Compiler-synthesized: no `/` or `*` markers.
+        posonly_end: 0,
+        kwonly_start: Option::None,
         vararg: Option::None,
         kwarg: Option::None,
         ret: Option::None,
@@ -1980,6 +1989,9 @@ fn lower_lambda_typed(
     let fd = ast::FuncDef {
         name: name.clone(),
         params: params.to_vec(),
+        // Compiler-synthesized: no `/` or `*` markers.
+        posonly_end: 0,
+        kwonly_start: Option::None,
         vararg: None,
         kwarg: None,
         ret: None,
@@ -2613,6 +2625,9 @@ fn synthesize_default_ne(methods: &mut Vec<ClassMethodAst<'_>>) -> bool {
     let synthetic = ast::FuncDef {
         name: "__ne__".to_string(),
         params: eq.params.clone(),
+        // Synthesized *from* `__eq__`, so it inherits that signature's shape.
+        posonly_end: eq.posonly_end,
+        kwonly_start: eq.kwonly_start,
         vararg: None,
         kwarg: None,
         ret: Some(ast::TypeName::Bool),
@@ -3553,6 +3568,8 @@ fn method_func_sig(
     }
     Ok(FuncSig {
         params,
+        posonly_end: f.posonly_end,
+        kwonly_start: f.kwonly_start,
         vararg,
         kwarg,
         ret,
@@ -3819,6 +3836,8 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                 f.name.clone(),
                 FuncSig {
                     params,
+                    posonly_end: f.posonly_end,
+                    kwonly_start: f.kwonly_start,
                     vararg,
                     kwarg,
                     ret,
@@ -6325,6 +6344,11 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                     }
                     register_method_sig(ir_name, {
                         let mut s = method_sig_lookup(ir_name).unwrap_or_else(|| FuncSig {
+                            // Rebuilt from an `ir::Function`, which carries no
+                            // `/` or `*` markers; the registered sig above is
+                            // the one that has them.
+                            posonly_end: 0,
+                            kwonly_start: Option::None,
                             params: f
                                 .params
                                 .iter()
@@ -6503,6 +6527,9 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
             let init_def = ast::FuncDef {
                 name: init_name.clone(),
                 params: vec![],
+                // Compiler-synthesized: no `/` or `*` markers.
+                posonly_end: 0,
+                kwonly_start: Option::None,
                 vararg: None,
                 kwarg: None,
                 ret: None,
@@ -7771,6 +7798,8 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     };
     let sig = FuncSig {
         params,
+        posonly_end: f.posonly_end,
+        kwonly_start: f.kwonly_start,
         vararg,
         kwarg,
         ret,
@@ -8201,6 +8230,8 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     };
     let sig = FuncSig {
         params,
+        posonly_end: f.posonly_end,
+        kwonly_start: f.kwonly_start,
         vararg,
         kwarg,
         ret,
@@ -8353,6 +8384,9 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     let nested_def = ast::FuncDef {
         name: ir_name.clone(),
         params: f.params.clone(),
+        // A nested `def f(a, *, b)` keeps its own boundaries.
+        posonly_end: f.posonly_end,
+        kwonly_start: f.kwonly_start,
         vararg: f.vararg.clone(),
         kwarg: f.kwarg.clone(),
         ret: f.ret,
@@ -10194,15 +10228,10 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                         }
                     }
                 }
-                if !keywords.is_empty() {
-                    return Err(err(
-                        "keyword arguments are not supported for this method call",
-                        keywords[0].name_span,
-                    ));
-                }
                 let plain = require_plain_args(args, method, *method_span)?;
                 let plain_owned: Vec<ast::Expr> = plain.iter().map(|e| (*e).clone()).collect();
-                let stmt = lower_method_stmt(base, method, *method_span, &plain_owned, ctx)?;
+                let stmt =
+                    lower_method_stmt(base, method, *method_span, &plain_owned, keywords, ctx)?;
                 out.push(stmt);
                 return Ok(());
             }
@@ -11442,6 +11471,7 @@ fn lower_method_stmt(
     method: &str,
     method_span: Span,
     args: &[ast::Expr],
+    keywords: &[ast::Keyword],
     ctx: &mut FnCtx,
 ) -> SResult<ir::Stmt> {
     // `super().m(...)` in statement position (e.g. super().__init__(...)).
@@ -11470,8 +11500,17 @@ fn lower_method_stmt(
                 method_span,
             ));
         }
-        let call = lower_instance_method_call(base_ir, id, method, method_span, args, ctx)?;
+        let call =
+            lower_instance_method_call_kw(base_ir, id, method, method_span, args, keywords, ctx)?;
         return Ok(ir::Stmt::ExprStmt(call));
+    }
+    // Past this point the base is a builtin type, whose method table has no
+    // keyword surface beyond the `sort` case handled by the caller.
+    if !keywords.is_empty() {
+        return Err(err(
+            "keyword arguments are not supported for this method call",
+            keywords[0].name_span,
+        ));
     }
     match base_ir.ty {
         ir::Ty::List(elem) => match method {
@@ -16727,6 +16766,10 @@ fn method_user_sig(sig: &FuncSig) -> FuncSig {
     let mut s = sig.clone();
     if !s.params.is_empty() {
         s.params = s.params[1..].to_vec();
+        // The `/` and `*` boundaries are indices into `params`, so dropping
+        // `self` shifts them by one.
+        s.posonly_end = s.posonly_end.saturating_sub(1);
+        s.kwonly_start = s.kwonly_start.map(|k| k.saturating_sub(1));
     }
     s
 }
@@ -17098,12 +17141,33 @@ fn lower_class_construct(
 }
 
 /// `obj.method(args)` for a user class instance.
+/// `obj.method(args)` with no keyword arguments — every internal dunder
+/// dispatch, and the shape most call sites want.
 fn lower_instance_method_call(
     base_ir: ir::Expr,
     class_id: ir::ClassId,
     method: &str,
     method_span: Span,
     args: &[ast::Expr],
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    lower_instance_method_call_kw(base_ir, class_id, method, method_span, args, &[], ctx)
+}
+
+/// `obj.method(a, b=1)`.
+///
+/// Keywords were rejected outright for any instance method — not just for a
+/// keyword-only parameter — while a free function accepted them. The binding
+/// logic already lived in `lower_call_with_sig`; this path simply never
+/// handed it the keywords.
+#[allow(clippy::too_many_arguments)]
+fn lower_instance_method_call_kw(
+    base_ir: ir::Expr,
+    class_id: ir::ClassId,
+    method: &str,
+    method_span: Span,
+    args: &[ast::Expr],
+    keywords: &[ast::Keyword],
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     if method == "__init__" {
@@ -17151,7 +17215,17 @@ fn lower_instance_method_call(
 
     // @staticmethod: no self; ignore instance (CPython still allows instance call).
     if kind == MethodKind::Static {
-        return lower_call_with_sig(method, direct, &sig, &pos, &[], None, method_span, ctx, &[]);
+        return lower_call_with_sig(
+            method,
+            direct,
+            &sig,
+            &pos,
+            keywords,
+            None,
+            method_span,
+            ctx,
+            &[],
+        );
     }
 
     // @classmethod on instance: pass the instance's class (static type for now).
@@ -17167,7 +17241,7 @@ fn lower_instance_method_call(
             direct,
             &user_sig,
             &pos,
-            &[],
+            keywords,
             None,
             method_span,
             ctx,
@@ -17195,7 +17269,7 @@ fn lower_instance_method_call(
         direct.clone(),
         &user_sig,
         &pos,
-        &[],
+        keywords,
         None,
         method_span,
         ctx,
@@ -17228,6 +17302,7 @@ fn lower_class_name_method_call(
     method: &str,
     method_span: Span,
     args: &[ast::Expr],
+    keywords: &[ast::Keyword],
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
     let direct = resolve_method(class_id, method).ok_or_else(|| {
@@ -17252,9 +17327,17 @@ fn lower_class_name_method_call(
         })?;
     let pos: Vec<ast::PosArg> = args.iter().map(|e| ast::PosArg::Pos(e.clone())).collect();
     match kind {
-        MethodKind::Static => {
-            lower_call_with_sig(method, direct, &sig, &pos, &[], None, method_span, ctx, &[])
-        }
+        MethodKind::Static => lower_call_with_sig(
+            method,
+            direct,
+            &sig,
+            &pos,
+            keywords,
+            None,
+            method_span,
+            ctx,
+            &[],
+        ),
         MethodKind::Class => {
             // Pass an uninitialized object as the cls token (only used for
             // type; body `cls(...)` is rewritten via classmethod_cls).
@@ -17268,7 +17351,7 @@ fn lower_class_name_method_call(
                 direct,
                 &user_sig,
                 &pos,
-                &[],
+                keywords,
                 None,
                 method_span,
                 ctx,
@@ -17656,11 +17739,42 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         expr.span,
                     )),
                 }
-            } else if ctx.funcs().contains_key(name) {
-                Err(err(
-                    format!("functions can only be called; add parentheses: '{name}(...)'"),
-                    expr.span,
-                ))
+            } else if let Some(sig) = ctx.funcs().get(name).cloned() {
+                // A module-level function in value position is a closure with
+                // an empty environment — the same shape the free-function
+                // decorator desugar already builds. Nested `def`s and lambdas
+                // have been first-class since closures existed; this arm was
+                // simply never written.
+                if sig.vararg.is_some() || sig.kwarg.is_some() {
+                    return Err(err(
+                        format!(
+                            "'{name}' cannot be used as a value because it takes \
+                             *args or **kwargs; a closure value has a fixed \
+                             parameter list"
+                        ),
+                        expr.span,
+                    ));
+                }
+                if sig.params.iter().any(|p| p.default.is_some()) {
+                    return Err(err(
+                        format!(
+                            "'{name}' cannot be used as a value because it has \
+                             default arguments; a closure value carries no defaults"
+                        ),
+                        expr.span,
+                    ));
+                }
+                let params: Vec<ir::Ty> = sig.params.iter().map(|p| p.ty).collect();
+                let ir_name = ctx.own_func(name);
+                let ty = ir::closure_of_full(&params, sig.ret, &[], &ir_name);
+                Ok(ir::Expr {
+                    ty,
+                    kind: ir::ExprKind::MakeClosure {
+                        func: ir_name,
+                        captures: vec![],
+                        capture_is_cell: vec![],
+                    },
+                })
             } else if name == "__name__" {
                 // The one module attribute with a compile-time answer: the
                 // entry module is `__main__`, an imported one is its import
@@ -18195,12 +18309,6 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     }
                 }
             }
-            if !keywords.is_empty() {
-                return Err(err(
-                    "keyword arguments are not supported for this method call",
-                    keywords[0].name_span,
-                ));
-            }
             let plain = require_plain_args(args, method, *method_span)?;
             let args: Vec<ast::Expr> = plain.iter().map(|e| (*e).clone()).collect();
             // `super().m(...)` — static parent method call (before lowering base).
@@ -18211,7 +18319,14 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             if let ast::ExprKind::Name(cls_name) = &base.kind
                 && let Some(class_id) = lookup_class(cls_name)
             {
-                return lower_class_name_method_call(class_id, method, *method_span, &args, ctx);
+                return lower_class_name_method_call(
+                    class_id,
+                    method,
+                    *method_span,
+                    &args,
+                    keywords,
+                    ctx,
+                );
             }
             if is_str_type_name(base, ctx) && method == "maketrans" {
                 return lower_str_maketrans(&args, *method_span, ctx);
@@ -18233,7 +18348,23 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         *method_span,
                     ));
                 }
-                return lower_instance_method_call(base_ir, id, method, *method_span, &args, ctx);
+                return lower_instance_method_call_kw(
+                    base_ir,
+                    id,
+                    method,
+                    *method_span,
+                    &args,
+                    keywords,
+                    ctx,
+                );
+            }
+            // Past this point the base is a builtin type, whose method table
+            // has no keyword surface.
+            if !keywords.is_empty() {
+                return Err(err(
+                    "keyword arguments are not supported for this method call",
+                    keywords[0].name_span,
+                ));
             }
             match base_ir.ty {
                 ir::Ty::List(elem) => match method.as_str() {
@@ -21136,6 +21267,9 @@ fn lower_call_with_sig(
     }
 
     let n = sig.params.len();
+    // Positional arguments stop at the `*` marker; `params[kwonly_start..]`
+    // can only be supplied by name.
+    let positional_limit = sig.kwonly_start.unwrap_or(n);
     let has_vararg = sig.vararg.is_some();
     let has_kwarg = sig.kwarg.is_some();
 
@@ -21150,7 +21284,7 @@ fn lower_call_with_sig(
     for arg in args {
         match arg {
             ast::PosArg::Pos(e) => {
-                if positional_count < n {
+                if positional_count < positional_limit {
                     let expected = sig.params[positional_count].ty;
                     let a = lower_arg_expr(
                         e,
@@ -21175,10 +21309,18 @@ fn lower_call_with_sig(
                     vararg_items.push(a);
                 } else {
                     return Err(err(
-                        format!(
-                            "function '{display}' takes {} argument(s) but more were given",
-                            n
-                        ),
+                        if positional_limit < n {
+                            format!(
+                                "function '{display}' takes {positional_limit} positional \
+                                 argument(s) but more were given ({} of its parameters are \
+                                 keyword-only)",
+                                n - positional_limit
+                            )
+                        } else {
+                            format!(
+                                "function '{display}' takes {n} argument(s) but more were given"
+                            )
+                        },
                         e.span,
                     ));
                 }
@@ -21194,7 +21336,7 @@ fn lower_call_with_sig(
                         ));
                     }
                 };
-                let remaining_fixed = n.saturating_sub(positional_count);
+                let remaining_fixed = positional_limit.saturating_sub(positional_count);
                 let seq_t = ctx.fresh_temp("star", seq.ty);
                 star_prelude.push(ir::Stmt::Assign {
                     name: seq_t.clone(),
@@ -21357,7 +21499,15 @@ fn lower_call_with_sig(
     // Keywords for fixed params; extras go to **kwargs.
     let mut kwarg_pairs: Vec<(ir::Expr, ir::Expr)> = Vec::new();
     for kw in keywords {
-        if let Some(idx) = sig.params.iter().position(|p| p.name == kw.name) {
+        // A keyword may not name a positional-only parameter. When the
+        // function has `**kwargs` the name lands there instead, which is
+        // exactly what CPython does — that is the point of `/`.
+        let named = sig
+            .params
+            .iter()
+            .position(|p| p.name == kw.name)
+            .filter(|idx| *idx >= sig.posonly_end);
+        if let Some(idx) = named {
             if filled[idx] {
                 return Err(err(
                     format!(
@@ -21392,6 +21542,18 @@ fn lower_call_with_sig(
                 kind: ir::ExprKind::ConstStr(kw.name.clone()),
             };
             kwarg_pairs.push((k, v));
+        } else if sig.params[..sig.posonly_end]
+            .iter()
+            .any(|p| p.name == kw.name)
+        {
+            return Err(err(
+                format!(
+                    "function '{display}' got some positional-only arguments \
+                     passed as keyword arguments: '{name}'",
+                    name = kw.name
+                ),
+                kw.name_span,
+            ));
         } else {
             return Err(err(
                 format!(
@@ -21543,6 +21705,14 @@ fn lower_call_with_sig(
                 ctx,
             )?;
             lowered_args.push(a);
+        } else if i >= positional_limit {
+            return Err(err(
+                format!(
+                    "function '{display}' missing required keyword-only argument '{name}'",
+                    name = p.name
+                ),
+                span,
+            ));
         } else {
             return Err(err(
                 format!(
@@ -22243,6 +22413,24 @@ fn lower_call(
         && let Some(class_id) = lookup_class_in_module(&module, &name)
     {
         return lower_class_construct(class_id, &name, args, keywords, kwargs, span, ctx);
+    }
+    // A comprehension target is stored under a renamed local, so `[g(1) for g
+    // in fs]` has to resolve `g` the same way the expression path's `Name` arm
+    // does. Without this the call reports `function 'g' is not defined` while
+    // the identical plain `for` loop works.
+    if let Some((_, storage, ty)) = ctx
+        .comp_renames
+        .iter()
+        .rev()
+        .find(|(user, _, _)| user == func)
+        .map(|(u, s, t)| (u.clone(), s.clone(), *t))
+        && let ir::Ty::Closure { .. } = ty
+    {
+        let clos_expr = ir::Expr {
+            ty,
+            kind: ir::ExprKind::Local(storage),
+        };
+        return lower_call_closure_value(&clos_expr, args, keywords, kwargs, span, ctx);
     }
     // Call through a local/global of closure type first (local rebind shadows nested def).
     // Decorated free functions rebind the name to a Closure global — prefer that
