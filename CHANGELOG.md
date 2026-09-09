@@ -45,15 +45,31 @@ is refused, exactly as `xs = [1]` then `xs.append("a")` always was — the
 empty-`[]`-plus-appends pre-pass still grows a type, and an annotation still
 widens one. Homogeneous literals keep their optimized unboxed storage.
 
-### The gap this makes more visible
+### The gap this makes more visible, now measured
 
-`v == 1` where `v` is a union is still refused. That is pre-existing — it
-fails for an annotated `list[int | str]` too — but more programs now reach it,
-since more programs now compile to a union. Narrowing first works
-(`if isinstance(v, int): ...`), and general runtime operations on unions and
-`Any` remain a roadmap item. Note a multi-member peel still keeps storage by
-design, so `isinstance(v, int)` over a union containing both `bool` and `int`
-does not narrow.
+More programs compile to a union, so more programs reach what a union cannot
+yet do. That surface was never written down, so it is now — a table in
+[GUIDE section 9](docs/GUIDE.md#9-differences-from-cpython), built by probing
+each operation rather than by reading the source.
+
+Works without narrowing: `print`, truthiness, `in` over a container of them,
+passing and returning one, storing one as a dict value. Needs `isinstance`
+first: `str`/`repr`/f-strings, every comparison and arithmetic operator,
+method calls, `len`, `sorted(key=...)`. All of it wants the same thing —
+runtime dispatch on the union tag — so it is one item with the `Any`
+runtime-operations work rather than several.
+
+**One of them was an oversight and is fixed here.** `bool(x)` on a union or a
+`None` was refused while `if x:` accepted both, because `lower_cast` kept its
+own list of convertible types and it had drifted from `to_bool_default`'s.
+That is the same shape as the `__bool__` defect 0.134 fixed, so the fix is the
+same: the bool cast now routes through `to_bool` in its entirety, and the two
+spellings are one code path that cannot drift again.
+
+Two related limits are *not* bugs and are documented as such: a multi-member
+peel keeps storage, because a subset's member indices do not match the
+original's and rematerializing them would mis-tag the value; and a union is
+not a valid dict key or set element, because a key must be hashable.
 
 ### How this is checked
 

@@ -17437,7 +17437,12 @@ fn lower_cast_ctx(
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    if matches!(ty, ast::TypeName::Bool) && matches!(value.ty, ir::Ty::Class(_)) {
+    // *Every* bool cast, not only a class one. `lower_cast` kept its own list
+    // of convertible types and it had drifted from `to_bool_default`'s —
+    // `bool(x)` on a union or a `None` was refused while `if x:` accepted
+    // both. Routing the whole cast through `to_bool` means the two spellings
+    // are one code path and cannot drift again.
+    if matches!(ty, ast::TypeName::Bool) {
         return to_bool(value, span, ctx);
     }
     lower_cast(ty, value, span)

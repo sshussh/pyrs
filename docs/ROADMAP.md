@@ -42,7 +42,7 @@ recorded in [the changelog](../CHANGELOG.md). The most recent run:
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1694 passed; none failed or ignored |
+| `cargo test --workspace` | 1696 passed; none failed or ignored |
 | `make examples` | All 14 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
 | `pyrs --version` | `PyRs 0.137.0` |
@@ -373,12 +373,22 @@ documentation and the relevant gates.
       `float`/`bool`/`frozenset` keys; dict views. Dict *keys* and set
       elements deliberately stayed restricted when 0.137 let container
       *values* infer a union, because a key must be hashable.
-- [ ] Operators on a union value. `v == 1` where `v` is `int | str` is
-      refused, and 0.137 made more programs reach it by inferring unions for
-      mixed literals — narrowing first (`isinstance`) is the working idiom.
-      Part of the same runtime-operations item as `Any` above. Note a
-      multi-member peel keeps storage by design, so `isinstance(v, int)` over
-      a union containing both `bool` and `int` does not narrow.
+- [ ] **Operators and conversions on a union value**, measured and documented
+      in [GUIDE section 9](GUIDE.md#9-differences-from-cpython) as of 0.137.
+      What works without narrowing: `print`, truthiness (`if x:` / `bool(x)`),
+      `in` over a container of them, passing/returning one, and storing one as
+      a dict value. What needs `isinstance` first: `str`/`repr`/f-string
+      interpolation, every comparison and arithmetic operator, method calls,
+      `len`, and `sorted(key=...)`. All of it needs the same thing — runtime
+      dispatch on the union tag — so it is one piece of work with the `Any`
+      runtime-operations item above, not several.
+      `str(x)` is the cheapest and most conspicuous: `print(x)` already
+      renders a union through the runtime's tag dispatch, and `ContainerRepr`
+      has no union arm to capture the same output.
+      Two related limits that are *not* bugs: a multi-member peel keeps
+      storage (a subset's member indices do not match the original's, so
+      rematerializing them would mis-tag the value), and a union is not a
+      valid dict key or set element because a key must be hashable.
 - [x] Tuple keys (0.107): dict keys and set elements may be tuples of
       hashable things, nested arbitrarily, which also unblocked the `a[i, j]`
       subscript rejected with a specific diagnostic since 0.87. `bool` stays

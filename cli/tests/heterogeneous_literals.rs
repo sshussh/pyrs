@@ -269,3 +269,67 @@ print(widened)
 "#,
     );
 }
+
+/// What a union value supports without narrowing, pinned so the table in
+/// GUIDE section 9 cannot quietly go stale. `bool(x)` is in here because it
+/// used to be refused while `if x:` was accepted — the cast kept its own list
+/// of convertible types and it had drifted from the truthiness path's.
+#[test]
+fn a_union_value_prints_tests_and_travels() {
+    matches_python(
+        "union-supported",
+        r#"
+xs = [1, "a", 2.5]
+v = xs[0]
+
+print(v)
+print(xs)
+if v:
+    print("truthy")
+print(bool(v), not v)
+print(1 in xs, "a" in xs, 9 in xs)
+
+def takes(u: int | str | float) -> str:
+    if isinstance(u, str):
+        return "s:" + u
+    return "n"
+
+print(takes(v))
+
+def gives(n: int) -> int | str:
+    return n if n > 0 else "neg"
+
+print(gives(1), gives(-1))
+
+d: dict[str, int | str] = {"a": 1, "b": "x"}
+print(d, d["a"])
+
+empty: int | None = None
+print(bool(empty), bool(0), bool(""))
+"#,
+    );
+}
+
+/// And what it does not, each refused by name rather than mistranslated.
+/// These are the rows of that table that say "needs narrowing first".
+#[test]
+fn a_union_value_needs_narrowing_for_operators() {
+    let header = "xs = [1, \"a\"]\nv = xs[0]\n";
+    for (tag, expr, want) in [
+        ("eq", "print(v == 1)", "operator '=='"),
+        ("lt", "print(v < 5)", "operator '<'"),
+        ("add", "print(v + 1)", "operator '+'"),
+        ("str", "print(str(v))", "str() cannot convert"),
+        ("method", "print(v.bit_length())", "has no method"),
+    ] {
+        let msg = rejects(tag, &format!("{header}{expr}\n"));
+        assert!(
+            msg.contains(want),
+            "{tag}: expected a diagnostic naming {want}, got: {msg}"
+        );
+        assert!(
+            msg.contains("int | str"),
+            "{tag}: the union should be named: {msg}"
+        );
+    }
+}

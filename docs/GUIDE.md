@@ -1796,6 +1796,50 @@ Container notes:
   `.symmetric_difference_update`; `==` / `!=`; subset operators
   `<` / `<=` / `>` / `>=`; methods `issubset` / `issuperset` / `isdisjoint` / `copy` / `pop`
   (last-inserted; empty → KeyError).
+- **Union values (limited):** a union arises from an annotation
+  (`x: int | str`), from `and` / `or` on mixed operands, from a mixed
+  container literal (0.137), or from a multi-assign join. It is stored as a
+  tag plus a payload slot, and **what you can do with one without narrowing
+  first is a short list**:
+
+  | Works on a union value | Needs narrowing first |
+  |---|---|
+  | `print(x)`, and printing a container of them | `str(x)`, `repr(x)`, `f"{x}"` |
+  | `if x:` / `not x` / `bool(x)` | `x == y`, `!=`, `<`, `<=`, `>`, `>=` |
+  | `in` over a container of them | `x + y` and every other operator |
+  | passing to a parameter of that union type | any method call (`x.upper()`) |
+  | returning one; storing one in a list or dict **value** | `len(x)` |
+  | `is None` / `isinstance` narrowing | `sorted(xs, key=...)` over them |
+
+  **Narrow with `isinstance` and the whole list becomes available**, because
+  after the peel the value has one concrete type and every operation is an
+  ordinary static one:
+
+  ```python
+  for v in [1, "ab", 2.5]:        # list[int | str | float]
+      print(v)                    # fine
+      if isinstance(v, int):
+          print(v + 1)            # fine: v is int here
+  ```
+
+  Two limits on that. A **multi-member peel keeps storage**, so
+  `isinstance(v, int)` over a union containing both `bool` and `int` does not
+  narrow — the member indices of a subset do not match the original's, and
+  rematerializing them would mis-tag the value. And a union is **not a valid
+  dict key or set element**, because a key must be hashable; `{1: "a", "b": 2}`
+  and `{1, "a"}` are refused by name.
+
+  The asymmetries are worth stating plainly, because each looks like an
+  oversight and one was: `print(x)` works where `str(x)` does not, since
+  printing goes through the runtime's tag dispatch and `str()` has no
+  equivalent node yet. `bool(x)` used to be refused where `if x:` was
+  accepted — the cast kept its own list of convertible types and it had
+  drifted; both are one code path as of 0.137.
+
+  General operators on a union need runtime dispatch on the tag, which is
+  tracked with the `Any` runtime-operations work in the
+  [roadmap](ROADMAP.md).
+
 - **Any (limited):** annotation `Any` / `list[Any]` etc. Values are
   heap-boxed print-tag + payload (same as container union slots).
   Concrete → Any and Any → concrete coerce at the boundary (runtime
