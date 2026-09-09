@@ -985,6 +985,24 @@ def clamp(x: float, lo: float, hi: float) -> float:
 - `*args: T` packs extra positionals into `list[T]`; `**kwargs: T` packs
   extra keywords into `dict[str, T]`. Call-site unpacking `f(1, *xs)` and
   `f(**d)` works for homogeneous `list` / `dict[str, …]` values.
+- **`/` and `*` markers** (0.138). `def f(a, /, b, *, c)` makes `a`
+  positional-only and `c` keyword-only, with CPython's rules: a keyword may
+  not name a positional-only parameter (it lands in `**kwargs` instead when
+  there is one), a positional argument may not fill a keyword-only slot, and
+  `def f(*, a=1, b)` is legal because ordering carries no information once a
+  parameter is supplied by name. A bare `*` must be followed by at least one
+  parameter, and `/` must precede `*` and have something before it.
+- **Keyword arguments work on methods** (0.138) — instance, `@staticmethod`,
+  `@classmethod` and through virtual dispatch. Builtin type methods
+  (`s.startswith(...)`, `xs.sort(...)`) take positional arguments only,
+  except `sort`'s documented `key=` / `reverse=`.
+- **A module-level function is a value** (0.138), like a nested `def` or a
+  lambda: `apply(double, 1)`, `sorted(xs, key=by_len)`, `map(square, xs)`,
+  and a dispatch table `{"build": cmd_build, "test": cmd_test}`. Two
+  functions with *different* signatures cannot share one container, and a
+  function taking `*args`/`**kwargs` or carrying defaults cannot be a value
+  at all — a closure value has a fixed parameter list and no defaults. All
+  three are compile errors that name the reason.
 - A lambda cannot carry annotations (the first `:` starts the body), so its
   parameter types are inferred: from the consumer where one knows (`key=`),
   otherwise from body usage, so `lambda a: a + 1` is fine. A body that

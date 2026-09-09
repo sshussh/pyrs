@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.138.0 — Signatures a library can publish, and functions as values
+
+M3 of the library-enablement plan. Three things were missing, and the one
+that mattered most was not in the plan.
+
+### `/` and `*` in a parameter list
+
+`def f(a, *, b)` died at the parser, which required a name after `*`;
+`def f(a, /, b)` died because `/` was never matched as a separator. You could
+not transcribe a signature from any library's documentation.
+
+`ast::FuncDef` carries two boundaries now, `posonly_end` and `kwonly_start`,
+and `FuncSig` carries them through to the call site: a keyword may not name a
+positional-only parameter (it lands in `**kwargs` instead when there is one,
+as CPython does), and a positional argument may not fill a keyword-only slot.
+Dropping `self` for a method call shifts both indices by one.
+
+`kwonly_start` is an `Option<usize>` rather than an index with a `0` default,
+and that is not decoration: the first version used a plain `usize`, and the
+natural default for a compiler-synthesized signature silently meant *every*
+parameter was keyword-only.
+
+The "no non-default after default" rule now applies only within the
+positional run, because `def f(*, a=1, b)` is legal Python — a keyword-only
+argument is supplied by name, so ordering carries no information.
+
+### Keyword arguments on a method — the real blocker
+
+`C().m(1, b=3)` was refused outright. Not for a keyword-only parameter: for
+**any** keyword on **any** instance method, while a free function accepted
+them. Library APIs are overwhelmingly methods, so `df.sort_values(by=...)`
+was unreachable no matter what the parameter list said.
+
+The binding logic already lived in `lower_call_with_sig`. The method path
+simply never handed it the keywords, and rejected them instead. It now does,
+through instance calls, `@staticmethod`, `@classmethod`, statement-position
+calls and virtual dispatch alike.
+
+**A silent wrong answer fell out of that.** `ClassName.static(1, b=2)` did not
+reject the keyword — it *dropped* it and used the default, returning 11 where
+CPython returns 12. That path ignored keywords rather than refusing them.
+Builtin methods still refuse keywords by name, since their method table has
+no keyword surface.
+
+### Module-level functions as values
+
+Nested `def`s and lambdas have been first-class since closures existed; the
+arm for a module-level one was never written, so `apply(double, 1)` reported
+`functions can only be called; add parentheses`. It now lowers to the same
+`MakeClosure` with an empty environment that the free-function decorator
+desugar already built.
+
+Combined with 0.137's union inference this makes a **dispatch table** work —
+`{"build": cmd_build, "test": cmd_test}` — because `join_elem_types` erases
+func identity for matching signatures. Two functions with *different*
+signatures in one container are still refused, and named: that would need a
+union of closure types and runtime dispatch through it.
+
+A function taking `*args`/`**kwargs`, or carrying defaults, cannot be a
+closure value — `Ty::Closure` has a fixed parameter list and no defaults — and
+both are now rejected by name rather than losing arguments.
+
+### Two defects found while testing
+
+**Calling a closure held by a comprehension target.** `[g(1) for g in fs]`
+reported `function 'g' is not defined` while the identical plain `for` loop
+worked: a comprehension target is stored under a renamed local, and the call
+path never consulted `comp_renames` the way the expression path's `Name` arm
+does.
+
+**The arity message counted keyword-only parameters as positional.**
+`f(1, 2)` against `def f(a, *, b)` said "takes 2 argument(s)"; it now says one
+positional and names how many are keyword-only.
+
+### Where this leaves the library probes
+
+Two of the eight blockers the original audit found are closed. Both CLI cores
+now match CPython byte for byte:
+
+```
+cli_parser    {'input': 'f.txt'} 1 True
+cli_dispatch  1 2
+```
+
+### How this is checked
+
+`cli/tests/callable_surface.rs` — 11 differential tests at -O0/-O2/-O3 and
+under `PYRS_GC_STRESS=1`. Both markers alone and together; the boundary
+surviving a method (where `self` shifts it), an inherited override and a
+nested `def`; six misuse diagnostics; keywords through instance, static,
+class, statement and virtual paths; builtin methods still refusing them;
+functions as values in a dispatch table, as a `key=`, and through `map`; and
+the three shapes that cannot be a closure value.
+
+Coverage went 151 to 156 of 210 probes.
+
 ## 0.137.0 — A container literal keeps each element's own type
 
 `[1, "a"]` was `list elements must share one type; found int and str`, while

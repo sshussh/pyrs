@@ -37,15 +37,15 @@ multi-module command-line workload.
 Every milestone runs the same gate before it lands, and the result is
 recorded in [the changelog](../CHANGELOG.md). The most recent run:
 
-| Check | Result after 0.137 |
+| Check | Result after 0.138 |
 |-------|--------------------|
 | `make doctor` | All required tools available |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
-| `cargo test --workspace` | 1696 passed; none failed or ignored |
+| `cargo test --workspace` | 1707 passed; none failed or ignored |
 | `make examples` | All 14 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.137.0` |
+| `pyrs --version` | `PyRs 0.138.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -393,8 +393,17 @@ documentation and the relevant gates.
       hashable things, nested arbitrarily, which also unblocked the `a[i, j]`
       subscript rejected with a specific diagnostic since 0.87. `bool` stays
       out because `True == 1` would demand collision with an int key.
-- [ ] Callable metadata, signature binding, positional-only and keyword-only
-      rules, `*args`/`**kwargs`, decorator factories, stacked decorators.
+- [x] Positional-only and keyword-only rules, and signature binding for them
+      (0.138): `/` and `*` markers with CPython's argument-passing rules,
+      keyword arguments on methods (instance, static, class and virtual — they
+      were refused for *any* method before, which made every
+      `df.sort_values(by=...)`-shaped API unreachable), and module-level
+      functions as first-class values including dispatch tables.
+- [ ] Callable metadata, decorator factories, stacked decorators. Also: a
+      container of functions with *differing* signatures, which needs a union
+      of closure types and runtime dispatch through it; and functions with
+      `*args`/`**kwargs` or defaults as values, which `Ty::Closure`'s fixed
+      parameter list cannot represent.
 - [ ] Class attributes, properties, descriptors, arithmetic and
       reflected/in-place dunders, `NotImplemented`, `__call__`, `__hash__`.
 - [x] Default `!=` dispatches virtually (0.89): a class with `__eq__` but no
