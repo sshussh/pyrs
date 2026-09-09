@@ -100,6 +100,46 @@ fn type_and_the_scope_helpers_are_named() {
     names("globals", "print(globals())\n", &["globals()"]);
 }
 
+/// `isinstance(x, A or B)` compiles under CPython and silently tests only
+/// `A`, because `or` yields its first truthy operand and a type object is
+/// always truthy. Rejecting it is right, but the message has to say *that*,
+/// or it reads as "PyRs cannot do multiple types" — which it can, with the
+/// tuple form the message names.
+#[test]
+fn isinstance_with_or_names_the_trap_and_the_tuple_form() {
+    let msg = rejects(
+        "isinstance_or",
+        "v: object = (1, \"a\")\nprint(isinstance(v, list or tuple))\n",
+    );
+    for want in ["(list, tuple)", "tests only the first type", "truthy"] {
+        assert!(msg.contains(want), "message lacks {want:?}:\n{msg}");
+    }
+
+    // The tuple form is accepted, so the message points somewhere real.
+    let dir = TempDir(
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("pyrs-diag-isinstance_ok-{}", std::process::id())),
+    );
+    fs::create_dir_all(&dir.0).unwrap();
+    let src = dir.0.join("prog.py");
+    fs::write(
+        &src,
+        "v: object = (1, \"a\")\nprint(isinstance(v, (list, tuple)))\n",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args(["run", "--no-cache", "-i"])
+        .arg(&src)
+        .output()
+        .expect("failed to spawn PyRs");
+    assert!(
+        out.status.success(),
+        "the suggested spelling was rejected:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "True\n");
+}
+
 #[test]
 fn slots_and_dict_are_named() {
     names(

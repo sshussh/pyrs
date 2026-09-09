@@ -1,4 +1,4 @@
-//! `json.loads`, written in PyRs.
+//! `json`, written in PyRs — both halves.
 //!
 //! The module used to be stubs: `loads_*` bodies were replaced by the
 //! compiler with calls into a JSON parser written in C, and there was no
@@ -6,10 +6,10 @@
 //! named in the function you called.
 //!
 //! `stdlib/json.py` is now a real recursive-descent parser compiled from
-//! PyRs source, returning `object`. The typed `loads_*` helpers are ordinary
-//! PyRs on top of it, so the C parser and its IR node are gone; only `dumps`
-//! is still compiler-lowered, because it dispatches on the *static* type of
-//! its argument and that is what makes `dumps([1, 2, 3])` work.
+//! PyRs source, returning `object`, and `dumps` is a plain PyRs function
+//! taking `object`. The typed `loads_*` helpers are ordinary PyRs on top of
+//! `loads`. No part of the module is compiler-lowered any more: the C parser,
+//! the C serialiser and both IR nodes are gone.
 //!
 //! These tests compare against CPython's `json` on both the values parsed and
 //! the text of the errors raised. Error parity is the interesting half: the
@@ -287,7 +287,7 @@ for call in ["int-of-str", "int-of-bool", "list-of-mixed", "dict-of-int"]:
 /// `dumps` stays compiler-lowered and keeps dispatching on the static type,
 /// which is the reason it is not written in PyRs.
 #[test]
-fn dumps_still_dispatches_on_static_types() {
+fn dumps_serialises_every_value_kind() {
     matches_python(
         "dumps",
         r#"
@@ -296,10 +296,110 @@ import json
 print(json.dumps(42))
 print(json.dumps(2.5))
 print(json.dumps(True))
+print(json.dumps(False))
+print(json.dumps(None))
 print(json.dumps("hi"))
 print(json.dumps([1, 2, 3]))
 print(json.dumps({"a": 1, "b": 2}))
+print(json.dumps([1.0, 2.5, 1e30, 0.1, 1e-7]))
+print(json.dumps({"x": [1, {"y": None}], "z": True}))
 "#,
+    );
+}
+
+/// `dumps` takes `object`, so a concrete `list[int]` and a `dict[str, float]`
+/// reach it boxed — carrying the tag of their own element type, not the
+/// `list[object]` encoding. Reading them back is what the dynamic-container
+/// operations exist for, and this is the case that would break if they were
+/// ever replaced by a peel to a fixed encoding.
+#[test]
+fn dumps_reads_a_concretely_typed_container() {
+    matches_python(
+        "dumps_concrete",
+        r#"
+import json
+
+xs: list[int] = [1, 2, 3]
+print(json.dumps(xs))
+d: dict[str, float] = {"p": 1.5, "q": 2.0}
+print(json.dumps(d))
+nested: dict[str, list[int]] = {"a": [1, 2], "b": []}
+print(json.dumps(nested))
+names: list[str] = ["x", "y"]
+print(json.dumps({"names": names}))
+"#,
+    );
+}
+
+/// CPython's `ensure_ascii=True` default: every non-ASCII code point is
+/// escaped, and one outside the BMP becomes a surrogate pair.
+#[test]
+fn dumps_escapes_the_way_cpython_does() {
+    matches_python(
+        "dumps_escapes",
+        r#"
+import json
+
+print(json.dumps('a"b\\c'))
+print(json.dumps("tab\there"))
+print(json.dumps("nl\ncr\r"))
+print(json.dumps("bell\x07 and \x1f"))
+print(json.dumps("h\u00e9llo"))
+print(json.dumps("\U0001F642"))
+print(json.dumps({"k\u00e9y": "v\u00e1l"}))
+"#,
+    );
+}
+
+/// A tuple serialises as an array, and a non-str key is coerced to its JSON
+/// spelling — both CPython encoder behaviours the old C serialiser did not
+/// have, because it dispatched on a static type that could not express them.
+#[test]
+fn dumps_handles_tuples_and_non_str_keys() {
+    matches_python(
+        "dumps_shapes",
+        r#"
+import json
+
+t: tuple[int, str] = (1, "a")
+print(json.dumps(t))
+print(json.dumps([(1, 2), (3, 4)]))
+counts: dict[int, str] = {1: "a", 2: "b"}
+print(json.dumps(counts))
+print(json.dumps({"pair": (1, "a")}))
+"#,
+    );
+}
+
+/// A value with no JSON spelling raises `TypeError`, and a container that
+/// contains itself raises `ValueError` rather than recursing forever.
+#[test]
+fn dumps_refuses_what_it_cannot_serialise() {
+    outputs(
+        "dumps_refuses",
+        r#"
+import json
+
+
+class Point:
+    def __init__(self, x: int):
+        self.x: int = x
+
+
+try:
+    print(json.dumps(Point(1)))
+except TypeError as exc:
+    print("TypeError:", exc)
+
+cycle: list[object] = [1]
+cycle.append(cycle)
+try:
+    print(json.dumps(cycle))
+except ValueError as exc:
+    print("ValueError:", exc)
+"#,
+        "TypeError: Object of this type is not JSON serializable\n\
+         ValueError: Circular reference detected\n",
     );
 }
 
