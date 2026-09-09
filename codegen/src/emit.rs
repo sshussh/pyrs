@@ -467,9 +467,12 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
     match &e.kind {
         Block { stmts, result } => max_try_depth_in_stmts(stmts).max(max_try_depth_in_expr(result)),
         Let { value, body, .. } => max_try_depth_in_expr(value).max(max_try_depth_in_expr(body)),
-        Binary { left, right, .. } | IsIdentity { left, right, .. } => {
-            max_try_depth_in_expr(left).max(max_try_depth_in_expr(right))
-        }
+        Binary { left, right, .. }
+        | IsIdentity { left, right, .. }
+        | AnyIterGet {
+            base: left,
+            index: right,
+        } => max_try_depth_in_expr(left).max(max_try_depth_in_expr(right)),
         Unary { operand, .. }
         | ToBool(operand)
         | Abs(operand)
@@ -492,6 +495,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | ExcRepr(operand)
         | StrRepr(operand)
         | StrAscii(operand)
+        | AnyDictKeys(operand)
         | ContainerRepr(operand)
         | ContainerAscii(operand)
         | IsNone { value: operand, .. }
@@ -515,7 +519,6 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | SetFromStr(operand)
         | MinList(operand)
         | MaxList(operand)
-        | JsonDumps(operand)
         | MathCall { arg: operand, .. }
         | ClosureCap {
             closure: operand, ..
@@ -792,6 +795,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | ExcRepr(operand)
         | StrRepr(operand)
         | StrAscii(operand)
+        | AnyDictKeys(operand)
         | ContainerRepr(operand)
         | ContainerAscii(operand)
         | IsNone { value: operand, .. }
@@ -815,7 +819,6 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | SetFromStr(operand)
         | MinList(operand)
         | MaxList(operand)
-        | JsonDumps(operand)
         | MathCall { arg: operand, .. } => count_yields_in_expr(operand),
         Sum { list, start } => count_yields_in_expr(list) + count_yields_in_expr(start),
         Round {
@@ -1242,14 +1245,19 @@ impl Emitter {
         // libm (linked with -lm); no reliable LLVM intrinsic for tan
         out.push_str("declare double @tan(double)\n");
         out.push_str("declare ptr @pyrs_os_getcwd()\n");
-        out.push_str("declare ptr @pyrs_json_dumps(i64, i32)\n");
         out.push_str("declare ptr @pyrs_object_new(i64, i64)\n");
         out.push_str("declare i32 @pyrs_isinstance_class(ptr, i64, ptr, i64)\n");
         out.push_str("declare void @pyrs_print_object(ptr)\n");
         out.push_str("declare void @pyrs_print_class_instance(ptr)\n");
         out.push_str("declare ptr @pyrs_str_from_object(ptr)\n");
         out.push_str("declare void @pyrs_set_class_names(ptr, i64)\n");
-        out.push_str("declare void @pyrs_set_class_reprs(ptr, i64)\n\n");
+        out.push_str("declare void @pyrs_set_class_reprs(ptr, i64)\n");
+        out.push_str("declare i64 @pyrs_any_len(i64)\n");
+        out.push_str("declare i64 @pyrs_any_list_get(i64, i64)\n");
+        out.push_str("declare i64 @pyrs_any_dict_get(i64, ptr)\n");
+        out.push_str("declare i64 @pyrs_any_dict_get_any(i64, i64)\n");
+        out.push_str("declare i64 @pyrs_any_iter_get(i64, i64)\n");
+        out.push_str("declare ptr @pyrs_any_dict_keys(i64)\n\n");
         out.push_str("declare void @pyrs_set_exc_classes(ptr, ptr, i64)\n\n");
         // glibc pointer-mangles the frame-pointer slot in jmp_buf on x86-64.
         // Functions containing setjmp reserve that register as an actual frame
@@ -4118,6 +4126,26 @@ impl Emitter {
             ExprKind::Index { base, index } => {
                 let b = self.emit_expr(base);
                 let i_tagged = self.emit_expr(index);
+                // A dynamic base dispatches in the runtime, which reads the
+                // container's element encoding out of the value's own tag.
+                if base.ty == Ty::Any {
+                    let t = self.tmp();
+                    if index.ty == Ty::Str {
+                        self.line(format!(
+                            "{t} = call i64 @pyrs_any_dict_get(i64 {b}, ptr {i_tagged})"
+                        ));
+                    } else if index.ty == Ty::Any {
+                        self.line(format!(
+                            "{t} = call i64 @pyrs_any_dict_get_any(i64 {b}, i64 {i_tagged})"
+                        ));
+                    } else {
+                        let i = self.emit_unbox_i64(&i_tagged);
+                        self.line(format!(
+                            "{t} = call i64 @pyrs_any_list_get(i64 {b}, i64 {i})"
+                        ));
+                    }
+                    return t;
+                }
                 match base.ty {
                     Ty::Str => {
                         let i = self.emit_unbox_i64(&i_tagged);
@@ -4793,8 +4821,31 @@ impl Emitter {
                 }
                 self.emit_expr(result)
             }
+            ExprKind::AnyIterGet { base, index } => {
+                let b = self.emit_expr(base);
+                let i_tagged = self.emit_expr(index);
+                let i = self.emit_unbox_i64(&i_tagged);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i64 @pyrs_any_iter_get(i64 {b}, i64 {i})"
+                ));
+                t
+            }
+            ExprKind::AnyDictKeys(inner) => {
+                let v = self.emit_expr(inner);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_any_dict_keys(i64 {v})"));
+                t
+            }
             ExprKind::Len(inner) => {
                 let v = self.emit_expr(inner);
+                // A dynamic value carries its own kind, so the length comes
+                // from the runtime rather than from a fixed header load.
+                if inner.ty == Ty::Any {
+                    let machine = self.tmp();
+                    self.line(format!("{machine} = call i64 @pyrs_any_len(i64 {v})"));
+                    return self.emit_box_i64(&machine);
+                }
                 let machine = self.emit_len(&v);
                 self.emit_box_i64(&machine)
             }
@@ -4842,16 +4893,6 @@ impl Emitter {
             ExprKind::OsGetcwd => {
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_os_getcwd()"));
-                t
-            }
-            ExprKind::JsonDumps(arg) => {
-                let v = self.emit_expr(arg);
-                let slot = self.slot_from_value(&v, arg.ty);
-                let tag = elem_tag(&arg.ty);
-                let t = self.tmp();
-                self.line(format!(
-                    "{t} = call ptr @pyrs_json_dumps(i64 {slot}, i32 {tag})"
-                ));
                 t
             }
             ExprKind::IntToFloat(inner) => {

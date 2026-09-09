@@ -1109,6 +1109,16 @@ pub enum ExprKind {
     },
     /// `len(x)` for str, list, tuple, dict, set.
     Len(Box<Expr>),
+    /// The i-th element of a dynamic value as a loop yields it: a list's
+    /// element, a dict's key, a str's character. Distinct from `Index`
+    /// because `d[0]` on a dict looks up the key `0`.
+    AnyIterGet {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// `v.keys()` where `v` is dynamic and holds a dict with str keys.
+    /// Yields `list[str]` in insertion order.
+    AnyDictKeys(Box<Expr>),
     /// `abs(x)` for int or float (bool is promoted to int first).
     /// Result type matches the operand. `abs(i64::MIN)` wraps (no bigints).
     Abs(Box<Expr>),
@@ -1156,8 +1166,6 @@ pub enum ExprKind {
     },
     /// `os.getcwd()` → str (POSIX getcwd via runtime).
     OsGetcwd,
-    /// `json.dumps(x)` for a json-able value (type on the arg).
-    JsonDumps(Box<Expr>),
     /// int → float (sitofp)
     IntToFloat(Box<Expr>),
     /// float → int, truncating toward zero (Python's `int()`)

@@ -7508,181 +7508,181 @@ PyrsStr *pyrs_os_getcwd(void) {
     return str_from_cstr(buf);
 }
 
-/* ---- json serialisation ----
+/* ---- dynamic container reads ----
  *
- * Only `dumps` lives here. It dispatches on the *static* type of its
- * argument, which is what lets `dumps([1, 2, 3])` serialise a `list[int]`.
- * Parsing is `stdlib/json.py`, written in PyRs.
+ * A value of type `Any` is a `{ print_tag, payload }` box. When the payload
+ * is a container, the tag also carries the container's *element* encoding —
+ * a list is `4 + 8 * elem_tag` — so a read can re-box an element correctly
+ * without knowing that encoding at compile time.
+ *
+ * This is what lets a `list[int]` and a `list[Any]` both be read out of an
+ * `Any`: no copy, no aliasing break, and no need for a static type that
+ * distinguishes them.
  */
 
-
-/* growable byte buffer for dumps */
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-} JsonBuf;
-
-static void jbuf_init(JsonBuf *b) {
-    b->cap = 64;
-    b->len = 0;
-    b->data = (char *)xmalloc(b->cap);
-    b->data[0] = '\0';
-}
-
-static void jbuf_dispose(void *context) {
-    JsonBuf *b = (JsonBuf *)context;
-    free(b->data);
-    b->data = NULL;
-    b->len = 0;
-    b->cap = 0;
-}
-
-static void jbuf_ensure(JsonBuf *b, size_t extra) {
-    if (b->len + extra + 1 > b->cap) {
-        size_t nc = b->cap * 2;
-        while (nc < b->len + extra + 1) {
-            nc *= 2;
-        }
-        char *nd = (char *)xmalloc(nc);
-        memcpy(nd, b->data, b->len + 1);
-        free(b->data);
-        b->data = nd;
-        b->cap = nc;
+/* Wrap a raw slot as an `Any`. A slot whose element tag is already the union
+ * encoding *is* a box; anything else needs one. */
+static long long any_from_slot(long long slot, int elem_tag) {
+    if (elem_tag == TAG_UNION) {
+        return slot;
     }
+    return (long long)(uintptr_t)pyrs_union_box_new(elem_tag, slot);
 }
 
-static void jbuf_putc(JsonBuf *b, char c) {
-    jbuf_ensure(b, 1);
-    b->data[b->len++] = c;
-    b->data[b->len] = '\0';
-}
-
-static void jbuf_puts(JsonBuf *b, const char *s) {
-    size_t n = strlen(s);
-    jbuf_ensure(b, n);
-    memcpy(b->data + b->len, s, n);
-    b->len += n;
-    b->data[b->len] = '\0';
-}
-
-static void jbuf_put_str_escaped(JsonBuf *b, const PyrsStr *s) {
-    jbuf_putc(b, '"');
-    for (long long i = 0; i < s->len; i++) {
-        unsigned char c = (unsigned char)s->data[i];
-        switch (c) {
-        case '"':
-            jbuf_puts(b, "\\\"");
-            break;
-        case '\\':
-            jbuf_puts(b, "\\\\");
-            break;
-        case '\b':
-            jbuf_puts(b, "\\b");
-            break;
-        case '\f':
-            jbuf_puts(b, "\\f");
-            break;
-        case '\n':
-            jbuf_puts(b, "\\n");
-            break;
-        case '\r':
-            jbuf_puts(b, "\\r");
-            break;
-        case '\t':
-            jbuf_puts(b, "\\t");
-            break;
-        default:
-            if (c < 0x20) {
-                char tmp[8];
-                snprintf(tmp, sizeof(tmp), "\\u%04x", c);
-                jbuf_puts(b, tmp);
-            } else {
-                jbuf_putc(b, (char)c);
-            }
-        }
+/* The element tag encoded in a container's own print tag. */
+static int any_elem_tag(int container_tag) {
+    if (container_tag >= 4 && ((container_tag - 4) % 8) == 0) {
+        return (container_tag - 4) / 8; /* list */
     }
-    jbuf_putc(b, '"');
+    return TAG_UNION; /* tuple/dict/set slots are already tagged per entry */
 }
 
-static void jbuf_put_int(JsonBuf *b, long long v) {
-    long long n;
-    char *s = int_to_dec(v, &n);
-    jbuf_puts(b, s);
-    free(s);
-}
-
-static void jbuf_put_float(JsonBuf *b, double v) {
-    /* Match CPython json: use repr-like shortest that round-trips; whole floats keep .0 */
-    char tmp[64];
-    if (isnan(v) || isinf(v)) {
-        pyrs_die("ValueError: Out of range float values are not JSON compliant");
+static const PyrsUnionBox *any_box(long long v) {
+    if (v == 0) {
+        pyrs_die("TypeError: operation on a dynamic None");
     }
-    /* Use the same idea as print: enough digits, then strip trailing zeros carefully */
-    snprintf(tmp, sizeof(tmp), "%.17g", v);
-    /* Ensure a decimal point or exponent for whole numbers (json allows "1" for 1.0) */
-    jbuf_puts(b, tmp);
+    return (const PyrsUnionBox *)(uintptr_t)v;
 }
 
-static void json_dumps_into(JsonBuf *b, long long slot, int tag) {
-    if (tag == TAG_INT) {
-        jbuf_put_int(b, slot);
-    } else if (tag == TAG_FLOAT) {
-        double d;
-        memcpy(&d, &slot, sizeof(double));
-        jbuf_put_float(b, d);
-    } else if (tag == TAG_BOOL) {
-        jbuf_puts(b, slot ? "true" : "false");
-    } else if (tag == TAG_STR) {
-        jbuf_put_str_escaped(b, (const PyrsStr *)(uintptr_t)slot);
-    } else if (tag == TAG_DICT) {
-        const PyrsDict *d = (const PyrsDict *)(uintptr_t)slot;
-        check_ref(d);
-        jbuf_putc(b, '{');
-        int first = 1;
-        PyrsList *items = pyrs_dict_items(d);
-        for (long long i = 0; i < items->len; i++) {
-            PyrsTuple *t = (PyrsTuple *)(uintptr_t)items->data[i];
-            if (!first) {
-                jbuf_puts(b, ", ");
-            }
-            first = 0;
-            long long kslot = t->data[0];
-            long long vslot = t->data[1];
-            int vtag = t->tags[1];
-            jbuf_put_str_escaped(b, (const PyrsStr *)(uintptr_t)kslot);
-            jbuf_puts(b, ": ");
-            json_dumps_into(b, vslot, vtag);
-        }
-        jbuf_putc(b, '}');
-    } else if (tag >= 4 && ((tag - 4) % 8) == 0) {
-        /* list: tag = 4 + 8 * elem_tag */
-        const PyrsList *l = (const PyrsList *)(uintptr_t)slot;
-        check_ref(l);
-        int elem_tag = (tag - 4) / 8;
-        jbuf_putc(b, '[');
-        for (long long i = 0; i < l->len; i++) {
-            if (i > 0) {
-                jbuf_puts(b, ", ");
-            }
-            json_dumps_into(b, l->data[i], elem_tag);
-        }
-        jbuf_putc(b, ']');
-    } else {
-        pyrs_die("TypeError: Object of this type is not JSON serializable");
+/* `len(v)` where `v` is dynamic. Every sized object keeps its count in the
+ * first i64, which is why `cplen` leads `PyrsStr`. */
+long long pyrs_any_len(long long v) {
+    const PyrsUnionBox *b = any_box(v);
+    int tag = b->print_tag;
+    int sized = (tag == TAG_STR) || (tag == TAG_TUPLE) || (tag == TAG_DICT)
+                || (tag == TAG_SET) || (tag >= 4 && ((tag - 4) % 8) == 0);
+    if (!sized || b->payload == 0) {
+        pyrs_die("TypeError: object of this dynamic type has no len()");
     }
+    return *(const long long *)(uintptr_t)b->payload;
 }
 
-PyrsStr *pyrs_json_dumps(long long slot, int tag) {
-    JsonBuf b;
-    PyrsCleanup cleanup;
-    jbuf_init(&b);
-    pyrs_cleanup_push(&cleanup, jbuf_dispose, &b);
-    json_dumps_into(&b, slot, tag);
-    PyrsStr *r = str_from_cstr(b.data);
-    pyrs_cleanup_pop(&cleanup);
-    jbuf_dispose(&b);
-    return r;
+/* `v[i]` where `v` is a dynamic list or tuple. Returns an `Any`. A tuple
+ * carries a tag per slot, so its elements come back exactly typed even though
+ * the tuple as a whole has no element type. */
+long long pyrs_any_list_get(long long v, long long index) {
+    const PyrsUnionBox *b = any_box(v);
+    int tag = b->print_tag;
+    if (b->payload == 0) {
+        pyrs_die("TypeError: dynamic value is not a list");
+    }
+    if (tag == TAG_TUPLE) {
+        const PyrsTuple *t = (const PyrsTuple *)(uintptr_t)b->payload;
+        long long ti = index < 0 ? t->len + index : index;
+        if (ti < 0 || ti >= t->len) {
+            pyrs_die("IndexError: tuple index out of range");
+        }
+        return any_from_slot(t->data[ti], t->tags[ti]);
+    }
+    if (!(tag >= 4 && ((tag - 4) % 8) == 0)) {
+        pyrs_die("TypeError: dynamic value is not a list");
+    }
+    const PyrsList *l = (const PyrsList *)(uintptr_t)b->payload;
+    long long i = index < 0 ? l->len + index : index;
+    if (i < 0 || i >= l->len) {
+        pyrs_die("IndexError: list index out of range");
+    }
+    return any_from_slot(l->data[i], any_elem_tag(tag));
+}
+
+/* `v[k]` where `v` is a dynamic dict with str keys. Returns an `Any`. */
+long long pyrs_any_dict_get(long long v, const PyrsStr *key) {
+    const PyrsUnionBox *b = any_box(v);
+    if (b->print_tag != TAG_DICT || b->payload == 0) {
+        pyrs_die("TypeError: dynamic value is not a dict");
+    }
+    const PyrsDict *d = (const PyrsDict *)(uintptr_t)b->payload;
+    if (d->order_len > 0 && d->table[d->order[0]].key_tag != TAG_STR) {
+        pyrs_die("TypeError: dynamic dict is not keyed by str");
+    }
+    long long slot = pyrs_dict_get((PyrsDict *)(uintptr_t)d,
+                                   (long long)(uintptr_t)key, TAG_STR);
+    /* Every insert stamps the value tag from the dict's static value type, so
+     * all full slots agree and any one of them answers for the dict. A miss
+     * would already have raised KeyError above. */
+    int vtag = TAG_UNION;
+    if (d->order_len > 0) {
+        vtag = d->table[d->order[0]].val_tag;
+    }
+    return any_from_slot(slot, vtag);
+}
+
+/* The i-th element of a dynamic value *as a loop yields it*: a list gives its
+ * element, a dict its key, a str its character. Separate from
+ * `pyrs_any_list_get` because `d[0]` on a dict is a lookup of the key `0`,
+ * not the first key — iteration and subscripting mean different things. */
+long long pyrs_any_iter_get(long long v, long long index) {
+    const PyrsUnionBox *b = any_box(v);
+    int tag = b->print_tag;
+    if (b->payload == 0) {
+        pyrs_die("TypeError: dynamic value is not iterable");
+    }
+    if (tag >= 4 && ((tag - 4) % 8) == 0) {
+        const PyrsList *l = (const PyrsList *)(uintptr_t)b->payload;
+        if (index < 0 || index >= l->len) {
+            pyrs_die("IndexError: list index out of range");
+        }
+        return any_from_slot(l->data[index], any_elem_tag(tag));
+    }
+    if (tag == TAG_TUPLE) {
+        const PyrsTuple *t = (const PyrsTuple *)(uintptr_t)b->payload;
+        if (index < 0 || index >= t->len) {
+            pyrs_die("IndexError: tuple index out of range");
+        }
+        return any_from_slot(t->data[index], t->tags[index]);
+    }
+    if (tag == TAG_DICT) {
+        const PyrsDict *d = (const PyrsDict *)(uintptr_t)b->payload;
+        if (index < 0 || index >= d->order_len) {
+            pyrs_die("IndexError: dict index out of range");
+        }
+        const DictSlot *e = &d->table[d->order[index]];
+        return any_from_slot(e->key, e->key_tag);
+    }
+    if (tag == TAG_STR) {
+        const PyrsStr *str = (const PyrsStr *)(uintptr_t)b->payload;
+        PyrsStr *ch = pyrs_str_index(str, index);
+        return any_from_slot((long long)(uintptr_t)ch, TAG_STR);
+    }
+    pyrs_die("TypeError: dynamic value is not iterable");
+    return 0;
+}
+
+/* `v.keys()` where `v` is a dynamic dict with str keys, in insertion order. */
+PyrsList *pyrs_any_dict_keys(long long v) {
+    const PyrsUnionBox *b = any_box(v);
+    if (b->print_tag != TAG_DICT || b->payload == 0) {
+        pyrs_die("TypeError: dynamic value is not a dict");
+    }
+    const PyrsDict *d = (const PyrsDict *)(uintptr_t)b->payload;
+    if (d->order_len > 0 && d->table[d->order[0]].key_tag != TAG_STR) {
+        /* The result is a `list[str]`; an int key here would be read back as
+         * a pointer. Iterate the dict instead, which tags each key. */
+        pyrs_die("TypeError: .keys() on a dynamic dict needs str keys");
+    }
+    PyrsList *out = pyrs_list_new(d->order_len);
+    for (long long i = 0; i < d->order_len; i++) {
+        const DictSlot *e = &d->table[d->order[i]];
+        pyrs_list_push(out, e->key);
+    }
+    return out;
+}
+
+/* `v[k]` where both the dict and the key are dynamic. The key's own box says
+ * which hash and comparison the lookup uses. Returns an `Any`. */
+long long pyrs_any_dict_get_any(long long v, long long key) {
+    const PyrsUnionBox *b = any_box(v);
+    if (b->print_tag != TAG_DICT || b->payload == 0) {
+        pyrs_die("TypeError: dynamic value is not a dict");
+    }
+    const PyrsUnionBox *kb = any_box(key);
+    PyrsDict *d = (PyrsDict *)(uintptr_t)b->payload;
+    long long slot = pyrs_dict_get(d, kb->payload, kb->print_tag);
+    int vtag = TAG_UNION;
+    if (d->order_len > 0) {
+        vtag = d->table[d->order[0]].val_tag;
+    }
+    return any_from_slot(slot, vtag);
 }
 
 /* ---- cells (nonlocal / mutable free vars) ---- */

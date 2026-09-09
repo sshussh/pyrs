@@ -17,20 +17,26 @@
 # run time. Making it implicit was tried and reverted: it turned `print(v)` on
 # a concretely-typed list into a trap.
 #
-# `dumps` is the one function here the compiler still lowers itself, and
-# deliberately: it dispatches on the *static* type of its argument, which is
-# what lets `dumps([1, 2, 3])` work on a `list[int]`. A version written here
-# could only take `object`, and a concrete `list[int]` boxed into `object`
-# carries a different runtime tag than the `list[object]` such a body would
-# have to read it back as — so it would refuse exactly the calls that matter.
+# `dumps` is written here too, as of v0.140. It takes `object` and walks
+# whatever it is handed, which needs no narrowing at all: `len`, `[]` and
+# iteration read a dynamic value by reading the container's element encoding
+# out of the value's own runtime tag, so a `list[int]` and a `list[object]`
+# are both readable through the same parameter with no copy. Iterating a dict
+# yields each key with its own tag, which is what lets a non-`str` key be
+# coerced the way CPython's encoder does.
 #
-# Differences from CPython's json, both deliberate:
+# Differences from CPython's json, all deliberate:
 #   * A lone surrogate escape (`"\ud800"` with no low surrogate following) is
 #     an error rather than a lone surrogate in the result, because a PyRs
 #     `str` is well-formed UTF-8 and has no way to hold one. A *pair* is
 #     decoded to the astral code point it denotes, as CPython does.
-#   * Nesting is capped at `MAX_DEPTH` to turn a deeply nested document into
-#     an exception rather than a native stack overflow.
+#   * `dumps` of an unserialisable value says "Object of this type is not JSON
+#     serializable" where CPython names the type. Naming it needs
+#     `type(x).__name__`, and `type()` is unsupported here: classes are not
+#     first-class values in a closed-world model.
+#   * Nesting is capped at `MAX_DEPTH` in both directions, to turn a deeply
+#     nested document — or a container that contains itself — into an
+#     exception rather than a native stack overflow.
 
 from typing import NoReturn
 
@@ -562,9 +568,126 @@ def loads_dict_str_bool(s: str) -> dict[str, bool]:
     return out
 
 
-def dumps(x: str) -> str:
-    # Compiler-lowered: it dispatches on the static type of the argument, so
-    # `dumps(42)`, `dumps([1, 2, 3])` and `dumps({"a": 1.0})` all work. The
-    # annotation here is only a placeholder for signature lookup; see the
-    # module docstring for why this one is not written in PyRs.
-    return x
+# ---- serialisation ------------------------------------------------------
+
+_HEX: str = "0123456789abcdef"
+
+
+def _hex4(code: int) -> str:
+    out: list[str] = []
+    shift: int = 12
+    while shift >= 0:
+        out.append(_HEX[(code >> shift) & 15])
+        shift -= 4
+    return "".join(out)
+
+
+def _dump_str(text: str, out: list[str]) -> None:
+    """CPython's `ensure_ascii=True` default: every non-ASCII code point is
+    escaped, and one outside the BMP becomes a surrogate pair."""
+    out.append('"')
+    for character in text:
+        code: int = ord(character)
+        if character == '"':
+            out.append('\\"')
+        elif character == "\\":
+            out.append("\\\\")
+        elif character == "\n":
+            out.append("\\n")
+        elif character == "\r":
+            out.append("\\r")
+        elif character == "\t":
+            out.append("\\t")
+        elif code == 8:
+            out.append("\\b")
+        elif code == 12:
+            out.append("\\f")
+        elif code < 0x20 or code > 0x7E:
+            if code > 0xFFFF:
+                base: int = code - 0x10000
+                out.append("\\u" + _hex4(0xD800 + (base >> 10)))
+                out.append("\\u" + _hex4(0xDC00 + (base & 0x3FF)))
+            else:
+                out.append("\\u" + _hex4(code))
+        else:
+            out.append(character)
+    out.append('"')
+
+
+def _key_name(key: object) -> str:
+    """CPython's `skipkeys=False` coercion: a str key is used as-is, and
+    `bool`, `int`, `float` and `None` become their JSON spellings."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if isinstance(key, int):
+        return str(key)
+    if isinstance(key, float):
+        return str(key)
+    if key is None:
+        return "null"
+    raise TypeError("keys must be str, int, float, bool or None")
+
+
+def _dump(value: object, out: list[str], depth: int) -> None:
+    if depth > MAX_DEPTH:
+        raise ValueError("Circular reference detected")
+
+    if value is None:
+        out.append("null")
+        return
+
+    # Before `int`, because a bool is one in Python and `true` is not `1`.
+    if isinstance(value, bool):
+        out.append("true" if value else "false")
+        return
+
+    if isinstance(value, int):
+        out.append(str(value))
+        return
+
+    if isinstance(value, float):
+        out.append(str(value))
+        return
+
+    if isinstance(value, str):
+        _dump_str(value, out)
+        return
+
+    # A tuple serialises as an array, as CPython's encoder does.
+    if isinstance(value, (list, tuple)):
+        out.append("[")
+        index: int = 0
+        while index < len(value):
+            if index > 0:
+                out.append(", ")
+            _dump(value[index], out, depth + 1)
+            index += 1
+        out.append("]")
+        return
+
+    if isinstance(value, dict):
+        out.append("{")
+        first: bool = True
+        # Iterating the dict yields each key with its own tag, which is what
+        # lets a non-str key be coerced the way CPython's encoder does.
+        for key in value:
+            if not first:
+                out.append(", ")
+            first = False
+            _dump_str(_key_name(key), out)
+            out.append(": ")
+            _dump(value[key], out, depth + 1)
+        out.append("}")
+        return
+
+    raise TypeError("Object of this type is not JSON serializable")
+
+
+def dumps(value: object) -> str:
+    """Serialise to JSON, with CPython's default separators and
+    `ensure_ascii=True` escaping."""
+    out: list[str] = []
+    _dump(value, out, 0)
+    return "".join(out)

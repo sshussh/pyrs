@@ -7526,30 +7526,6 @@ fn lower_function_inner(
             ty: ir::Ty::Str,
             kind: ir::ExprKind::OsGetcwd,
         }))]
-    } else if mctx.module == "json" && f.name == "dumps" {
-        // Polymorphic: body never used; calls are special-cased. Keep a
-        // trivial body so the function still exists for signature lookup.
-        if params.len() != 1 {
-            return Err(err(
-                "json.dumps must take exactly one parameter".to_string(),
-                f.span,
-            ));
-        }
-        if ctx.ret != ir::Ty::Str {
-            return Err(err(
-                format!("json.dumps must return str (found {})", ctx.ret),
-                f.span,
-            ));
-        }
-        // Return dumps of the parameter (typed as str in the stub).
-        let arg = ir::Expr {
-            ty: params[0].1,
-            kind: ir::ExprKind::Local(params[0].0.clone()),
-        };
-        vec![ir::Stmt::Return(Some(ir::Expr {
-            ty: ir::Ty::Str,
-            kind: ir::ExprKind::JsonDumps(Box::new(arg)),
-        }))]
     } else {
         lower_block(&f.body, &mut ctx)?
     };
@@ -15598,7 +15574,13 @@ fn lower_for(
         ir::Ty::Class(id) if resolve_method(id, "__iter__").is_some() => {
             lower_for_user_iter(target, seq, id, body, orelse, iter.span, ctx, out)
         }
-        other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
+        // A dynamic value is iterated by index; the runtime decides what the
+        // i-th element *is* from the value's own tag.
+        ir::Ty::Any => lower_for_indexed(target, seq, body, orelse, ctx, out),
+        other => Err(err(
+            format!("'{}' object is not iterable", display_ty(other)),
+            iter.span,
+        )),
     }
 }
 
@@ -16254,6 +16236,8 @@ fn lower_for_indexed(
     let elem_ty = match seq.ty {
         ir::Ty::List(e) => *e,
         ir::Ty::Str => ir::Ty::Str,
+        // A dynamic value yields dynamic elements.
+        ir::Ty::Any => ir::Ty::Any,
         ir::Ty::Tuple(elems) => {
             if elems.is_empty() {
                 // loop body never runs; bind as int placeholder — use a dummy
@@ -16315,11 +16299,20 @@ fn lower_for_indexed(
     };
 
     // target = seq[idx] as the first statement(s) of the body
+    // A dynamic sequence uses the iteration accessor rather than the
+    // subscript: iterating a dict yields its keys, while `d[0]` looks one up.
     let element = ir::Expr {
         ty: elem_ty,
-        kind: ir::ExprKind::Index {
-            base: Box::new(seq_local),
-            index: Box::new(idx_local.clone()),
+        kind: if seq_ty == ir::Ty::Any {
+            ir::ExprKind::AnyIterGet {
+                base: Box::new(seq_local),
+                index: Box::new(idx_local.clone()),
+            }
+        } else {
+            ir::ExprKind::Index {
+                base: Box::new(seq_local),
+                index: Box::new(idx_local.clone()),
+            }
         },
     };
     let entry_ref = ctx.type_refinements.clone();
@@ -17964,8 +17957,37 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     })
                 }
                 ir::Ty::Class(id) => lower_class_getitem(base_ir, id, index, expr.span, ctx),
+                // A dynamic value knows at run time whether it is a list or a
+                // dict; the index type says which one is being asked for, and
+                // the result is dynamic in turn.
+                ir::Ty::Any => {
+                    let key_ir = lower_expr(index, ctx)?;
+                    match key_ir.ty {
+                        // A dynamic key carries its own tag, so it hashes and
+                        // compares as whatever it holds.
+                        ir::Ty::Int | ir::Ty::Bool | ir::Ty::Str | ir::Ty::Any => {}
+                        other => {
+                            return Err(err(
+                                format!(
+                                    "a dynamic value can be indexed by int (list or \
+                                     tuple), str (dict), or another dynamic value \
+                                     (dict), found {}",
+                                    display_ty(other)
+                                ),
+                                index.span,
+                            ));
+                        }
+                    }
+                    Ok(ir::Expr {
+                        ty: ir::Ty::Any,
+                        kind: ir::ExprKind::Index {
+                            base: Box::new(base_ir),
+                            index: Box::new(key_ir),
+                        },
+                    })
+                }
                 other => Err(err(
-                    format!("'{other}' object is not subscriptable"),
+                    format!("'{}' object is not subscriptable", display_ty(other)),
                     base.span,
                 )),
             }
@@ -18587,6 +18609,12 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         *method_span,
                     )),
                 },
+                // A dynamic dict can list its keys; the runtime reads the
+                // insertion order the value already carries.
+                ir::Ty::Any if method == "keys" && args.is_empty() => Ok(ir::Expr {
+                    ty: ir::list_of(ir::Ty::Str),
+                    kind: ir::ExprKind::AnyDictKeys(Box::new(base_ir)),
+                }),
                 other => Err(err(
                     format!("'{other}' has no method '{method}'"),
                     *method_span,
@@ -19896,7 +19924,13 @@ fn lower_comp_iter(
         ir::Ty::Class(id) if resolve_method(id, "__iter__").is_some() => {
             lower_comp_user_iter(seq, id, iter.span, ctx, setup)
         }
-        other => Err(err(format!("'{other}' object is not iterable"), iter.span)),
+        // A dynamic value is iterated by index, like the other indexed
+        // sequences; the runtime decides what the i-th element is.
+        ir::Ty::Any => lower_comp_indexed(seq, want_cap, iter.span, ctx, setup),
+        other => Err(err(
+            format!("'{}' object is not iterable", display_ty(other)),
+            iter.span,
+        )),
     }
 }
 
@@ -19922,6 +19956,8 @@ fn lower_comp_indexed(
         ir::Ty::List(e) => **e,
         ir::Ty::Str => ir::Ty::Str,
         ir::Ty::Tuple(elems) => homogeneous_tuple_elem(elems, span)?,
+        // A dynamic value yields dynamic elements.
+        ir::Ty::Any => ir::Ty::Any,
         other => {
             return Err(err(
                 format!("internal error: lower_comp_indexed on {other}"),
@@ -19950,12 +19986,24 @@ fn lower_comp_indexed(
             kind: ir::ExprKind::Len(Box::new(seq_local.clone())),
         },
     );
-    let element = ir::Expr {
-        ty: src_elem_ty,
-        kind: ir::ExprKind::Index {
-            base: Box::new(seq_local.clone()),
-            index: Box::new(idx_local.clone()),
-        },
+    // A dynamic sequence uses the iteration accessor: iterating a dict
+    // yields its keys, while `d[0]` would look one up.
+    let element = if seq_ty == ir::Ty::Any {
+        ir::Expr {
+            ty: src_elem_ty,
+            kind: ir::ExprKind::AnyIterGet {
+                base: Box::new(seq_local.clone()),
+                index: Box::new(idx_local.clone()),
+            },
+        }
+    } else {
+        ir::Expr {
+            ty: src_elem_ty,
+            kind: ir::ExprKind::Index {
+                base: Box::new(seq_local.clone()),
+                index: Box::new(idx_local.clone()),
+            },
+        }
     };
     let step_stmt = ir::Stmt::Assign {
         name: idx_t,
@@ -22091,30 +22139,6 @@ fn lower_module_call(
     }) {
         return lower_class_construct(class_id, method, args, keywords, kwargs, method_span, ctx);
     }
-    // json.dumps is polymorphic: special-case before signature matching.
-    if real == "json" && method == "dumps" {
-        if kwargs.is_some() {
-            return Err(err("json.dumps() does not take **kwargs", method_span));
-        }
-        if !keywords.is_empty() {
-            return Err(err(
-                "json.dumps() does not take keyword arguments",
-                keywords[0].name_span,
-            ));
-        }
-        let plain = require_plain_args(args, "json.dumps", method_span)?;
-        if plain.len() != 1 {
-            return Err(err(
-                format!(
-                    "json.dumps() takes exactly one argument ({} given)",
-                    plain.len()
-                ),
-                method_span,
-            ));
-        }
-        return lower_json_dumps(plain[0], ctx);
-    }
-
     let Some(data) = ctx.mctx.mods.get(real) else {
         // Parent package mid-init has no ModuleData yet.
         if is_strict_package_prefix(real, ctx.mctx.module) {
@@ -22179,33 +22203,6 @@ fn lower_module_call(
         format!("module '{real}' has no attribute '{method}'"),
         method_span,
     ))
-}
-
-fn lower_json_dumps(arg: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
-    let v = lower_expr(arg, ctx)?;
-    if !json_dumps_supported(v.ty) {
-        return Err(err(
-            format!(
-                "json.dumps() does not support type {} (supported: int, float, bool, str, \
-                 list/dict of those with str keys)",
-                v.ty
-            ),
-            arg.span,
-        ));
-    }
-    Ok(ir::Expr {
-        ty: ir::Ty::Str,
-        kind: ir::ExprKind::JsonDumps(Box::new(v)),
-    })
-}
-
-fn json_dumps_supported(ty: ir::Ty) -> bool {
-    match ty {
-        ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Str => true,
-        ir::Ty::List(e) => json_dumps_supported(*e),
-        ir::Ty::Dict { key, value } => *key == ir::Ty::Str && json_dumps_supported(*value),
-        _ => false,
-    }
 }
 
 /// Drop flow-sensitive refinements for cell-backed names that a nested call
@@ -22697,28 +22694,6 @@ fn lower_call(
         .or_else(|| ctx.mctx.imports.get(func))
         .cloned()
     {
-        if module == "json" && name == "dumps" {
-            if kwargs.is_some() {
-                return Err(err("json.dumps() does not take **kwargs", span));
-            }
-            if !keywords.is_empty() {
-                return Err(err(
-                    "json.dumps() does not take keyword arguments",
-                    keywords[0].name_span,
-                ));
-            }
-            let plain = require_plain_args(args, "json.dumps", span)?;
-            if plain.len() != 1 {
-                return Err(err(
-                    format!(
-                        "json.dumps() takes exactly one argument ({} given)",
-                        plain.len()
-                    ),
-                    span,
-                ));
-            }
-            return lower_json_dumps(plain[0], ctx);
-        }
         if let Some(data) = ctx.mctx.mods.get(&module) {
             let (om, on) = data
                 .reexports
@@ -22914,6 +22889,8 @@ fn lower_call(
                         args[0].span,
                     ));
                 }
+                // `Any` is sized when it holds a sized thing, which only the
+                // runtime tag can say — so the check moves there.
                 if !matches!(
                     arg.ty,
                     ir::Ty::Str
@@ -22921,9 +22898,10 @@ fn lower_call(
                         | ir::Ty::Tuple(_)
                         | ir::Ty::Dict { .. }
                         | ir::Ty::Set(_)
+                        | ir::Ty::Any
                 ) {
                     return Err(err(
-                        format!("object of type '{}' has no len()", arg.ty),
+                        format!("object of type '{}' has no len()", display_ty(arg.ty)),
                         args[0].span,
                     ));
                 }
@@ -23168,6 +23146,33 @@ fn parse_isinstance_type_arg(e: &ast::Expr) -> SResult<Vec<IsInstancePat>> {
                 out.extend(parse_isinstance_type_arg(it)?);
             }
             Ok(out)
+        }
+        // `isinstance(x, A or B)` is accepted by CPython and does not mean what
+        // it looks like: `or` yields its first truthy operand and a type object
+        // is always truthy, so `A or B` is just `A` and `B` is never tested.
+        // Name the trap rather than letting the general message send someone
+        // looking for a different mistake.
+        ast::ExprKind::Binary {
+            op: ast::BinOp::Or | ast::BinOp::And,
+            left,
+            right,
+        } => {
+            let spelled = |x: &ast::Expr| match &x.kind {
+                ast::ExprKind::Name(n) => n.clone(),
+                ast::ExprKind::NoneLit => "None".to_string(),
+                _ => "...".to_string(),
+            };
+            Err(err(
+                format!(
+                    "isinstance() second argument cannot use 'or'/'and': write a \
+                     tuple, isinstance(x, ({}, {})). CPython accepts this spelling \
+                     but it tests only the first type — 'A or B' evaluates to 'A', \
+                     because a type object is always truthy",
+                    spelled(left),
+                    spelled(right)
+                ),
+                e.span,
+            ))
         }
         // type(None) if written as a call — not supported; require None or name.
         _ => Err(err(
@@ -24436,6 +24441,8 @@ fn call_builtin_sort_key(
                 }
                 return Ok(call);
             }
+            // `Any` is sized when it holds a sized thing, which only the
+            // runtime tag can say — so the check moves there.
             if !matches!(
                 arg.ty,
                 ir::Ty::Str
@@ -24443,9 +24450,10 @@ fn call_builtin_sort_key(
                     | ir::Ty::Tuple(_)
                     | ir::Ty::Dict { .. }
                     | ir::Ty::Set(_)
+                    | ir::Ty::Any
             ) {
                 return Err(err(
-                    format!("object of type '{}' has no len()", arg.ty),
+                    format!("object of type '{}' has no len()", display_ty(arg.ty)),
                     span,
                 ));
             }
@@ -25723,6 +25731,8 @@ fn lower_enumerate_expr(
     let elem_ty = match seq.ty {
         ir::Ty::List(e) => *e,
         ir::Ty::Str => ir::Ty::Str,
+        // A dynamic value yields dynamic elements.
+        ir::Ty::Any => ir::Ty::Any,
         ir::Ty::Tuple(es) if !es.is_empty() && es.iter().all(|e| e == &es[0]) => es[0],
         ir::Ty::Tuple(_) => {
             return Err(err(
