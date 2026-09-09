@@ -271,19 +271,22 @@ fn a_tuple_subscript_on_a_list_is_a_type_error() {
 }
 
 #[test]
-fn matmul_operator_reports_its_own_limitation() {
-    // Previously "expected ')' after call arguments, found '@'".
+fn matmul_on_two_ints_names_both_operands() {
+    // `@` parses as an operator as of 0.135 and dispatches to `__matmul__`.
+    // No builtin type implements it, so on two ints there is no numeric path
+    // to fall back to -- and the message must say that rather than the old
+    // "PyRs has no array type", which stopped being the reason.
     rejected_with(
         "matmul",
         "a = 2\nb = 3\nprint(a @ b)\n",
-        "matrix multiplication operator",
+        "operator '@' is not supported between int and int",
     );
 }
 
 #[test]
-fn decorators_still_parse_after_the_matmul_diagnostic() {
-    // `@` at statement start must keep working; the new error is only for `@`
-    // in operator position.
+fn decorators_still_parse_alongside_the_matmul_operator() {
+    // `@` at statement start is a decorator; `@` in operator position is
+    // matrix multiplication. The parser must keep telling them apart.
     matches_python_at_all_opt_levels(
         "decorator",
         r#"

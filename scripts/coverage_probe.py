@@ -56,6 +56,10 @@ KNOWN_DIVERGENCES: dict[str, str] = {
     # does; a module-level def re-evaluates it. Also pinned as a `mismatch`
     # in compatibility/cases/mutable_defaults.py.
     "mutable default (module level)": "module-level defaults are not frozen",
+    # `print(obj)` calls __repr__, but printing a *container* of instances
+    # renders each element as `<Name object>`. The runtime formats container
+    # elements from a numeric type tag with no hook back into user code.
+    "container of instances repr": "containers do not call element __repr__",
 }
 
 
@@ -439,6 +443,26 @@ p(
 )
 p("class", "isinstance", "class A:\n    pass\nprint(isinstance(A(), A), isinstance(1, int))")
 p("class", "type(x)", "print(type(1).__name__)")
+p(
+    "class",
+    "reflected dunder",
+    "class V:\n    def __init__(self, x: float) -> None:\n        self.x: float = x\n"
+    "    def __rmul__(self, k: float) -> float:\n        return self.x * k\nprint(2.0 * V(3.0))",
+)
+p(
+    "class",
+    "in-place dunder",
+    "class A:\n    def __init__(self) -> None:\n        self.v: int = 0\n"
+    "    def __iadd__(self, o: int) -> 'A':\n        self.v += o\n        return self\n"
+    "a = A()\nb = a\na += 3\nprint(a.v, a is b)",
+)
+p(
+    "class",
+    "container of instances repr",
+    "class M:\n    def __init__(self, v: int) -> None:\n        self.v: int = v\n"
+    "    def __repr__(self) -> str:\n        return 'M(' + str(self.v) + ')'\n"
+    "print([M(1), M(2)])",
+)
 
 # ---------------------------------------------------------------- builtins
 
