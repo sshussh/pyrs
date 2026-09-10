@@ -16,7 +16,7 @@ pub mod strfast;
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 
-pub use emit::{emit_library_ir, emit_llvm_ir};
+pub use emit::{EmitOptions, emit_library_ir, emit_llvm_ir, emit_llvm_ir_opts};
 
 /// Source of the C runtime linked into every compiled program.
 pub const RUNTIME_C: &str = include_str!("../runtime/runtime.c");

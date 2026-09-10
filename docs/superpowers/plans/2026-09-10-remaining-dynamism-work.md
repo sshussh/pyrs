@@ -165,6 +165,8 @@ plus every error message above.
 
 ## 4. Item C — `pyrs profile`, profile-guided type feedback
 
+**Status: implemented in 0.147.0.**
+
 **Size: medium. Recommended next after A and B, ahead of D3/D4.**
 
 This is the highest-value remaining item and the plan under-ranked it. The

@@ -101,6 +101,7 @@ pyrs <command> [options]
 | command   | what it does |
 |-----------|--------------|
 | `compile` | compile a source file to a native executable |
+| `profile` | run an instrumented build that records type tags at polymorphic sites |
 | `build-extension` | build an experimental CPython numerical extension |
 | `run`     | compile to a temporary location and execute immediately |
 | `check`   | load and analyze native source without linking or execution |
@@ -119,9 +120,24 @@ $ pyrs compile -i prog.py -o prog [-O 2] [--emit-llvm]
 | `-o, --output` | output executable path | `a.out` |
 | `-O, --opt-level` | LLVM optimization level, 0–3 | `2` |
 | `--emit-llvm`  | also write the generated LLVM IR to `<output>.ll` | off |
+| `--profile FILE` | consume a type profile from `pyrs profile` | off |
 
 `--emit-llvm` is the window into the compiler: the `.ll` file is exactly
 what PyRs hands to LLVM, readable and diffable.
+
+A missing or stale `--profile` file is ignored with a warning. The flag
+does not change observable behaviour.
+
+### `pyrs profile`
+
+```console
+$ pyrs profile -i prog.py -o prog.prof
+$ pyrs compile --profile prog.prof -i prog.py -o prog
+```
+
+The instrumented binary records up to four type tags per polymorphic site
+and a hit count. The artifact is text, hashed by source, and pinned to the
+compiler version so a rebuild cannot silently trust the wrong types.
 
 ### `pyrs run`
 

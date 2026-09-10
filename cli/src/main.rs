@@ -18,6 +18,7 @@ mod hash;
 mod interpreter;
 mod manifest;
 mod modules;
+mod profile;
 mod testing;
 
 use diagnostics::{Failure, Format};
@@ -56,6 +57,7 @@ fn run(args: cli::Cli) -> Result<i32, String> {
             Ok(0)
         }
         cli::Command::Compile(cmd) => compile_command(cmd),
+        cli::Command::Profile(cmd) => profile_command(cmd),
         cli::Command::Run(cmd) => run_program(cmd),
         cli::Command::Check(cmd) => check_program(cmd),
         cli::Command::BuildExtension(cmd) => {
@@ -211,27 +213,35 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     let module = analyze(loaded).map_err(|f| f.render(format))?;
     let workdir = temp_workdir()?;
     let exe = workdir.join("program");
-    let result = compile_module(&module, &exe, opt_level, &target_cpu, false, !cmd.no_cache)
-        .and_then(|()| {
-            if let Some(key) = &key {
-                cache::program_store(key, &exe);
-                cache::maintain(fs::metadata(&exe).map(|m| m.len()).unwrap_or(0));
-            }
-            let mut process = process::Command::new(&exe);
-            process.args(&cmd.args);
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                process.arg0(&argv0);
-            }
-            #[cfg(not(unix))]
-            let _ = argv0;
-            // Keep the parent alive to clean up the native executable afterwards.
-            process
-                .status()
-                .map(exit_code)
-                .map_err(|e| format!("failed to run compiled program: {e}"))
-        });
+    let result = compile_module(
+        &module,
+        &exe,
+        opt_level,
+        &target_cpu,
+        false,
+        !cmd.no_cache,
+        &codegen::EmitOptions::default(),
+    )
+    .and_then(|()| {
+        if let Some(key) = &key {
+            cache::program_store(key, &exe);
+            cache::maintain(fs::metadata(&exe).map(|m| m.len()).unwrap_or(0));
+        }
+        let mut process = process::Command::new(&exe);
+        process.args(&cmd.args);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            process.arg0(&argv0);
+        }
+        #[cfg(not(unix))]
+        let _ = argv0;
+        // Keep the parent alive to clean up the native executable afterwards.
+        process
+            .status()
+            .map(exit_code)
+            .map_err(|e| format!("failed to run compiled program: {e}"))
+    });
     drop(workdir);
     result
 }
@@ -311,6 +321,7 @@ fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
         cmd.emit_llvm,
         !cmd.no_cache,
         cmd.message_format,
+        cmd.profile.as_deref(),
     )?;
     // On stderr, so stdout stays clean for anything reading a build's
     // output -- and because the compatibility harness classifies a build by
@@ -327,6 +338,100 @@ fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
         );
     }
     Ok(0)
+}
+
+fn compiler_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// A missing, unreadable, or stale profile is ignored: never a wrong compile.
+fn load_profile(path: Option<&Path>, sources: &[(String, String)]) -> Option<profile::Profile> {
+    let path = path?;
+    if !path.exists() {
+        eprintln!(
+            "warning: type profile {} is missing; compiling without it",
+            path.display()
+        );
+        return None;
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "warning: type profile {} could not be read ({e}); compiling without it",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match profile::parse(&text) {
+        Ok(p) => {
+            let source = profile::source_hash(sources);
+            if profile::matches(&p, compiler_version(), &source) {
+                Some(p)
+            } else {
+                eprintln!(
+                    "warning: type profile {} is stale; compiling without it",
+                    path.display()
+                );
+                None
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: type profile {} is unreadable ({e}); compiling without it",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn profile_command(mut cmd: cli::ProfileCommand) -> Result<i32, String> {
+    let input = cmd.input.take().or_else(|| {
+        if !cmd.args.is_empty() {
+            Some(PathBuf::from(cmd.args.remove(0)))
+        } else {
+            None
+        }
+    });
+    let input =
+        input.ok_or_else(|| "no input: pass -i, or `pyrs profile <script.py>`".to_string())?;
+    let output = cmd
+        .output
+        .clone()
+        .unwrap_or_else(|| input.with_extension("prof"));
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let format = cmd.message_format;
+    let loaded = modules::load_program(&input).map_err(|e| fail(e, format))?;
+    let sources = program_sources(&loaded);
+    let module = analyze(loaded).map_err(|f| f.render(format))?;
+    let opt_level = cmd.opt_level.unwrap_or(2);
+    let target_cpu = resolve_target_cpu(cmd.target_cpu.as_deref(), None, Purpose::ThisMachine);
+    let emit = codegen::EmitOptions {
+        instrument_profile: true,
+        profile_compiler: compiler_version().to_string(),
+        profile_source: profile::source_hash(&sources),
+    };
+    let workdir = temp_workdir()?;
+    let exe = workdir.join("program");
+    compile_module(&module, &exe, opt_level, &target_cpu, false, false, &emit)?;
+    let status = process::Command::new(&exe)
+        .env("PYRS_PROFILE_OUT", &output)
+        .args(&cmd.args)
+        .status()
+        .map_err(|e| format!("failed to run profiled program: {e}"))?;
+    if !output.exists() {
+        return Err(format!("profile was not written to {}", output.display()));
+    }
+    eprintln!("  Wrote {}", output.display());
+    Ok(exit_code(status))
 }
 
 /// Whether a build did any work, which is the difference between 9 ms and
@@ -357,6 +462,7 @@ fn compile(
     emit_llvm: bool,
     use_cache: bool,
     format: Format,
+    consume_profile: Option<&Path>,
 ) -> Result<Built, String> {
     let loaded = match &import_root {
         Some(root) => modules::load_program_in_project(input, root),
@@ -383,8 +489,18 @@ fn compile(
             .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
         return Ok(Built::FromCache);
     }
+    let sources = program_sources(&loaded);
     let module = analyze(loaded).map_err(|f| f.render(format))?;
-    compile_module(&module, output, opt_level, target_cpu, emit_llvm, use_cache)?;
+    let _ = load_profile(consume_profile, &sources);
+    compile_module(
+        &module,
+        output,
+        opt_level,
+        target_cpu,
+        emit_llvm,
+        use_cache,
+        &codegen::EmitOptions::default(),
+    )?;
     if let Some(key) = &key {
         cache::program_store(key, output);
         cache::maintain(fs::metadata(output).map(|m| m.len()).unwrap_or(0));
@@ -455,8 +571,9 @@ fn compile_module(
     target_cpu: &str,
     emit_llvm: bool,
     use_cache: bool,
+    emit: &codegen::EmitOptions,
 ) -> Result<(), String> {
-    let llvm_ir = codegen::emit_llvm_ir(module);
+    let llvm_ir = codegen::emit_llvm_ir_opts(module, emit);
 
     if emit_llvm {
         let ll_path = output.with_extension("ll");
@@ -818,7 +935,15 @@ fn run_tests(cmd: cli::TestCommand) -> Result<i32, String> {
         .unwrap_or(2);
     let target_cpu =
         resolve_target_cpu(cmd.target_cpu.as_deref(), m.as_ref(), Purpose::ThisMachine);
-    compile_module(&ir, &exe, opt_level, &target_cpu, false, !cmd.no_cache)?;
+    compile_module(
+        &ir,
+        &exe,
+        opt_level,
+        &target_cpu,
+        false,
+        !cmd.no_cache,
+        &codegen::EmitOptions::default(),
+    )?;
 
     println!("running {total} test{}", if total == 1 { "" } else { "s" });
     let status = process::Command::new(&exe)

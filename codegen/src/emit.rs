@@ -29,7 +29,27 @@ use ir::{
 };
 
 pub fn emit_llvm_ir(module: &Module) -> String {
-    let mut e = Emitter::default();
+    emit_llvm_ir_opts(module, &EmitOptions::default())
+}
+
+/// Extra knobs for a compile. The default is today's uninstrumented emit.
+#[derive(Default, Clone)]
+pub struct EmitOptions {
+    /// Insert `pyrs_profile_hit` at each dynamic operator/method site.
+    pub instrument_profile: bool,
+    /// Compiler version baked into an instrumented binary's profile header.
+    pub profile_compiler: String,
+    /// Source digest baked into an instrumented binary's profile header.
+    pub profile_source: String,
+}
+
+pub fn emit_llvm_ir_opts(module: &Module, opts: &EmitOptions) -> String {
+    let mut e = Emitter {
+        instrument_profile: opts.instrument_profile,
+        profile_compiler: opts.profile_compiler.clone(),
+        profile_source: opts.profile_source.clone(),
+        ..Default::default()
+    };
     e.emit_module(module, true);
     e.finish()
 }
@@ -319,6 +339,11 @@ struct Emitter {
     /// `PYRS_INLINE_INT=0` reverts every site to a plain runtime call, which
     /// is what makes the inline-vs-runtime differential test possible.
     inline_int: bool,
+    /// Record operand tags at dynamic sites for `pyrs profile`.
+    instrument_profile: bool,
+    profile_compiler: String,
+    profile_source: String,
+    profile_site: i32,
 }
 
 impl Default for Emitter {
@@ -353,6 +378,10 @@ impl Default for Emitter {
             int_helpers: std::collections::BTreeSet::new(),
             str_helpers: std::collections::BTreeSet::new(),
             inline_int: std::env::var("PYRS_INLINE_INT").as_deref() != Ok("0"),
+            instrument_profile: false,
+            profile_compiler: String::new(),
+            profile_source: String::new(),
+            profile_site: 0,
         }
     }
 }
@@ -1015,6 +1044,8 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_dyn_method(i32, i64, ptr, i32, ptr, ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_dyn_contains(i32, i64, i32, i64)\n");
         out.push_str("declare i64 @pyrs_dyn_sorted(i32, i64, i32, ptr)\n");
+        out.push_str("declare void @pyrs_profile_init(ptr, ptr)\n");
+        out.push_str("declare void @pyrs_profile_hit(i32, i32)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
@@ -1495,10 +1526,30 @@ impl Emitter {
                 ));
             }
         }
+        let mut profile_setup = String::new();
+        if self.instrument_profile {
+            let (c_esc, c_len) = escape_bytes(&self.profile_compiler);
+            let (s_esc, s_len) = escape_bytes(&self.profile_source);
+            self.global_defs.push_str(&format!(
+                "@.pyrs.prof.compiler = private unnamed_addr constant [{c_len} x i8] \
+                 c\"{c_esc}\", align 1\n"
+            ));
+            self.global_defs.push_str(&format!(
+                "@.pyrs.prof.source = private unnamed_addr constant [{s_len} x i8] \
+                 c\"{s_esc}\", align 1\n"
+            ));
+            profile_setup = format!(
+                "call void @pyrs_profile_init(ptr getelementptr inbounds \
+                 ([{c_len} x i8], ptr @.pyrs.prof.compiler, i32 0, i32 0), \
+                 ptr getelementptr inbounds ([{s_len} x i8], ptr @.pyrs.prof.source, \
+                 i32 0, i32 0))\n  "
+            );
+        }
         self.funcs.push_str(&format!(
             "define i32 @main(i32 %argc, ptr %argv) {{\nentry:\n  \
              %gc.stack.anchor = alloca i8, align 16\n\
              call void @pyrs_gc_init(ptr %gc.stack.anchor)\n\
+             {profile_setup}\
              {root_setup}  \
              call void @pyrs_set_args(i32 %argc, ptr %argv)\n\
              {class_setup}  \
@@ -2419,6 +2470,15 @@ impl Emitter {
     /// does not grow the frame.
     fn dyn_tag_slot(&mut self) -> String {
         "%.dyn.tag".to_string()
+    }
+
+    fn profile_hit(&mut self, tag: &str) {
+        if !self.instrument_profile {
+            return;
+        }
+        let id = self.profile_site;
+        self.profile_site += 1;
+        self.line(format!("call void @pyrs_profile_hit(i32 {id}, i32 {tag})"));
     }
 
     /// Assemble a dynamic value from a print tag and a payload word.
@@ -4148,8 +4208,10 @@ impl Emitter {
             ExprKind::DynBinop { left, right, op } => {
                 let l = self.emit_expr(left);
                 let (lt, lp) = self.emit_any_unpack(&l);
+                self.profile_hit(&lt);
                 let r = self.emit_expr(right);
                 let (rt, rp) = self.emit_any_unpack(&r);
+                self.profile_hit(&rt);
                 let slot = self.dyn_tag_slot();
                 let pay = self.tmp();
                 self.line(format!(
@@ -4164,8 +4226,10 @@ impl Emitter {
             ExprKind::DynCompare { left, right, op } => {
                 let l = self.emit_expr(left);
                 let (lt, lp) = self.emit_any_unpack(&l);
+                self.profile_hit(&lt);
                 let r = self.emit_expr(right);
                 let (rt, rp) = self.emit_any_unpack(&r);
+                self.profile_hit(&rt);
                 let c = self.tmp();
                 self.line(format!(
                     "{c} = call i32 @pyrs_dyn_compare(i32 {lt}, i64 {lp}, i32 {rt}, \
@@ -4186,6 +4250,7 @@ impl Emitter {
             } => {
                 let r = self.emit_expr(receiver);
                 let (rt, rp) = self.emit_any_unpack(&r);
+                self.profile_hit(&rt);
                 let n = args.len();
                 let (tags_ptr, pays_ptr) = if n == 0 {
                     ("null".to_string(), "null".to_string())
@@ -4228,8 +4293,10 @@ impl Emitter {
             } => {
                 let e = self.emit_expr(elem);
                 let (et, ep) = self.emit_any_unpack(&e);
+                self.profile_hit(&et);
                 let c = self.emit_expr(container);
                 let (ct, cp) = self.emit_any_unpack(&c);
+                self.profile_hit(&ct);
                 let r = self.tmp();
                 self.line(format!(
                     "{r} = call i32 @pyrs_dyn_contains(i32 {et}, i64 {ep}, i32 {ct}, i64 {cp})"
@@ -4242,6 +4309,7 @@ impl Emitter {
             ExprKind::DynUnary { value, op } => {
                 let v = self.emit_expr(value);
                 let (vt, vp) = self.emit_any_unpack(&v);
+                self.profile_hit(&vt);
                 let slot = self.dyn_tag_slot();
                 let pay = self.tmp();
                 self.line(format!(
@@ -4256,6 +4324,7 @@ impl Emitter {
             ExprKind::DynSorted { value, reverse } => {
                 let v = self.emit_expr(value);
                 let (vt, vp) = self.emit_any_unpack(&v);
+                self.profile_hit(&vt);
                 let rev = self.emit_expr(reverse);
                 let rev_i32 = self.tmp();
                 self.line(format!("{rev_i32} = zext i1 {rev} to i32"));

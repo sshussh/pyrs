@@ -9367,6 +9367,87 @@ long long pyrs_any_dict_get_any(long long v, long long key) {
     return any_from_slot(slot, vtag);
 }
 
+/* ---- type-profile collection (pyrs profile) ----
+ *
+ * Hits are recorded per polymorphic site, up to four tags. The dump is a
+ * text artifact consumed by `pyrs compile --profile`; a missing env path
+ * means this binary was not launched by `pyrs profile` and is silent. */
+
+#define PYRS_PROFILE_MAX_SITES 4096
+#define PYRS_PROFILE_TOP 4
+
+typedef struct {
+    int tags[PYRS_PROFILE_TOP];
+    unsigned long long counts[PYRS_PROFILE_TOP];
+    int n;
+} PyrsProfileSite;
+
+static PyrsProfileSite g_profile_sites[PYRS_PROFILE_MAX_SITES];
+static const char *g_profile_compiler = "";
+static const char *g_profile_source = "";
+static int g_profile_inited;
+
+static void pyrs_profile_flush(void) {
+    const char *path = getenv("PYRS_PROFILE_OUT");
+    if (path == NULL || path[0] == 0) {
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+        return;
+    }
+    fprintf(f, "pyrs-profile 1\n");
+    fprintf(f, "compiler %s\n", g_profile_compiler);
+    fprintf(f, "source %s\n", g_profile_source);
+    for (int i = 0; i < PYRS_PROFILE_MAX_SITES; i++) {
+        PyrsProfileSite *s = &g_profile_sites[i];
+        if (s->n == 0) {
+            continue;
+        }
+        fprintf(f, "site %d\n", i);
+        for (int k = 0; k < s->n; k++) {
+            fprintf(f, "  %d %llu\n", s->tags[k], s->counts[k]);
+        }
+    }
+    fclose(f);
+}
+
+void pyrs_profile_init(const char *compiler, const char *source) {
+    g_profile_compiler = compiler ? compiler : "";
+    g_profile_source = source ? source : "";
+    if (!g_profile_inited) {
+        g_profile_inited = 1;
+        atexit(pyrs_profile_flush);
+    }
+}
+
+void pyrs_profile_hit(int site, int tag) {
+    if (site < 0 || site >= PYRS_PROFILE_MAX_SITES) {
+        return;
+    }
+    PyrsProfileSite *s = &g_profile_sites[site];
+    for (int i = 0; i < s->n; i++) {
+        if (s->tags[i] == tag) {
+            s->counts[i]++;
+            return;
+        }
+    }
+    if (s->n < PYRS_PROFILE_TOP) {
+        s->tags[s->n] = tag;
+        s->counts[s->n] = 1;
+        s->n++;
+        return;
+    }
+    int lo = 0;
+    for (int i = 1; i < PYRS_PROFILE_TOP; i++) {
+        if (s->counts[i] < s->counts[lo]) {
+            lo = i;
+        }
+    }
+    s->tags[lo] = tag;
+    s->counts[lo] = 1;
+}
+
 /* ---- cells (nonlocal / mutable free vars) ---- */
 typedef struct {
     long long slot;

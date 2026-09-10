@@ -1,3 +1,15 @@
+## 0.147.0 — `pyrs profile`
+
+An instrumented build records, at each polymorphic site, up to four concrete
+type tags and a hit count. The output is a text artifact: compiler version
+and a source digest in the header, so a stale file is ignored rather than
+trusted.
+
+`pyrs compile --profile <file>` consumes it. A missing, unreadable, or
+version-mismatched profile warns and degrades to today's emit — never to a
+wrong one. `--profile` does not change observable behaviour; it is the input
+to guarded specialization.
+
 ## 0.146.0 — `str % args` on a dynamic value
 
 `"x=%d" % 5` on an `object` raised `NotImplementedError` naming the gap.

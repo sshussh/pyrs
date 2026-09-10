@@ -145,6 +145,9 @@ pub enum Command {
     #[command(alias = "build")]
     Compile(CompileCommand),
 
+    /// Run an instrumented build that records type tags at polymorphic sites
+    Profile(ProfileCommand),
+
     /// Compile the input file and run it immediately
     Run(RunCommand),
 
@@ -373,9 +376,40 @@ pub struct CompileCommand {
     #[arg(short, long)]
     pub quiet: bool,
 
+    /// Type profile from `pyrs profile`; ignored if missing or stale
+    #[arg(long, value_name = "FILE")]
+    pub profile: Option<path::PathBuf>,
+
     /// How to print diagnostics
     #[arg(long, value_name = "FORMAT", default_value = "human")]
     pub message_format: crate::diagnostics::Format,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileCommand {
+    /// Input file path
+    #[arg(short, long)]
+    pub input: Option<path::PathBuf>,
+
+    /// Where to write the profile (default: <script>.prof)
+    #[arg(short, long)]
+    pub output: Option<path::PathBuf>,
+
+    /// Optimization level (0-3); defaults to 2
+    #[arg(short = 'O', long = "opt-level", value_parser = clap::value_parser!(u8).range(0..=3))]
+    pub opt_level: Option<u8>,
+
+    /// Target CPU: "generic", "native", or a model name
+    #[arg(long, value_name = "CPU")]
+    pub target_cpu: Option<String>,
+
+    /// How to print diagnostics
+    #[arg(long, value_name = "FORMAT", default_value = "human")]
+    pub message_format: crate::diagnostics::Format,
+
+    /// Script and arguments when not passed as -i
+    #[arg(trailing_var_arg = true)]
+    pub args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
