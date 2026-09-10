@@ -1587,6 +1587,7 @@ impl Parser {
             star = true;
         } else {
             star = false;
+            let paren = self.eat(&Token::LParen);
             loop {
                 let (name, name_span) = self.expect_ident("in the import list")?;
                 let alias = if self.eat(&Token::As) {
@@ -1598,6 +1599,13 @@ impl Parser {
                 if !self.eat(&Token::Comma) {
                     break;
                 }
+                // allow trailing comma
+                if paren && self.peek() == &Token::RParen {
+                    break;
+                }
+            }
+            if paren {
+                self.expect(Token::RParen, "to close the import list")?;
             }
         }
         let end = self.peek_span();
@@ -4837,6 +4845,82 @@ class P:
         let e = parse_err("from m import * as all\n");
         assert!(
             e.message.contains("as") && e.message.contains("*"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn parses_multi_name_from_import() {
+        // `parses_multi_name_import` covers `import a, b` -- a different
+        // function. Nothing covered this loop until a paren list broke it.
+        let m = parse_ok("from pkg import a, b as c\n");
+        let StmtKind::FromImport {
+            module,
+            names,
+            star,
+            ..
+        } = &m.body[0].kind
+        else {
+            panic!("expected from-import");
+        };
+        assert_eq!(module, "pkg");
+        assert!(!*star);
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].0, "a");
+        assert!(names[0].1.is_none());
+        assert_eq!(names[1].0, "b");
+        assert_eq!(names[1].1.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn parses_parenthesized_from_import() {
+        let m = parse_ok(concat!(
+            "from pkg import (a)\n",
+            "from pkg import (a, b)\n",
+            "from pkg import (a as x, b,)\n",
+            "from pkg import (\n    a,\n    b as y,\n)\n",
+        ));
+
+        fn names(m: &Module, i: usize) -> Vec<(&str, Option<&str>)> {
+            let StmtKind::FromImport { names, .. } = &m.body[i].kind else {
+                panic!("expected a from-import at body[{i}]");
+            };
+            names
+                .iter()
+                .map(|(n, a, _)| (n.as_str(), a.as_deref()))
+                .collect()
+        }
+
+        assert_eq!(names(&m, 0), vec![("a", None)]);
+        assert_eq!(names(&m, 1), vec![("a", None), ("b", None)]);
+        assert_eq!(names(&m, 2), vec![("a", Some("x")), ("b", None)]);
+        assert_eq!(names(&m, 3), vec![("a", None), ("b", Some("y"))]);
+    }
+
+    #[test]
+    fn an_empty_parenthesized_import_list_is_rejected() {
+        let e = parse_err("from pkg import ()\n");
+        assert!(e.message.contains("import list"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_star_inside_a_parenthesized_import_list_is_rejected() {
+        let e = parse_err("from pkg import (*)\n");
+        assert!(e.message.contains("import list"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_trailing_comma_in_an_import_list_needs_parentheses() {
+        let e = parse_err("from pkg import a,\n");
+        assert!(e.message.contains("import list"), "{}", e.message);
+    }
+
+    #[test]
+    fn an_unclosed_import_list_is_rejected() {
+        let e = parse_err("from pkg import (a\nx = 1\n");
+        assert!(
+            e.message.contains(')') && e.message.contains("import list"),
             "{}",
             e.message
         );
