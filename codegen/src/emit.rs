@@ -20,12 +20,12 @@
 //! All user symbols are prefixed `pyrs_` so they can never collide with
 //! libc symbols (a user function named `printf` is fine).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 
 use ir::{
-    BinOp, ClassInfo, Expr, ExprKind, FileFn, Function, MathOp, Module, SetUpdateOp, Stmt, StrFn,
-    Ty, UnOp,
+    BinOp, ClassInfo, DynBinOp, DynCmpOp, DynUnOp, Expr, ExprKind, FileFn, Function, MathOp,
+    Module, SetUpdateOp, Stmt, StrFn, Ty, UnOp,
 };
 
 pub fn emit_llvm_ir(module: &Module) -> String {
@@ -41,6 +41,8 @@ pub struct EmitOptions {
     pub profile_compiler: String,
     /// Source digest baked into an instrumented binary's profile header.
     pub profile_source: String,
+    /// Monomorphic sites from `pyrs compile --profile`. Empty means kernel.
+    pub profile_sites: BTreeMap<i32, Vec<(i32, u64)>>,
 }
 
 pub fn emit_llvm_ir_opts(module: &Module, opts: &EmitOptions) -> String {
@@ -48,6 +50,7 @@ pub fn emit_llvm_ir_opts(module: &Module, opts: &EmitOptions) -> String {
         instrument_profile: opts.instrument_profile,
         profile_compiler: opts.profile_compiler.clone(),
         profile_source: opts.profile_source.clone(),
+        profile_sites: opts.profile_sites.clone(),
         ..Default::default()
     };
     e.emit_module(module, true);
@@ -344,6 +347,7 @@ struct Emitter {
     profile_compiler: String,
     profile_source: String,
     profile_site: i32,
+    profile_sites: BTreeMap<i32, Vec<(i32, u64)>>,
 }
 
 impl Default for Emitter {
@@ -382,6 +386,7 @@ impl Default for Emitter {
             profile_compiler: String::new(),
             profile_source: String::new(),
             profile_site: 0,
+            profile_sites: BTreeMap::new(),
         }
     }
 }
@@ -2472,13 +2477,270 @@ impl Emitter {
         "%.dyn.tag".to_string()
     }
 
-    fn profile_hit(&mut self, tag: &str) {
-        if !self.instrument_profile {
-            return;
-        }
+    fn profile_hit(&mut self, tag: &str) -> Option<i32> {
         let id = self.profile_site;
         self.profile_site += 1;
-        self.line(format!("call void @pyrs_profile_hit(i32 {id}, i32 {tag})"));
+        if self.instrument_profile {
+            self.line(format!("call void @pyrs_profile_hit(i32 {id}, i32 {tag})"));
+        }
+        let hits = self.profile_sites.get(&id)?;
+        (hits.len() == 1).then_some(hits[0].0)
+    }
+
+    fn emit_int_arith(&mut self, name: &'static str, l: &str, r: &str) -> String {
+        let t = self.tmp();
+        match self.int_fast(name) {
+            Some(sym) => self.line(format!("{t} = call i64 {sym}(i64 {l}, i64 {r})")),
+            None => self.line(format!("{t} = call i64 @pyrs_int_{name}(i64 {l}, i64 {r})")),
+        }
+        t
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_dyn_binop(
+        &mut self,
+        op: DynBinOp,
+        lt: &str,
+        lp: &str,
+        rt: &str,
+        rp: &str,
+        lexp: Option<i32>,
+        rexp: Option<i32>,
+    ) -> String {
+        let slot = self.dyn_tag_slot();
+        let int_name = match op {
+            DynBinOp::Add => Some("add"),
+            DynBinOp::Sub => Some("sub"),
+            DynBinOp::Mul => Some("mul"),
+            DynBinOp::FloorDiv => Some("floordiv"),
+            DynBinOp::Mod => Some("mod"),
+            _ => None,
+        };
+        let float_instr = match op {
+            DynBinOp::Add => Some("fadd"),
+            DynBinOp::Sub => Some("fsub"),
+            DynBinOp::Mul => Some("fmul"),
+            DynBinOp::Div => Some("fdiv"),
+            _ => None,
+        };
+        if lexp == Some(0)
+            && rexp == Some(0)
+            && let Some(name) = int_name
+        {
+            let (fast_l, slow_l, join_l) = self.branch_if_tags(lt, 0, rt, 0);
+            self.start_block(&fast_l);
+            let fr = self.emit_int_arith(name, lp, rp);
+            self.line(format!("store i32 0, ptr {slot}"));
+            self.line(format!("br label %{join_l}"));
+            self.start_block(&slow_l);
+            let sr = self.tmp();
+            self.line(format!(
+                "{sr} = call i64 @pyrs_dyn_binop(i32 {lt}, i64 {lp}, i32 {rt}, \
+                 i64 {rp}, i32 {}, ptr {slot})",
+                op as i32
+            ));
+            self.line(format!("br label %{join_l}"));
+            self.start_block(&join_l);
+            let pay = self.tmp();
+            self.line(format!(
+                "{pay} = phi i64 [ {fr}, %{fast_l} ], [ {sr}, %{slow_l} ]"
+            ));
+            let tag = self.tmp();
+            self.line(format!("{tag} = load i32, ptr {slot}"));
+            return self.build_any(&tag, &pay);
+        }
+        if lexp == Some(1)
+            && rexp == Some(1)
+            && let Some(instr) = float_instr
+        {
+            let (fast_l, slow_l, join_l) = self.branch_if_tags(lt, 1, rt, 1);
+            self.start_block(&fast_l);
+            let ld = self.tmp();
+            let rd = self.tmp();
+            self.line(format!("{ld} = bitcast i64 {lp} to double"));
+            self.line(format!("{rd} = bitcast i64 {rp} to double"));
+            let fv = self.tmp();
+            self.line(format!("{fv} = {instr} double {ld}, {rd}"));
+            let fr = self.tmp();
+            self.line(format!("{fr} = bitcast double {fv} to i64"));
+            self.line(format!("store i32 1, ptr {slot}"));
+            self.line(format!("br label %{join_l}"));
+            self.start_block(&slow_l);
+            let sr = self.tmp();
+            self.line(format!(
+                "{sr} = call i64 @pyrs_dyn_binop(i32 {lt}, i64 {lp}, i32 {rt}, \
+                 i64 {rp}, i32 {}, ptr {slot})",
+                op as i32
+            ));
+            self.line(format!("br label %{join_l}"));
+            self.start_block(&join_l);
+            let pay = self.tmp();
+            self.line(format!(
+                "{pay} = phi i64 [ {fr}, %{fast_l} ], [ {sr}, %{slow_l} ]"
+            ));
+            let tag = self.tmp();
+            self.line(format!("{tag} = load i32, ptr {slot}"));
+            return self.build_any(&tag, &pay);
+        }
+        let pay = self.tmp();
+        self.line(format!(
+            "{pay} = call i64 @pyrs_dyn_binop(i32 {lt}, i64 {lp}, i32 {rt}, \
+             i64 {rp}, i32 {}, ptr {slot})",
+            op as i32
+        ));
+        let tag = self.tmp();
+        self.line(format!("{tag} = load i32, ptr {slot}"));
+        self.build_any(&tag, &pay)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_dyn_compare(
+        &mut self,
+        op: DynCmpOp,
+        lt: &str,
+        lp: &str,
+        rt: &str,
+        rp: &str,
+        lexp: Option<i32>,
+        rexp: Option<i32>,
+    ) -> String {
+        let name = match op {
+            DynCmpOp::Lt => "lt",
+            DynCmpOp::Le => "le",
+            DynCmpOp::Gt => "gt",
+            DynCmpOp::Ge => "ge",
+            DynCmpOp::Eq => "eq",
+            DynCmpOp::Ne => "ne",
+        };
+        if lexp == Some(0) && rexp == Some(0) {
+            let (fast_l, slow_l, join_l) = self.branch_if_tags(lt, 0, rt, 0);
+            self.start_block(&fast_l);
+            let fr = self.tmp();
+            match self.int_fast(name) {
+                Some(sym) => self.line(format!("{fr} = call i1 {sym}(i64 {lp}, i64 {rp})")),
+                None => {
+                    let c = self.tmp();
+                    self.line(format!("{c} = call i32 @pyrs_int_cmp(i64 {lp}, i64 {rp})"));
+                    let pred = match op {
+                        DynCmpOp::Lt => "slt",
+                        DynCmpOp::Le => "sle",
+                        DynCmpOp::Gt => "sgt",
+                        DynCmpOp::Ge => "sge",
+                        DynCmpOp::Eq => "eq",
+                        DynCmpOp::Ne => "ne",
+                    };
+                    self.line(format!("{fr} = icmp {pred} i32 {c}, 0"));
+                }
+            }
+            self.line(format!("br label %{join_l}"));
+            self.start_block(&slow_l);
+            let sc = self.tmp();
+            self.line(format!(
+                "{sc} = call i32 @pyrs_dyn_compare(i32 {lt}, i64 {lp}, i32 {rt}, \
+                 i64 {rp}, i32 {})",
+                op as i32
+            ));
+            let sr = self.tmp();
+            self.line(format!("{sr} = icmp ne i32 {sc}, 0"));
+            self.line(format!("br label %{join_l}"));
+            self.start_block(&join_l);
+            let t = self.tmp();
+            self.line(format!(
+                "{t} = phi i1 [ {fr}, %{fast_l} ], [ {sr}, %{slow_l} ]"
+            ));
+            return t;
+        }
+        let c = self.tmp();
+        self.line(format!(
+            "{c} = call i32 @pyrs_dyn_compare(i32 {lt}, i64 {lp}, i32 {rt}, \
+             i64 {rp}, i32 {})",
+            op as i32
+        ));
+        let t = self.tmp();
+        self.line(format!("{t} = icmp ne i32 {c}, 0"));
+        t
+    }
+
+    fn emit_dyn_unary(&mut self, op: DynUnOp, vt: &str, vp: &str, vexp: Option<i32>) -> String {
+        let slot = self.dyn_tag_slot();
+        if vexp == Some(0) {
+            let (fast_l, slow_l, join_l) = self.branch_if_tag(vt, 0);
+            self.start_block(&fast_l);
+            let fr = match op {
+                DynUnOp::Pos => vp.to_string(),
+                DynUnOp::Neg => self.emit_int_arith_unary("neg", vp),
+                DynUnOp::Invert => self.emit_int_arith_unary("invert", vp),
+                DynUnOp::Abs => {
+                    let t = self.tmp();
+                    self.line(format!("{t} = call i64 @pyrs_int_abs(i64 {vp})"));
+                    t
+                }
+            };
+            self.line(format!("store i32 0, ptr {slot}"));
+            self.line(format!("br label %{join_l}"));
+            self.start_block(&slow_l);
+            let sr = self.tmp();
+            self.line(format!(
+                "{sr} = call i64 @pyrs_dyn_unary(i32 {vt}, i64 {vp}, i32 {}, ptr {slot})",
+                op as i32
+            ));
+            self.line(format!("br label %{join_l}"));
+            self.start_block(&join_l);
+            let pay = self.tmp();
+            self.line(format!(
+                "{pay} = phi i64 [ {fr}, %{fast_l} ], [ {sr}, %{slow_l} ]"
+            ));
+            let tag = self.tmp();
+            self.line(format!("{tag} = load i32, ptr {slot}"));
+            return self.build_any(&tag, &pay);
+        }
+        let pay = self.tmp();
+        self.line(format!(
+            "{pay} = call i64 @pyrs_dyn_unary(i32 {vt}, i64 {vp}, i32 {}, ptr {slot})",
+            op as i32
+        ));
+        let tag = self.tmp();
+        self.line(format!("{tag} = load i32, ptr {slot}"));
+        self.build_any(&tag, &pay)
+    }
+
+    fn emit_int_arith_unary(&mut self, name: &'static str, v: &str) -> String {
+        let t = self.tmp();
+        match self.int_fast(name) {
+            Some(sym) => self.line(format!("{t} = call i64 {sym}(i64 {v})")),
+            None => self.line(format!("{t} = call i64 @pyrs_int_{name}(i64 {v})")),
+        }
+        t
+    }
+
+    fn branch_if_tags(
+        &mut self,
+        lt: &str,
+        lexp: i32,
+        rt: &str,
+        rexp: i32,
+    ) -> (String, String, String) {
+        let fast_l = self.fresh_block("dyn.fast");
+        let slow_l = self.fresh_block("dyn.slow");
+        let join_l = self.fresh_block("dyn.join");
+        let ol = self.tmp();
+        let oright = self.tmp();
+        let both = self.tmp();
+        self.line(format!("{ol} = icmp eq i32 {lt}, {lexp}"));
+        self.line(format!("{oright} = icmp eq i32 {rt}, {rexp}"));
+        self.line(format!("{both} = and i1 {ol}, {oright}"));
+        self.line(format!("br i1 {both}, label %{fast_l}, label %{slow_l}"));
+        (fast_l, slow_l, join_l)
+    }
+
+    fn branch_if_tag(&mut self, tag: &str, expected: i32) -> (String, String, String) {
+        let fast_l = self.fresh_block("dyn.fast");
+        let slow_l = self.fresh_block("dyn.slow");
+        let join_l = self.fresh_block("dyn.join");
+        let ok = self.tmp();
+        self.line(format!("{ok} = icmp eq i32 {tag}, {expected}"));
+        self.line(format!("br i1 {ok}, label %{fast_l}, label %{slow_l}"));
+        (fast_l, slow_l, join_l)
     }
 
     /// Assemble a dynamic value from a print tag and a payload word.
@@ -4208,37 +4470,20 @@ impl Emitter {
             ExprKind::DynBinop { left, right, op } => {
                 let l = self.emit_expr(left);
                 let (lt, lp) = self.emit_any_unpack(&l);
-                self.profile_hit(&lt);
+                let lexp = self.profile_hit(&lt);
                 let r = self.emit_expr(right);
                 let (rt, rp) = self.emit_any_unpack(&r);
-                self.profile_hit(&rt);
-                let slot = self.dyn_tag_slot();
-                let pay = self.tmp();
-                self.line(format!(
-                    "{pay} = call i64 @pyrs_dyn_binop(i32 {lt}, i64 {lp}, i32 {rt}, \
-                     i64 {rp}, i32 {}, ptr {slot})",
-                    *op as i32
-                ));
-                let tag = self.tmp();
-                self.line(format!("{tag} = load i32, ptr {slot}"));
-                self.build_any(&tag, &pay)
+                let rexp = self.profile_hit(&rt);
+                self.emit_dyn_binop(*op, &lt, &lp, &rt, &rp, lexp, rexp)
             }
             ExprKind::DynCompare { left, right, op } => {
                 let l = self.emit_expr(left);
                 let (lt, lp) = self.emit_any_unpack(&l);
-                self.profile_hit(&lt);
+                let lexp = self.profile_hit(&lt);
                 let r = self.emit_expr(right);
                 let (rt, rp) = self.emit_any_unpack(&r);
-                self.profile_hit(&rt);
-                let c = self.tmp();
-                self.line(format!(
-                    "{c} = call i32 @pyrs_dyn_compare(i32 {lt}, i64 {lp}, i32 {rt}, \
-                     i64 {rp}, i32 {})",
-                    *op as i32
-                ));
-                let t = self.tmp();
-                self.line(format!("{t} = icmp ne i32 {c}, 0"));
-                t
+                let rexp = self.profile_hit(&rt);
+                self.emit_dyn_compare(*op, &lt, &lp, &rt, &rp, lexp, rexp)
             }
             // The receiver and every argument travel as tag/payload pairs. The
             // argument pairs go into two stack arrays sized for this call site,
@@ -4309,17 +4554,8 @@ impl Emitter {
             ExprKind::DynUnary { value, op } => {
                 let v = self.emit_expr(value);
                 let (vt, vp) = self.emit_any_unpack(&v);
-                self.profile_hit(&vt);
-                let slot = self.dyn_tag_slot();
-                let pay = self.tmp();
-                self.line(format!(
-                    "{pay} = call i64 @pyrs_dyn_unary(i32 {vt}, i64 {vp}, i32 {}, \
-                     ptr {slot})",
-                    *op as i32
-                ));
-                let tag = self.tmp();
-                self.line(format!("{tag} = load i32, ptr {slot}"));
-                self.build_any(&tag, &pay)
+                let vexp = self.profile_hit(&vt);
+                self.emit_dyn_unary(*op, &vt, &vp, vexp)
             }
             ExprKind::DynSorted { value, reverse } => {
                 let v = self.emit_expr(value);

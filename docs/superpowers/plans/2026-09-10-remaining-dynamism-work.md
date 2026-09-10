@@ -198,6 +198,8 @@ to four types per site, not one.
 
 ## 5. Item D — guarded specialization
 
+**Status: implemented in 0.148.0.**
+
 **Size: medium–large. Needs Item C.**
 
 Each polymorphic site becomes:

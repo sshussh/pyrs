@@ -1,3 +1,22 @@
+## 0.148.0 — guarded specialization
+
+A profiled monomorphic site compiles as a tag check around the typed
+operation, with the generic kernel beside it. There is no deoptimization:
+the slow path was compiled AOT. A site the profile does not call
+monomorphic still calls the kernel directly.
+
+On 2M iterations of `total = total + i` with `total` and `i` as `object`:
+
+| path | time |
+|---|---:|
+| `total: int` | 0.0054s |
+| `total: object`, no profile | 0.0566s |
+| `total: object`, profiled | **0.0061s** |
+| CPython | 0.239s |
+
+The profiled loop is 1.13× the typed path and 9× the unprofiled kernel.
+Stdout is byte-identical with and without `--profile`.
+
 ## 0.147.0 — `pyrs profile`
 
 An instrumented build records, at each polymorphic site, up to four concrete

@@ -126,7 +126,8 @@ $ pyrs compile -i prog.py -o prog [-O 2] [--emit-llvm]
 what PyRs hands to LLVM, readable and diffable.
 
 A missing or stale `--profile` file is ignored with a warning. The flag
-does not change observable behaviour.
+does not change observable behaviour; a monomorphic site becomes a tag
+guard around the typed operation, with the generic kernel as the miss path.
 
 ### `pyrs profile`
 

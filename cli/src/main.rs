@@ -418,6 +418,7 @@ fn profile_command(mut cmd: cli::ProfileCommand) -> Result<i32, String> {
         instrument_profile: true,
         profile_compiler: compiler_version().to_string(),
         profile_source: profile::source_hash(&sources),
+        ..Default::default()
     };
     let workdir = temp_workdir()?;
     let exe = workdir.join("program");
@@ -480,7 +481,7 @@ fn compile(
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     // `--emit-llvm` asks for a side artifact the cache does not hold, so it
     // always rebuilds rather than silently not producing the .ll file.
-    let key = (use_cache && !emit_llvm)
+    let key = (use_cache && !emit_llvm && consume_profile.is_none())
         .then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc, target_cpu));
     if let Some(key) = &key
         && let Some(cached) = cache::program_lookup(key)
@@ -491,15 +492,13 @@ fn compile(
     }
     let sources = program_sources(&loaded);
     let module = analyze(loaded).map_err(|f| f.render(format))?;
-    let _ = load_profile(consume_profile, &sources);
+    let prof = load_profile(consume_profile, &sources);
+    let emit = codegen::EmitOptions {
+        profile_sites: prof.map(|p| p.sites).unwrap_or_default(),
+        ..Default::default()
+    };
     compile_module(
-        &module,
-        output,
-        opt_level,
-        target_cpu,
-        emit_llvm,
-        use_cache,
-        &codegen::EmitOptions::default(),
+        &module, output, opt_level, target_cpu, emit_llvm, use_cache, &emit,
     )?;
     if let Some(key) = &key {
         cache::program_store(key, output);
