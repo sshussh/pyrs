@@ -92,7 +92,7 @@ Vec<(Token, Span)>
    │  parser/src/lib.rs         recursive descent  →  parser/src/ast.rs
    ▼
 ast::Module                     (syntax only, no types)
-   │  semantic/src/lib.rs       names, types, coercions, desugaring
+   │  semantic/src/*.rs         names, types, coercions, desugaring (split modules)
    ▼
 ir::Module                      (ir/src/lib.rs — fully typed, no sugar)
    │  codegen/src/emit.rs       LLVM IR *text* emission
@@ -177,7 +177,7 @@ Five vertical slices:
 IsDigit,
 ```
 
-### 2. `semantic/src/lib.rs` — method table in `lower_str_method`
+### 2. `semantic/src/lower_stmt.rs` — method table in `lower_str_method`
 
 ```rust
 "isdigit" => (IsDigit, ir::Ty::Bool, 0),
@@ -347,7 +347,7 @@ Open these sites in order (or `rg IsDigit` / `rg isdigit`):
 | Layer | Where to look |
 |-------|----------------|
 | IR | `ir/src/lib.rs` — `StrFn::IsDigit` |
-| Semantic | `semantic/src/lib.rs` — `"isdigit" =>` in `lower_str_method` |
+| Semantic | `semantic/src/lower_stmt.rs` — `"isdigit" =>` in `lower_str_method` |
 | Codegen | `codegen/src/emit.rs` — `StrFn::IsDigit` → `pyrs_str_isdigit` + `declare` |
 | Runtime | `codegen/runtime/runtime.c` — `pyrs_str_isdigit` |
 | Tests | `semantic` unit test `str_isdigit_*`; e2e `str_isdigit_matches_python` |
@@ -359,7 +359,7 @@ the `call … @pyrs_str_isdigit` in the `.ll` file.
 
 | Layer | Where to look |
 |-------|----------------|
-| Reserved name | `BUILTINS` in `semantic/src/lib.rs` (includes `"abs"`) |
+| Reserved name | `BUILTINS` in `semantic/src/module.rs` (includes `"abs"`) |
 | Lowering | `"abs" =>` arm in `lower_call` (bool → int, then `Abs`) |
 | IR | `ExprKind::Abs` in `ir/src/lib.rs` |
 | Codegen | `ExprKind::Abs` → `llvm.abs.i64` / `llvm.fabs.f64` |
