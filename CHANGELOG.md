@@ -1,3 +1,18 @@
+## 0.146.0 — `str % args` on a dynamic value
+
+`"x=%d" % 5` on an `object` raised `NotImplementedError` naming the gap.
+The operator kernel now does printf-style formatting: `%s %d %i %u %f %e %g
+%r %x %o` and `%%`, with width, precision, and the flags `- + 0` space and
+`#`, a tuple right-hand side as well as a scalar.
+
+CPython's three different type-error wordings are preserved (`%d format: a
+real number is required, not str`, `must be real number, not str`, `%x
+format: an integer is required, not str`), as are `not enough arguments for
+format string`, `not all arguments converted during string formatting`,
+`incomplete format`, and `unsupported format character`. Mapping keys,
+`*` width, and `%c` still name themselves as unimplemented rather than
+borrowing a TypeError CPython would not raise.
+
 ## 0.145.0 — `sorted()` on a dynamic value
 
 `sorted(v)` on an `object` was a compile error, with a diagnostic that named

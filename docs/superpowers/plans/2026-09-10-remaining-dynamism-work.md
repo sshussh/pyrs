@@ -147,6 +147,8 @@ instances of 'int' and 'str'`; `sorted()` of a dynamic dict yields its keys;
 
 ## 3. Item B — `str % args` on a dynamic value
 
+**Status: implemented in 0.146.0.**
+
 **Size: small–medium.** Currently raises `NotImplementedError` naming itself,
 from `pyrs_dyn_binop`'s `PYRS_DYN_MOD` path.
 

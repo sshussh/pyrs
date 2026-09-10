@@ -315,30 +315,135 @@ fn unary_operators_reject_the_kinds_python_rejects() {
 // the one gap, named rather than mistranslated
 // ---------------------------------------------------------------------------
 
-/// printf-style `%` on a dynamic str is not implemented. CPython succeeds
-/// here, so the runtime must say what is missing rather than raise a TypeError
-/// CPython would never raise.
 #[test]
-fn printf_formatting_on_a_dynamic_str_says_it_is_unsupported() {
-    let dir = temp_source(
+fn printf_formatting_on_a_dynamic_str_matches_python() {
+    matches_python(
         "str-percent",
-        "a: object = \"x=%d\"\nb: object = 5\nprint(a % b)\n",
+        concat!(
+            "s: object = \"%s\"\n",
+            "d: object = \"%d\"\n",
+            "f: object = \"%f\"\n",
+            "print(s % 5, s % \"hi\", s % 1.5, s % True, s % None)\n",
+            "print(d % 5, d % True, d % 3.9, d % -3.9)\n",
+            "i: object = \"%i\"\n",
+            "print(i % 5)\n",
+            "print(f % 1.5, f % 1, f % True)\n",
+            "r: object = \"%r\"\n",
+            "print(r % \"q\", r % 5)\n",
+            "x: object = \"%x\"\n",
+            "X: object = \"%X\"\n",
+            "o: object = \"%o\"\n",
+            "print(x % 255, X % 255, o % 8)\n",
+            "e: object = \"%e\"\n",
+            "E: object = \"%E\"\n",
+            "g: object = \"%g\"\n",
+            "G: object = \"%G\"\n",
+            "print(e % 1.5, E % 1.5, g % 1.5, G % 1500000)\n",
+            "p: object = \"%%\"\n",
+            "print(p % ())\n",
+            "p2: object = \"100%%\"\n",
+            "print(p2 % ())\n",
+            "p3: object = \"%d%%\"\n",
+            "print(p3 % 50)\n",
+            "two: object = \"%s-%s\"\n",
+            "print(two % (\"a\", \"b\"))\n",
+            "mix: object = \"%d-%s\"\n",
+            "print(mix % (3, \"a\"))\n",
+            "one: object = \"%s\"\n",
+            "print(one % (1,))\n",
+            "n: object = \"n=%d\"\n",
+            "print(n % 3)\n",
+            "print(s % [1, 2])\n",
+        ),
     );
-    let out = Command::new(PYRS)
-        .args(["run", "-i", "prog.py"])
-        .current_dir(&dir.0)
-        .output()
-        .expect("failed to spawn PyRs");
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("printf-style") && stderr.contains("not supported yet"),
-        "the gap must name itself, not raise a TypeError CPython would not: {stderr}"
+}
+
+#[test]
+fn printf_flags_width_and_precision_on_a_dynamic_str() {
+    matches_python(
+        "str-percent-spec",
+        concat!(
+            "a: object = \"%.2f\"\n",
+            "print(a % 3.14159)\n",
+            "b: object = \"%5d|\"\n",
+            "print(b % 42)\n",
+            "c: object = \"%-5s|\"\n",
+            "print(c % \"ab\")\n",
+            "d: object = \"%05d\"\n",
+            "print(d % 42)\n",
+            "e: object = \"%8.3f|\"\n",
+            "print(e % 2.5)\n",
+            "f: object = \"%x %o\"\n",
+            "print(f % (255, 8))\n",
+            "g: object = \"%+d %+d\"\n",
+            "print(g % (5, -5))\n",
+            "h: object = \"% d % d\"\n",
+            "print(h % (5, -5))\n",
+            "i: object = \"%+f\"\n",
+            "print(i % 1.5)\n",
+            "j: object = \"%10s|\"\n",
+            "print(j % \"ab\")\n",
+            "k: object = \"%-10s|\"\n",
+            "print(k % \"ab\")\n",
+            "m: object = \"%010d\"\n",
+            "print(m % -7)\n",
+            "n: object = \"%.0f\"\n",
+            "print(n % 1.5)\n",
+            "p: object = \"%#x\"\n",
+            "print(p % 255)\n",
+            "q: object = \"%#o\"\n",
+            "print(q % 8)\n",
+            "t: object = \"%5.3d\"\n",
+            "print(t % 7)\n",
+            "u: object = \"%.3s\"\n",
+            "print(u % \"hello\")\n",
+            "w: object = \"%10.3s\"\n",
+            "print(w % \"hello\")\n",
+        ),
     );
-    assert!(
-        !stderr.contains("unsupported operand type(s)"),
-        "must not claim a TypeError CPython does not raise: {stderr}"
-    );
+}
+
+#[test]
+fn printf_formatting_errors_match_python() {
+    fails_like_python("pct-few", "a: object = \"%d %d\"\nprint(a % (1,))\n");
+    fails_like_python("pct-many", "a: object = \"%d\"\nprint(a % (1, 2))\n");
+    fails_like_python("pct-d-str", "a: object = \"%d\"\nprint(a % \"x\")\n");
+    fails_like_python("pct-d-none", "a: object = \"%d\"\nprint(a % None)\n");
+    fails_like_python("pct-f-str", "a: object = \"%f\"\nprint(a % \"x\")\n");
+    fails_like_python("pct-x-str", "a: object = \"%x\"\nprint(a % \"x\")\n");
+    fails_like_python("pct-ss-int", "a: object = \"%s %s\"\nprint(a % 1)\n");
+    fails_like_python("pct-bad", "a: object = \"%q\"\nprint(a % 1)\n");
+    fails_like_python("pct-incomplete", "a: object = \"%\"\nprint(a % 1)\n");
+    fails_like_python("pct-s-two", "a: object = \"%s\"\nprint(a % (1, 2))\n");
+    fails_like_python("pct-leftover", "a: object = \"hello\"\nprint(a % 1)\n");
+}
+
+/// Mapping keys and `*` width are accepted by CPython; naming the gap
+/// avoids reporting a TypeError it would not raise.
+#[test]
+fn printf_mapping_and_star_width_name_the_gap() {
+    for (tag, src) in [
+        ("pct-map", "a: object = \"%(k)s\"\nprint(a % {\"k\": 1})\n"),
+        ("pct-star", "a: object = \"%*d\"\nprint(a % (5, 3))\n"),
+        ("pct-c", "a: object = \"%c\"\nprint(a % 65)\n"),
+    ] {
+        let dir = temp_source(tag, src);
+        let out = Command::new(PYRS)
+            .args(["run", "-i", "prog.py"])
+            .current_dir(&dir.0)
+            .output()
+            .expect("failed to spawn PyRs");
+        assert!(!out.status.success(), "{tag} succeeded");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("not supported yet"),
+            "{tag}: gap must name itself: {stderr}"
+        );
+        assert!(
+            !stderr.contains("unsupported operand type(s)"),
+            "{tag}: must not claim a TypeError CPython does not raise: {stderr}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

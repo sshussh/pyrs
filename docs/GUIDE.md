@@ -672,9 +672,11 @@ Both accept the same mini-language f-strings do, plus `!r` / `!s` / `!a` for
 `.format()` and the printf flags (`-`, `+`, `0`, space), width, precision,
 `%d %i %s %r %a %f %e %g %x %o %b` and `%%` for `%`.
 
-The format string must be a **literal**: the fields are resolved at compile
-time, which is what lets both reuse the f-string machinery. A format string
-held in a variable is rejected — use an f-string, or inline the literal.
+The format string must be a **literal** for `.format()` and for `%` on a
+typed `str`: the fields are resolved at compile time, which is what lets
+both reuse the f-string machinery. A typed format string held in a variable
+is rejected — use an f-string, or inline the literal. A dynamic `str`
+(`object`) does `%` at run time (0.146).
 Argument-count and field-name mistakes are compile errors here rather than
 `IndexError` / `KeyError` at run time. A nested `{}` inside a format spec
 (`"{:{}}"`) is rejected in `.format()`, because it names an argument there and
@@ -1043,8 +1045,10 @@ def clamp(x: float, lo: float, hi: float) -> float:
   operand type(s) for +`, `can only concatenate str (not "int") to str`, and
   `'<' not supported between instances of`). `bool` counts as an int, floored
   division keeps Python's signs, and `==` / `!=` never raise where `<` would.
-  Still refused: `str % args` on a dynamic str, which names itself as
-  unimplemented rather than reporting an error CPython would not raise.
+  `str % args` on a dynamic str does printf-style formatting (0.146), with
+  CPython's conversion letters, flags, width, precision, and its exact
+  error messages. Mapping keys, `*` width and `%c` still name themselves
+  as unimplemented.
 - **Methods and `in` work on a dynamic value** (0.144). The runtime looks a
   method up against the type the value's tag names, and a dynamic call
   allocates nothing. `in` works over a dynamic str, list, tuple, dict or set.

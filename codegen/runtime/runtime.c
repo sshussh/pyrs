@@ -8000,6 +8000,423 @@ static long long dyn_repeat_count(long long tagged) {
     return pyrs_int_as_i64(tagged);
 }
 
+/* ---- printf-style '%' on a dynamic str ----
+ *
+ * CPython's messages differ by conversion (`%d format: a real number is
+ * required, not str` vs `must be real number, not str` vs `%x format: an
+ * integer is required, not str`) and default alignment is the opposite of
+ * `{:>}` vs `{:}` for strings, so this does not go through the brace
+ * mini-language the compile-time path uses. */
+
+static void sb_put_bytes(StrBuf *b, const char *p, long long n) {
+    if (n <= 0) {
+        return;
+    }
+    sb_reserve(b, n);
+    memcpy(b->data + b->len, p, (size_t)n);
+    b->len += n;
+    long long i = 0;
+    while (i < n) {
+        unsigned char c = (unsigned char)p[i];
+        if (c < 0x80) {
+            i += 1;
+        } else if ((c & 0xe0) == 0xc0) {
+            i += 2;
+        } else if ((c & 0xf0) == 0xe0) {
+            i += 3;
+        } else {
+            i += 4;
+        }
+        b->cplen++;
+    }
+}
+
+static void sb_put_pystr(StrBuf *b, const PyrsStr *s) {
+    check_ref(s);
+    sb_put_bytes(b, s->data, s->len);
+}
+
+static PyrsStr *dyn_str_of(int tag, long long payload) {
+    if (dyn_kind(tag) == DK_STR) {
+        return (PyrsStr *)(uintptr_t)payload;
+    }
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    if (tag < 0) {
+        out_puts("None");
+    } else {
+        print_slot(payload, tag);
+    }
+    return capture_end(&buf, prev);
+}
+
+static PyrsStr *dyn_repr_of(int tag, long long payload) {
+    OutBuf buf;
+    OutBuf *prev = capture_begin(&buf);
+    if (tag < 0) {
+        out_puts("None");
+    } else {
+        print_slot(payload, tag);
+    }
+    return capture_end(&buf, prev);
+}
+
+static PyrsStr *dyn_percent_pad(const PyrsStr *body, int minus, int width) {
+    if (width < 0 || body->cplen >= width) {
+        return (PyrsStr *)body;
+    }
+    long long pad = width - body->cplen;
+    PyrsStr *r = str_alloc(body->len + pad);
+    if (minus) {
+        memcpy(r->data, body->data, (size_t)body->len);
+        memset(r->data + body->len, ' ', (size_t)pad);
+    } else {
+        memset(r->data, ' ', (size_t)pad);
+        memcpy(r->data + pad, body->data, (size_t)body->len);
+    }
+    return str_done_cplen(r, width);
+}
+
+static PyrsStr *dyn_percent_trunc(const PyrsStr *s, int prec) {
+    if (prec < 0 || s->cplen <= prec) {
+        return (PyrsStr *)s;
+    }
+    long long bytes = 0;
+    long long i = 0;
+    long long seen = 0;
+    while (seen < prec && i < s->len) {
+        unsigned char c = (unsigned char)s->data[i];
+        long long step = 1;
+        if (c >= 0x80) {
+            if ((c & 0xe0) == 0xc0) {
+                step = 2;
+            } else if ((c & 0xf0) == 0xe0) {
+                step = 3;
+            } else {
+                step = 4;
+            }
+        }
+        i += step;
+        bytes = i;
+        seen++;
+    }
+    PyrsStr *r = str_alloc(bytes);
+    memcpy(r->data, s->data, (size_t)bytes);
+    return str_done_cplen(r, prec);
+}
+
+_Noreturn static void dyn_percent_need_number(char conv, int tag) {
+    char msg[128];
+    if (conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E' || conv == 'g'
+        || conv == 'G') {
+        snprintf(msg, sizeof msg, "TypeError: must be real number, not %s",
+                 dyn_type_name(tag));
+    } else if (conv == 'd' || conv == 'i' || conv == 'u') {
+        snprintf(msg, sizeof msg,
+                 "TypeError: %%%c format: a real number is required, not %s",
+                 conv, dyn_type_name(tag));
+    } else {
+        snprintf(msg, sizeof msg,
+                 "TypeError: %%%c format: an integer is required, not %s", conv,
+                 dyn_type_name(tag));
+    }
+    pyrs_die(msg);
+}
+
+static PyrsStr *dyn_percent_int(int tag, long long payload, int minus, int plus,
+                               int space, int zero, int hash, int width,
+                               int prec, char conv) {
+    long long v = 0;
+    int ok = 0;
+    if (conv == 'd' || conv == 'i' || conv == 'u') {
+        long long iv = 0;
+        double d;
+        int as_i = dyn_as_int(tag, payload, &iv);
+        int as_d = dyn_as_double(tag, payload, &d);
+        if (as_i) {
+            v = iv;
+            ok = 1;
+        } else if (as_d) {
+            v = pyrs_int_from_i64((long long)d);
+            ok = 1;
+        }
+    } else {
+        ok = dyn_as_int(tag, payload, &v);
+    }
+    if (!ok) {
+        dyn_percent_need_number(conv, tag);
+    }
+    int base = 10;
+    int upper = 0;
+    const char *prefix = "";
+    if (conv == 'x') {
+        base = 16;
+        if (hash) {
+            prefix = "0x";
+        }
+    } else if (conv == 'X') {
+        base = 16;
+        upper = 1;
+        if (hash) {
+            prefix = "0X";
+        }
+    } else if (conv == 'o') {
+        base = 8;
+        if (hash) {
+            prefix = "0o";
+        }
+    }
+    long long raw_len = 0;
+    char *raw = int_to_base_str(v, base, upper, &raw_len);
+    int neg = raw_len > 0 && raw[0] == '-';
+    const char *digits = neg ? raw + 1 : raw;
+    long long dlen = neg ? raw_len - 1 : raw_len;
+    char sign = 0;
+    if (neg) {
+        sign = '-';
+    } else if (plus) {
+        sign = '+';
+    } else if (space) {
+        sign = ' ';
+    }
+    long long prelen = (long long)strlen(prefix);
+    long long zpad = 0;
+    if (prec >= 0 && (long long)prec > dlen) {
+        zpad = (long long)prec - dlen;
+    }
+    long long core = (sign ? 1 : 0) + prelen + zpad + dlen;
+    long long spad = 0;
+    char fill = ' ';
+    if (width >= 0 && (long long)width > core) {
+        if (zero && !minus && prec < 0) {
+            fill = '0';
+            zpad += (long long)width - core;
+            core = width;
+        } else {
+            spad = (long long)width - core;
+        }
+    }
+    long long total = spad + core;
+    PyrsStr *r = str_alloc(total);
+    long long o = 0;
+    if (!minus) {
+        memset(r->data + o, ' ', (size_t)spad);
+        o += spad;
+    }
+    if (fill == '0' && sign) {
+        r->data[o++] = sign;
+        sign = 0;
+    }
+    if (sign) {
+        r->data[o++] = sign;
+    }
+    if (prelen) {
+        memcpy(r->data + o, prefix, (size_t)prelen);
+        o += prelen;
+    }
+    memset(r->data + o, '0', (size_t)zpad);
+    o += zpad;
+    memcpy(r->data + o, digits, (size_t)dlen);
+    o += dlen;
+    if (minus) {
+        memset(r->data + o, ' ', (size_t)spad);
+    }
+    free(raw);
+    return str_done_ascii(r);
+}
+
+static PyrsStr *dyn_percent_float(int tag, long long payload, int minus, int plus,
+                                 int space, int zero, int hash, int width,
+                                 int prec, char conv) {
+    double d;
+    if (!dyn_as_double(tag, payload, &d)) {
+        dyn_percent_need_number(conv, tag);
+    }
+    char spec[80];
+    int n = 0;
+    spec[n++] = minus ? '<' : '>';
+    if (plus) {
+        spec[n++] = '+';
+    } else if (space) {
+        spec[n++] = ' ';
+    }
+    if (hash) {
+        spec[n++] = '#';
+    }
+    if (zero && !minus) {
+        spec[n++] = '0';
+    }
+    if (width >= 0) {
+        n += sprintf(spec + n, "%d", width);
+    }
+    if (prec >= 0) {
+        n += sprintf(spec + n, ".%d", prec);
+    }
+    spec[n++] = conv;
+    spec[n] = 0;
+    return pyrs_format_float(d, str_from_cstr(spec));
+}
+
+static PyrsStr *dyn_percent_text(int tag, long long payload, int minus, int width,
+                                int prec, int as_repr) {
+    PyrsStr *s = as_repr ? dyn_repr_of(tag, payload) : dyn_str_of(tag, payload);
+    s = dyn_percent_trunc(s, prec);
+    return dyn_percent_pad(s, minus, width);
+}
+
+static PyrsStr *dyn_percent_format(const PyrsStr *fmt, int rt, long long rp) {
+    check_ref(fmt);
+    int is_tuple = dyn_kind(rt) == DK_TUPLE;
+    const PyrsTuple *tup = is_tuple ? (const PyrsTuple *)(uintptr_t)rp : NULL;
+    long long nargs = is_tuple ? tup->len : 1;
+    long long next = 0;
+
+    StrBuf b;
+    sb_init(&b, fmt->len);
+    const char *s = fmt->data;
+    long long n = fmt->len;
+    long long i = 0;
+    while (i < n) {
+        if (s[i] != '%') {
+            long long start = i;
+            while (i < n && s[i] != '%') {
+                i++;
+            }
+            sb_put_bytes(&b, s + start, i - start);
+            continue;
+        }
+        i++;
+        if (i < n && s[i] == '%') {
+            sb_put_bytes(&b, "%", 1);
+            i++;
+            continue;
+        }
+        if (i < n && s[i] == '(') {
+            pyrs_die("NotImplementedError: mapping keys in '%' formatting on "
+                     "a dynamic str are not supported yet; use an f-string, "
+                     "or narrow with isinstance first");
+        }
+        int minus = 0, plus = 0, space = 0, zero = 0, hash = 0;
+        while (i < n) {
+            char f = s[i];
+            if (f == '-') {
+                minus = 1;
+            } else if (f == '+') {
+                plus = 1;
+            } else if (f == ' ') {
+                space = 1;
+            } else if (f == '0') {
+                zero = 1;
+            } else if (f == '#') {
+                hash = 1;
+            } else {
+                break;
+            }
+            i++;
+        }
+        if (i < n && s[i] == '*') {
+            pyrs_die("NotImplementedError: '*' width in '%' formatting on a "
+                     "dynamic str is not supported yet; use an f-string, or "
+                     "narrow with isinstance first");
+        }
+        int width = -1;
+        if (i < n && s[i] >= '1' && s[i] <= '9') {
+            width = 0;
+            while (i < n && s[i] >= '0' && s[i] <= '9') {
+                width = width * 10 + (s[i] - '0');
+                i++;
+            }
+        }
+        int prec = -1;
+        if (i < n && s[i] == '.') {
+            i++;
+            if (i < n && s[i] == '*') {
+                pyrs_die("NotImplementedError: '*' precision in '%' formatting "
+                         "on a dynamic str is not supported yet; use an "
+                         "f-string, or narrow with isinstance first");
+            }
+            prec = 0;
+            while (i < n && s[i] >= '0' && s[i] <= '9') {
+                prec = prec * 10 + (s[i] - '0');
+                i++;
+            }
+        }
+        while (i < n && (s[i] == 'h' || s[i] == 'l' || s[i] == 'L')) {
+            i++;
+        }
+        if (i >= n) {
+            pyrs_die("ValueError: incomplete format");
+        }
+        long long conv_at = i;
+        char conv = s[i];
+        i++;
+        if (next >= nargs) {
+            pyrs_die("TypeError: not enough arguments for format string");
+        }
+        int atag;
+        long long apay;
+        if (is_tuple) {
+            atag = tup->tags[next];
+            apay = tup->data[next];
+        } else {
+            atag = rt;
+            apay = rp;
+        }
+        next++;
+        PyrsStr *piece;
+        switch (conv) {
+        case 's':
+            piece = dyn_percent_text(atag, apay, minus, width, prec, 0);
+            break;
+        case 'r':
+            piece = dyn_percent_text(atag, apay, minus, width, prec, 1);
+            break;
+        case 'd':
+        case 'i':
+        case 'u':
+        case 'x':
+        case 'X':
+        case 'o':
+            piece = dyn_percent_int(atag, apay, minus, plus, space, zero, hash,
+                                    width, prec, conv);
+            break;
+        case 'f':
+        case 'F':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G':
+            piece = dyn_percent_float(atag, apay, minus, plus, space, zero, hash,
+                                      width, prec, conv);
+            break;
+        case 'c':
+        case 'a': {
+            char msg[192];
+            snprintf(msg, sizeof msg,
+                     "NotImplementedError: '%%%c' formatting on a dynamic str "
+                     "is not supported yet; use an f-string, or narrow with "
+                     "isinstance first",
+                     conv);
+            pyrs_die(msg);
+        }
+        default: {
+            char msg[96];
+            snprintf(msg, sizeof msg,
+                     "ValueError: unsupported format character '%c' (0x%x) at "
+                     "index %lld",
+                     conv, (unsigned char)conv, conv_at);
+            pyrs_die(msg);
+        }
+        }
+        sb_put_pystr(&b, piece);
+    }
+    if (next < nargs) {
+        pyrs_die("TypeError: not all arguments converted during string "
+                 "formatting");
+    }
+    return sb_finish(&b);
+}
+
 /* The operands arrive as their own tag/payload pairs and the result leaves the
  * same way, with the tag written through `out_tag`. Boxing here would cost
  * three GC allocations per operation, which is the whole reason a dynamic
@@ -8176,9 +8593,9 @@ long long pyrs_dyn_binop(int lt, long long lp, int rt, long long rp, int op,
     }
 
     if (op == PYRS_DYN_MOD && lk == DK_STR) {
-        pyrs_die("NotImplementedError: printf-style '%' formatting on a "
-                 "dynamic str is not supported yet; use an f-string, or "
-                 "narrow with isinstance first");
+        return dyn_result(out_tag, TAG_STR,
+                          (long long)(uintptr_t)dyn_percent_format(
+                              (const PyrsStr *)(uintptr_t)lp, rt, rp));
     }
     dyn_binop_error(op, lt, rt);
 }
