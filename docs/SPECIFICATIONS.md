@@ -18,7 +18,7 @@ surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
 0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
 **PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
 use** (not merely because the minor is large). Current milestone:
-**v0.148** / `0.148.0`. Optional release tags: `vX.Y.Z`.
+**v0.149** / `0.149.0`. Optional release tags: `vX.Y.Z`.
 
 ---
 
@@ -339,7 +339,7 @@ programs** link only the object file from the shim plus `runtime.c` and
 
 ## 7. Type system (current vs direction)
 
-**Today (v0.148.0 subset):**
+**Today (v0.149.0 subset):**
 
 - Storage type is the join of all RHS types (and annotation); bare
   multi-assign may produce a union (`x = 1; x = "a"` → `int | str`);
@@ -350,9 +350,11 @@ programs** link only the object file from the shim plus `runtime.c` and
   promotions allowed; Any→union matches member tags). Not full gradual
   typing (no open setattr / bare-Any methods).
 - Parameter annotations optional when a default is present; bare params
-  may be monomorphically inferred from body usage (arithmetic,
-  comparisons, methods, indexing, single-type `isinstance` — multi-type
-  or container `isinstance` and conflicting uses require annotation).
+  may be inferred from body usage (unique type), from an observed set of
+  conflicting uses (`Any`, so the generic kernel applies), from call-site
+  argument types iterated to a named 8-round fixpoint, or from a typeshed
+  table of builtin/stdlib signatures. An unconstrained parameter still
+  needs an annotation.
   Return annotation optional (inferred from returns when feasible, else
   “returns nothing”).
 - Homogeneous lists; unannotated empty `[]` defaults to `list[Any]`;
@@ -506,7 +508,7 @@ These are product constraints that affect design choices:
 | Builtins / kit   | `isinstance` (incl. on `Any`), `any`/`all`, `enumerate`/`zip`/`reversed`, set/dict kit | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
 | stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
 | Language surface | Subset (see [the guide](GUIDE.md)); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
-| Product version  | `0.148.0` (and later `0.148.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
+| Product version  | `0.149.0` (and later `0.149.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
 
 Features explicitly **out of IR/runtime today** (non-exhaustive): full
 CPython class dynamism (v0.20 has closed-world classes + isinstance peels),

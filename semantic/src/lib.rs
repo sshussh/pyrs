@@ -785,10 +785,16 @@ fn synth_yield_ty(name: &str) -> Option<ir::Ty> {
 }
 
 /// Resolve all formal params, inferring bare ones monomorphically from body usage.
+///
+/// `fail_unresolved` is true for nested functions, which cannot wait for the
+/// program-level fixpoint. Top-level and methods leave remaining names in
+/// the second return value so `refine_bare_params` can seed them from the
+/// call graph and typeshed.
 fn resolve_params_with_body_infer(
     formals: &[ast::Param],
     body: &[ast::Stmt],
-) -> SResult<Vec<ParamSig>> {
+    fail_unresolved: bool,
+) -> SResult<(Vec<ParamSig>, Vec<String>)> {
     let mut params = Vec::new();
     let mut bare_idxs = Vec::new();
     let mut seen = HashSet::new();
@@ -821,6 +827,7 @@ fn resolve_params_with_body_infer(
             default: p.default.clone(),
         });
     }
+    let mut pending = Vec::new();
     if !bare_idxs.is_empty() {
         let mut bare_names: HashSet<String> =
             bare_idxs.iter().map(|&i| params[i].name.clone()).collect();
@@ -843,20 +850,32 @@ fn resolve_params_with_body_infer(
             }
         }
         for &i in &bare_idxs {
-            if bare_names.contains(&params[i].name) {
-                let param_map: HashMap<String, ir::Ty> =
-                    params.iter().map(|p| (p.name.clone(), p.ty)).collect();
-                if let Some(ty) =
-                    try_infer_param_from_body(&params[i].name, body, &param_map, &HashSet::new())
-                {
-                    params[i].ty = ty;
-                } else {
-                    return Err(bare_param_infer_err(&formals[i]));
-                }
+            if !bare_names.contains(&params[i].name) {
+                continue;
             }
+            let param_map: HashMap<String, ir::Ty> =
+                params.iter().map(|p| (p.name.clone(), p.ty)).collect();
+            if let Some(ty) =
+                try_infer_param_from_body(&params[i].name, body, &param_map, &HashSet::new())
+            {
+                params[i].ty = ty;
+                continue;
+            }
+            // Conflict is a specialization plan, not a failure: the observed
+            // set is real, and Any is the kernel those sites already have.
+            if let Some(ty) =
+                decide_param_from_observed(&params[i].name, body, &param_map, &HashSet::new())
+            {
+                params[i].ty = ty;
+                continue;
+            }
+            if fail_unresolved {
+                return Err(bare_param_infer_err(&formals[i]));
+            }
+            pending.push(params[i].name.clone());
         }
     }
-    Ok(params)
+    Ok((params, pending))
 }
 
 /// Infer a type from a simple default expression (literals and short forms).
@@ -1109,6 +1128,29 @@ struct FuncSig {
     yield_ty: Option<ir::Ty>,
     /// Frame slot count for generator resume (params + locals); 0 if unknown.
     gen_frame_slots: i64,
+    /// Bare params still waiting on call-graph / typeshed evidence. Their
+    /// stored `ty` is a placeholder and must not be used as a seed.
+    pending_bare: Vec<String>,
+}
+
+thread_local! {
+    /// Signatures visible to body/call-graph inference. Keyed by the name a
+    /// call site writes (`f`, `sqrt`) and, when known, by `module.name`.
+    static INFER_FUNCS: RefCell<HashMap<String, FuncSig>> = RefCell::new(HashMap::new());
+}
+
+fn infer_func_lookup(name: &str) -> Option<FuncSig> {
+    INFER_FUNCS.with(|m| m.borrow().get(name).cloned())
+}
+
+fn infer_func_register(name: &str, sig: &FuncSig) {
+    INFER_FUNCS.with(|m| {
+        m.borrow_mut().insert(name.to_string(), sig.clone());
+    });
+}
+
+fn clear_infer_funcs() {
+    INFER_FUNCS.with(|m| m.borrow_mut().clear());
 }
 
 /// Nested function visible only inside its enclosing function.
@@ -3573,10 +3615,13 @@ fn method_func_sig(
 ) -> SResult<FuncSig> {
     let mut formals = f.params.clone();
     let mut params;
+    let pending_bare;
     match kind {
         MethodKind::Static => {
             // No implicit self — all params are user params.
-            params = resolve_params_with_body_infer(&formals, &f.body)?;
+            let (p, pending) = resolve_params_with_body_infer(&formals, &f.body, false)?;
+            params = p;
+            pending_bare = pending;
         }
         MethodKind::Class => {
             if formals.is_empty() {
@@ -3589,7 +3634,9 @@ fn method_func_sig(
             formals[0].ty = Some(ast::TypeName::Class(Box::leak(
                 class_short_name.to_string().into_boxed_str(),
             )));
-            params = resolve_params_with_body_infer(&formals, &f.body)?;
+            let (p, pending) = resolve_params_with_body_infer(&formals, &f.body, false)?;
+            params = p;
+            pending_bare = pending;
             params[0].ty = ir::Ty::Class(class_id);
         }
         MethodKind::Instance | MethodKind::Property => {
@@ -3603,7 +3650,9 @@ fn method_func_sig(
             formals[0].ty = Some(ast::TypeName::Class(Box::leak(
                 class_short_name.to_string().into_boxed_str(),
             )));
-            params = resolve_params_with_body_infer(&formals, &f.body)?;
+            let (p, pending) = resolve_params_with_body_infer(&formals, &f.body, false)?;
+            params = p;
+            pending_bare = pending;
             params[0].ty = ir::Ty::Class(class_id);
             if kind == MethodKind::Property && params.len() != 1 {
                 return Err(err(
@@ -3699,6 +3748,7 @@ fn method_func_sig(
         is_generator: false,
         yield_ty: None,
         gen_frame_slots: 0,
+        pending_bare,
     })
 }
 
@@ -3892,7 +3942,7 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                     f.span,
                 ));
             }
-            let params = resolve_params_with_body_infer(&f.params, &f.body)?;
+            let (params, pending_bare) = resolve_params_with_body_infer(&f.params, &f.body, false)?;
             let mut seen_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
             let vararg = if let Some(p) = &f.vararg {
                 let ty = resolve_param_ty(p)?;
@@ -3954,21 +4004,21 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
             } else {
                 None
             };
-            funcs.insert(
-                f.name.clone(),
-                FuncSig {
-                    params,
-                    posonly_end: f.posonly_end,
-                    kwonly_start: f.kwonly_start,
-                    vararg,
-                    kwarg,
-                    ret,
-                    span: f.span,
-                    is_generator,
-                    yield_ty,
-                    gen_frame_slots: 0,
-                },
-            );
+            let sig = FuncSig {
+                params,
+                posonly_end: f.posonly_end,
+                kwonly_start: f.kwonly_start,
+                vararg,
+                kwarg,
+                ret,
+                span: f.span,
+                is_generator,
+                yield_ty,
+                gen_frame_slots: 0,
+                pending_bare,
+            };
+            infer_func_register(&f.name, &sig);
+            funcs.insert(f.name.clone(), sig);
             order.push(f);
         }
     }
@@ -4015,6 +4065,9 @@ fn pre_infer_module_returns(order: &[&ast::FuncDef], funcs: &mut HashMap<String,
                 continue;
             };
             if sig.is_generator {
+                continue;
+            }
+            if !sig.pending_bare.is_empty() {
                 continue;
             }
             // Only refine still-void signatures.
@@ -4299,6 +4352,106 @@ fn try_infer_param_from_body(
     Some(acc)
 }
 
+/// Flattened set of types the body observed for `name`. Parallel to
+/// [`try_infer_param_from_body`]: that function unifies, this one enumerates.
+fn observed_param_types_from_body(
+    name: &str,
+    body: &[ast::Stmt],
+    params: &HashMap<String, ir::Ty>,
+    bare: &HashSet<String>,
+) -> Vec<ir::Ty> {
+    let mut constraints = Vec::new();
+    collect_param_constraints(name, body, params, bare, &mut constraints);
+    let mut out = Vec::new();
+    for t in constraints {
+        if t == ir::Ty::None || t == ir::Ty::Any {
+            if t == ir::Ty::Any && !out.contains(&ir::Ty::Any) {
+                out.push(ir::Ty::Any);
+            }
+            continue;
+        }
+        for m in ir::flatten_union_members(t) {
+            if m != ir::Ty::None && !out.contains(&m) {
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// One type if the observed set is monomorphic, `Any` if it is a real
+/// conflict (the specialization plan), `None` if unconstrained.
+fn decide_from_observed_set(observed: &[ir::Ty]) -> Option<ir::Ty> {
+    if observed.contains(&ir::Ty::Any) {
+        return Some(ir::Ty::Any);
+    }
+    match observed.len() {
+        0 => None,
+        1 => Some(observed[0]),
+        _ => Some(ir::Ty::Any),
+    }
+}
+
+fn decide_param_from_observed(
+    name: &str,
+    body: &[ast::Stmt],
+    params: &HashMap<String, ir::Ty>,
+    bare: &HashSet<String>,
+) -> Option<ir::Ty> {
+    decide_from_observed_set(&observed_param_types_from_body(name, body, params, bare))
+}
+
+/// Ground-truth parameter types for builtins and the supported stdlib.
+/// Lookup is by the name a call site writes (`open`) or a qualified
+/// `module.func` (`math.sqrt`). `Any` is omitted: it is not a seed.
+fn typeshed_params(qual: &str) -> Option<&'static [ir::Ty]> {
+    Some(match qual {
+        "open" => &[ir::Ty::Str],
+        "ord" => &[ir::Ty::Str],
+        "chr" | "hex" | "bin" | "oct" => &[ir::Ty::Int],
+        "range" => &[ir::Ty::Int],
+        "abs" => &[ir::Ty::Int],
+        "math.sqrt" | "math.sin" | "math.cos" | "math.tan" | "math.log" | "math.log10"
+        | "math.exp" | "math.fabs" | "math.floor" | "math.ceil" => &[ir::Ty::Float],
+        "os.path.dirname" | "os.path.basename" | "os.path.exists" | "os.path.isfile"
+        | "os.path.isdir" | "os.path.join" => &[ir::Ty::Str],
+        "json.loads" => &[ir::Ty::Str],
+        _ => return None,
+    })
+}
+
+fn callee_param_types(func: &str) -> Vec<ir::Ty> {
+    if let Some(sig) = infer_func_lookup(func)
+        && sig.pending_bare.is_empty()
+    {
+        return sig.params.iter().map(|p| p.ty).collect();
+    }
+    typeshed_params(func).unwrap_or(&[]).to_vec()
+}
+
+fn constrain_call_args_for_param(
+    name: &str,
+    func: &str,
+    args: &[ast::PosArg],
+    out: &mut Vec<ir::Ty>,
+) {
+    let wants = callee_param_types(func);
+    for (i, a) in args.iter().enumerate() {
+        let ast::PosArg::Pos(e) = a else {
+            continue;
+        };
+        if !matches!(&e.kind, ast::ExprKind::Name(n) if n == name) {
+            continue;
+        }
+        if let Some(&t) = wants.get(i)
+            && t != ir::Ty::Any
+            && t != ir::Ty::None
+        {
+            out.push(t);
+        }
+    }
+}
+
 fn collect_param_constraints(
     name: &str,
     stmts: &[ast::Stmt],
@@ -4563,6 +4716,7 @@ fn collect_param_constraints_expr(
                     _ => out.push(ir::union_of(&tys)),
                 }
             }
+            constrain_call_args_for_param(name, func, args, out);
             for a in args {
                 let ae = match a {
                     ast::PosArg::Pos(e) | ast::PosArg::Star(e) => e,
@@ -4613,6 +4767,9 @@ fn collect_param_constraints_expr(
                     "keys" | "values" | "items" | "get" | "update" => {}
                     _ => {}
                 }
+            }
+            if let ast::ExprKind::Name(mod_name) = &base.kind {
+                constrain_call_args_for_param(name, &format!("{mod_name}.{method}"), args, out);
             }
             collect_param_constraints_expr(name, base, params, bare, out);
             for a in args {
@@ -6249,6 +6406,400 @@ fn collect_imports_block(
     )
 }
 
+fn for_each_call_in_stmts(stmts: &[ast::Stmt], visit: &mut impl FnMut(&str, &[ast::PosArg])) {
+    for st in stmts {
+        match &st.kind {
+            ast::StmtKind::Return(Some(e))
+            | ast::StmtKind::ExprStmt(e)
+            | ast::StmtKind::Raise {
+                message: Some(e), ..
+            } => for_each_call_in_expr(e, visit),
+            ast::StmtKind::Assign { value, .. } => for_each_call_in_expr(value, visit),
+            ast::StmtKind::AugAssign { value, .. } => for_each_call_in_expr(value, visit),
+            ast::StmtKind::If { branches, orelse } => {
+                for (c, b) in branches {
+                    for_each_call_in_expr(c, visit);
+                    for_each_call_in_stmts(b, visit);
+                }
+                for_each_call_in_stmts(orelse, visit);
+            }
+            ast::StmtKind::While { cond, body, orelse } => {
+                for_each_call_in_expr(cond, visit);
+                for_each_call_in_stmts(body, visit);
+                for_each_call_in_stmts(orelse, visit);
+            }
+            ast::StmtKind::For {
+                iter, body, orelse, ..
+            } => {
+                for_each_call_in_expr(iter, visit);
+                for_each_call_in_stmts(body, visit);
+                for_each_call_in_stmts(orelse, visit);
+            }
+            ast::StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finally,
+            } => {
+                for_each_call_in_stmts(body, visit);
+                for h in handlers {
+                    for_each_call_in_stmts(&h.body, visit);
+                }
+                for_each_call_in_stmts(orelse, visit);
+                for_each_call_in_stmts(finally, visit);
+            }
+            ast::StmtKind::With { item, body, .. } => {
+                for_each_call_in_expr(item, visit);
+                for_each_call_in_stmts(body, visit);
+            }
+            ast::StmtKind::Match { subject, cases } => {
+                for_each_call_in_expr(subject, visit);
+                for c in cases {
+                    if let Some(g) = &c.guard {
+                        for_each_call_in_expr(g, visit);
+                    }
+                    for_each_call_in_stmts(&c.body, visit);
+                }
+            }
+            ast::StmtKind::FuncDef(f) => {
+                for p in &f.params {
+                    if let Some(d) = &p.default {
+                        for_each_call_in_expr(d, visit);
+                    }
+                }
+                for_each_call_in_stmts(&f.body, visit);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn for_each_call_in_expr(e: &ast::Expr, visit: &mut impl FnMut(&str, &[ast::PosArg])) {
+    match &e.kind {
+        ast::ExprKind::Call {
+            func, args, kwargs, ..
+        } => {
+            visit(func, args);
+            for a in args {
+                let ae = match a {
+                    ast::PosArg::Pos(e) | ast::PosArg::Star(e) => e,
+                };
+                for_each_call_in_expr(ae, visit);
+            }
+            if let Some(k) = kwargs {
+                for_each_call_in_expr(k, visit);
+            }
+        }
+        ast::ExprKind::MethodCall {
+            base,
+            method,
+            args,
+            kwargs,
+            ..
+        } => {
+            if let ast::ExprKind::Name(n) = &base.kind {
+                visit(&format!("{n}.{method}"), args);
+            }
+            for_each_call_in_expr(base, visit);
+            for a in args {
+                let ae = match a {
+                    ast::PosArg::Pos(e) | ast::PosArg::Star(e) => e,
+                };
+                for_each_call_in_expr(ae, visit);
+            }
+            if let Some(k) = kwargs {
+                for_each_call_in_expr(k, visit);
+            }
+        }
+        ast::ExprKind::Binary { left, right, .. } => {
+            for_each_call_in_expr(left, visit);
+            for_each_call_in_expr(right, visit);
+        }
+        ast::ExprKind::Unary { operand, .. } => for_each_call_in_expr(operand, visit),
+        ast::ExprKind::Compare { first, rest } => {
+            for_each_call_in_expr(first, visit);
+            for (_, r) in rest {
+                for_each_call_in_expr(r, visit);
+            }
+        }
+        ast::ExprKind::Index { base, index } => {
+            for_each_call_in_expr(base, visit);
+            for_each_call_in_expr(index, visit);
+        }
+        ast::ExprKind::Attribute { base, .. } => for_each_call_in_expr(base, visit),
+        ast::ExprKind::Slice {
+            base, lo, hi, step, ..
+        } => {
+            for_each_call_in_expr(base, visit);
+            if let Some(e) = lo {
+                for_each_call_in_expr(e, visit);
+            }
+            if let Some(e) = hi {
+                for_each_call_in_expr(e, visit);
+            }
+            if let Some(e) = step {
+                for_each_call_in_expr(e, visit);
+            }
+        }
+        ast::ExprKind::ListLit(items) => {
+            for it in items {
+                let e = match it {
+                    ast::ListElem::Item(e) | ast::ListElem::Star(e) => e,
+                };
+                for_each_call_in_expr(e, visit);
+            }
+        }
+        ast::ExprKind::TupleLit(items) | ast::ExprKind::SetLit(items) => {
+            for it in items {
+                for_each_call_in_expr(it, visit);
+            }
+        }
+        ast::ExprKind::DictLit(items) => {
+            for (k, v) in items {
+                for_each_call_in_expr(k, visit);
+                for_each_call_in_expr(v, visit);
+            }
+        }
+        ast::ExprKind::Cast { arg, .. } => for_each_call_in_expr(arg, visit),
+        ast::ExprKind::IfExp { test, body, orelse } => {
+            for_each_call_in_expr(test, visit);
+            for_each_call_in_expr(body, visit);
+            for_each_call_in_expr(orelse, visit);
+        }
+        ast::ExprKind::NamedExpr { value, .. } => for_each_call_in_expr(value, visit),
+        ast::ExprKind::Lambda { body, .. } => for_each_call_in_expr(body, visit),
+        ast::ExprKind::JoinedStr(parts) => {
+            for p in parts {
+                if let ast::FStringPart::Expr { expr, .. } = p {
+                    for_each_call_in_expr(expr, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_infer_callee(
+    func: &str,
+    caller_module: &str,
+    imports: &HashMap<String, ImportBinding>,
+    own_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+) -> Option<(String, String)> {
+    if let Some(b) = imports.get(func) {
+        return match b {
+            ImportBinding::Symbol { module, name } => Some((module.clone(), name.clone())),
+            _ => None,
+        };
+    }
+    if own_funcs
+        .get(caller_module)
+        .is_some_and(|f| f.contains_key(func))
+    {
+        return Some((caller_module.to_string(), func.to_string()));
+    }
+    if let Some((mod_name, fname)) = func.rsplit_once('.') {
+        if let Some(ImportBinding::Module(m)) = imports.get(mod_name) {
+            return Some((m.clone(), fname.to_string()));
+        }
+        if own_funcs
+            .get(mod_name)
+            .is_some_and(|f| f.contains_key(fname))
+        {
+            return Some((mod_name.to_string(), fname.to_string()));
+        }
+    }
+    None
+}
+
+fn register_all_infer_funcs(
+    own_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+    modules: &[ModuleInput],
+    all_imports: &[HashMap<String, ImportBinding>],
+) {
+    clear_infer_funcs();
+    for (mod_name, funcs) in own_funcs {
+        for (fname, sig) in funcs {
+            infer_func_register(fname, sig);
+            if !mod_name.is_empty() {
+                infer_func_register(&format!("{mod_name}.{fname}"), sig);
+            }
+        }
+    }
+    for (i, _m) in modules.iter().enumerate() {
+        for (local, binding) in &all_imports[i] {
+            if let ImportBinding::Symbol { module, name } = binding
+                && let Some(sig) = own_funcs.get(module).and_then(|f| f.get(name))
+            {
+                infer_func_register(local, sig);
+                infer_func_register(&format!("{module}.{name}"), sig);
+            }
+        }
+    }
+}
+
+/// Cap matches [`resolve_params_with_body_infer`].
+const PARAM_FIXPOINT_ROUNDS: usize = 8;
+
+fn refine_bare_params(
+    modules: &[ModuleInput],
+    own_funcs: &mut HashMap<String, HashMap<String, FuncSig>>,
+    all_orders: &[Vec<&ast::FuncDef>],
+    method_orders: &HashMap<String, Vec<(String, ir::ClassId, &ast::FuncDef)>>,
+    all_imports: &[HashMap<String, ImportBinding>],
+) -> SResult<()> {
+    for _ in 0..PARAM_FIXPOINT_ROUNDS {
+        register_all_infer_funcs(own_funcs, modules, all_imports);
+        let snapshot = own_funcs.clone();
+        let mut extra: HashMap<(String, String, String), Vec<ir::Ty>> = HashMap::new();
+        for (i, m) in modules.iter().enumerate() {
+            let imports = &all_imports[i];
+            let mut visit_from = |caller_params: &HashMap<String, ir::Ty>, stmts: &[ast::Stmt]| {
+                for_each_call_in_stmts(stmts, &mut |func, args| {
+                    let Some((cm, cn)) = resolve_infer_callee(func, &m.name, imports, &snapshot)
+                    else {
+                        return;
+                    };
+                    let Some(sig) = snapshot.get(&cm).and_then(|f| f.get(&cn)) else {
+                        return;
+                    };
+                    if sig.pending_bare.is_empty() {
+                        return;
+                    }
+                    for (ai, a) in args.iter().enumerate() {
+                        let ast::PosArg::Pos(e) = a else {
+                            continue;
+                        };
+                        if ai >= sig.params.len() {
+                            break;
+                        }
+                        let pname = &sig.params[ai].name;
+                        if !sig.pending_bare.contains(pname) {
+                            continue;
+                        }
+                        if let Some(t) = try_type_ast_expr(e, caller_params, &HashMap::new())
+                            && t != ir::Ty::None
+                        {
+                            extra
+                                .entry((cm.clone(), cn.clone(), pname.clone()))
+                                .or_default()
+                                .push(t);
+                        }
+                    }
+                });
+            };
+            visit_from(&HashMap::new(), &m.ast.body);
+            if let Some(funcs) = snapshot.get(&m.name) {
+                for fdef in &all_orders[i] {
+                    if let Some(sig) = funcs.get(&fdef.name) {
+                        let mut pm = HashMap::new();
+                        for p in &sig.params {
+                            if !sig.pending_bare.contains(&p.name) {
+                                pm.insert(p.name.clone(), p.ty);
+                            }
+                        }
+                        visit_from(&pm, &fdef.body);
+                    }
+                }
+            }
+        }
+        let mut changed = false;
+        for (mod_name, funcs) in own_funcs.iter_mut() {
+            let bodies: Vec<(String, &[ast::Stmt])> = modules
+                .iter()
+                .filter(|m| m.name == *mod_name)
+                .flat_map(|m| {
+                    m.ast
+                        .body
+                        .iter()
+                        .filter_map(|s| match &s.kind {
+                            ast::StmtKind::FuncDef(f) => Some((f.name.clone(), f.body.as_slice())),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let method_bodies: Vec<(String, &[ast::Stmt])> = method_orders
+                .get(mod_name)
+                .map(|ms| {
+                    ms.iter()
+                        .map(|(ir_name, _, def)| (ir_name.clone(), def.body.as_slice()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (fname, sig) in funcs.iter_mut() {
+                if sig.pending_bare.is_empty() {
+                    continue;
+                }
+                let body = bodies
+                    .iter()
+                    .find(|(n, _)| n == fname)
+                    .or_else(|| method_bodies.iter().find(|(n, _)| n == fname))
+                    .map(|(_, b)| *b)
+                    .unwrap_or(&[]);
+                let pending = sig.pending_bare.clone();
+                let param_map: HashMap<String, ir::Ty> = sig
+                    .params
+                    .iter()
+                    .filter(|p| !pending.contains(&p.name))
+                    .map(|p| (p.name.clone(), p.ty))
+                    .collect();
+                let bare: HashSet<String> = pending.iter().cloned().collect();
+                for pname in pending {
+                    let mut ev = observed_param_types_from_body(&pname, body, &param_map, &bare);
+                    if let Some(more) = extra.get(&(mod_name.clone(), fname.clone(), pname.clone()))
+                    {
+                        ev.extend(more.iter().copied());
+                    }
+                    let mut uniq = Vec::new();
+                    for t in ev {
+                        if !uniq.contains(&t) {
+                            uniq.push(t);
+                        }
+                    }
+                    if let Some(ty) = decide_from_observed_set(&uniq)
+                        && let Some(p) = sig.params.iter_mut().find(|p| p.name == pname)
+                    {
+                        p.ty = ty;
+                        sig.pending_bare.retain(|n| n != &pname);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    register_all_infer_funcs(own_funcs, modules, all_imports);
+    for (i, m) in modules.iter().enumerate() {
+        for fdef in &all_orders[i] {
+            let pending = own_funcs[&m.name][&fdef.name].pending_bare.clone();
+            if let Some(pname) = pending.first() {
+                let p = fdef
+                    .params
+                    .iter()
+                    .find(|p| p.name == *pname)
+                    .unwrap_or(&fdef.params[0]);
+                return Err(bare_param_infer_err(p).with_file(i));
+            }
+        }
+        if let Some(methods) = method_orders.get(&m.name) {
+            for (ir_name, _, def) in methods {
+                let pending = own_funcs[&m.name][ir_name].pending_bare.clone();
+                if let Some(pname) = pending.first() {
+                    let p = def
+                        .params
+                        .iter()
+                        .find(|p| p.name == *pname)
+                        .unwrap_or(&def.params[0]);
+                    return Err(bare_param_infer_err(p).with_file(i));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Analyze a whole program: several modules with cross-file imports.
 /// `modules` is in topological order (dependencies first, root last);
 /// diagnostics are tagged with the module index as their file id.
@@ -6262,6 +6813,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     clear_class_env();
     clear_class_consts();
     clear_synth_param_tys();
+    clear_infer_funcs();
     SYNTH_YIELD_TYS.with(|m| m.borrow_mut().clear());
     // Before regular class collection: an exception class must not acquire a
     // ClassId, a layout or a vtable.
@@ -6356,6 +6908,19 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
         )
         .map_err(|d| d.with_file(i))?;
         all_imports.push(imports);
+    }
+
+    refine_bare_params(
+        modules,
+        &mut own_funcs,
+        &all_orders,
+        &method_orders,
+        &all_imports,
+    )?;
+    for (i, m) in modules.iter().enumerate() {
+        if let Some(funcs) = own_funcs.get_mut(&m.name) {
+            pre_infer_module_returns(&all_orders[i], funcs);
+        }
     }
 
     // Re-export origins for deferred parent attribute/call resolution.
@@ -6490,6 +7055,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                             is_generator: false,
                             yield_ty: None,
                             gen_frame_slots: 0,
+                            pending_bare: Vec::new(),
                         });
                         s.ret = f.ret;
                         s
@@ -7398,7 +7964,7 @@ fn lower_function_inner(
             params.push((p.name.clone(), ty));
         }
     } else {
-        let formals = resolve_params_with_body_infer(&f.params, &f.body)?;
+        let (formals, _) = resolve_params_with_body_infer(&f.params, &f.body, true)?;
         for p in &formals {
             if ctx.locals.insert(p.name.clone(), p.ty).is_some() {
                 return Err(err(format!("duplicate parameter '{}'", p.name), f.span));
@@ -7877,7 +8443,7 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     if ctx.locals.contains_key(&f.name) {
         return Ok(());
     }
-    let params = resolve_params_with_body_infer(&f.params, &f.body)?;
+    let (params, _) = resolve_params_with_body_infer(&f.params, &f.body, true)?;
     let mut seen: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     let vararg = if let Some(p) = &f.vararg {
         let ty = resolve_param_ty(p)?;
@@ -7929,6 +8495,7 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
         is_generator,
         yield_ty,
         gen_frame_slots: 0,
+        pending_bare: Vec::new(),
     };
     ctx.nested_funcs.insert(
         f.name.clone(),
@@ -8304,7 +8871,7 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     }
 
     // Build nested signature (params / *args / **kwargs) with bare-param infer.
-    let params = resolve_params_with_body_infer(&f.params, &f.body)?;
+    let (params, _) = resolve_params_with_body_infer(&f.params, &f.body, true)?;
     let mut seen: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     let vararg = if let Some(p) = &f.vararg {
         let ty = resolve_param_ty(p)?;
@@ -8361,6 +8928,7 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
         is_generator,
         yield_ty,
         gen_frame_slots: 0,
+        pending_bare: Vec::new(),
     };
 
     // Free vars: names loaded in nested body that resolve to outer locals.
@@ -33756,8 +34324,8 @@ print(f(3))
     }
 
     #[test]
-    fn bare_param_multi_isinstance_needs_annotation() {
-        let e = analyze_err(
+    fn bare_param_multi_isinstance_is_any() {
+        let m = analyze_ok(
             "\
 def f(x):
     if isinstance(x, (int, float)):
@@ -33766,22 +34334,103 @@ def f(x):
 print(f(3))
 ",
         );
-        assert!(
-            e.message.contains("missing a type annotation"),
-            "{}",
-            e.message
-        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Any);
     }
 
     #[test]
-    fn bare_param_isinstance_list_needs_annotation() {
-        let e = analyze_err(
+    fn bare_param_isinstance_list_uses_call_site() {
+        let m = analyze_ok(
             "\
 def f(x):
     if isinstance(x, list):
         return len(x)
     return 0
 print(f([1]))
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::list_of(ir::Ty::Int));
+    }
+
+    #[test]
+    fn bare_param_identity_uses_call_site() {
+        let m = analyze_ok(
+            "\
+def identity(x):
+    return x
+print(identity(3))
+",
+        );
+        let f = find_func(&m, "identity");
+        assert_eq!(f.params[0].1, ir::Ty::Int);
+        assert_eq!(f.ret, ir::Ty::Int);
+    }
+
+    #[test]
+    fn bare_param_callee_signature_propagates() {
+        let m = analyze_ok(
+            "\
+def g(x: int) -> int:
+    return x + 1
+def f(y):
+    return g(y)
+print(f(3))
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Int);
+    }
+
+    #[test]
+    fn bare_param_polymorphic_call_sites_are_any() {
+        let m = analyze_ok(
+            "\
+def identity(x):
+    return x
+print(identity(3))
+print(identity(\"a\"))
+",
+        );
+        let f = find_func(&m, "identity");
+        assert_eq!(f.params[0].1, ir::Ty::Any);
+    }
+
+    #[test]
+    fn bare_param_typeshed_open_is_str() {
+        let m = analyze_ok(
+            "\
+def f(path):
+    return open(path)
+print(f)
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Str);
+    }
+
+    #[test]
+    fn bare_param_typeshed_range_is_int() {
+        let m = analyze_ok(
+            "\
+def f(n):
+    s = 0
+    for i in range(n):
+        s += i
+    return s
+print(f(3))
+",
+        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Int);
+    }
+
+    #[test]
+    fn bare_param_still_errors_when_unconstrained() {
+        let e = analyze_err(
+            "\
+def f(x):
+    return x
 ",
         );
         assert!(

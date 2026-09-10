@@ -357,9 +357,10 @@ are valid Python programs with the same output — the reverse is not true,
 since PyRs rejects unsupported dynamic features (each with a
 "not supported yet" error naming the feature). Parameter annotations are
 optional when a default value is present (the type is inferred from the
-default); bare parameters may be monomorphically inferred from body usage
-(arithmetic, comparisons, methods, indexing, `isinstance` branches —
-otherwise an annotation is required).
+default); bare parameters may be inferred from body usage, from call
+sites, or from known builtin/stdlib signatures — a unique type stays
+concrete, a conflicting observed set becomes `object`, and an
+unconstrained parameter still needs an annotation.
 
 ### Program structure
 

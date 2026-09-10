@@ -7819,13 +7819,16 @@ for x in f():
 }
 
 #[test]
-fn bare_unannotated_param_error() {
-    let (_, stderr) =
-        run_program_expect_fail("no_ann", "def f(x) -> int:\n    return x\nprint(f(1))\n");
-    assert!(
-        stderr.contains("missing a type annotation") && stderr.contains("parameter 'x'"),
-        "stderr: {stderr}"
-    );
+fn bare_unannotated_param_uses_the_call_site() {
+    let src = "def f(x) -> int:\n    return x\nprint(f(1))\n";
+    let out = run_program("no_ann", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
@@ -11880,41 +11883,41 @@ print(f())
 }
 
 #[test]
-fn v020_multi_isinstance_bare_needs_annotation() {
-    let (_, stderr) = run_program_expect_fail(
-        "v020_multi_isinstance_bare",
-        "\
+fn v020_multi_isinstance_bare_is_dynamic() {
+    let src = "\
 def f(x):
     if isinstance(x, (int, float)):
         return x + 1
     return 0
 print(f(3))
-",
-    );
-    assert!(
-        stderr.contains("missing a type annotation")
-            && stderr.contains("could not infer a unique type"),
-        "stderr: {stderr}"
-    );
+";
+    let out = run_program("v020_multi_isinstance_bare", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]
-fn v020_isinstance_list_bare_needs_annotation() {
-    let (_, stderr) = run_program_expect_fail(
-        "v020_isinstance_list_bare",
-        "\
+fn v020_isinstance_list_bare_uses_call_site() {
+    let src = "\
 def f(x):
     if isinstance(x, list):
         return len(x)
     return 0
 print(f([1, 2]))
-",
-    );
-    assert!(
-        stderr.contains("missing a type annotation")
-            && stderr.contains("could not infer a unique type"),
-        "stderr: {stderr}"
-    );
+";
+    let out = run_program("v020_isinstance_list_bare", src);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(src)
+        .output()
+        .expect("python3");
+    assert!(py.status.success());
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
 #[test]

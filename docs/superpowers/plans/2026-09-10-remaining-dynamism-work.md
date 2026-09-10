@@ -223,6 +223,8 @@ specialization that changes behaviour is a bug, not an optimization.
 
 ## 6. Item E — the inference engine
 
+**Status: implemented in 0.149.0.**
+
 **Size: large.** Three specific, locatable defects:
 
 1. **`try_infer_param_from_body` (`semantic/src/lib.rs`) returns `Option<Ty>`

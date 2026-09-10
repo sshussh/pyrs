@@ -1,3 +1,24 @@
+## 0.149.0 — inference: observed-set, call-graph, typeshed
+
+Bare parameters no longer fail as soon as the body does not name a unique
+type. A parallel observed-set path records the types the body actually
+saw; a conflict is `Any` — the specialization plan, not an error — so
+`isinstance(x, (int, float))` and two call sites of different types
+compile and run through the generic kernel.
+
+A program-level worklist, capped at 8 rounds like the existing body
+infer, seeds remaining parameters from call-site argument types and from
+callee signatures. A typeshed table supplies builtin and stdlib
+signatures (`open`, `range`, `math.sqrt`, `os.path.*`, `json.loads`)
+without analyzing those bodies. An unconstrained parameter still needs
+an annotation.
+
+After C (profile) and E, the residue that still needs `object` is
+reach — shapes and types as values — not missing type information at
+sites the compiler can see. A learned predictor is not justified: unique
+sites are inferred, conflicts are already `Any`, and `pyrs profile`
+covers what actually ran.
+
 ## 0.148.0 — guarded specialization
 
 A profiled monomorphic site compiles as a tag check around the typed
