@@ -1,3 +1,38 @@
+## 0.143.0 — operators on a dynamic value
+
+Reading a dynamic value became free in 0.142.0. Operating on one was still
+refused: `a + b`, `a < b`, `a == b`, `-a` and `abs(a)` on an `object` were all
+compile errors, so any code that touched a value it could not name statically
+simply did not compile.
+
+A generic kernel in the runtime — `pyrs_dyn_binop`, `pyrs_dyn_compare`,
+`pyrs_dyn_unary` — dispatches on the tags the values already carry. CPython is
+the contract for both halves: the result types and the error messages.
+
+Covered: `+ - * / // % **` over the numeric tower with int/float promotion and
+`bool` treated as an int; `+` and `*` for str, list and tuple, in either
+operand order; set difference; `< <= > >=` over numbers, str, list and tuple;
+`== !=` over everything, which never raises; and unary `- + ~` with `abs()`.
+Python's floored division is preserved, so `-7 // 2` is -4 and `-7 % 2` is 1,
+and a negative exponent gives a float. Bigints go through unchanged.
+
+The error messages match CPython verbatim, including the three different
+wordings it uses for what looks like one failure:
+
+```
+TypeError: unsupported operand type(s) for +: 'int' and 'str'
+TypeError: can only concatenate str (not "int") to str
+TypeError: '<' not supported between instances of 'int' and 'str'
+```
+
+One gap is named rather than mistranslated. `"x=%d" % 5` on a dynamic str
+needs printf-style formatting, which the kernel does not implement, so it says
+so — raising the `TypeError` the operator table would otherwise produce would
+claim CPython rejects a program it accepts.
+
+Still refused, and now the remaining dynamism work: method calls on a dynamic
+value, `in` over a dynamic container, and `sorted()` of one.
+
 ## 0.142.0 — a dynamic value is a register pair
 
 `Ty::Any` lowered to an `i64` holding a pointer to a GC box

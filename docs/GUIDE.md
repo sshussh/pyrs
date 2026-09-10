@@ -1036,6 +1036,16 @@ def clamp(x: float, lo: float, hi: float) -> float:
   `write`, `writelines`, `flush`, iteration and `with`, and are singletons. `print(...,
   file=f)` reaches any open file. Closing a standard stream raises — CPython
   allows it, but here it would break every later print with no way back.
+- **Operators work on a dynamic value** (0.143). Every binary arithmetic
+  operator, every comparison and the unary operators dispatch in the runtime on
+  the tag the value carries, with CPython's result types and its exact error
+  messages -- including the three different wordings it uses (`unsupported
+  operand type(s) for +`, `can only concatenate str (not "int") to str`, and
+  `'<' not supported between instances of`). `bool` counts as an int, floored
+  division keeps Python's signs, and `==` / `!=` never raise where `<` would.
+  Still refused: method calls on a dynamic value, `in` over a dynamic
+  container, `sorted()` of one, and `str % args`, which names itself as
+  unimplemented rather than reporting a TypeError CPython would not raise.
 - **A dynamic container reads without narrowing** (0.140). `len(v)`, `v[i]`,
   `v[k]`, `v.keys()` and `for x in v` work on an `object` whose contents are
   only known at run time, reading it through the tag it already carries — so

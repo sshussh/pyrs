@@ -169,7 +169,7 @@ Risks to settle in the design, not in review:
 - **Float payloads.** A float in an `i64` payload is a bitcast today; that
   stays.
 
-### D2 — A generic kernel, so nothing has to be rejected
+### D2 — A generic kernel, so nothing has to be rejected — **operators SHIPPED in 0.143.0**
 
 `pyrs_dyn_add`, `pyrs_dyn_getattr`, `pyrs_dyn_call`, `pyrs_dyn_getitem`, …:
 one runtime function per operation, taking tagged values, doing CPython's

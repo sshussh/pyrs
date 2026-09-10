@@ -45,7 +45,7 @@ recorded in [the changelog](../CHANGELOG.md). The most recent run:
 | `cargo test --workspace` | 1751 passed; none failed or ignored |
 | `make examples` | All 15 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.142.0` |
+| `pyrs --version` | `PyRs 0.143.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -403,6 +403,14 @@ documentation and the relevant gates.
       brackets, so the wrapped form needed nothing beyond consuming the
       parentheses. An empty list, a `*` inside the parentheses, and a trailing
       comma without them stay rejected, as CPython rejects them.
+- [x] **Operators on a dynamic value** (0.143): every binary arithmetic
+      operator, every comparison, and the unary operators work on an `Any`
+      through a generic runtime kernel that dispatches on the tag the value
+      already carries. CPython's result types and its three distinct error
+      wordings are matched verbatim. `str % args` is named as unimplemented
+      rather than reported as a TypeError CPython would not raise. What is
+      still refused: method calls on a dynamic value, `in` over a dynamic
+      container, and `sorted()` of one.
 - [ ] **Operators and conversions on a union value**, measured and documented
       in [GUIDE section 9](GUIDE.md#9-differences-from-cpython) as of 0.137.
       What works without narrowing: `print`, truthiness (`if x:` / `bool(x)`),
