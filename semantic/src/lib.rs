@@ -12757,25 +12757,28 @@ fn lower_file_method(
 ) -> SResult<ir::Expr> {
     use ir::FileFn::*;
 
-    let (func, ret, takes_str_arg) = match method {
-        "read" => (Read, ir::Ty::Str, false),
-        "readline" => (ReadLine, ir::Ty::Str, false),
-        "readlines" => (ReadLines, ir::list_of(ir::Ty::Str), false),
-        "write" => (Write, ir::Ty::Int, true),
-        "close" => (Close, ir::Ty::None, false),
-        "flush" => (Flush, ir::Ty::None, false),
+    // The third field is the single argument's type, or None for a method
+    // that takes no argument.
+    let (func, ret, arg_ty) = match method {
+        "read" => (Read, ir::Ty::Str, None),
+        "readline" => (ReadLine, ir::Ty::Str, None),
+        "readlines" => (ReadLines, ir::list_of(ir::Ty::Str), None),
+        "write" => (Write, ir::Ty::Int, Some(ir::Ty::Str)),
+        "writelines" => (WriteLines, ir::Ty::None, Some(ir::list_of(ir::Ty::Str))),
+        "close" => (Close, ir::Ty::None, None),
+        "flush" => (Flush, ir::Ty::None, None),
         _ => {
             return Err(err(
                 format!(
                     "file method '{method}' is not supported yet (supported: \
-                     read, readline, readlines, write, close, flush)"
+                     read, readline, readlines, write, writelines, close, flush)"
                 ),
                 method_span,
             ));
         }
     };
 
-    let expected_args = usize::from(takes_str_arg);
+    let expected_args = usize::from(arg_ty.is_some());
     if args.len() != expected_args {
         return Err(err(
             format!(
@@ -12787,14 +12790,18 @@ fn lower_file_method(
     }
 
     let mut call_args = vec![base_ir];
-    if takes_str_arg {
+    if let Some(want) = arg_ty {
         let a = lower_expr(&args[0], ctx)?;
-        if a.ty != ir::Ty::Str {
-            return Err(err(
-                format!("{method}() expects a str argument, found {}", a.ty),
+        let found = a.ty;
+        // `coerce` is what every other call site uses, and it is what lets an
+        // empty `[]` take the parameter's element type: `f.writelines([])` is
+        // ordinary Python, and a bare `[]` is provisionally `list[Any]`.
+        let a = coerce(a, want, args[0].span, &format!("{method}()")).map_err(|_| {
+            err(
+                format!("{method}() expects a {want} argument, found {found}"),
                 args[0].span,
-            ));
-        }
+            )
+        })?;
         call_args.push(a);
     }
     Ok(ir::Expr {

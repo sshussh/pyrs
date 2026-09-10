@@ -1208,6 +1208,7 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_file_readline(ptr)\n");
         out.push_str("declare ptr @pyrs_file_readlines(ptr)\n");
         out.push_str("declare i64 @pyrs_file_write(ptr, ptr)\n");
+        out.push_str("declare void @pyrs_file_writelines(ptr, ptr)\n");
         out.push_str("declare void @pyrs_file_close(ptr)\n");
         out.push_str("declare void @pyrs_file_flush(ptr)\n");
         out.push_str("declare i64 @pyrs_ipow(i64, i64)\n");
@@ -4106,6 +4107,10 @@ impl Emitter {
                         let t = self.tmp();
                         self.line(format!("{t} = call i64 @pyrs_file_write({args_str})"));
                         self.emit_box_i64(&t)
+                    }
+                    FileFn::WriteLines => {
+                        self.line(format!("call void @pyrs_file_writelines({args_str})"));
+                        String::new()
                     }
                     FileFn::Close => {
                         self.line(format!("call void @pyrs_file_close({args_str})"));

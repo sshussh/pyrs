@@ -1457,6 +1457,8 @@ pub enum FileFn {
     ReadLines,
     /// `f.write(s)` → int (characters written)
     Write,
+    /// `f.writelines(lines)` → None (each item back to back, no separator)
+    WriteLines,
     /// `f.close()` → None (idempotent)
     Close,
     /// `f.flush()` → None

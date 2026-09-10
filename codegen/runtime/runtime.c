@@ -6128,6 +6128,27 @@ long long pyrs_file_write(PyrsFile *f, const PyrsStr *s) {
     return s->cplen;
 }
 
+/* Each item written back to back, with no separator, exactly as Python's
+ * writelines does -- the name says "lines" but it adds none. Its own runtime
+ * function rather than a lowered loop over `write`, because `write` flushes
+ * per call and a loop would be one syscall per item; here the whole list
+ * costs one writability check and one flush. A non-str item cannot reach
+ * this: the argument is typed `list[str]`, so the TypeError CPython raises
+ * mid-write is a compile error instead. */
+void pyrs_file_writelines(PyrsFile *f, const PyrsList *lines) {
+    file_check_open(f);
+    if (!f->writable) {
+        pyrs_die("io.UnsupportedOperation: not writable");
+    }
+    check_ref(lines);
+    for (long long i = 0; i < lines->len; i++) {
+        const PyrsStr *s = (const PyrsStr *)lines->data[i];
+        check_ref(s);
+        fwrite(s->data, 1, (size_t)s->len, f->fp);
+    }
+    fflush(f->fp);
+}
+
 /* idempotent, like Python */
 void pyrs_file_flush(PyrsFile *f) {
     check_ref(f);
