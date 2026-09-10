@@ -112,6 +112,39 @@ That is the governing rule from 0.139 applied: when a compiler gap would make
 the compiler say something Python would not, the gap gets named and written
 down.
 
+## The ABI decision, and why the first one was wrong
+
+The kernel's first version took boxed slots, matching every other `pyrs_any_*`
+entry point, which all take one word. That is three GC allocations per
+operation -- both operands and the result -- and it measured **2.5x slower than
+CPython**:
+
+| 5M-iteration `total = total + i` | time | allocated |
+|---|---:|---:|
+| `total: int` | 0.0043s | 0 B |
+| `total: object`, read only | 0.0043s | 0 B |
+| `total: object`, dynamic `+` -- **boxed ABI** | 0.444s | **240 MB** |
+| `total: object`, dynamic `+` -- **pair ABI** | **0.024s** | 16 B |
+| CPython | 0.178s | — |
+
+That version was correct and passed every test. It also gave back everything
+tier 1 had won, on exactly the code the tier exists to serve. The invariant
+from the plan -- *the cost of a dynamic feature is paid by the code that uses
+it, and by nothing else* -- was satisfied, but the cost was too high to be
+worth paying, and a kernel slower than CPython is the one outcome the whole
+plan says loses.
+
+The fix is to stop crossing the ABI as a box. Operands arrive as their own
+tag and payload; the result payload is the return value and the result tag is
+written through an `int *`, which is a stack slot allocated once per function
+in the entry block rather than a heap allocation per operation. The 16 bytes
+that remain are the single box `print` needs at the end.
+
+The general lesson is that the C ABI's one-word convention was a habit, not a
+constraint. Every other `pyrs_any_*` function inherited it from a time when a
+dynamic value *was* one word. After tier 1 it no longer is, and the entry
+points added since should not pretend otherwise.
+
 ## The bug that appeared twice
 
 Both crashes in this work were the same mistake, and the second one is the

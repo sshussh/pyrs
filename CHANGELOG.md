@@ -30,6 +30,22 @@ needs printf-style formatting, which the kernel does not implement, so it says
 so — raising the `TypeError` the operator table would otherwise produce would
 claim CPython rejects a program it accepts.
 
+The kernel takes its operands as tag/payload pairs and returns the result the
+same way, writing the tag through a stack slot. The first version boxed instead,
+because the existing `Any` runtime entry points all take one word -- and that
+cost three GC allocations per operation, which measured **2.5x slower than
+CPython**: 0.444s and 240 MB against CPython's 0.178s on a 5M-iteration
+accumulation. Passing the pair directly makes the same loop **0.024s with 16
+bytes allocated**, or 7.4x faster than CPython. Correctness was never the
+question; the boxed version simply gave up everything 0.142.0 had won.
+
+| 5M-iteration `total = total + i` | time | allocated |
+|---|---:|---:|
+| `total: int` | 0.0043s | 0 B |
+| `total: object`, read only | 0.0043s | 0 B |
+| `total: object`, dynamic `+` | **0.024s** | 16 B |
+| CPython | 0.178s | — |
+
 Still refused, and now the remaining dynamism work: method calls on a dynamic
 value, `in` over a dynamic container, and `sorted()` of one.
 

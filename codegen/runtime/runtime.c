@@ -7827,6 +7827,12 @@ static PyrsTuple *dyn_tuple_repeat(const PyrsTuple *a, long long n) {
 #define PYRS_DYN_INVERT 2
 #define PYRS_DYN_ABS 3
 
+/* Write the result tag through the out-pointer and hand back the payload. */
+static long long dyn_result(int *out_tag, int tag, long long payload) {
+    *out_tag = tag;
+    return payload;
+}
+
 /* The tag space is sparse -- a list is 4 + 8*elem_tag and a class is
  * 13 + 8*class_id -- so collapse it to a dense kind before switching. */
 typedef enum {
@@ -7994,13 +8000,12 @@ static long long dyn_repeat_count(long long tagged) {
     return pyrs_int_as_i64(tagged);
 }
 
-long long pyrs_dyn_binop(long long a_slot, long long b_slot, int op) {
-    const PyrsUnionBox *ba = any_box(a_slot);
-    const PyrsUnionBox *bb = any_box(b_slot);
-    int lt = ba->print_tag;
-    int rt = bb->print_tag;
-    long long lp = ba->payload;
-    long long rp = bb->payload;
+/* The operands arrive as their own tag/payload pairs and the result leaves the
+ * same way, with the tag written through `out_tag`. Boxing here would cost
+ * three GC allocations per operation, which is the whole reason a dynamic
+ * value stopped being boxed in the first place. */
+long long pyrs_dyn_binop(int lt, long long lp, int rt, long long rp, int op,
+                         int *out_tag) {
     PyrsDynKind lk = dyn_kind(lt);
     PyrsDynKind rk = dyn_kind(rt);
 
@@ -8018,25 +8023,19 @@ long long pyrs_dyn_binop(long long a_slot, long long b_slot, int op) {
      * because `*` means something different for them. */
     if (op == PYRS_DYN_ADD) {
         if (lk == DK_STR && rk == DK_STR) {
-            return any_from_slot(
-                (long long)(uintptr_t)pyrs_str_concat(
+            return dyn_result(out_tag, TAG_STR, (long long)(uintptr_t)pyrs_str_concat(
                     (const PyrsStr *)(uintptr_t)lp,
-                    (const PyrsStr *)(uintptr_t)rp),
-                TAG_STR);
+                    (const PyrsStr *)(uintptr_t)rp));
         }
         if (lk == DK_LIST && rk == DK_LIST) {
-            return any_from_slot(
-                (long long)(uintptr_t)pyrs_list_concat(
+            return dyn_result(out_tag, lt, (long long)(uintptr_t)pyrs_list_concat(
                     (const PyrsList *)(uintptr_t)lp,
-                    (const PyrsList *)(uintptr_t)rp),
-                lt);
+                    (const PyrsList *)(uintptr_t)rp));
         }
         if (lk == DK_TUPLE && rk == DK_TUPLE) {
-            return any_from_slot(
-                (long long)(uintptr_t)dyn_tuple_concat(
+            return dyn_result(out_tag, TAG_TUPLE, (long long)(uintptr_t)dyn_tuple_concat(
                     (const PyrsTuple *)(uintptr_t)lp,
-                    (const PyrsTuple *)(uintptr_t)rp),
-                TAG_TUPLE);
+                    (const PyrsTuple *)(uintptr_t)rp));
         }
     }
     /* Set algebra, which shares `-` with numeric subtraction. */
@@ -8051,46 +8050,34 @@ long long pyrs_dyn_binop(long long a_slot, long long b_slot, int op) {
             break;
         }
         if (r != NULL) {
-            return any_from_slot((long long)(uintptr_t)r, TAG_SET);
+            return dyn_result(out_tag, TAG_SET, (long long)(uintptr_t)r);
         }
     }
     if (op == PYRS_DYN_MUL) {
         /* Either order repeats: `3 * "ab"` and `"ab" * 3` agree. */
         if (lk == DK_STR && (rk == DK_INT || rk == DK_BOOL)) {
-            return any_from_slot(
-                (long long)(uintptr_t)pyrs_str_repeat(
-                    (const PyrsStr *)(uintptr_t)lp, dyn_repeat_count(ri)),
-                TAG_STR);
+            return dyn_result(out_tag, TAG_STR, (long long)(uintptr_t)pyrs_str_repeat(
+                    (const PyrsStr *)(uintptr_t)lp, dyn_repeat_count(ri)));
         }
         if (rk == DK_STR && (lk == DK_INT || lk == DK_BOOL)) {
-            return any_from_slot(
-                (long long)(uintptr_t)pyrs_str_repeat(
-                    (const PyrsStr *)(uintptr_t)rp, dyn_repeat_count(li)),
-                TAG_STR);
+            return dyn_result(out_tag, TAG_STR, (long long)(uintptr_t)pyrs_str_repeat(
+                    (const PyrsStr *)(uintptr_t)rp, dyn_repeat_count(li)));
         }
         if (lk == DK_LIST && (rk == DK_INT || rk == DK_BOOL)) {
-            return any_from_slot(
-                (long long)(uintptr_t)pyrs_list_repeat(
-                    (const PyrsList *)(uintptr_t)lp, dyn_repeat_count(ri)),
-                lt);
+            return dyn_result(out_tag, lt, (long long)(uintptr_t)pyrs_list_repeat(
+                    (const PyrsList *)(uintptr_t)lp, dyn_repeat_count(ri)));
         }
         if (rk == DK_LIST && (lk == DK_INT || lk == DK_BOOL)) {
-            return any_from_slot(
-                (long long)(uintptr_t)pyrs_list_repeat(
-                    (const PyrsList *)(uintptr_t)rp, dyn_repeat_count(li)),
-                rt);
+            return dyn_result(out_tag, rt, (long long)(uintptr_t)pyrs_list_repeat(
+                    (const PyrsList *)(uintptr_t)rp, dyn_repeat_count(li)));
         }
         if (lk == DK_TUPLE && (rk == DK_INT || rk == DK_BOOL)) {
-            return any_from_slot(
-                (long long)(uintptr_t)dyn_tuple_repeat(
-                    (const PyrsTuple *)(uintptr_t)lp, dyn_repeat_count(ri)),
-                TAG_TUPLE);
+            return dyn_result(out_tag, TAG_TUPLE, (long long)(uintptr_t)dyn_tuple_repeat(
+                    (const PyrsTuple *)(uintptr_t)lp, dyn_repeat_count(ri)));
         }
         if (rk == DK_TUPLE && (lk == DK_INT || lk == DK_BOOL)) {
-            return any_from_slot(
-                (long long)(uintptr_t)dyn_tuple_repeat(
-                    (const PyrsTuple *)(uintptr_t)rp, dyn_repeat_count(li)),
-                TAG_TUPLE);
+            return dyn_result(out_tag, TAG_TUPLE, (long long)(uintptr_t)dyn_tuple_repeat(
+                    (const PyrsTuple *)(uintptr_t)rp, dyn_repeat_count(li)));
         }
     }
 
@@ -8107,7 +8094,7 @@ long long pyrs_dyn_binop(long long a_slot, long long b_slot, int op) {
         double r = ld / rd;
         long long bits;
         memcpy(&bits, &r, sizeof bits);
-        return any_from_slot(bits, TAG_FLOAT);
+        return dyn_result(out_tag, TAG_FLOAT, bits);
     }
 
     if (both_int) {
@@ -8140,12 +8127,12 @@ long long pyrs_dyn_binop(long long a_slot, long long b_slot, int op) {
                 double res = pow(ld, rd);
                 long long bits;
                 memcpy(&bits, &res, sizeof bits);
-                return any_from_slot(bits, TAG_FLOAT);
+                return dyn_result(out_tag, TAG_FLOAT, bits);
             }
             r = pyrs_int_pow(li, ri);
             break;
         }
-        return any_from_slot(r, TAG_INT);
+        return dyn_result(out_tag, TAG_INT, r);
     }
 
     {
@@ -8184,7 +8171,7 @@ long long pyrs_dyn_binop(long long a_slot, long long b_slot, int op) {
             }
             long long bits;
             memcpy(&bits, &r, sizeof bits);
-            return any_from_slot(bits, TAG_FLOAT);
+            return dyn_result(out_tag, TAG_FLOAT, bits);
         }
     }
 
@@ -8198,13 +8185,7 @@ long long pyrs_dyn_binop(long long a_slot, long long b_slot, int op) {
 
 /* `==` and `!=` never raise: mismatched types are simply unequal. Ordering
  * does raise, which is the only difference between the two halves. */
-int pyrs_dyn_compare(long long a_slot, long long b_slot, int op) {
-    const PyrsUnionBox *ba = any_box(a_slot);
-    const PyrsUnionBox *bb = any_box(b_slot);
-    int lt = ba->print_tag;
-    int rt = bb->print_tag;
-    long long lp = ba->payload;
-    long long rp = bb->payload;
+int pyrs_dyn_compare(int lt, long long lp, int rt, long long rp, int op) {
     PyrsDynKind lk = dyn_kind(lt);
     PyrsDynKind rk = dyn_kind(rt);
     int equality = op == PYRS_DYN_EQ || op == PYRS_DYN_NE;
@@ -8288,10 +8269,7 @@ int pyrs_dyn_compare(long long a_slot, long long b_slot, int op) {
     }
 }
 
-long long pyrs_dyn_unary(long long a_slot, int op) {
-    const PyrsUnionBox *ba = any_box(a_slot);
-    int tag = ba->print_tag;
-    long long payload = ba->payload;
+long long pyrs_dyn_unary(int tag, long long payload, int op, int *out_tag) {
     PyrsDynKind k = dyn_kind(tag);
 
     long long i = 0;
@@ -8311,7 +8289,7 @@ long long pyrs_dyn_unary(long long a_slot, int op) {
             r = pyrs_int_abs(i);
             break;
         }
-        return any_from_slot(r, TAG_INT);
+        return dyn_result(out_tag, TAG_INT, r);
     }
     if (k == DK_FLOAT) {
         double d;
@@ -8336,7 +8314,7 @@ long long pyrs_dyn_unary(long long a_slot, int op) {
         }
         long long bits;
         memcpy(&bits, &r, sizeof bits);
-        return any_from_slot(bits, TAG_FLOAT);
+        return dyn_result(out_tag, TAG_FLOAT, bits);
     }
 
     {

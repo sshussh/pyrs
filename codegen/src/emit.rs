@@ -995,9 +995,9 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_ascii_set(ptr)\n");
         out.push_str("declare void @pyrs_print_any(i64)\n");
         out.push_str("declare i32 @pyrs_any_truth(i64)\n");
-        out.push_str("declare i64 @pyrs_dyn_binop(i64, i64, i32)\n");
-        out.push_str("declare i32 @pyrs_dyn_compare(i64, i64, i32)\n");
-        out.push_str("declare i64 @pyrs_dyn_unary(i64, i32)\n");
+        out.push_str("declare i64 @pyrs_dyn_binop(i32, i64, i32, i64, i32, ptr)\n");
+        out.push_str("declare i32 @pyrs_dyn_compare(i32, i64, i32, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_dyn_unary(i32, i64, i32, ptr)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
@@ -2397,6 +2397,13 @@ impl Emitter {
         self.build_any(&print_tag, &payload)
     }
 
+    /// A function-wide `i32` stack slot the generic kernel writes result tags
+    /// into. One per function, allocated in the entry block, so a loop body
+    /// does not grow the frame.
+    fn dyn_tag_slot(&mut self) -> String {
+        "%.dyn.tag".to_string()
+    }
+
     /// Assemble a dynamic value from a print tag and a payload word.
     fn build_any(&mut self, print_tag: &str, payload: &str) -> String {
         let a0 = self.tmp();
@@ -3197,6 +3204,10 @@ impl Emitter {
             self.line(format!("{p} = alloca i32, align 4"));
             self.try_pool.push((e, l, p));
         }
+        // Result tag for the generic dynamic-operator kernel. One slot per
+        // function, in the entry block, so a loop body cannot grow the frame
+        // on every iteration.
+        self.line("%.dyn.tag = alloca i32, align 4");
         // spill params into allocas so assignment to params just works
         for (name, ty) in &func.params {
             self.line(format!("%v.{name} = alloca {}", lty(*ty)));
@@ -4114,26 +4125,34 @@ impl Emitter {
             }
             // The generic kernel takes boxed slots, because its C signature is
             // one word per operand. Nothing keeps the boxes afterwards.
+            // The pair is passed straight through; the result tag comes back
+            // in a stack slot. Boxing for the call would cost three GC
+            // allocations per operation.
             ExprKind::DynBinop { left, right, op } => {
                 let l = self.emit_expr(left);
-                let l = self.any_box(&l);
+                let (lt, lp) = self.emit_any_unpack(&l);
                 let r = self.emit_expr(right);
-                let r = self.any_box(&r);
-                let t = self.tmp();
+                let (rt, rp) = self.emit_any_unpack(&r);
+                let slot = self.dyn_tag_slot();
+                let pay = self.tmp();
                 self.line(format!(
-                    "{t} = call i64 @pyrs_dyn_binop(i64 {l}, i64 {r}, i32 {})",
+                    "{pay} = call i64 @pyrs_dyn_binop(i32 {lt}, i64 {lp}, i32 {rt}, \
+                     i64 {rp}, i32 {}, ptr {slot})",
                     *op as i32
                 ));
-                self.any_unbox(&t)
+                let tag = self.tmp();
+                self.line(format!("{tag} = load i32, ptr {slot}"));
+                self.build_any(&tag, &pay)
             }
             ExprKind::DynCompare { left, right, op } => {
                 let l = self.emit_expr(left);
-                let l = self.any_box(&l);
+                let (lt, lp) = self.emit_any_unpack(&l);
                 let r = self.emit_expr(right);
-                let r = self.any_box(&r);
+                let (rt, rp) = self.emit_any_unpack(&r);
                 let c = self.tmp();
                 self.line(format!(
-                    "{c} = call i32 @pyrs_dyn_compare(i64 {l}, i64 {r}, i32 {})",
+                    "{c} = call i32 @pyrs_dyn_compare(i32 {lt}, i64 {lp}, i32 {rt}, \
+                     i64 {rp}, i32 {})",
                     *op as i32
                 ));
                 let t = self.tmp();
@@ -4142,13 +4161,17 @@ impl Emitter {
             }
             ExprKind::DynUnary { value, op } => {
                 let v = self.emit_expr(value);
-                let v = self.any_box(&v);
-                let t = self.tmp();
+                let (vt, vp) = self.emit_any_unpack(&v);
+                let slot = self.dyn_tag_slot();
+                let pay = self.tmp();
                 self.line(format!(
-                    "{t} = call i64 @pyrs_dyn_unary(i64 {v}, i32 {})",
+                    "{pay} = call i64 @pyrs_dyn_unary(i32 {vt}, i64 {vp}, i32 {}, \
+                     ptr {slot})",
                     *op as i32
                 ));
-                self.any_unbox(&t)
+                let tag = self.tmp();
+                self.line(format!("{tag} = load i32, ptr {slot}"));
+                self.build_any(&tag, &pay)
             }
             ExprKind::FromAny { value } => {
                 let v = self.emit_expr(value);
