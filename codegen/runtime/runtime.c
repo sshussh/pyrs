@@ -7763,6 +7763,596 @@ long long pyrs_any_len(long long v) {
     return *(const long long *)(uintptr_t)b->payload;
 }
 
+/* Tuple concatenation and repetition for the dynamic kernel. A tuple carries a
+ * tag per slot, so both are copied alongside the payloads. */
+static PyrsTuple *dyn_tuple_concat(const PyrsTuple *a, const PyrsTuple *b) {
+    check_ref(a);
+    check_ref(b);
+    PyrsTuple *t = pyrs_tuple_new(a->len + b->len);
+    for (long long i = 0; i < a->len; i++) {
+        t->data[i] = a->data[i];
+        t->tags[i] = a->tags[i];
+    }
+    for (long long i = 0; i < b->len; i++) {
+        t->data[a->len + i] = b->data[i];
+        t->tags[a->len + i] = b->tags[i];
+    }
+    return t;
+}
+
+static PyrsTuple *dyn_tuple_repeat(const PyrsTuple *a, long long n) {
+    check_ref(a);
+    if (n < 0) {
+        n = 0;
+    }
+    PyrsTuple *t = pyrs_tuple_new(a->len * n);
+    long long k = 0;
+    for (long long r = 0; r < n; r++) {
+        for (long long i = 0; i < a->len; i++) {
+            t->data[k] = a->data[i];
+            t->tags[k] = a->tags[i];
+            k++;
+        }
+    }
+    return t;
+}
+
+/* ---- generic operators on dynamic values ----
+ *
+ * A dynamic value carries its own print tag, so an operator on one has to
+ * dispatch at run time. These are the always-correct path: the compiler emits
+ * a call here when it cannot name both operand types, and CPython's exact
+ * result types and error messages are the contract.
+ *
+ * The op codes are shared with codegen/src/emit.rs and must not be reordered.
+ */
+
+#define PYRS_DYN_ADD 0
+#define PYRS_DYN_SUB 1
+#define PYRS_DYN_MUL 2
+#define PYRS_DYN_DIV 3
+#define PYRS_DYN_FLOORDIV 4
+#define PYRS_DYN_MOD 5
+#define PYRS_DYN_POW 6
+
+#define PYRS_DYN_LT 0
+#define PYRS_DYN_LE 1
+#define PYRS_DYN_GT 2
+#define PYRS_DYN_GE 3
+#define PYRS_DYN_EQ 4
+#define PYRS_DYN_NE 5
+
+#define PYRS_DYN_NEG 0
+#define PYRS_DYN_POS 1
+#define PYRS_DYN_INVERT 2
+#define PYRS_DYN_ABS 3
+
+/* The tag space is sparse -- a list is 4 + 8*elem_tag and a class is
+ * 13 + 8*class_id -- so collapse it to a dense kind before switching. */
+typedef enum {
+    DK_NONE = 0,
+    DK_INT,
+    DK_FLOAT,
+    DK_BOOL,
+    DK_STR,
+    DK_LIST,
+    DK_TUPLE,
+    DK_DICT,
+    DK_SET,
+    DK_OTHER
+} PyrsDynKind;
+
+static PyrsDynKind dyn_kind(int tag) {
+    if (tag < 0) {
+        return DK_NONE;
+    }
+    switch (tag) {
+    case TAG_INT:
+        return DK_INT;
+    case TAG_FLOAT:
+        return DK_FLOAT;
+    case TAG_BOOL:
+        return DK_BOOL;
+    case TAG_STR:
+        return DK_STR;
+    case TAG_TUPLE:
+        return DK_TUPLE;
+    case TAG_DICT:
+        return DK_DICT;
+    case TAG_SET:
+        return DK_SET;
+    default:
+        break;
+    }
+    if (tag >= 4 && ((tag - 4) % 8) == 0) {
+        return DK_LIST;
+    }
+    return DK_OTHER;
+}
+
+static const char *dyn_type_name(int tag) {
+    switch (dyn_kind(tag)) {
+    case DK_NONE:
+        return "NoneType";
+    case DK_INT:
+        return "int";
+    case DK_FLOAT:
+        return "float";
+    case DK_BOOL:
+        return "bool";
+    case DK_STR:
+        return "str";
+    case DK_LIST:
+        return "list";
+    case DK_TUPLE:
+        return "tuple";
+    case DK_DICT:
+        return "dict";
+    case DK_SET:
+        return "set";
+    default:
+        return "object";
+    }
+}
+
+static const char *dyn_binop_symbol(int op) {
+    switch (op) {
+    case PYRS_DYN_ADD:
+        return "+";
+    case PYRS_DYN_SUB:
+        return "-";
+    case PYRS_DYN_MUL:
+        return "*";
+    case PYRS_DYN_DIV:
+        return "/";
+    case PYRS_DYN_FLOORDIV:
+        return "//";
+    case PYRS_DYN_MOD:
+        return "%";
+    default:
+        return "**";
+    }
+}
+
+static const char *dyn_cmp_symbol(int op) {
+    switch (op) {
+    case PYRS_DYN_LT:
+        return "<";
+    case PYRS_DYN_LE:
+        return "<=";
+    case PYRS_DYN_GT:
+        return ">";
+    default:
+        return ">=";
+    }
+}
+
+/* `unsupported operand type(s) for +: 'int' and 'str'`, and the separate
+ * wording CPython uses when the left operand is a sequence. */
+_Noreturn static void dyn_binop_error(int op, int lt, int rt) {
+    char msg[192];
+    PyrsDynKind lk = dyn_kind(lt);
+    int concat = op == PYRS_DYN_ADD
+                 && (lk == DK_STR || lk == DK_LIST || lk == DK_TUPLE);
+    if (concat) {
+        snprintf(msg, sizeof msg,
+                 "TypeError: can only concatenate %s (not \"%s\") to %s",
+                 dyn_type_name(lt), dyn_type_name(rt), dyn_type_name(lt));
+    } else {
+        snprintf(msg, sizeof msg,
+                 "TypeError: unsupported operand type(s) for %s: '%s' and '%s'",
+                 dyn_binop_symbol(op), dyn_type_name(lt), dyn_type_name(rt));
+    }
+    pyrs_die(msg);
+}
+
+_Noreturn static void dyn_cmp_error(int op, int lt, int rt) {
+    char msg[192];
+    snprintf(msg, sizeof msg,
+             "TypeError: '%s' not supported between instances of '%s' and '%s'",
+             dyn_cmp_symbol(op), dyn_type_name(lt), dyn_type_name(rt));
+    pyrs_die(msg);
+}
+
+/* An int-like operand as a tagged PyRs int. `bool` is an int in Python, so
+ * `True + True` is 2 and `True * "ab"` is "ab". */
+static int dyn_as_int(int tag, long long payload, long long *out) {
+    switch (dyn_kind(tag)) {
+    case DK_INT:
+        *out = payload;
+        return 1;
+    case DK_BOOL:
+        *out = pyrs_int_from_i64(payload != 0);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Any numeric operand widened to double, for the mixed int/float cases. */
+static int dyn_as_double(int tag, long long payload, double *out) {
+    switch (dyn_kind(tag)) {
+    case DK_FLOAT: {
+        double d;
+        memcpy(&d, &payload, sizeof d);
+        *out = d;
+        return 1;
+    }
+    case DK_INT:
+        *out = pyrs_int_to_float(payload);
+        return 1;
+    case DK_BOOL:
+        *out = payload != 0 ? 1.0 : 0.0;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* A repetition count: `"ab" * True` is "ab", and a negative count gives "". */
+static long long dyn_repeat_count(long long tagged) {
+    return pyrs_int_as_i64(tagged);
+}
+
+long long pyrs_dyn_binop(long long a_slot, long long b_slot, int op) {
+    const PyrsUnionBox *ba = any_box(a_slot);
+    const PyrsUnionBox *bb = any_box(b_slot);
+    int lt = ba->print_tag;
+    int rt = bb->print_tag;
+    long long lp = ba->payload;
+    long long rp = bb->payload;
+    PyrsDynKind lk = dyn_kind(lt);
+    PyrsDynKind rk = dyn_kind(rt);
+
+    long long li = 0;
+    long long ri = 0;
+    /* Both conversions run unconditionally: `&&` would short-circuit, and the
+     * repetition cases below read whichever side is the count even when the
+     * other side is a sequence. An unconverted 0 is not a tagged small int --
+     * its low bit is clear, so it would be read as a heap pointer. */
+    int l_is_int = dyn_as_int(lt, lp, &li);
+    int r_is_int = dyn_as_int(rt, rp, &ri);
+    int both_int = l_is_int && r_is_int;
+
+    /* Sequence concatenation and repetition come before the numeric tower,
+     * because `*` means something different for them. */
+    if (op == PYRS_DYN_ADD) {
+        if (lk == DK_STR && rk == DK_STR) {
+            return any_from_slot(
+                (long long)(uintptr_t)pyrs_str_concat(
+                    (const PyrsStr *)(uintptr_t)lp,
+                    (const PyrsStr *)(uintptr_t)rp),
+                TAG_STR);
+        }
+        if (lk == DK_LIST && rk == DK_LIST) {
+            return any_from_slot(
+                (long long)(uintptr_t)pyrs_list_concat(
+                    (const PyrsList *)(uintptr_t)lp,
+                    (const PyrsList *)(uintptr_t)rp),
+                lt);
+        }
+        if (lk == DK_TUPLE && rk == DK_TUPLE) {
+            return any_from_slot(
+                (long long)(uintptr_t)dyn_tuple_concat(
+                    (const PyrsTuple *)(uintptr_t)lp,
+                    (const PyrsTuple *)(uintptr_t)rp),
+                TAG_TUPLE);
+        }
+    }
+    /* Set algebra, which shares `-` with numeric subtraction. */
+    if (lk == DK_SET && rk == DK_SET) {
+        PyrsSet *r = NULL;
+        switch (op) {
+        case PYRS_DYN_SUB:
+            r = pyrs_set_diff((const PyrsSet *)(uintptr_t)lp,
+                              (const PyrsSet *)(uintptr_t)rp);
+            break;
+        default:
+            break;
+        }
+        if (r != NULL) {
+            return any_from_slot((long long)(uintptr_t)r, TAG_SET);
+        }
+    }
+    if (op == PYRS_DYN_MUL) {
+        /* Either order repeats: `3 * "ab"` and `"ab" * 3` agree. */
+        if (lk == DK_STR && (rk == DK_INT || rk == DK_BOOL)) {
+            return any_from_slot(
+                (long long)(uintptr_t)pyrs_str_repeat(
+                    (const PyrsStr *)(uintptr_t)lp, dyn_repeat_count(ri)),
+                TAG_STR);
+        }
+        if (rk == DK_STR && (lk == DK_INT || lk == DK_BOOL)) {
+            return any_from_slot(
+                (long long)(uintptr_t)pyrs_str_repeat(
+                    (const PyrsStr *)(uintptr_t)rp, dyn_repeat_count(li)),
+                TAG_STR);
+        }
+        if (lk == DK_LIST && (rk == DK_INT || rk == DK_BOOL)) {
+            return any_from_slot(
+                (long long)(uintptr_t)pyrs_list_repeat(
+                    (const PyrsList *)(uintptr_t)lp, dyn_repeat_count(ri)),
+                lt);
+        }
+        if (rk == DK_LIST && (lk == DK_INT || lk == DK_BOOL)) {
+            return any_from_slot(
+                (long long)(uintptr_t)pyrs_list_repeat(
+                    (const PyrsList *)(uintptr_t)rp, dyn_repeat_count(li)),
+                rt);
+        }
+        if (lk == DK_TUPLE && (rk == DK_INT || rk == DK_BOOL)) {
+            return any_from_slot(
+                (long long)(uintptr_t)dyn_tuple_repeat(
+                    (const PyrsTuple *)(uintptr_t)lp, dyn_repeat_count(ri)),
+                TAG_TUPLE);
+        }
+        if (rk == DK_TUPLE && (lk == DK_INT || lk == DK_BOOL)) {
+            return any_from_slot(
+                (long long)(uintptr_t)dyn_tuple_repeat(
+                    (const PyrsTuple *)(uintptr_t)rp, dyn_repeat_count(li)),
+                TAG_TUPLE);
+        }
+    }
+
+    /* `/` is always float, even on two ints. */
+    if (op == PYRS_DYN_DIV) {
+        double ld;
+        double rd;
+        if (!dyn_as_double(lt, lp, &ld) || !dyn_as_double(rt, rp, &rd)) {
+            dyn_binop_error(op, lt, rt);
+        }
+        if (rd == 0.0) {
+            pyrs_die("ZeroDivisionError: division by zero");
+        }
+        double r = ld / rd;
+        long long bits;
+        memcpy(&bits, &r, sizeof bits);
+        return any_from_slot(bits, TAG_FLOAT);
+    }
+
+    if (both_int) {
+        long long r;
+        switch (op) {
+        case PYRS_DYN_ADD:
+            r = pyrs_int_add(li, ri);
+            break;
+        case PYRS_DYN_SUB:
+            r = pyrs_int_sub(li, ri);
+            break;
+        case PYRS_DYN_MUL:
+            r = pyrs_int_mul(li, ri);
+            break;
+        case PYRS_DYN_FLOORDIV:
+            r = pyrs_int_floordiv(li, ri);
+            break;
+        case PYRS_DYN_MOD:
+            r = pyrs_int_mod(li, ri);
+            break;
+        default:
+            /* `2 ** -1` is a float, which `pyrs_int_pow` handles by trapping;
+             * route a negative exponent through the float path instead. */
+            if (pyrs_int_cmp(ri, pyrs_int_from_i64(0)) < 0) {
+                double ld = pyrs_int_to_float(li);
+                double rd = pyrs_int_to_float(ri);
+                if (ld == 0.0) {
+                    pyrs_die("ZeroDivisionError: zero to a negative power");
+                }
+                double res = pow(ld, rd);
+                long long bits;
+                memcpy(&bits, &res, sizeof bits);
+                return any_from_slot(bits, TAG_FLOAT);
+            }
+            r = pyrs_int_pow(li, ri);
+            break;
+        }
+        return any_from_slot(r, TAG_INT);
+    }
+
+    {
+        double ld;
+        double rd;
+        if (dyn_as_double(lt, lp, &ld) && dyn_as_double(rt, rp, &rd)) {
+            double r;
+            switch (op) {
+            case PYRS_DYN_ADD:
+                r = ld + rd;
+                break;
+            case PYRS_DYN_SUB:
+                r = ld - rd;
+                break;
+            case PYRS_DYN_MUL:
+                r = ld * rd;
+                break;
+            case PYRS_DYN_FLOORDIV:
+                if (rd == 0.0) {
+                    pyrs_die("ZeroDivisionError: division by zero");
+                }
+                r = pyrs_ffloordiv(ld, rd);
+                break;
+            case PYRS_DYN_MOD:
+                if (rd == 0.0) {
+                    pyrs_die("ZeroDivisionError: division by zero");
+                }
+                r = pyrs_fmod_floored(ld, rd);
+                break;
+            default:
+                if (ld == 0.0 && rd < 0.0) {
+                    pyrs_die("ZeroDivisionError: zero to a negative power");
+                }
+                r = pow(ld, rd);
+                break;
+            }
+            long long bits;
+            memcpy(&bits, &r, sizeof bits);
+            return any_from_slot(bits, TAG_FLOAT);
+        }
+    }
+
+    if (op == PYRS_DYN_MOD && lk == DK_STR) {
+        pyrs_die("NotImplementedError: printf-style '%' formatting on a "
+                 "dynamic str is not supported yet; use an f-string, or "
+                 "narrow with isinstance first");
+    }
+    dyn_binop_error(op, lt, rt);
+}
+
+/* `==` and `!=` never raise: mismatched types are simply unequal. Ordering
+ * does raise, which is the only difference between the two halves. */
+int pyrs_dyn_compare(long long a_slot, long long b_slot, int op) {
+    const PyrsUnionBox *ba = any_box(a_slot);
+    const PyrsUnionBox *bb = any_box(b_slot);
+    int lt = ba->print_tag;
+    int rt = bb->print_tag;
+    long long lp = ba->payload;
+    long long rp = bb->payload;
+    PyrsDynKind lk = dyn_kind(lt);
+    PyrsDynKind rk = dyn_kind(rt);
+    int equality = op == PYRS_DYN_EQ || op == PYRS_DYN_NE;
+
+    int order = 0;
+    int have = 0;
+
+    long long li = 0;
+    long long ri = 0;
+    /* Both conversions run unconditionally. `&&` would short-circuit, and the
+     * mixed int/float arms below read whichever side is the integer -- an
+     * unconverted 0 has its low bit clear, so it would be read as a heap
+     * pointer rather than as a small int. */
+    int l_is_int = dyn_as_int(lt, lp, &li);
+    int r_is_int = dyn_as_int(rt, rp, &ri);
+    if (l_is_int && r_is_int) {
+        order = pyrs_int_cmp(li, ri);
+        have = 1;
+    } else {
+        double ld;
+        double rd;
+        int lnum = dyn_as_double(lt, lp, &ld);
+        int rnum = dyn_as_double(rt, rp, &rd);
+        if (lnum && rnum) {
+            /* An exact int/float comparison, so a bigint against a double
+             * does not lose the answer to rounding. */
+            if (lk == DK_FLOAT && (rk == DK_INT || rk == DK_BOOL)) {
+                order = -pyrs_int_float_cmp(ri, ld);
+            } else if (rk == DK_FLOAT && (lk == DK_INT || lk == DK_BOOL)) {
+                order = pyrs_int_float_cmp(li, rd);
+            } else {
+                order = ld < rd ? -1 : (ld > rd ? 1 : 0);
+                if (!(ld == rd) && !(ld < rd) && !(ld > rd)) {
+                    /* NaN: unequal and unordered. */
+                    return op == PYRS_DYN_NE ? 1 : 0;
+                }
+            }
+            have = 1;
+        } else if (lk == DK_STR && rk == DK_STR) {
+            order = pyrs_str_cmp((const PyrsStr *)(uintptr_t)lp,
+                                 (const PyrsStr *)(uintptr_t)rp);
+            have = 1;
+        } else if (lk == DK_LIST && rk == DK_LIST) {
+            /* Both sides carry their own element tag; `pyrs_list_cmp` takes
+             * one, so a mismatch is compared through the left's encoding. */
+            order = pyrs_list_cmp((const PyrsList *)(uintptr_t)lp,
+                                  (const PyrsList *)(uintptr_t)rp,
+                                  any_elem_tag(lt));
+            have = 1;
+        } else if (lk == DK_TUPLE && rk == DK_TUPLE) {
+            order = pyrs_tuple_cmp((const PyrsTuple *)(uintptr_t)lp,
+                                   (const PyrsTuple *)(uintptr_t)rp);
+            have = 1;
+        } else if (equality && lk == DK_NONE && rk == DK_NONE) {
+            order = 0;
+            have = 1;
+        }
+    }
+
+    if (!have) {
+        if (equality) {
+            /* Different kinds are unequal, and that is not an error. */
+            return op == PYRS_DYN_NE ? 1 : 0;
+        }
+        dyn_cmp_error(op, lt, rt);
+    }
+
+    switch (op) {
+    case PYRS_DYN_LT:
+        return order < 0;
+    case PYRS_DYN_LE:
+        return order <= 0;
+    case PYRS_DYN_GT:
+        return order > 0;
+    case PYRS_DYN_GE:
+        return order >= 0;
+    case PYRS_DYN_EQ:
+        return order == 0;
+    default:
+        return order != 0;
+    }
+}
+
+long long pyrs_dyn_unary(long long a_slot, int op) {
+    const PyrsUnionBox *ba = any_box(a_slot);
+    int tag = ba->print_tag;
+    long long payload = ba->payload;
+    PyrsDynKind k = dyn_kind(tag);
+
+    long long i = 0;
+    if (dyn_as_int(tag, payload, &i)) {
+        long long r;
+        switch (op) {
+        case PYRS_DYN_NEG:
+            r = pyrs_int_neg(i);
+            break;
+        case PYRS_DYN_POS:
+            r = i;
+            break;
+        case PYRS_DYN_INVERT:
+            r = pyrs_int_invert(i);
+            break;
+        default:
+            r = pyrs_int_abs(i);
+            break;
+        }
+        return any_from_slot(r, TAG_INT);
+    }
+    if (k == DK_FLOAT) {
+        double d;
+        memcpy(&d, &payload, sizeof d);
+        double r;
+        switch (op) {
+        case PYRS_DYN_NEG:
+            r = -d;
+            break;
+        case PYRS_DYN_POS:
+            r = d;
+            break;
+        case PYRS_DYN_INVERT: {
+            char msg[96];
+            snprintf(msg, sizeof msg,
+                     "TypeError: bad operand type for unary ~: 'float'");
+            pyrs_die(msg);
+        }
+        default:
+            r = d < 0.0 ? -d : d;
+            break;
+        }
+        long long bits;
+        memcpy(&bits, &r, sizeof bits);
+        return any_from_slot(bits, TAG_FLOAT);
+    }
+
+    {
+        char msg[128];
+        const char *what = op == PYRS_DYN_NEG
+                               ? "unary -"
+                               : (op == PYRS_DYN_POS
+                                      ? "unary +"
+                                      : (op == PYRS_DYN_INVERT ? "unary ~"
+                                                               : "abs()"));
+        snprintf(msg, sizeof msg, "TypeError: bad operand type for %s: '%s'",
+                 what, dyn_type_name(tag));
+        pyrs_die(msg);
+    }
+}
+
 /* `v[i]` where `v` is a dynamic list or tuple. Returns an `Any`. A tuple
  * carries a tag per slot, so its elements come back exactly typed even though
  * the tuple as a whole has no element type. */

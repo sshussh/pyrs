@@ -18856,6 +18856,26 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             if matches!(value.ty, ir::Ty::Class(_)) && class_unary_method(*op).is_some() {
                 return lower_class_unary(*op, value, expr.span, ctx);
             }
+            // A dynamic operand has no static rule, so the runtime decides.
+            // Checked before the typed arms, since `Neg` below folds literals
+            // and would otherwise wrap the dynamic result in a typed node.
+            if value.ty == ir::Ty::Any {
+                let dyn_op = match op {
+                    ast::UnaryOp::Neg => Some(ir::DynUnOp::Neg),
+                    ast::UnaryOp::Pos => Some(ir::DynUnOp::Pos),
+                    ast::UnaryOp::Invert => Some(ir::DynUnOp::Invert),
+                    ast::UnaryOp::Not => None,
+                };
+                if let Some(dyn_op) = dyn_op {
+                    return Ok(ir::Expr {
+                        ty: ir::Ty::Any,
+                        kind: ir::ExprKind::DynUnary {
+                            value: Box::new(value),
+                            op: dyn_op,
+                        },
+                    });
+                }
+            }
             match op {
                 // `+x` is identity on a number. It is not a no-op in general,
                 // which is why the parser records it: CPython rejects `+"a"`.
@@ -23167,6 +23187,17 @@ fn lower_call(
                 }
                 let arg = lower_expr(args[0], ctx)?;
                 // bool → int (abs(True) is 1); int/float keep their type
+                // A dynamic operand has no static type to check, so the
+                // runtime raises CPython's message if the tag has no abs().
+                if arg.ty == ir::Ty::Any {
+                    return Ok(ir::Expr {
+                        ty: ir::Ty::Any,
+                        kind: ir::ExprKind::DynUnary {
+                            value: Box::new(arg),
+                            op: ir::DynUnOp::Abs,
+                        },
+                    });
+                }
                 let arg = match arg.ty {
                     ir::Ty::Bool => ir::Expr {
                         ty: ir::Ty::Int,
@@ -24650,6 +24681,15 @@ fn call_builtin_sort_key(
             })
         }
         BuiltinKey::Abs => {
+            if arg.ty == ir::Ty::Any {
+                return Ok(ir::Expr {
+                    ty: ir::Ty::Any,
+                    kind: ir::ExprKind::DynUnary {
+                        value: Box::new(arg),
+                        op: ir::DynUnOp::Abs,
+                    },
+                });
+            }
             let arg = match arg.ty {
                 ir::Ty::Bool => ir::Expr {
                     ty: ir::Ty::Int,
@@ -27594,6 +27634,64 @@ fn lower_is_none(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
     }
 }
 
+/// An operator with at least one dynamic operand.
+///
+/// Returns `None` for the operators the kernel does not implement, so the
+/// caller falls through to the existing diagnostic rather than this one
+/// silently accepting something it cannot do. Both operands are boxed into
+/// `Any` first, so a mixed `Any + int` needs no separate path.
+fn lower_dynamic_binary(
+    op: ast::BinOp,
+    l: &ir::Expr,
+    r: &ir::Expr,
+    span: Span,
+) -> SResult<Option<ir::Expr>> {
+    use ast::BinOp as B;
+    let arith = match op {
+        B::Add => Some(ir::DynBinOp::Add),
+        B::Sub => Some(ir::DynBinOp::Sub),
+        B::Mul => Some(ir::DynBinOp::Mul),
+        B::Div => Some(ir::DynBinOp::Div),
+        B::FloorDiv => Some(ir::DynBinOp::FloorDiv),
+        B::Mod => Some(ir::DynBinOp::Mod),
+        B::Pow => Some(ir::DynBinOp::Pow),
+        _ => None,
+    };
+    let cmp = match op {
+        B::Lt => Some(ir::DynCmpOp::Lt),
+        B::LtEq => Some(ir::DynCmpOp::Le),
+        B::Gt => Some(ir::DynCmpOp::Gt),
+        B::GtEq => Some(ir::DynCmpOp::Ge),
+        B::Eq => Some(ir::DynCmpOp::Eq),
+        B::NotEq => Some(ir::DynCmpOp::Ne),
+        _ => None,
+    };
+    let to_any = |e: &ir::Expr| -> SResult<ir::Expr> {
+        coerce(e.clone(), ir::Ty::Any, span, "a dynamic operator")
+    };
+    if let Some(op) = arith {
+        return Ok(Some(ir::Expr {
+            ty: ir::Ty::Any,
+            kind: ir::ExprKind::DynBinop {
+                left: Box::new(to_any(l)?),
+                right: Box::new(to_any(r)?),
+                op,
+            },
+        }));
+    }
+    if let Some(op) = cmp {
+        return Ok(Some(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::DynCompare {
+                left: Box::new(to_any(l)?),
+                right: Box::new(to_any(r)?),
+                op,
+            },
+        }));
+    }
+    Ok(None)
+}
+
 fn lower_binary(
     op: ast::BinOp,
     l: ir::Expr,
@@ -27611,6 +27709,17 @@ fn lower_binary(
     // `is` / `is not` — only `… is None` / `… is not None` (either side).
     if matches!(op, ast::BinOp::Is | ast::BinOp::IsNot) {
         return lower_is_none(op, l, r, span);
+    }
+
+    // ---- a dynamic operand dispatches in the runtime ----
+    // Either side being `Any` means no static type rule applies, so the
+    // operator goes to the generic kernel, which dispatches on the tags the
+    // values already carry. This is checked after `in` and `is`, which have
+    // their own dynamic paths, and before every typed rule below.
+    if (l.ty == ir::Ty::Any || r.ty == ir::Ty::Any)
+        && let Some(e) = lower_dynamic_binary(op, &l, &r, span)?
+    {
+        return Ok(e);
     }
 
     // ---- set algebra before bitwise int ops ----

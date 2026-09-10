@@ -845,6 +845,27 @@ pub enum ExprKind {
     ToAny {
         value: Box<Expr>,
     },
+    /// An operator on values whose types are not known until run time. The
+    /// runtime dispatches on the operands' own tags and raises CPython's
+    /// error when the pair has no meaning. Result is [`Ty::Any`].
+    DynBinop {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        op: DynBinOp,
+    },
+    /// A comparison on values whose types are not known until run time.
+    /// Result is Bool. Equality never raises; ordering does.
+    DynCompare {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        op: DynCmpOp,
+    },
+    /// A unary operator on a value whose type is not known until run time.
+    /// Result is [`Ty::Any`].
+    DynUnary {
+        value: Box<Expr>,
+        op: DynUnOp,
+    },
     /// Unbox [`Ty::Any`] to a concrete type (`expr.ty`) with a runtime tag check
     /// (TypeError on mismatch). Class targets accept subclasses via type_id.
     FromAny {
@@ -1443,6 +1464,39 @@ pub enum UnOp {
     Not,
     /// Bitwise invert `~` on Int.
     Invert,
+}
+
+/// A generic operator applied to a value whose type is not known statically.
+/// The discriminants are shared with the C runtime and must not be reordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynBinOp {
+    Add = 0,
+    Sub = 1,
+    Mul = 2,
+    Div = 3,
+    FloorDiv = 4,
+    Mod = 5,
+    Pow = 6,
+}
+
+/// A generic comparison. `Eq` / `Ne` never raise; the four orderings do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynCmpOp {
+    Lt = 0,
+    Le = 1,
+    Gt = 2,
+    Ge = 3,
+    Eq = 4,
+    Ne = 5,
+}
+
+/// A generic unary operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynUnOp {
+    Neg = 0,
+    Pos = 1,
+    Invert = 2,
+    Abs = 3,
 }
 
 /// File methods implemented by the C runtime. Errors (closed file,

@@ -481,6 +481,8 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         Let { value, body, .. } => max_try_depth_in_expr(value).max(max_try_depth_in_expr(body)),
         Binary { left, right, .. }
         | IsIdentity { left, right, .. }
+        | DynBinop { left, right, .. }
+        | DynCompare { left, right, .. }
         | AnyIterGet {
             base: left,
             index: right,
@@ -518,6 +520,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | ToUnion { value: operand, .. }
         | ToAny { value: operand }
         | FromAny { value: operand }
+        | DynUnary { value: operand, .. }
         | DictKeys(operand)
         | DictValues(operand)
         | DictItems(operand)
@@ -820,6 +823,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | ToUnion { value: operand, .. }
         | ToAny { value: operand }
         | FromAny { value: operand }
+        | DynUnary { value: operand, .. }
         | DictKeys(operand)
         | DictValues(operand)
         | DictItems(operand)
@@ -991,6 +995,9 @@ impl Emitter {
         out.push_str("declare ptr @pyrs_ascii_set(ptr)\n");
         out.push_str("declare void @pyrs_print_any(i64)\n");
         out.push_str("declare i32 @pyrs_any_truth(i64)\n");
+        out.push_str("declare i64 @pyrs_dyn_binop(i64, i64, i32)\n");
+        out.push_str("declare i32 @pyrs_dyn_compare(i64, i64, i32)\n");
+        out.push_str("declare i64 @pyrs_dyn_unary(i64, i32)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
@@ -4104,6 +4111,44 @@ impl Emitter {
             ExprKind::ToAny { value } => {
                 let v = self.emit_expr(value);
                 self.emit_to_any(&v, value.ty)
+            }
+            // The generic kernel takes boxed slots, because its C signature is
+            // one word per operand. Nothing keeps the boxes afterwards.
+            ExprKind::DynBinop { left, right, op } => {
+                let l = self.emit_expr(left);
+                let l = self.any_box(&l);
+                let r = self.emit_expr(right);
+                let r = self.any_box(&r);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i64 @pyrs_dyn_binop(i64 {l}, i64 {r}, i32 {})",
+                    *op as i32
+                ));
+                self.any_unbox(&t)
+            }
+            ExprKind::DynCompare { left, right, op } => {
+                let l = self.emit_expr(left);
+                let l = self.any_box(&l);
+                let r = self.emit_expr(right);
+                let r = self.any_box(&r);
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_dyn_compare(i64 {l}, i64 {r}, i32 {})",
+                    *op as i32
+                ));
+                let t = self.tmp();
+                self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                t
+            }
+            ExprKind::DynUnary { value, op } => {
+                let v = self.emit_expr(value);
+                let v = self.any_box(&v);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i64 @pyrs_dyn_unary(i64 {v}, i32 {})",
+                    *op as i32
+                ));
+                self.any_unbox(&t)
             }
             ExprKind::FromAny { value } => {
                 let v = self.emit_expr(value);
