@@ -341,3 +341,165 @@ fn printf_formatting_on_a_dynamic_str_says_it_is_unsupported() {
         "must not claim a TypeError CPython does not raise: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// method calls and `in`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn str_methods_on_a_dynamic_value() {
+    matches_python(
+        "str-methods",
+        concat!(
+            "s: object = \"  Hello World  \"\n",
+            "t: object = s.strip()\n",
+            "print(t.upper(), t.lower(), t.title(), t.swapcase(), t.capitalize())\n",
+            "print(t.split(\" \"), t.startswith(\"Hello\"), t.endswith(\"World\"))\n",
+            "print(t.find(\"World\"), t.rfind(\"o\"), t.count(\"l\"))\n",
+            "u: object = \"abc\"\n",
+            "print(u.isalpha(), u.isdigit(), u.isspace(), u.isupper(), u.islower())\n",
+            "print(u.removeprefix(\"a\"), u.removesuffix(\"c\"), u.zfill(6))\n",
+            "v: object = \" x \"\n",
+            "print(repr(v.strip()), repr(v.lstrip()), repr(v.rstrip()))\n",
+            "w: object = \"xxaxx\"\n",
+            "print(w.strip(\"x\"), w.lstrip(\"x\"), w.rstrip(\"x\"))\n",
+        ),
+    );
+}
+
+#[test]
+fn list_methods_on_a_dynamic_value() {
+    // Mutating methods in statement position are the point: they take a
+    // different lowering path from a method call in expression position.
+    matches_python(
+        "list-methods",
+        concat!(
+            "xs: object = [3, 1, 2]\n",
+            "xs.append(4)\n",
+            "xs.insert(0, 9)\n",
+            "print(xs, xs.count(1), len(xs))\n",
+            "xs.reverse()\n",
+            "print(xs, xs.pop(), xs)\n",
+            "ys: object = xs.copy()\n",
+            "ys.clear()\n",
+            "print(ys, len(ys), xs)\n",
+        ),
+    );
+}
+
+#[test]
+fn dict_and_set_methods_on_a_dynamic_value() {
+    matches_python(
+        "dict-set-methods",
+        concat!(
+            "d: object = {\"a\": 1, \"b\": 2}\n",
+            "print(d.get(\"a\"), d.get(\"z\"), d.get(\"z\", 99), sorted(d.keys()))\n",
+            "e: object = d.copy()\n",
+            "e.clear()\n",
+            "print(len(e), len(d))\n",
+            "st: object = {1, 2}\n",
+            "st.add(3)\n",
+            "st.discard(1)\n",
+            "print(len(st))\n",
+        ),
+    );
+}
+
+#[test]
+fn membership_over_a_dynamic_container() {
+    matches_python(
+        "contains",
+        concat!(
+            "xs: object = [1, 2]\n",
+            "s: object = \"hello\"\n",
+            "d: object = {\"a\": 1}\n",
+            "st: object = {1, 2}\n",
+            "tp: object = (1, 2)\n",
+            "print(1 in xs, 9 in xs, 1 not in xs)\n",
+            "print(\"ell\" in s, \"zz\" in s, \"zz\" not in s)\n",
+            "print(\"a\" in d, \"z\" in d)\n",
+            "print(1 in st, 9 in st)\n",
+            "print(1 in tp, 9 in tp)\n",
+        ),
+    );
+}
+
+#[test]
+fn a_method_that_does_not_exist_reports_cpythons_attribute_error() {
+    for (tag, src) in [
+        ("attr-int", "a: object = 5\nprint(a.nope())\n"),
+        ("attr-str", "a: object = \"x\"\nprint(a.nope())\n"),
+        ("attr-list", "a: object = [1]\nprint(a.nope())\n"),
+        ("attr-dict", "a: object = {\"k\": 1}\nprint(a.nope())\n"),
+    ] {
+        fails_like_python(tag, src);
+    }
+}
+
+#[test]
+fn method_arity_and_argument_types_match_cpython() {
+    for (tag, src) in [
+        ("arity-0", "a: object = \"x\"\nprint(a.upper(1))\n"),
+        ("arity-1", "a: object = [1]\nprint(a.count())\n"),
+        ("arity-clear", "a: object = [1]\na.clear(2)\n"),
+        (
+            "arg-startswith",
+            "a: object = \"x\"\nprint(a.startswith(5))\n",
+        ),
+        ("arg-find", "a: object = \"x\"\nprint(a.find(5))\n"),
+        ("arg-zfill", "a: object = \"x\"\nprint(a.zfill(\"a\"))\n"),
+    ] {
+        fails_like_python(tag, src);
+    }
+}
+
+#[test]
+fn membership_on_a_non_container_matches_cpython() {
+    fails_like_python("in-int", "a: object = 5\nprint(1 in a)\n");
+    fails_like_python("in-none", "a: object = None\nprint(1 in a)\n");
+}
+
+/// A method CPython *has* but this kernel does not implement must say so, not
+/// claim the attribute is missing. Reporting AttributeError here would tell a
+/// user their valid program is invalid.
+#[test]
+fn an_unimplemented_method_is_named_not_disguised_as_missing() {
+    let dir = temp_source(
+        "unimplemented-method",
+        "a: object = \"x-y\"\nprint(a.partition(\"-\"))\n",
+    );
+    let out = Command::new(PYRS)
+        .args(["run", "-i", "prog.py"])
+        .current_dir(&dir.0)
+        .output()
+        .expect("failed to spawn PyRs");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not supported on a dynamic str yet"),
+        "the gap must name itself: {stderr}"
+    );
+    assert!(
+        !stderr.contains("has no attribute"),
+        "a method CPython has must not be reported as missing: {stderr}"
+    );
+}
+
+/// `sorted()` of a dynamic value stays refused, but the diagnostic must not
+/// claim the value is not iterable -- `for x in v` works.
+#[test]
+fn sorted_of_a_dynamic_value_names_the_real_reason() {
+    let dir = temp_source("sorted-dyn", "a: object = [3, 1]\nprint(sorted(a))\n");
+    let out = Command::new(PYRS)
+        .args(["run", "-i", "prog.py"])
+        .current_dir(&dir.0)
+        .output()
+        .expect("failed to spawn PyRs");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not supported yet"), "{stderr}");
+    assert!(
+        !stderr.contains("expects an iterable"),
+        "a dynamic value IS iterable; the message must not say otherwise: {stderr}"
+    );
+}
