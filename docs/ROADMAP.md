@@ -45,7 +45,7 @@ recorded in [the changelog](../CHANGELOG.md). The most recent run:
 | `cargo test --workspace` | 1751 passed; none failed or ignored |
 | `make examples` | All 15 example entry points matched CPython |
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
-| `pyrs --version` | `PyRs 0.141.1` |
+| `pyrs --version` | `PyRs 0.142.0` |
 
 Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
@@ -382,6 +382,15 @@ documentation and the relevant gates.
       `for x in v` instead read the value *through* the tag it already
       carries, which needs no peel and no copy, so aliasing is untouched. A
       tuple reads element by element, since it carries a tag per slot.
+- [x] A dynamic value is a register pair, not an allocation (0.142). `Ty::Any`
+      lowered to an `i64` pointing at a GC box `{ i32 print_tag, i64 payload }`
+      while `Ty::Union` carried the same two fields in registers for free; a
+      20M-iteration loop cost 0.654s and 320 MB through `object` against 0.023s
+      and no allocation through a five-member union. `Any` now uses that same
+      pair -- it is the open union, carrying a print tag where a closed union
+      carries a member index -- and boxes only at a container slot or the C
+      runtime ABI, the two places that are one word wide. The dynamic path went
+      from 1.3x CPython to 37.7x, matching the statically typed loop exactly.
 - [ ] One canonical container encoding inside `Any`, so that narrowing works
       too and not only reading. Still needs the aliasing answer from the
       `list[T1]` -> `list[T2]` item above, since the conversion is an O(n)

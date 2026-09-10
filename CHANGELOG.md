@@ -1,3 +1,42 @@
+## 0.142.0 — a dynamic value is a register pair
+
+`Ty::Any` lowered to an `i64` holding a pointer to a GC box
+`{ i32 print_tag, i64 payload }`, so every dynamic value cost an allocation.
+`Ty::Union` carries the same two fields **in registers** and costs nothing. The
+fast representation already existed; `Any` did not use it.
+
+It now lowers to that same `{ i32, i64 }` pair. Measured on a 20M-iteration
+loop at -O2:
+
+| | before | after |
+|---|---:|---:|
+| `v: object = i` | 0.654s, 320 MB, 305 collections | **0.023s, 0 B, 0 collections** |
+| vs CPython | 1.3x | **37.7x** |
+| vs the same loop typed `int` | 28x slower | **the same speed** |
+
+The box survives at exactly two boundaries, both one word wide and neither
+carrying a tag of its own: a container slot, and the C runtime ABI. Everything
+else -- locals, parameters, returns, class fields, globals -- is now inline.
+`Any` is the open union: the same pair a closed union uses, carrying a print
+tag instead of a member index, so no new machinery was needed at either
+boundary.
+
+Two consequences worth naming:
+
+- **A dynamic global is 16 bytes, not 8**, and is registered with the
+  collector at that size. Registering only the tag word would have hidden the
+  payload, which can be the only live reference to an object.
+- **An unwritten dynamic slot reads as `None`.** `zeroinitializer` would be
+  `{ 0, 0 }`, and tag 0 is `int` while payload 0 is not a tagged small integer
+  -- a slot read before it was written would have been dereferenced as a heap
+  integer at address 0. Locals were already covered by definite-assignment
+  flags; a class field and a module global are not, and both segfaulted until
+  the initializer named `None` explicitly.
+
+Nothing about the language surface changed. 1,783 tests pass, `make examples`
+is byte-identical to CPython, and the compatibility suite is unchanged at
+81 native / 28 compat.
+
 # Changelog
 
 ## 0.141.1 — link the C++ runtime by its platform's name

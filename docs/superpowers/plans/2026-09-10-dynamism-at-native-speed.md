@@ -131,7 +131,7 @@ Ordered by *tax removed per unit of work*, not by how Pythonic the feature
 sounds. The first two are worth more than the rest combined, because they
 are what make everything after them affordable.
 
-### D1 — `Any` gets the representation `Union` already has
+### D1 — `Any` gets the representation `Union` already has — **SHIPPED in 0.142.0**
 
 **The single highest-value change in this document**, and by far the
 smallest. `ir::Ty::Any` lowers to an SSA `{ i32, i64 }` — exactly what
@@ -146,6 +146,17 @@ and is already exercised by unions in containers.
 Expected: the 0.591s row collapses toward the 0.024s row for every `Any`
 that does not escape into a container. That is the 23.6× tax, mostly gone,
 before a single new feature ships.
+
+**Outcome.** The 0.591s row became 0.023s with zero allocations, matching the
+typed loop exactly, and the dynamic path went from 1.3x CPython to 37.7x. The
+blast radius feared below did not materialise: `lty` and the two slot helpers
+carried almost all of it, because the box already existed at exactly the
+boundaries that still need one. Two things did have to be found by attacking
+the change rather than by testing it: a dynamic global must be registered with
+the collector as 16 bytes rather than 8, and an unwritten slot must initialise
+to `{ -1, 0 }` (None) rather than `zeroinitializer`, since tag 0 is `int` and
+payload 0 is not a tagged small integer. The second segfaulted on class fields
+and module globals until it was fixed.
 
 Risks to settle in the design, not in review:
 - **`lty(Ty::Any)` is `i64` in ~20k lines of lowering.** The change is
