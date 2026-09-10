@@ -1578,6 +1578,9 @@ from ..other import x      # parent package (when nested)
 - `import pkg.mod as m` — binds `m` to the leaf module.
 - `from M import a, b as c` — bring names into scope (functions, globals,
   or submodules of a package).
+- `from M import (a, b as c,)` — the same list, parenthesized. The list may
+  be wrapped over several lines and may end with a trailing comma; without
+  the parentheses a trailing comma is a syntax error, as in CPython.
 - `from M import *` — module-level only; public names of `M`, or static
   `__all__` when present (see below).
 - **Package re-exports:** a package `__init__.py` may

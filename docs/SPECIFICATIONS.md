@@ -282,9 +282,11 @@ programs** link only the object file from the shim plus `runtime.c` and
   Intermediate path components must be packages. Embedded packages use the
   same layout (`os/__init__.py`, `os/path.py`).
 - Supported forms: `import M` / `import M as A`, `import pkg.mod` /
-  `import pkg.mod as m`, `from M import x, y as z`, `from pkg.mod import
-  x`, `from pkg import mod` (submodule), and relative imports inside
-  packages (`from . import x`, `from .mod import y`, `from .. import z`).
+  `import pkg.mod as m`, `from M import x, y as z`, `from M import (x, y)`
+  (parenthesized, optionally wrapped over lines and ending with a trailing
+  comma), `from pkg.mod import x`, `from pkg import mod` (submodule), and
+  relative imports inside packages (`from . import x`, `from .mod import y`,
+  `from .. import z`).
 - Relative imports are rewritten to absolute names at load time using the
   importer’s `__package__`. They are illegal in non-packages / top-level
   scripts (`attempted relative import with no known parent package`).

@@ -387,9 +387,13 @@ documentation and the relevant gates.
       `list[T1]` -> `list[T2]` item above, since the conversion is an O(n)
       re-box. Lower priority now that the reads above cover the case the
       libraries actually hit.
-- [ ] Parenthesized import lists — `from x import (a, b, c)` is not parsed.
+- [x] Parenthesized import lists: `from x import (a, b, c)`, with an alias,
+      a trailing comma and the list wrapped over several lines.
       Ordinary Python and common for long lists; found while writing
-      `stdlib/json.py` in 0.139.
+      `stdlib/json.py` in 0.139. The lexer already suppressed newlines inside
+      brackets, so the wrapped form needed nothing beyond consuming the
+      parentheses. An empty list, a `*` inside the parentheses, and a trailing
+      comma without them stay rejected, as CPython rejects them.
 - [ ] **Operators and conversions on a union value**, measured and documented
       in [GUIDE section 9](GUIDE.md#9-differences-from-cpython) as of 0.137.
       What works without narrowing: `print`, truthiness (`if x:` / `bool(x)`),
