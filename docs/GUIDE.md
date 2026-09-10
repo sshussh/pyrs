@@ -1033,7 +1033,7 @@ def clamp(x: float, lo: float, hi: float) -> float:
   refused.
 - **The standard streams are file objects** (0.141): `sys.stdin`,
   `sys.stdout` and `sys.stderr` support `read`, `readline`, `readlines`,
-  `write`, `flush`, iteration and `with`, and are singletons. `print(...,
+  `write`, `writelines`, `flush`, iteration and `with`, and are singletons. `print(...,
   file=f)` reaches any open file. Closing a standard stream raises — CPython
   allows it, but here it would break every later print with no way back.
 - **A dynamic container reads without narrowing** (0.140). `len(v)`, `v[i]`,
@@ -1315,7 +1315,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `set()` | empty only; needs annotation | `s: set[int] = set()` |
 | `global x` | (statement) | write access to a module global |
 | `input([prompt])` | optional str prompt | line from stdin (no newline); `EOFError` at EOF |
-| `open(path[, mode])` | str path, mode "r"/"w"/"a" | file value with read/readline/readlines/write/close |
+| `open(path[, mode])` | str path, mode "r"/"w"/"a" | file value with read/readline/readlines/write/writelines/flush/close |
 | `sys.argv` | needs `import sys` | list[str]; `[0]` is the binary path |
 | `int(x[, base])` | int, float (truncates toward zero), bool; `str` (optional `base` 0 or 2..=36, positional or `base=`) | int; no-arg `int()` is `0`; string parse is CPython (sign, underscores, prefixes when base allows); ASCII whitespace only |
 | `float(x)` | int, float, bool, `str` | float; no-arg `float()` is `0.0`; string parse is CPython (`inf`/`nan`/scientific/underscores); ASCII whitespace only |
@@ -1355,6 +1355,7 @@ underscores (`1_000_000`), hex/bin/oct prefixes (`0x10FFFF`, `0b1010`,
 ```python
 out = open("report.txt", "w")
 out.write("hello\n")           # returns the character count
+out.writelines(["a\n", "b\n"]) # each item back to back; adds no separator
 out.close()                    # idempotent, like Python
 
 f = open("report.txt")
@@ -1370,6 +1371,11 @@ for line in f:
     print(line.strip())
 f.close()
 ```
+
+`writelines` takes a `list[str]`, not CPython's "any iterable of str".
+Passing a `str` is therefore a compile error rather than a write of each
+character, and a non-`str` element is caught at compile time instead of
+raising `TypeError` part-way through the write.
 
 `with` works for files and guarantees the close on every exit path,
 including early `return`/`break` (the return value is evaluated before
@@ -1999,8 +2005,8 @@ import name, so `if __name__ == "__main__":` works. `sys.exit(code)` flushes
 and leaves — it is not a catchable `SystemExit` here — and
 `print(..., file=f)` takes any file: `sys.stderr`, `sys.stdout`, or one from
 `open()`. `sys.stdin` / `sys.stdout` / `sys.stderr` are themselves file
-objects, so `read`, `readline`, `readlines`, `write`, `flush`, iteration and
-`with` all work on them; they are singletons, and closing one raises.
+objects, so `read`, `readline`, `readlines`, `write`, `writelines`, `flush`,
+iteration and `with` all work on them; they are singletons, and closing one raises.
 
 Exception notes: supported named types include OverflowError, EOFError,
 FileNotFoundError, OSError, PermissionError, IsADirectoryError, NameError,

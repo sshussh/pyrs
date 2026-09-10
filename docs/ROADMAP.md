@@ -435,6 +435,14 @@ documentation and the relevant gates.
       `print(file=...)` takes any file; `os.environ` / `os.getenv`; and
       `os.path` gained `exists`, `isfile`, `isdir`, `splitext`, `isabs`,
       `normpath`, `abspath`, `expanduser`.
+- [x] `f.writelines(lines)`: each item written back to back, with no
+      separator, as CPython's does despite the name. Its own runtime function
+      rather than a lowered loop over `write`, which flushes per call and
+      would cost one syscall per item. The argument is a `list[str]`, not
+      CPython's "any iterable of str", so passing a `str` is a compile error
+      instead of a write of each character, and a non-`str` element is caught
+      at compile time instead of raising `TypeError` part-way through the
+      write.
 - [ ] `os.get_terminal_size()`, so help text can wrap to the terminal. Needs
       an `ioctl`; noted while writing `examples/cli.py`, which pads to a fixed
       width instead.

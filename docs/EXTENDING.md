@@ -560,7 +560,7 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 
 ### `FileFn` (current)
 
-`Read`, `ReadLine`, `ReadLines`, `Write`, `Close`.
+`Read`, `ReadLine`, `ReadLines`, `Write`, `WriteLines`, `Close`, `Flush`.
 
 ### `BinOp` notes
 
