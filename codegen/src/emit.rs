@@ -46,7 +46,7 @@ pub fn emit_library_ir(module: &Module) -> String {
 /// unions are `{ i32, i64 }`. Function returns of `None` use [`lty_ret`].
 fn lty(ty: Ty) -> &'static str {
     match ty {
-        Ty::Int | Ty::Any => "i64",
+        Ty::Int => "i64",
         Ty::Float => "double",
         Ty::Bool => "i1",
         Ty::Str => "ptr",
@@ -63,7 +63,9 @@ fn lty(ty: Ty) -> &'static str {
         | Ty::BoundMethod { .. } => "ptr",
         // Value-level None (expression); not the void function return.
         Ty::None => "i8",
-        Ty::Union(_) => "{ i32, i64 }",
+        // `Any` is the open union: the same { tag, payload } pair a
+        // closed union uses, carrying a print tag instead of a member index.
+        Ty::Union(_) | Ty::Any => "{ i32, i64 }",
     }
 }
 
@@ -83,7 +85,7 @@ fn lty_ret(ty: Ty) -> &'static str {
 /// static union member layout. Other scalar-only globals need no registration.
 fn gc_root_range_size(ty: Ty) -> Option<u64> {
     match ty {
-        Ty::Int | Ty::Any => Some(8),
+        Ty::Int => Some(8),
         Ty::Str
         | Ty::List(_)
         | Ty::Tuple(_)
@@ -96,7 +98,7 @@ fn gc_root_range_size(ty: Ty) -> Option<u64> {
         | Ty::Generator { .. }
         | Ty::Exception
         | Ty::Class(_) => Some(8),
-        Ty::Union(_) => Some(16),
+        Ty::Union(_) | Ty::Any => Some(16),
         Ty::Float | Ty::Bool | Ty::None => None,
     }
 }
@@ -142,7 +144,8 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Tuple(_) => 5,
         Ty::Dict { .. } => 6,
         Ty::Set(_) => 7,
-        // Any is always a heap box {print_tag, payload}; reuse union list tag.
+        // In a container slot both a union and a dynamic value are boxed, and
+        // the box is what the slot's tag describes.
         Ty::Union(_) | Ty::Any => 8,
         // Closures / generators / bound methods as list/dict values (pointer slots).
         Ty::Closure { .. } | Ty::BoundMethod { .. } => 9,
@@ -173,6 +176,15 @@ fn class_struct_ty(info: &ClassInfo) -> String {
 }
 
 /// Print tag stored inside a heap union box for the active member (-1 = None).
+/// An unwritten dynamic slot reads as `None`.
+///
+/// `zeroinitializer` would be `{ 0, 0 }`, and tag 0 is `int` while payload 0 is
+/// not a tagged small integer (that is 1) -- so a slot that is read before it
+/// is written would be dereferenced as a heap `PyrsInt*` at address 0. A union
+/// can use `zeroinitializer` because member index 0 is a real member; the open
+/// union has no member 0 to fall back on, so it names None explicitly.
+const ANY_NONE_INIT: &str = "{ i32 -1, i64 0 }";
+
 fn member_print_tag(ty: Ty) -> i32 {
     match ty {
         Ty::None => -1,
@@ -1416,7 +1428,8 @@ impl Emitter {
                 | Ty::Exception
                 | Ty::Class(_) => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
-                // Any / None / etc.: zero i64 (null box for Any)
+                Ty::Any => ANY_NONE_INIT.to_string(),
+                // None / scalars: a zero word.
                 _ => "0".to_string(),
             };
             self.global_defs.push_str(&format!(
@@ -2095,7 +2108,10 @@ impl Emitter {
 
     fn slot_from_value(&mut self, value: &str, ty: Ty) -> String {
         match ty {
-            Ty::Int | Ty::Any => value.to_string(),
+            Ty::Int => value.to_string(),
+            // A container slot is 8 bytes and carries no tag of its own, so a
+            // dynamic value has to be boxed to enter one.
+            Ty::Any => self.any_box(value),
             Ty::Float => {
                 let t = self.tmp();
                 self.line(format!("{t} = bitcast double {value} to i64"));
@@ -2150,7 +2166,8 @@ impl Emitter {
 
     fn value_from_slot(&mut self, slot: &str, ty: Ty) -> String {
         match ty {
-            Ty::Int | Ty::Any => slot.to_string(),
+            Ty::Int => slot.to_string(),
+            Ty::Any => self.any_unbox(slot),
             Ty::Float => {
                 let t = self.tmp();
                 self.line(format!("{t} = bitcast i64 {slot} to double"));
@@ -2350,29 +2367,82 @@ impl Emitter {
         u1
     }
 
-    /// Box a concrete/union value into `Ty::Any` (heap `{print_tag, payload}` as i64).
+    /// Build a dynamic value from a concrete one: a `{ print_tag, payload }`
+    /// pair in registers, with no allocation.
     fn emit_to_any(&mut self, value: &str, value_ty: Ty) -> String {
         if value_ty == Ty::Any {
             return value.to_string();
         }
-        // Reuse container-union boxing: slot_from_value for Union already builds
-        // a heap box; for concrete types, build the box with print_tag + payload.
+        // A closed union already carries { member_index, payload }; only the tag
+        // has to be rewritten from an index into a print tag.
         if let Ty::Union(members) = value_ty {
-            return self.slot_from_value(value, Ty::Union(members));
+            let idx = self.tmp();
+            self.line(format!("{idx} = extractvalue {{ i32, i64 }} {value}, 0"));
+            let payload = self.tmp();
+            self.line(format!(
+                "{payload} = extractvalue {{ i32, i64 }} {value}, 1"
+            ));
+            let print_tag = self.emit_union_index_to_print_tag(&idx, members);
+            return self.build_any(&print_tag, &payload);
         }
-        let print_tag = member_print_tag(value_ty);
+        let print_tag = member_print_tag(value_ty).to_string();
         let payload = self.slot_from_value(value, value_ty);
+        self.build_any(&print_tag, &payload)
+    }
+
+    /// Assemble a dynamic value from a print tag and a payload word.
+    fn build_any(&mut self, print_tag: &str, payload: &str) -> String {
+        let a0 = self.tmp();
+        self.line(format!(
+            "{a0} = insertvalue {{ i32, i64 }} undef, i32 {print_tag}, 0"
+        ));
+        let a1 = self.tmp();
+        self.line(format!(
+            "{a1} = insertvalue {{ i32, i64 }} {a0}, i64 {payload}, 1"
+        ));
+        a1
+    }
+
+    /// Heap-box a dynamic value so it can cross into a container slot or the C
+    /// runtime ABI, both of which are one word wide.
+    fn any_box(&mut self, value: &str) -> String {
+        let tag = self.tmp();
+        self.line(format!("{tag} = extractvalue {{ i32, i64 }} {value}, 0"));
+        let payload = self.tmp();
+        self.line(format!(
+            "{payload} = extractvalue {{ i32, i64 }} {value}, 1"
+        ));
         let box_p = self.tmp();
         self.line(format!(
-            "{box_p} = call ptr @pyrs_union_box_new(i32 {print_tag}, i64 {payload})"
+            "{box_p} = call ptr @pyrs_union_box_new(i32 {tag}, i64 {payload})"
         ));
         let slot = self.tmp();
         self.line(format!("{slot} = ptrtoint ptr {box_p} to i64"));
         slot
     }
 
-    /// Load print_tag + payload from an Any i64 slot. Null slot → tag -1 (None).
-    fn emit_any_unpack(&mut self, any_slot: &str) -> (String, String) {
+    /// Read a boxed dynamic value back into a register pair. A null slot is
+    /// `None`, which is how an uninitialised container slot reads.
+    fn any_unbox(&mut self, slot: &str) -> String {
+        let (tag, payload) = self.emit_boxed_any_unpack(slot);
+        self.build_any(&tag, &payload)
+    }
+
+    /// Split a dynamic value into its print tag and payload. No loads: the
+    /// value is already a register pair.
+    fn emit_any_unpack(&mut self, value: &str) -> (String, String) {
+        let tag = self.tmp();
+        self.line(format!("{tag} = extractvalue {{ i32, i64 }} {value}, 0"));
+        let payload = self.tmp();
+        self.line(format!(
+            "{payload} = extractvalue {{ i32, i64 }} {value}, 1"
+        ));
+        (tag, payload)
+    }
+
+    /// Load print_tag + payload from a *boxed* Any slot. Null slot → tag -1
+    /// (None), which is how an uninitialised container slot reads.
+    fn emit_boxed_any_unpack(&mut self, any_slot: &str) -> (String, String) {
         let is_null = self.tmp();
         self.line(format!("{is_null} = icmp eq i64 {any_slot}, 0"));
         let end_l = self.fresh_block("any.unpack.end");
@@ -2919,8 +2989,9 @@ impl Emitter {
                 Ty::Int => "1".to_string(),
                 Ty::Float => fconst(0.0),
                 Ty::Bool => "false".to_string(),
-                Ty::None | Ty::Any => "0".to_string(),
+                Ty::None => "0".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
+                Ty::Any => ANY_NONE_INIT.to_string(),
                 Ty::Str
                 | Ty::List(_)
                 | Ty::Tuple(_)
@@ -3023,8 +3094,10 @@ impl Emitter {
                 self.start_block(&end_l);
             }
             Ty::Any => {
-                // Any is a heap box {print_tag, payload}; print via TAG_UNION path.
-                self.line(format!("call void @pyrs_print_any(i64 {v})"));
+                // The runtime prints through a boxed slot, so the pair is boxed
+                // for the call and nothing keeps the box afterwards.
+                let slot = self.any_box(v);
+                self.line(format!("call void @pyrs_print_any(i64 {slot})"));
             }
             Ty::File => unreachable!("semantic rejects file print"),
         }
@@ -3148,6 +3221,7 @@ impl Emitter {
                 | Ty::Exception
                 | Ty::Class(_) => "null".to_string(),
                 Ty::Union(_) => "zeroinitializer".to_string(),
+                Ty::Any => ANY_NONE_INIT.to_string(),
                 _ => "0".to_string(),
             };
             let vol = self.local_volatile(name);
@@ -4156,12 +4230,14 @@ impl Emitter {
                 // A dynamic base dispatches in the runtime, which reads the
                 // container's element encoding out of the value's own tag.
                 if base.ty == Ty::Any {
+                    let b = self.any_box(&b);
                     let t = self.tmp();
                     if index.ty == Ty::Str {
                         self.line(format!(
                             "{t} = call i64 @pyrs_any_dict_get(i64 {b}, ptr {i_tagged})"
                         ));
                     } else if index.ty == Ty::Any {
+                        let i_tagged = self.any_box(&i_tagged);
                         self.line(format!(
                             "{t} = call i64 @pyrs_any_dict_get_any(i64 {b}, i64 {i_tagged})"
                         ));
@@ -4171,7 +4247,7 @@ impl Emitter {
                             "{t} = call i64 @pyrs_any_list_get(i64 {b}, i64 {i})"
                         ));
                     }
-                    return t;
+                    return self.any_unbox(&t);
                 }
                 match base.ty {
                     Ty::Str => {
@@ -4850,16 +4926,18 @@ impl Emitter {
             }
             ExprKind::AnyIterGet { base, index } => {
                 let b = self.emit_expr(base);
+                let b = self.any_box(&b);
                 let i_tagged = self.emit_expr(index);
                 let i = self.emit_unbox_i64(&i_tagged);
                 let t = self.tmp();
                 self.line(format!(
                     "{t} = call i64 @pyrs_any_iter_get(i64 {b}, i64 {i})"
                 ));
-                t
+                self.any_unbox(&t)
             }
             ExprKind::AnyDictKeys(inner) => {
                 let v = self.emit_expr(inner);
+                let v = self.any_box(&v);
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_any_dict_keys(i64 {v})"));
                 t
@@ -4869,8 +4947,9 @@ impl Emitter {
                 // A dynamic value carries its own kind, so the length comes
                 // from the runtime rather than from a fixed header load.
                 if inner.ty == Ty::Any {
+                    let slot = self.any_box(&v);
                     let machine = self.tmp();
-                    self.line(format!("{machine} = call i64 @pyrs_any_len(i64 {v})"));
+                    self.line(format!("{machine} = call i64 @pyrs_any_len(i64 {slot})"));
                     return self.emit_box_i64(&machine);
                 }
                 let machine = self.emit_len(&v);
@@ -4934,6 +5013,7 @@ impl Emitter {
             }
             ExprKind::AnyToStr { value, repr } => {
                 let v = self.emit_expr(value);
+                let v = self.any_box(&v);
                 let callee = if *repr {
                     "pyrs_repr_any"
                 } else {
@@ -6957,13 +7037,12 @@ impl Emitter {
         let r = self.emit_expr(right);
         let t = self.tmp();
         match left.ty {
-            Ty::Int | Ty::Bool | Ty::Any => {
+            Ty::Int | Ty::Bool => {
                 let pred = if not { "ne" } else { "eq" };
                 // bool is i1; zext both for a uniform compare when mixed — types match.
                 if left.ty == Ty::Bool {
                     self.line(format!("{t} = icmp {pred} i1 {l}, {r}"));
                 } else {
-                    // Int and Any are both i64 slots (Any is boxed heap ptr bits).
                     self.line(format!("{t} = icmp {pred} i64 {l}, {r}"));
                 }
             }
@@ -6976,7 +7055,9 @@ impl Emitter {
                 let pred = if not { "ne" } else { "eq" };
                 self.line(format!("{t} = icmp {pred} i64 {lb}, {rb}"));
             }
-            Ty::Union(_) => {
+            // A dynamic value and a union share the same pair layout, and
+            // identity is the same question for both: same tag, same payload.
+            Ty::Union(_) | Ty::Any => {
                 // Compare tag and payload bits.
                 let lt = self.tmp();
                 let lp = self.tmp();
@@ -7054,7 +7135,8 @@ impl Emitter {
             // empty containers, null/None, nested union boxes.
             Ty::Any => {
                 let c = self.tmp();
-                self.line(format!("{c} = call i32 @pyrs_any_truth(i64 {v})"));
+                let slot = self.any_box(v);
+                self.line(format!("{c} = call i32 @pyrs_any_truth(i64 {slot})"));
                 let t = self.tmp();
                 self.line(format!("{t} = icmp ne i32 {c}, 0"));
                 t

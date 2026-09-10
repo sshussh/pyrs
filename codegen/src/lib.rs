@@ -219,8 +219,11 @@ mod tests {
             ll.contains("call void @pyrs_gc_add_root_range(ptr @g.number, i64 8)"),
             "{ll}"
         );
+        // A dynamic global is an inline { i32 tag, i64 payload } pair, the same
+        // 16 bytes a union global occupies. Registering only the first 8 would
+        // hide the payload word from the collector.
         assert!(
-            ll.contains("call void @pyrs_gc_add_root_range(ptr @g.dynamic, i64 8)"),
+            ll.contains("call void @pyrs_gc_add_root_range(ptr @g.dynamic, i64 16)"),
             "{ll}"
         );
         assert!(
@@ -235,8 +238,12 @@ mod tests {
 
     #[test]
     fn emits_managed_box_constructors_without_raw_malloc() {
+        // The dynamic value is stored into a list, because that is the case
+        // that still needs a box: a container slot is one word and carries no
+        // tag, so the pair cannot enter it inline. A bare `dynamic: Any = x`
+        // no longer allocates at all.
         let ll = lower(
-            "class Greeter:\n    def message(self) -> str:\n        return \"hi\"\n\ngreeter = Greeter()\ncallback = greeter.message\ndynamic: Any = callback\n",
+            "class Greeter:\n    def message(self) -> str:\n        return \"hi\"\n\ngreeter = Greeter()\ncallback = greeter.message\ndynamic: Any = callback\nkeep: list[Any] = []\nkeep.append(dynamic)\n",
         );
 
         assert!(
