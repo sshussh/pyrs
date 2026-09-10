@@ -9859,6 +9859,90 @@ PyrsStr *pyrs_str_from_object(void *obj) {
     return str_from_utf8(buf, (long long)n);
 }
 
+static void type_display_name(long long type_id, char *buf, size_t n) {
+    const char *name = "type";
+    if (g_class_names != NULL && type_id >= 0 && type_id < g_class_n
+        && g_class_names[type_id] != NULL) {
+        name = g_class_names[type_id];
+    }
+    if (strchr(name, '.') == NULL) {
+        snprintf(buf, n, "__main__.%s", name);
+    } else {
+        snprintf(buf, n, "%s", name);
+    }
+}
+
+void pyrs_print_type(long long type_id) {
+    char name[256];
+    type_display_name(type_id, name, sizeof name);
+    out_puts("<class '");
+    out_puts(name);
+    out_puts("'>");
+}
+
+PyrsStr *pyrs_str_from_type(long long type_id) {
+    char name[256];
+    char buf[288];
+    type_display_name(type_id, name, sizeof name);
+    snprintf(buf, sizeof buf, "<class '%s'>", name);
+    return str_from_utf8(buf, (long long)strlen(buf));
+}
+
+static const char *shape_class_name(void *obj) {
+    if (obj != NULL && g_class_names != NULL) {
+        long long tid = *(long long *)obj;
+        if (tid >= 0 && tid < g_class_n && g_class_names[tid] != NULL) {
+            return g_class_names[tid];
+        }
+    }
+    return "object";
+}
+
+long long pyrs_shape_get(void *obj, PyrsDict **slot, PyrsStr *name, int *out_tag) {
+    check_ref(name);
+    if (slot == NULL || *slot == NULL) {
+        char msg[192];
+        snprintf(msg, sizeof msg,
+                 "AttributeError: '%s' object has no attribute '%s'",
+                 shape_class_name(obj), name->data);
+        pyrs_die(msg);
+    }
+    int found = 0;
+    long long idx = dict_lookup(*slot, (long long)(uintptr_t)name, 3, &found);
+    if (!found) {
+        char msg[192];
+        snprintf(msg, sizeof msg,
+                 "AttributeError: '%s' object has no attribute '%s'",
+                 shape_class_name(obj), name->data);
+        pyrs_die(msg);
+    }
+    if (out_tag != NULL) {
+        *out_tag = (*slot)->table[idx].val_tag;
+    }
+    return (*slot)->table[idx].val;
+}
+
+void pyrs_shape_set(PyrsDict **slot, PyrsStr *name, int tag, long long payload) {
+    check_ref(name);
+    if (slot == NULL) {
+        pyrs_die("AttributeError: setattr on a closed class");
+    }
+    if (*slot == NULL) {
+        *slot = pyrs_dict_new();
+    }
+    pyrs_dict_set(*slot, (long long)(uintptr_t)name, 3, payload, tag);
+}
+
+int pyrs_shape_has(PyrsDict **slot, PyrsStr *name) {
+    check_ref(name);
+    if (slot == NULL || *slot == NULL) {
+        return 0;
+    }
+    int found = 0;
+    (void)dict_lookup(*slot, (long long)(uintptr_t)name, 3, &found);
+    return found;
+}
+
 /* ---- collector object-model hooks ----
  *
  * These are deliberately kept beside the concrete runtime layouts instead of

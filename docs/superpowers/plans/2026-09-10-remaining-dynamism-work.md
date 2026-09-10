@@ -249,6 +249,8 @@ important conclusion of the research document.
 
 ## 7. Item F — shapes, and types as values
 
+**Status: implemented in 0.150.0.**
+
 **Size: large.** These are the plan's D3 and D4 and add *reach* rather than
 speed. Deliberately after C/D/E, which are the performance argument.
 

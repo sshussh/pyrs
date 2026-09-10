@@ -69,6 +69,9 @@ pub enum Ty {
     /// User-defined class instance. `ClassId` indexes [`Module::classes`].
     /// Layout: header `i64 type_id` then fixed, collector-traced fields.
     Class(ClassId),
+    /// A class object as a value (`k = C`, `type(x)`). LLVM `i64` holding
+    /// the runtime `type_id` (a [`ClassId`]).
+    Type,
     /// Bound method value (`obj.method` without call). Heap `{ ptr object }`;
     /// call supplies user args after the captured self. `func` is the IR
     /// method name for static dispatch (virtual when `virtual` is true —
@@ -155,8 +158,9 @@ pub fn ty_cmp(a: &Ty, b: &Ty) -> std::cmp::Ordering {
             Ty::Generator { .. } => 13,
             Ty::Exception => 14,
             Ty::Class(_) => 15,
-            Ty::BoundMethod { .. } => 16,
-            Ty::Any => 17,
+            Ty::Type => 16,
+            Ty::BoundMethod { .. } => 17,
+            Ty::Any => 18,
         }
     }
     match (a, b) {
@@ -364,6 +368,7 @@ impl std::fmt::Display for Ty {
             Ty::Generator { yield_ty } => write!(f, "generator[{yield_ty}]"),
             Ty::Exception => write!(f, "exception"),
             Ty::Class(id) => write!(f, "class#{id}"),
+            Ty::Type => write!(f, "type"),
             Ty::BoundMethod { params, ret, .. } => {
                 write!(f, "bound_method[(")?;
                 for (i, p) in params.iter().enumerate() {
@@ -391,6 +396,10 @@ pub struct ClassInfo {
     pub fields: Vec<(String, Ty)>,
     /// Method name → fully-qualified IR function (most specific implementation).
     pub methods: Vec<(String, String)>,
+    /// True when whole-program analysis cannot prove the class closed
+    /// (`setattr` / `getattr` / `__getattr__` may target it). Open classes
+    /// carry a trailing overflow dict; closed classes keep today's layout.
+    pub open: bool,
 }
 
 /// Exception type tags matching the C runtime (`pyrs_raise` / handlers).
@@ -1337,6 +1346,33 @@ pub enum ExprKind {
     NewObject {
         class_id: ClassId,
     },
+    /// A class object (`C` in value position). Payload is `class_id` as i64.
+    TypeObject {
+        class_id: ClassId,
+    },
+    /// `type(obj)` for a class instance: the object's runtime `type_id`.
+    TypeOf {
+        object: Box<Expr>,
+    },
+    /// `getattr(obj, name)` on an open class: layout field or overflow dict.
+    GetAttr {
+        object: Box<Expr>,
+        name: Box<Expr>,
+        class_id: ClassId,
+    },
+    /// `setattr(obj, name, value)` on an open class.
+    SetAttr {
+        object: Box<Expr>,
+        name: Box<Expr>,
+        value: Box<Expr>,
+        class_id: ClassId,
+    },
+    /// `hasattr(obj, name)` on an open class.
+    HasAttr {
+        object: Box<Expr>,
+        name: Box<Expr>,
+        class_id: ClassId,
+    },
     /// Classmethod `cls(...)`: allocate + `__init__` using the runtime
     /// `type_id` of `cls_obj`. `candidates` are `(class_id, optional init IR
     /// name)` for closed-world classes whose `__init__` accepts `args`.
@@ -1404,8 +1440,15 @@ pub enum ExprKind {
         /// Target class id (True if value's type is this or a subclass).
         class_id: ClassId,
     },
+    /// `isinstance(obj, k)` when `k` is a type value.
+    ClassIsInstanceDyn {
+        value: Box<Expr>,
+        type_val: Box<Expr>,
+    },
     /// Default `str(obj)` for an instance: runtime type_id → `"<Name object>"`.
     ObjectToStr(Box<Expr>),
+    /// `str(k)` for a type value: `"<class 'Name'>"`.
+    TypeToStr(Box<Expr>),
 }
 
 /// Unary ops from the pure-PyRs `math` module (bodies replaced at lower).

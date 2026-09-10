@@ -1,3 +1,17 @@
+## 0.150.0 — types as values, and pay-per-use shapes
+
+A class name is a value: `k = C`, `k()`, `type(x)` on a class instance,
+`isinstance(x, k)`. Printing a type object matches CPython's
+`<class '__main__.Name'>`. `type()` of a non-class instance still names
+the gap.
+
+`getattr` / `setattr` / `hasattr` on a class instance write through a
+trailing overflow dict only on classes the program actually reflects, and
+on their subclasses. A class nobody touches keeps today's layout and
+today's speed. A known field name still uses the layout slot; a new name
+goes in the overflow. Receivers that are not class instances name the
+gap rather than borrowing a CPython AttributeError.
+
 ## 0.149.0 — inference: observed-set, call-graph, typeshed
 
 Bare parameters no longer fail as soon as the body does not name a unique

@@ -84,6 +84,7 @@ fn lty(ty: Ty) -> &'static str {
         | Ty::Exception
         | Ty::Class(_)
         | Ty::BoundMethod { .. } => "ptr",
+        Ty::Type => "i64",
         // Value-level None (expression); not the void function return.
         Ty::None => "i8",
         // `Any` is the open union: the same { tag, payload } pair a
@@ -122,7 +123,7 @@ fn gc_root_range_size(ty: Ty) -> Option<u64> {
         | Ty::Exception
         | Ty::Class(_) => Some(8),
         Ty::Union(_) | Ty::Any => Some(16),
-        Ty::Float | Ty::Bool | Ty::None => None,
+        Ty::Float | Ty::Bool | Ty::None | Ty::Type => None,
     }
 }
 
@@ -175,6 +176,7 @@ fn elem_tag(ty: &Ty) -> u32 {
         Ty::Generator { .. } => 10,
         // Exception objects: union-box print tag only (not list/dict elements).
         Ty::Exception => 11,
+        Ty::Type => 12,
         // User class instances: per-class tag so multi-class unions in containers
         // do not share one print_tag (switch cases must be unique).
         // Encoding 13 + 8*class_id avoids collision with list tags (4+8*k).
@@ -190,12 +192,19 @@ fn elem_tag(ty: &Ty) -> u32 {
 /// LLVM struct type for a class instance: `{ i64 type_id, field0, field1, ... }`.
 fn class_struct_ty(info: &ClassInfo) -> String {
     let mut s = String::from("{ i64");
+    if info.open {
+        s.push_str(", ptr");
+    }
     for (_, ty) in &info.fields {
         s.push_str(", ");
         s.push_str(lty(*ty));
     }
     s.push_str(" }");
     s
+}
+
+fn class_field_llvm_index(info: &ClassInfo, field_index: u32) -> i32 {
+    field_index as i32 + 1 + i32::from(info.open)
 }
 
 /// Print tag stored inside a heap union box for the active member (-1 = None).
@@ -645,6 +654,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         IsInstance { value, .. }
         | ExcIsInstance { value, .. }
         | ClassIsInstance { value, .. }
+        | ClassIsInstanceDyn { value, .. }
         | GetField { object: value, .. }
         | GetFieldPartial { object: value, .. } => max_try_depth_in_expr(value),
         CallMethod { args, .. } => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
@@ -655,14 +665,25 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
             .max()
             .unwrap_or(0)
             .max(max_try_depth_in_expr(bound)),
-        NewObject { .. } => 0,
+        NewObject { .. } | TypeObject { .. } => 0,
+        TypeOf { object } | GetAttr { object, .. } | HasAttr { object, .. } => {
+            max_try_depth_in_expr(object)
+        }
+        SetAttr {
+            object,
+            name,
+            value,
+            ..
+        } => max_try_depth_in_expr(object)
+            .max(max_try_depth_in_expr(name))
+            .max(max_try_depth_in_expr(value)),
         ClassConstructDynamic { cls_obj, args, .. } => args
             .iter()
             .map(max_try_depth_in_expr)
             .max()
             .unwrap_or(0)
             .max(max_try_depth_in_expr(cls_obj)),
-        ObjectToStr(operand) => max_try_depth_in_expr(operand),
+        ObjectToStr(operand) | TypeToStr(operand) => max_try_depth_in_expr(operand),
         SetUnion { left, right }
         | SetIntersect { left, right }
         | SetDiff { left, right }
@@ -939,6 +960,7 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         IsInstance { value, .. }
         | ExcIsInstance { value, .. }
         | ClassIsInstance { value, .. }
+        | ClassIsInstanceDyn { value, .. }
         | GetField { object: value, .. }
         | GetFieldPartial { object: value, .. } => count_yields_in_expr(value),
         CallMethod { args, .. } => args.iter().map(count_yields_in_expr).sum(),
@@ -946,11 +968,22 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         CallBoundMethod { bound, args, .. } => {
             count_yields_in_expr(bound) + args.iter().map(count_yields_in_expr).sum::<i64>()
         }
-        NewObject { .. } => 0,
+        NewObject { .. } | TypeObject { .. } => 0,
+        TypeOf { object } | GetAttr { object, .. } | HasAttr { object, .. } => {
+            count_yields_in_expr(object)
+        }
+        SetAttr {
+            object,
+            name,
+            value,
+            ..
+        } => {
+            count_yields_in_expr(object) + count_yields_in_expr(name) + count_yields_in_expr(value)
+        }
         ClassConstructDynamic { cls_obj, args, .. } => {
             count_yields_in_expr(cls_obj) + args.iter().map(count_yields_in_expr).sum::<i64>()
         }
-        ObjectToStr(operand) => count_yields_in_expr(operand),
+        ObjectToStr(operand) | TypeToStr(operand) => count_yields_in_expr(operand),
         SetUnion { left, right }
         | SetIntersect { left, right }
         | SetDiff { left, right }
@@ -1334,6 +1367,11 @@ impl Emitter {
         out.push_str("declare i32 @pyrs_isinstance_class(ptr, i64, ptr, i64)\n");
         out.push_str("declare void @pyrs_print_object(ptr)\n");
         out.push_str("declare void @pyrs_print_class_instance(ptr)\n");
+        out.push_str("declare void @pyrs_print_type(i64)\n");
+        out.push_str("declare ptr @pyrs_str_from_type(i64)\n");
+        out.push_str("declare i64 @pyrs_shape_get(ptr, ptr, ptr, ptr)\n");
+        out.push_str("declare void @pyrs_shape_set(ptr, ptr, i32, i64)\n");
+        out.push_str("declare i32 @pyrs_shape_has(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_from_object(ptr)\n");
         out.push_str("declare void @pyrs_set_class_names(ptr, i64)\n");
         out.push_str("declare void @pyrs_set_class_reprs(ptr, i64)\n");
@@ -2188,7 +2226,7 @@ impl Emitter {
 
     fn slot_from_value(&mut self, value: &str, ty: Ty) -> String {
         match ty {
-            Ty::Int => value.to_string(),
+            Ty::Int | Ty::Type => value.to_string(),
             // A container slot is 8 bytes and carries no tag of its own, so a
             // dynamic value has to be boxed to enter one.
             Ty::Any => self.any_box(value),
@@ -2246,7 +2284,7 @@ impl Emitter {
 
     fn value_from_slot(&mut self, slot: &str, ty: Ty) -> String {
         match ty {
-            Ty::Int => slot.to_string(),
+            Ty::Int | Ty::Type => slot.to_string(),
             Ty::Any => self.any_unbox(slot),
             Ty::Float => {
                 let t = self.tmp();
@@ -2897,6 +2935,7 @@ impl Emitter {
             Ty::Generator { .. } => src == 10,
             Ty::Exception => src == 11,
             Ty::Class(_) => src >= 13 && (src - 13) % 8 == 0,
+            Ty::Type => src == 12,
             Ty::Any => true,
             Ty::Union(_) | Ty::File | Ty::Cell(_) => false,
         }
@@ -3286,7 +3325,7 @@ impl Emitter {
                 .get(*cid as usize)
                 .expect("GetFieldPartial class");
             let sty = class_struct_ty(info);
-            let idx = *fidx as i32 + 1;
+            let idx = class_field_llvm_index(info, *fidx);
             let fp = self.tmp();
             self.line(format!(
                 "{fp} = getelementptr inbounds {sty}, ptr {obj}, i32 0, i32 {idx}"
@@ -3333,13 +3372,13 @@ impl Emitter {
             class_id as i64
         ));
         for (fi, (_, fty)) in info.fields.iter().enumerate() {
-            let idx = fi as i32 + 1;
+            let idx = class_field_llvm_index(&info, fi as u32);
             let fp = self.tmp();
             self.line(format!(
                 "{fp} = getelementptr inbounds {sty}, ptr {t}, i32 0, i32 {idx}"
             ));
             let zero = match fty {
-                Ty::Int => "1".to_string(),
+                Ty::Int | Ty::Type => "1".to_string(),
                 Ty::Float => fconst(0.0),
                 Ty::Bool => "false".to_string(),
                 Ty::None => "0".to_string(),
@@ -3361,6 +3400,20 @@ impl Emitter {
             self.line(format!("store {} {zero}, ptr {fp}", lty(*fty)));
         }
         t
+    }
+
+    fn emit_overflow_slot(&mut self, obj: &str, class_id: u32) -> String {
+        let info = self
+            .classes
+            .get(class_id as usize)
+            .expect("overflow class_id")
+            .clone();
+        let sty = class_struct_ty(&info);
+        let fp = self.tmp();
+        self.line(format!(
+            "{fp} = getelementptr inbounds {sty}, ptr {obj}, i32 0, i32 1"
+        ));
+        fp
     }
 
     /// Call a mangled method/function with already-emitted arg values.
@@ -3402,6 +3455,7 @@ impl Emitter {
                 // Runtime type_id → class display name (needs pyrs_set_class_names).
                 self.line(format!("call void @pyrs_print_class_instance(ptr {v})"));
             }
+            Ty::Type => self.line(format!("call void @pyrs_print_type(i64 {v})")),
             Ty::List(elem) => self.line(format!(
                 "call void @pyrs_print_list(ptr {v}, i32 {})",
                 elem_tag(elem)
@@ -3904,8 +3958,7 @@ impl Emitter {
                     .get(*class_id as usize)
                     .expect("SetField class_id");
                 let sty = class_struct_ty(info);
-                // field_index is 0-based into fields; LLVM index is 1+field (0=type_id)
-                let idx = *field_index as i32 + 1;
+                let idx = class_field_llvm_index(info, *field_index);
                 let fp = self.tmp();
                 self.line(format!(
                     "{fp} = getelementptr inbounds {sty}, ptr {obj}, i32 0, i32 {idx}"
@@ -5924,13 +5977,19 @@ impl Emitter {
             } => {
                 // Load type_id from cls_obj, switch among candidates: NewObject + init.
                 // Arity-incompatible subclasses TypeError (no short-arg call / SIGSEGV).
-                let cls_p = self.emit_expr(cls_obj);
-                let tid_p = self.tmp();
-                self.line(format!(
-                    "{tid_p} = getelementptr inbounds {{ i64 }}, ptr {cls_p}, i32 0, i32 0"
-                ));
-                let tid = self.tmp();
-                self.line(format!("{tid} = load i64, ptr {tid_p}"));
+                // A type value already *is* the id; a classmethod `cls` token is an instance.
+                let tid = if cls_obj.ty == Ty::Type {
+                    self.emit_expr(cls_obj)
+                } else {
+                    let cls_p = self.emit_expr(cls_obj);
+                    let tid_p = self.tmp();
+                    self.line(format!(
+                        "{tid_p} = getelementptr inbounds {{ i64 }}, ptr {cls_p}, i32 0, i32 0"
+                    ));
+                    let t = self.tmp();
+                    self.line(format!("{t} = load i64, ptr {tid_p}"));
+                    t
+                };
                 let mut arg_vals: Vec<(String, Ty)> = Vec::new();
                 for a in args {
                     arg_vals.push((self.emit_expr(a), a.ty));
@@ -6004,6 +6063,66 @@ impl Emitter {
                 }
             }
             ExprKind::NewObject { class_id } => self.emit_new_object(*class_id),
+            ExprKind::TypeObject { class_id } => (*class_id as i64).to_string(),
+            ExprKind::TypeOf { object } => {
+                let obj = self.emit_expr(object);
+                let p = self.tmp();
+                self.line(format!(
+                    "{p} = getelementptr inbounds {{ i64 }}, ptr {obj}, i32 0, i32 0"
+                ));
+                let t = self.tmp();
+                self.line(format!("{t} = load i64, ptr {p}"));
+                t
+            }
+            ExprKind::GetAttr {
+                object,
+                name,
+                class_id,
+            } => {
+                let obj = self.emit_expr(object);
+                let nm = self.emit_expr(name);
+                let slot = self.emit_overflow_slot(&obj, *class_id);
+                let pay = self.tmp();
+                let tag_slot = self.dyn_tag_slot();
+                self.line(format!(
+                    "{pay} = call i64 @pyrs_shape_get(ptr {obj}, ptr {slot}, ptr {nm}, ptr {tag_slot})"
+                ));
+                let tag = self.tmp();
+                self.line(format!("{tag} = load i32, ptr {tag_slot}"));
+                self.build_any(&tag, &pay)
+            }
+            ExprKind::HasAttr {
+                object,
+                name,
+                class_id,
+            } => {
+                let obj = self.emit_expr(object);
+                let nm = self.emit_expr(name);
+                let slot = self.emit_overflow_slot(&obj, *class_id);
+                let c = self.tmp();
+                self.line(format!(
+                    "{c} = call i32 @pyrs_shape_has(ptr {slot}, ptr {nm})"
+                ));
+                let t = self.tmp();
+                self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                t
+            }
+            ExprKind::SetAttr {
+                object,
+                name,
+                value,
+                class_id,
+            } => {
+                let obj = self.emit_expr(object);
+                let nm = self.emit_expr(name);
+                let val = self.emit_expr(value);
+                let (tag, pay) = self.emit_any_unpack(&val);
+                let slot = self.emit_overflow_slot(&obj, *class_id);
+                self.line(format!(
+                    "call void @pyrs_shape_set(ptr {slot}, ptr {nm}, i32 {tag}, i64 {pay})"
+                ));
+                "0".to_string()
+            }
             ExprKind::GetField {
                 object,
                 class_id,
@@ -6016,7 +6135,7 @@ impl Emitter {
                     .expect("GetField class_id");
                 let sty = class_struct_ty(info);
                 let fty = info.fields[*field_index as usize].1;
-                let idx = *field_index as i32 + 1;
+                let idx = class_field_llvm_index(info, *field_index);
                 let fp = self.tmp();
                 self.line(format!(
                     "{fp} = getelementptr inbounds {sty}, ptr {obj}, i32 0, i32 {idx}"
@@ -6195,10 +6314,28 @@ impl Emitter {
                 self.line(format!("{b} = icmp ne i32 {t}, 0"));
                 b
             }
+            ExprKind::ClassIsInstanceDyn { value, type_val } => {
+                let v = self.emit_expr(value);
+                let tid = self.emit_expr(type_val);
+                let n = self.classes.len() as i64;
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = call i32 @pyrs_isinstance_class(ptr {v}, i64 {tid}, ptr @pyrs_class_parents, i64 {n})"
+                ));
+                let b = self.tmp();
+                self.line(format!("{b} = icmp ne i32 {t}, 0"));
+                b
+            }
             ExprKind::ObjectToStr(obj) => {
                 let v = self.emit_expr(obj);
                 let t = self.tmp();
                 self.line(format!("{t} = call ptr @pyrs_str_from_object(ptr {v})"));
+                t
+            }
+            ExprKind::TypeToStr(obj) => {
+                let v = self.emit_expr(obj);
+                let t = self.tmp();
+                self.line(format!("{t} = call ptr @pyrs_str_from_type(i64 {v})"));
                 t
             }
             ExprKind::Binary { op, left, right } => self.emit_binary(*op, left, right),
@@ -7506,7 +7643,7 @@ impl Emitter {
         let r = self.emit_expr(right);
         let t = self.tmp();
         match left.ty {
-            Ty::Int | Ty::Bool => {
+            Ty::Int | Ty::Bool | Ty::Type => {
                 let pred = if not { "ne" } else { "eq" };
                 // bool is i1; zext both for a uniform compare when mixed — types match.
                 if left.ty == Ty::Bool {
@@ -7596,7 +7733,7 @@ impl Emitter {
             // Exception instances are always truthy (CPython BaseException).
             // User class instances are always truthy when non-null (we never
             // produce null instances after construction).
-            Ty::Exception | Ty::Class(_) => {
+            Ty::Exception | Ty::Class(_) | Ty::Type => {
                 let _ = v;
                 "true".to_string()
             }

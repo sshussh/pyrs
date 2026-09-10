@@ -85,18 +85,23 @@ fn eval_and_exec_say_why_and_point_at_compat() {
 
 #[test]
 fn attribute_reflection_is_named() {
+    names(
+        "delattr",
+        "delattr(1, \"x\")\n",
+        &["reflection", "statically"],
+    );
     for (tag, source) in [
         ("getattr", "print(getattr(1, \"x\"))\n"),
         ("hasattr", "print(hasattr(1, \"x\"))\n"),
         ("setattr", "setattr(1, \"x\", 2)\n"),
     ] {
-        names(tag, source, &["reflection", "statically"]);
+        names(tag, source, &["class instance"]);
     }
 }
 
 #[test]
 fn type_and_the_scope_helpers_are_named() {
-    names("type", "print(type(1))\n", &["type()", "isinstance"]);
+    names("type", "print(type(1))\n", &["not supported yet"]);
     names("globals", "print(globals())\n", &["globals()"]);
 }
 

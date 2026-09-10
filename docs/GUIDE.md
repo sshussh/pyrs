@@ -1317,11 +1317,13 @@ print(isinstance(d, Animal))  # True
   function; monomorphic closures)
 
 **Not supported yet** (named compile errors): multiple inheritance,
-metaclasses, `__new__`, `__slots__`, open `__dict__` / `__getattr__`,
-nested classes, class decorators, stacked custom decorators, two-arg
-`super()`, class-body attributes, dotted bases (`class D(pkg.C)` —
-import the base first), first-class class objects as values (use as
-constructor/type only).
+metaclasses, `__new__`, `__slots__`, nested classes, class decorators,
+stacked custom decorators, two-arg `super()`, class-body attributes,
+dotted bases (`class D(pkg.C)` — import the base first). Class names are
+values (`k = C`, `k()`, `type(x)` on a class instance). `getattr` /
+`setattr` / `hasattr` on a class instance write an overflow dict only on
+classes the program actually reflects; a class nobody touches keeps
+today's layout. `type()` of a non-class instance still names the gap.
 Mixed **container literals** infer a union of the element types as of
 0.137 (`[1, "a"]` is `list[int | str]`), so an annotation is no longer
 required; each element keeps its own type. A `file` element still errors,
@@ -1361,7 +1363,9 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `int(x[, base])` | int, float (truncates toward zero), bool; `str` (optional `base` 0 or 2..=36, positional or `base=`) | int; no-arg `int()` is `0`; string parse is CPython (sign, underscores, prefixes when base allows); ASCII whitespace only |
 | `float(x)` | int, float, bool, `str` | float; no-arg `float()` is `0.0`; string parse is CPython (`inf`/`nan`/scientific/underscores); ASCII whitespace only |
 | `bool(x)` | int, float, bool, str, list, tuple, dict, set | bool |
-| `str(x)` | int, float, bool, str | str |
+| `str(x)` | int, float, bool, str, class instance, type | str |
+| `type(x)` | a class instance | the class object (`<class 'Name'>`) |
+| `getattr(obj, name)` / `hasattr(obj, name)` / `setattr(obj, name, value)` | class instance; `name` is `str` | field or overflow dict; a class nobody reflects keeps today's layout |
 
 `print` formatting matches CPython: floats use the shortest
 representation that round-trips (`0.1 + 0.2` → `0.30000000000000004`,

@@ -643,7 +643,7 @@ fn unsupported_feature(name: &str) -> Option<&'static str> {
             "runtime compilation and dynamic import are not supported: PyRs \
              resolves the whole import graph at compile time. Use --compat"
         }
-        "getattr" | "setattr" | "hasattr" | "delattr" | "vars" | "dir" => {
+        "delattr" | "vars" | "dir" => {
             "attribute reflection is not supported: instance fields are \
              resolved statically, so an attribute named at run time cannot be \
              looked up. Use a dict, or --compat"
@@ -653,8 +653,8 @@ fn unsupported_feature(name: &str) -> Option<&'static str> {
              at run time. Pass the values you need as arguments"
         }
         "type" => {
-            "type() is not supported: classes are not first-class values \
-             here. Use isinstance(x, C) to test, or a field for a tag"
+            "type as a value (without a call) is not supported: write type(x), \
+             or bind a class name"
         }
         "callable" | "issubclass" => {
             "callable() and issubclass() are not supported: they need \
@@ -3166,6 +3166,7 @@ fn register_class_ids(classes: &[ClassAst<'_>]) -> SResult<()> {
                 parent: None,
                 fields: vec![],
                 methods: vec![],
+                open: false,
             });
             env.module_of.insert(id, c.module.clone());
             env.by_key.insert((c.module.clone(), c.name.clone()), id);
@@ -17312,6 +17313,7 @@ fn can_box_as_any(ty: ir::Ty) -> bool {
         | ir::Ty::Generator { .. }
         | ir::Ty::Exception
         | ir::Ty::Class(_)
+        | ir::Ty::Type
         | ir::Ty::Union(_)
         | ir::Ty::Any => true,
         ir::Ty::File | ir::Ty::Cell(_) => false,
@@ -18299,6 +18301,7 @@ fn to_bool_default(value: ir::Expr, span: Span) -> SResult<ir::Expr> {
         | ir::Ty::Union(_)
         | ir::Ty::Exception
         | ir::Ty::Class(_)
+        | ir::Ty::Type
         | ir::Ty::Any => Ok(ir::Expr {
             ty: ir::Ty::Bool,
             kind: ir::ExprKind::ToBool(Box::new(value)),
@@ -18535,12 +18538,10 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         format!("module '{name}' is not a value; use '{name}.<name>'"),
                         expr.span,
                     )),
-                    ImportBinding::Class(_) => Err(err(
-                        format!(
-                            "'{name}' is a class; construct with '{name}(...)' or use it as a type"
-                        ),
-                        expr.span,
-                    )),
+                    ImportBinding::Class(id) => Ok(ir::Expr {
+                        ty: ir::Ty::Type,
+                        kind: ir::ExprKind::TypeObject { class_id: *id },
+                    }),
                 }
             } else if let Some(sig) = ctx.funcs().get(name).cloned() {
                 // A module-level function in value position is a closure with
@@ -18577,6 +18578,11 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         captures: vec![],
                         capture_is_cell: vec![],
                     },
+                })
+            } else if let Some(id) = lookup_class(name) {
+                Ok(ir::Expr {
+                    ty: ir::Ty::Type,
+                    kind: ir::ExprKind::TypeObject { class_id: id },
                 })
             } else if name == "__name__" {
                 // The one module attribute with a compile-time answer: the
@@ -23050,6 +23056,7 @@ fn lower_value_call(
         ir::Ty::Closure { .. } => {
             lower_call_closure_value(&callee, user_args, keywords, kwargs, span, ctx)
         }
+        ir::Ty::Type => lower_type_construct(callee, user_args, keywords, kwargs, span, ctx),
         other => Err(err(
             format!("'{other}' object is not callable"),
             callee_ast.span,
@@ -23201,6 +23208,289 @@ fn lower_call_closure_value(
     })
 }
 
+fn mark_class_tree_open(id: ir::ClassId) {
+    with_class_env_mut(|env| {
+        let mut ids: Vec<ir::ClassId> = env
+            .infos
+            .iter()
+            .filter(|c| class_is_subclass_in(env, c.id, id))
+            .map(|c| c.id)
+            .collect();
+        ids.push(id);
+        for cid in ids {
+            if let Some(info) = env.infos.get_mut(cid as usize) {
+                info.open = true;
+            }
+        }
+    });
+}
+
+fn lower_type_construct(
+    callee: ir::Expr,
+    args: &[ast::PosArg],
+    keywords: &[ast::Keyword],
+    kwargs: Option<&ast::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if let ir::ExprKind::TypeObject { class_id } = callee.kind {
+        return lower_class_construct(class_id, "", args, keywords, kwargs, span, ctx);
+    }
+    if kwargs.is_some() || !keywords.is_empty() {
+        return Err(err(
+            "keyword arguments on a type value are not supported yet",
+            span,
+        ));
+    }
+    let plain = require_plain_args(args, "type", span)?;
+    let n_args = plain.len();
+    let n_classes = with_class_env(|e| e.infos.len());
+    let mut matches: Vec<(ir::ClassId, Vec<ir::Ty>, Option<String>)> = Vec::new();
+    for cid in 0..n_classes as ir::ClassId {
+        let init_name = resolve_method(cid, "__init__");
+        let Some(init_name) = init_name else {
+            if n_args == 0 {
+                matches.push((cid, vec![], None));
+            }
+            continue;
+        };
+        let Some(sig) =
+            method_sig_lookup(&init_name).or_else(|| ctx.mctx.funcs.get(&init_name).cloned())
+        else {
+            continue;
+        };
+        let user = method_user_sig(&sig);
+        let required = user.params.iter().filter(|p| p.default.is_none()).count();
+        if n_args >= required && n_args <= user.params.len() {
+            let tys: Vec<ir::Ty> = user.params.iter().map(|p| p.ty).collect();
+            matches.push((cid, tys, Some(init_name)));
+        }
+    }
+    if matches.is_empty() {
+        return Err(err(
+            format!("type() takes {n_args} argument(s) but no class matches that constructor"),
+            span,
+        ));
+    }
+    let tys0 = matches[0].1.clone();
+    if matches.iter().any(|(_, t, _)| *t != tys0) {
+        return Err(err(
+            "calling a type value with arguments needs a constant class when \
+             matching constructors disagree on parameter types; write C(...)",
+            span,
+        ));
+    }
+    let mut user_args = Vec::new();
+    for (i, a) in plain.iter().enumerate() {
+        let v = lower_expr(a, ctx)?;
+        user_args.push(coerce(v, tys0[i], a.span, "constructor argument")?);
+    }
+    let result_ty = ir::Ty::Class(matches[0].0);
+    let candidates = matches
+        .iter()
+        .map(|(cid, _, init)| (*cid, init.clone()))
+        .collect();
+    Ok(ir::Expr {
+        ty: result_ty,
+        kind: ir::ExprKind::ClassConstructDynamic {
+            cls_obj: Box::new(callee),
+            candidates,
+            arity_errors: vec![],
+            args: user_args,
+        },
+    })
+}
+
+fn lower_type_builtin(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() != 1 {
+        return Err(err(
+            format!("type() takes exactly one argument ({} given)", args.len()),
+            span,
+        ));
+    }
+    let v = lower_expr(args[0], ctx)?;
+    match v.ty {
+        ir::Ty::Class(_) => Ok(ir::Expr {
+            ty: ir::Ty::Type,
+            kind: ir::ExprKind::TypeOf {
+                object: Box::new(v),
+            },
+        }),
+        ir::Ty::Type => Ok(v),
+        other => Err(err(
+            format!(
+                "type() of {other} is not supported yet: type() returns a class \
+                 object, and only user-class instances have one here"
+            ),
+            span,
+        )),
+    }
+}
+
+fn const_str_name(e: &ir::Expr) -> Option<&str> {
+    match &e.kind {
+        ir::ExprKind::ConstStr(s) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+fn lower_getattr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() != 2 {
+        return Err(err(
+            format!("getattr() takes 2 arguments ({} given)", args.len()),
+            span,
+        ));
+    }
+    let obj = lower_expr(args[0], ctx)?;
+    let name = lower_expr(args[1], ctx)?;
+    if name.ty != ir::Ty::Str {
+        return Err(err(
+            format!(
+                "getattr() attribute name must be str, not {}",
+                display_ty(name.ty)
+            ),
+            args[1].span,
+        ));
+    }
+    let ir::Ty::Class(id) = obj.ty else {
+        return Err(err(
+            format!(
+                "getattr() on {} is not supported yet: the receiver must be a \
+                 class instance so the overflow dict is pay-per-use",
+                display_ty(obj.ty)
+            ),
+            args[0].span,
+        ));
+    };
+    if let Some(attr) = const_str_name(&name)
+        && let Some((idx, ty)) = field_index(id, attr)
+    {
+        return Ok(ir::Expr {
+            ty,
+            kind: ir::ExprKind::GetField {
+                object: Box::new(obj),
+                class_id: id,
+                field_index: idx,
+            },
+        });
+    }
+    mark_class_tree_open(id);
+    Ok(ir::Expr {
+        ty: ir::Ty::Any,
+        kind: ir::ExprKind::GetAttr {
+            object: Box::new(obj),
+            name: Box::new(name),
+            class_id: id,
+        },
+    })
+}
+
+fn lower_hasattr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() != 2 {
+        return Err(err(
+            format!("hasattr() takes 2 arguments ({} given)", args.len()),
+            span,
+        ));
+    }
+    let obj = lower_expr(args[0], ctx)?;
+    let name = lower_expr(args[1], ctx)?;
+    if name.ty != ir::Ty::Str {
+        return Err(err(
+            format!(
+                "hasattr() attribute name must be str, not {}",
+                display_ty(name.ty)
+            ),
+            args[1].span,
+        ));
+    }
+    let ir::Ty::Class(id) = obj.ty else {
+        return Err(err(
+            format!(
+                "hasattr() on {} is not supported yet: the receiver must be a \
+                 class instance",
+                display_ty(obj.ty)
+            ),
+            args[0].span,
+        ));
+    };
+    if let Some(attr) = const_str_name(&name)
+        && (field_index(id, attr).is_some() || resolve_method(id, attr).is_some())
+    {
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ConstBool(true),
+        });
+    }
+    mark_class_tree_open(id);
+    Ok(ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::HasAttr {
+            object: Box::new(obj),
+            name: Box::new(name),
+            class_id: id,
+        },
+    })
+}
+
+fn lower_setattr(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult<ir::Expr> {
+    if args.len() != 3 {
+        return Err(err(
+            format!("setattr() takes 3 arguments ({} given)", args.len()),
+            span,
+        ));
+    }
+    let obj = lower_expr(args[0], ctx)?;
+    let name = lower_expr(args[1], ctx)?;
+    let val = lower_expr(args[2], ctx)?;
+    if name.ty != ir::Ty::Str {
+        return Err(err(
+            format!(
+                "setattr() attribute name must be str, not {}",
+                display_ty(name.ty)
+            ),
+            args[1].span,
+        ));
+    }
+    let ir::Ty::Class(id) = obj.ty else {
+        return Err(err(
+            format!(
+                "setattr() on {} is not supported yet: the receiver must be a \
+                 class instance so a class nobody touches keeps today's layout",
+                display_ty(obj.ty)
+            ),
+            args[0].span,
+        ));
+    };
+    if let Some(attr) = const_str_name(&name)
+        && let Some((idx, ty)) = field_index(id, attr)
+    {
+        let v = coerce(val, ty, args[2].span, "setattr value")?;
+        return Ok(ir::Expr {
+            ty: ir::Ty::None,
+            kind: ir::ExprKind::Block {
+                stmts: vec![ir::Stmt::SetField {
+                    object: obj,
+                    class_id: id,
+                    field_index: idx,
+                    value: v,
+                }],
+                result: Box::new(const_none()),
+            },
+        });
+    }
+    mark_class_tree_open(id);
+    let boxed = coerce(val, ir::Ty::Any, args[2].span, "setattr value")?;
+    Ok(ir::Expr {
+        ty: ir::Ty::None,
+        kind: ir::ExprKind::SetAttr {
+            object: Box::new(obj),
+            name: Box::new(name),
+            value: Box::new(boxed),
+            class_id: id,
+        },
+    })
+}
+
 /// Conservatively clear all cell refinements (unknown callees / CallClosure).
 fn invalidate_all_cell_refinements(ctx: &mut FnCtx) {
     let names: Vec<String> = ctx.cell_locals.keys().cloned().collect();
@@ -23313,6 +23603,20 @@ fn lower_call(
         .get(func)
         .copied()
         .or_else(|| ctx.globals.get(func).copied());
+    if closure_ty == Some(ir::Ty::Type) {
+        let callee = if ctx.locals.contains_key(func) {
+            ir::Expr {
+                ty: ir::Ty::Type,
+                kind: ir::ExprKind::Local(func.to_string()),
+            }
+        } else {
+            ir::Expr {
+                ty: ir::Ty::Type,
+                kind: ir::ExprKind::GlobalLoad(ctx.own_global(func)),
+            }
+        };
+        return lower_type_construct(callee, args, keywords, kwargs, span, ctx);
+    }
     if let Some(ty) = closure_ty
         && let ir::Ty::Closure { .. } = ty
         && !ctx.locals.contains_key(func)
@@ -23912,6 +24216,10 @@ fn lower_call(
                     },
                 })
             }
+            "type" => lower_type_builtin(&args, span, ctx),
+            "getattr" => lower_getattr(&args, span, ctx),
+            "setattr" => lower_setattr(&args, span, ctx),
+            "hasattr" => lower_hasattr(&args, span, ctx),
             "isinstance" => lower_isinstance(&args, span, ctx),
             "any" => lower_any_all(true, &args, span, ctx),
             "all" => lower_any_all(false, &args, span, ctx),
@@ -24108,6 +24416,27 @@ fn lower_isinstance(args: &[&ast::Expr], span: Span, ctx: &mut FnCtx) -> SResult
         ir::ExprKind::FromUnion { value: inner } => *inner,
         _ => value,
     };
+    if parse_isinstance_type_arg(args[1]).is_err()
+        && let Ok(t) = lower_expr(args[1], ctx)
+        && t.ty == ir::Ty::Type
+    {
+        let ir::Ty::Class(_) = value.ty else {
+            return Err(err(
+                format!(
+                    "isinstance() of {} against a type value is not supported yet",
+                    display_ty(value.ty)
+                ),
+                args[0].span,
+            ));
+        };
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::ClassIsInstanceDyn {
+                value: Box::new(value),
+                type_val: Box::new(t),
+            },
+        });
+    }
     let pats = parse_isinstance_type_arg(args[1])?;
     let exc_filters: Vec<i32> = pats
         .iter()
@@ -27394,6 +27723,7 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
             | ir::Ty::Set(_)
             | ir::Ty::Exception
             | ir::Ty::Class(_)
+            | ir::Ty::Type
             | ir::Ty::Any => Ok(ir::Expr {
                 ty: ir::Ty::Bool,
                 kind: ir::ExprKind::ToBool(Box::new(value)),
@@ -27419,6 +27749,10 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
                 kind: ir::ExprKind::ExcToStr(Box::new(value)),
             }),
             ir::Ty::Class(id) => lower_class_to_str(value, id, span),
+            ir::Ty::Type => Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::TypeToStr(Box::new(value)),
+            }),
             // A container renders as the text `print` writes -- CPython's
             // `str` and `repr` agree there, elements included.
             ir::Ty::List(_) | ir::Ty::Tuple(_) | ir::Ty::Dict { .. } | ir::Ty::Set(_) => {
@@ -28439,6 +28773,27 @@ fn lower_binary(
     if matches!(l.ty, ir::Ty::Tuple(_)) || matches!(r.ty, ir::Ty::Tuple(_)) {
         return lower_tuple_binary(op, l, r, span, ctx);
     }
+    if l.ty == ir::Ty::Type && r.ty == ir::Ty::Type {
+        match op {
+            ast::BinOp::Eq | ast::BinOp::NotEq => {
+                return Ok(ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::IsIdentity {
+                        left: Box::new(l),
+                        right: Box::new(r),
+                        not: matches!(op, ast::BinOp::NotEq),
+                    },
+                });
+            }
+            _ => {
+                return Err(err(
+                    format!("operator '{op}' is not supported for type objects"),
+                    span,
+                ));
+            }
+        }
+    }
+
     // ---- class operators (identity or matching dunder) ----
     if matches!(l.ty, ir::Ty::Class(_)) || matches!(r.ty, ir::Ty::Class(_)) {
         match op {
