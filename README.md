@@ -41,7 +41,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.143.0**.
+Current milestone: **v0.144.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -296,8 +296,8 @@ benchmarks and a release workflow.
   section as its notes. So a milestone releases itself once its version bump
   lands.
 
-Pushing a tag by hand still works and takes the same path — `git tag v0.143.0
-&& git push origin v0.143.0`. Nothing is ever published from a commit whose CI
+Pushing a tag by hand still works and takes the same path — `git tag v0.144.0
+&& git push origin v0.144.0`. Nothing is ever published from a commit whose CI
 did not pass.
 
 Linux x86_64 is the released build. macOS arm64 and Windows x86_64 are in the

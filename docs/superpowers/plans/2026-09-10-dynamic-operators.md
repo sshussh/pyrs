@@ -186,12 +186,65 @@ file whose parts all passed individually.
   {int, str, float, bool, None, list, tuple} to hold the line that `==` never
   raises where `<` does.
 
+## Method calls and `in` (0.144.0)
+
+Both closed by the same ABI decision. `pyrs_dyn_method` takes the receiver and
+every argument as tag/payload pairs -- the arguments in two stack arrays sized
+per call site -- and writes the result tag through the same slot the operator
+kernel uses, so **a dynamic method call allocates nothing**:
+
+| 2M iterations of `s.startswith("h")` | time | allocated |
+|---|---:|---:|
+| `s: str` | 0.010s | 0 B |
+| `s: object` | 0.093s | 0 B |
+| CPython | 0.096s | — |
+
+On par with CPython, and 9.3x the typed path. The factor is a linear `strcmp`
+walk through the method table before the match, not allocation — a contained
+optimization (length bucketing or a perfect hash) left for later because it
+changes no behaviour.
+
+Mutating methods needed a second site: `xs.append(1)` in statement position
+lowers through `lower_method_stmt`, not the expression path, and routing only
+the expression path made `xs.append(1)` still fail after `xs.count(1)` worked.
+
+### The error contract has two failure directions
+
+This is the part that took the care, because being wrong is possible in two
+opposite ways:
+
+| Case | Must say |
+|---|---|
+| the type has no such name | `AttributeError: 'int' object has no attribute 'nope'` — CPython's exact message |
+| the type **has** it, the kernel does not implement it | `NotImplementedError: 'partition' is not supported on a dynamic str yet` |
+
+Reporting `AttributeError` for the second would tell a user their valid program
+is invalid. Telling the two apart needs CPython's full method-name list per
+type, which the kernel carries for exactly that purpose — it is not a list of
+what works, it is a list of what exists.
+
+Arity and argument-type messages match verbatim too, and CPython is
+inconsistent here in ways worth knowing: `str.upper() takes no arguments (1
+given)` and `list.count() takes exactly one argument (0 given)` are
+type-prefixed with different number words, `startswith first arg must be str or
+a tuple of str, not int` has no prefix at all, and an integer slot reports the
+operand rather than the method (`'str' object cannot be interpreted as an
+integer`). Three CPython methods use a fourth form (`startswith expected at
+least 1 argument, got 0`); those are per-method and are not reproduced.
+
+### One bug worth recording
+
+`d.get("a")` segfaulted. `pyrs_dict_get_default` writes the raw slot, not a
+boxed value, and the kernel treated it as a box pointer — so a dict of `int`
+had a tagged integer dereferenced as a `PyrsUnionBox *`. The fix is the rule
+`pyrs_any_dict_get` already documents: every insert stamps the value tag from
+the dict's static value type, so any full slot answers for the dict.
+
 ## What is still refused
 
-- **Method calls on a dynamic value** — `a.upper()` is `'Any' has no method
-  'upper'`. This needs a name-to-dispatch table, not an operator table, and is
-  the larger remaining half of D2.
-- **`in` over a dynamic container** — `1 in d` where `d` is dynamic. `in` works
-  in the other direction, with a dynamic element in a typed container.
-- **`sorted()` of a dynamic value** — needs the iterable protocol on `Any`.
+- **`sorted()` of a dynamic value** — sorting needs an ordering for each pair
+  of elements. The old diagnostic claimed the value was not iterable, which is
+  false (`for x in v` works); it now names the real reason.
 - **`str % args`** — above.
+- **Attribute *reads*** on a dynamic value (`a.field` without a call), which is
+  D3's shapes work rather than D2's.

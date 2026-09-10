@@ -1,3 +1,50 @@
+## 0.144.0 — method calls and `in` on a dynamic value
+
+The other half of the generic kernel. `a.upper()`, `xs.append(1)`, `d.get("k")`
+and `1 in xs` on an `object` were compile errors; the runtime now looks the
+method up against the type the value's tag names.
+
+`pyrs_dyn_method` takes the receiver and every argument as tag/payload pairs
+and writes the result tag through a stack slot, the same ABI the operator
+kernel settled on, so a dynamic method call **allocates nothing**. Measured on
+2M iterations of `s.startswith("h")`:
+
+| receiver | time | allocated |
+|---|---:|---:|
+| `s: str` | 0.010s | 0 B |
+| `s: object` | 0.093s | 0 B |
+| CPython | 0.096s | — |
+
+On par with CPython and 9.3x the typed path. That factor is a linear `strcmp`
+chain through the method table, not allocation — the obvious next optimization
+and a contained one.
+
+Covered: 25 `str` methods, `list` append/insert/pop/count/copy/clear/reverse,
+`dict` get/keys/copy/clear, `set` add/discard/remove/copy/clear, and `in` over
+str, list, tuple, dict and set. Mutating methods work in statement position,
+which is a separate lowering path from a method call in expression position.
+
+The error contract is where the care went, because there are two ways to be
+wrong and they point in opposite directions:
+
+- A name the type **does not have** reports CPython's message exactly:
+  `AttributeError: 'int' object has no attribute 'nope'`.
+- A name the type **does** have but this kernel does not implement says so:
+  `NotImplementedError: 'partition' is not supported on a dynamic str yet`.
+  Reporting AttributeError there would tell a user their valid program is
+  invalid, so the kernel carries CPython's full method-name list per type in
+  order to tell the two apart.
+
+Arity and argument-type messages also match verbatim, including the three
+different wordings CPython itself uses (`str.upper() takes no arguments (1
+given)`, `list.count() takes exactly one argument (0 given)`, `startswith first
+arg must be str or a tuple of str, not int`, and `'str' object cannot be
+interpreted as an integer`).
+
+`sorted()` of a dynamic value stays refused, and its diagnostic was wrong
+before: it claimed the value was not iterable, when `for x in v` works. It now
+names the real reason — sorting needs an ordering per element pair.
+
 ## 0.143.0 — operators on a dynamic value
 
 Reading a dynamic value became free in 0.142.0. Operating on one was still

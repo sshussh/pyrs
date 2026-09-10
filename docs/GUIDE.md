@@ -1043,9 +1043,14 @@ def clamp(x: float, lo: float, hi: float) -> float:
   operand type(s) for +`, `can only concatenate str (not "int") to str`, and
   `'<' not supported between instances of`). `bool` counts as an int, floored
   division keeps Python's signs, and `==` / `!=` never raise where `<` would.
-  Still refused: method calls on a dynamic value, `in` over a dynamic
-  container, `sorted()` of one, and `str % args`, which names itself as
-  unimplemented rather than reporting a TypeError CPython would not raise.
+  Still refused: `sorted()` of a dynamic value and `str % args`, both of which
+  name themselves as unimplemented rather than reporting an error CPython would
+  not raise.
+- **Methods and `in` work on a dynamic value** (0.144). The runtime looks a
+  method up against the type the value's tag names, and a dynamic call
+  allocates nothing. `in` works over a dynamic str, list, tuple, dict or set.
+  A name the type does not have reports CPython's `AttributeError`; a name it
+  has that is not implemented yet says so instead.
 - **A dynamic container reads without narrowing** (0.140). `len(v)`, `v[i]`,
   `v[k]`, `v.keys()` and `for x in v` work on an `object` whose contents are
   only known at run time, reading it through the tag it already carries — so
