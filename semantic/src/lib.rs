@@ -11837,6 +11837,23 @@ fn lower_method_stmt(
         ir::Ty::Generator { yield_ty } => {
             lower_generator_method_stmt(base_ir, *yield_ty, method, method_span, args, ctx)
         }
+        // A method call on a dynamic value in statement position. The result is
+        // discarded, but a mutating method like `append` is the whole point.
+        ir::Ty::Any => {
+            let mut lowered = Vec::with_capacity(args.len());
+            for a in args {
+                let v = lower_expr(a, ctx)?;
+                lowered.push(coerce(v, ir::Ty::Any, a.span, "a dynamic method argument")?);
+            }
+            Ok(ir::Stmt::ExprStmt(ir::Expr {
+                ty: ir::Ty::Any,
+                kind: ir::ExprKind::DynMethod {
+                    receiver: Box::new(base_ir),
+                    name: method.to_string(),
+                    args: lowered,
+                },
+            }))
+        }
         other => Err(err(
             format!("'{other}' has no method '{method}'"),
             method_span,
@@ -18797,11 +18814,31 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     )),
                 },
                 // A dynamic dict can list its keys; the runtime reads the
-                // insertion order the value already carries.
+                // insertion order the value already carries. Kept ahead of the
+                // general dynamic path because it returns a typed
+                // `list[str]` rather than a dynamic value.
                 ir::Ty::Any if method == "keys" && args.is_empty() => Ok(ir::Expr {
                     ty: ir::list_of(ir::Ty::Str),
                     kind: ir::ExprKind::AnyDictKeys(Box::new(base_ir)),
                 }),
+                // Any other method on a dynamic value: the runtime looks the
+                // name up against the type its tag names, and reports
+                // CPython's AttributeError when that type has no such method.
+                ir::Ty::Any => {
+                    let mut lowered = Vec::with_capacity(args.len());
+                    for a in &args {
+                        let v = lower_expr(a, ctx)?;
+                        lowered.push(coerce(v, ir::Ty::Any, a.span, "a dynamic method argument")?);
+                    }
+                    Ok(ir::Expr {
+                        ty: ir::Ty::Any,
+                        kind: ir::ExprKind::DynMethod {
+                            receiver: Box::new(base_ir),
+                            name: method.clone(),
+                            args: lowered,
+                        },
+                    })
+                }
                 other => Err(err(
                     format!("'{other}' has no method '{method}'"),
                     *method_span,
@@ -24760,6 +24797,20 @@ fn lower_sorted_expr(
     let arg = materialize_iterable_arg(args[0], ctx)?;
     let elem = match arg.ty {
         ir::Ty::List(e) => *e,
+        // A dynamic value is iterable -- `for x in v` works -- so the generic
+        // "expects an iterable" wording would be wrong about why this fails.
+        // Sorting needs an ordering per element pair, which means threading the
+        // dynamic comparison kernel through the sort.
+        ir::Ty::Any => {
+            return Err(err(
+                "sorted() on a dynamic value is not supported yet: sorting \
+                 needs an ordering for each pair of elements, and a dynamic \
+                 value carries its type per value rather than per container. \
+                 Narrow with isinstance first, or build a typed list"
+                    .to_string(),
+                args[0].span,
+            ));
+        }
         other => {
             return Err(err(
                 format!("sorted() expects an iterable, found {other}"),
@@ -29053,6 +29104,18 @@ fn lower_contains(
     span: Span,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
+    // A dynamic container dispatches in the runtime on the tag it carries.
+    if r.ty == ir::Ty::Any {
+        let elem = coerce(l, ir::Ty::Any, span, "a dynamic 'in'")?;
+        return Ok(ir::Expr {
+            ty: ir::Ty::Bool,
+            kind: ir::ExprKind::DynContains {
+                elem: Box::new(elem),
+                container: Box::new(r),
+                not: matches!(op, ast::BinOp::NotIn),
+            },
+        });
+    }
     // Class with __contains__(self, item) -> bool (desugar; do not use Contains IR).
     if let ir::Ty::Class(id) = r.ty {
         if resolve_method(id, "__contains__").is_none() {

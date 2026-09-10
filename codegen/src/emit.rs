@@ -479,10 +479,17 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
     match &e.kind {
         Block { stmts, result } => max_try_depth_in_stmts(stmts).max(max_try_depth_in_expr(result)),
         Let { value, body, .. } => max_try_depth_in_expr(value).max(max_try_depth_in_expr(body)),
+        DynMethod { receiver, args, .. } => max_try_depth_in_expr(receiver)
+            .max(args.iter().map(max_try_depth_in_expr).max().unwrap_or(0)),
         Binary { left, right, .. }
         | IsIdentity { left, right, .. }
         | DynBinop { left, right, .. }
         | DynCompare { left, right, .. }
+        | DynContains {
+            elem: left,
+            container: right,
+            ..
+        }
         | AnyIterGet {
             base: left,
             index: right,
@@ -998,6 +1005,8 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_dyn_binop(i32, i64, i32, i64, i32, ptr)\n");
         out.push_str("declare i32 @pyrs_dyn_compare(i32, i64, i32, i64, i32)\n");
         out.push_str("declare i64 @pyrs_dyn_unary(i32, i64, i32, ptr)\n");
+        out.push_str("declare i64 @pyrs_dyn_method(i32, i64, ptr, i32, ptr, ptr, ptr)\n");
+        out.push_str("declare i32 @pyrs_dyn_contains(i32, i64, i32, i64)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
@@ -4157,6 +4166,69 @@ impl Emitter {
                 ));
                 let t = self.tmp();
                 self.line(format!("{t} = icmp ne i32 {c}, 0"));
+                t
+            }
+            // The receiver and every argument travel as tag/payload pairs. The
+            // argument pairs go into two stack arrays sized for this call site,
+            // so nothing is boxed and nothing is heap-allocated.
+            ExprKind::DynMethod {
+                receiver,
+                name,
+                args,
+            } => {
+                let r = self.emit_expr(receiver);
+                let (rt, rp) = self.emit_any_unpack(&r);
+                let n = args.len();
+                let (tags_ptr, pays_ptr) = if n == 0 {
+                    ("null".to_string(), "null".to_string())
+                } else {
+                    let tags = self.tmp();
+                    let pays = self.tmp();
+                    self.line(format!("{tags} = alloca i32, i64 {n}"));
+                    self.line(format!("{pays} = alloca i64, i64 {n}"));
+                    for (i, a) in args.iter().enumerate() {
+                        let v = self.emit_expr(a);
+                        let (at, ap) = self.emit_any_unpack(&v);
+                        let tslot = self.tmp();
+                        self.line(format!(
+                            "{tslot} = getelementptr inbounds i32, ptr {tags}, i64 {i}"
+                        ));
+                        self.line(format!("store i32 {at}, ptr {tslot}"));
+                        let pslot = self.tmp();
+                        self.line(format!(
+                            "{pslot} = getelementptr inbounds i64, ptr {pays}, i64 {i}"
+                        ));
+                        self.line(format!("store i64 {ap}, ptr {pslot}"));
+                    }
+                    (tags, pays)
+                };
+                let name_g = self.intern_string(name);
+                let slot = self.dyn_tag_slot();
+                let pay = self.tmp();
+                self.line(format!(
+                    "{pay} = call i64 @pyrs_dyn_method(i32 {rt}, i64 {rp}, ptr {name_g}, \
+                     i32 {n}, ptr {tags_ptr}, ptr {pays_ptr}, ptr {slot})"
+                ));
+                let tag = self.tmp();
+                self.line(format!("{tag} = load i32, ptr {slot}"));
+                self.build_any(&tag, &pay)
+            }
+            ExprKind::DynContains {
+                elem,
+                container,
+                not,
+            } => {
+                let e = self.emit_expr(elem);
+                let (et, ep) = self.emit_any_unpack(&e);
+                let c = self.emit_expr(container);
+                let (ct, cp) = self.emit_any_unpack(&c);
+                let r = self.tmp();
+                self.line(format!(
+                    "{r} = call i32 @pyrs_dyn_contains(i32 {et}, i64 {ep}, i32 {ct}, i64 {cp})"
+                ));
+                let t = self.tmp();
+                let pred = if *not { "eq" } else { "ne" };
+                self.line(format!("{t} = icmp {pred} i32 {r}, 0"));
                 t
             }
             ExprKind::DynUnary { value, op } => {

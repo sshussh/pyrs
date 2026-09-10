@@ -8331,6 +8331,391 @@ long long pyrs_dyn_unary(int tag, long long payload, int op, int *out_tag) {
     }
 }
 
+/* ---- `in` and method calls on a dynamic value ---- */
+
+/* Defined below, with the other dynamic container reads. */
+PyrsList *pyrs_any_dict_keys(long long v);
+
+
+/* `x in v` where the container is dynamic. */
+int pyrs_dyn_contains(int etag, long long epay, int ctag, long long cpay) {
+    switch (dyn_kind(ctag)) {
+    case DK_STR:
+        if (dyn_kind(etag) != DK_STR) {
+            pyrs_die("TypeError: 'in <string>' requires string as left operand");
+        }
+        return pyrs_str_contains((const PyrsStr *)(uintptr_t)cpay,
+                                 (const PyrsStr *)(uintptr_t)epay);
+    case DK_LIST:
+        return pyrs_list_contains((const PyrsList *)(uintptr_t)cpay, epay, etag);
+    case DK_SET:
+        return pyrs_set_contains((const PyrsSet *)(uintptr_t)cpay, epay, etag);
+    case DK_DICT:
+        return pyrs_dict_contains((const PyrsDict *)(uintptr_t)cpay, epay, etag);
+    case DK_TUPLE: {
+        const PyrsTuple *t = (const PyrsTuple *)(uintptr_t)cpay;
+        for (long long i = 0; i < t->len; i++) {
+            if (t->tags[i] == etag && t->data[i] == epay) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    default: {
+        char msg[128];
+        snprintf(msg, sizeof msg,
+                 "TypeError: argument of type '%s' is not a container or iterable",
+                 dyn_type_name(ctag));
+        pyrs_die(msg);
+    }
+    }
+}
+
+/* Every method CPython puts on these types. A name in this list that the
+ * kernel does not implement is a gap and says so; a name that is not here at
+ * all is an AttributeError, exactly as CPython reports it. Getting this
+ * backwards would tell a user their valid program is invalid. */
+static int dyn_name_known(PyrsDynKind k, const char *m) {
+    static const char *str_names[] = {
+        "capitalize", "casefold", "center", "count", "encode", "endswith",
+        "expandtabs", "find", "format", "format_map", "index", "isalnum",
+        "isalpha", "isascii", "isdecimal", "isdigit", "isidentifier",
+        "islower", "isnumeric", "isprintable", "isspace", "istitle",
+        "isupper", "join", "ljust", "lower", "lstrip", "maketrans",
+        "partition", "removeprefix", "removesuffix", "replace", "rfind",
+        "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split",
+        "splitlines", "startswith", "strip", "swapcase", "title",
+        "translate", "upper", "zfill", NULL};
+    static const char *list_names[] = {
+        "append", "clear", "copy", "count", "extend", "index", "insert",
+        "pop", "remove", "reverse", "sort", NULL};
+    static const char *dict_names[] = {
+        "clear", "copy", "fromkeys", "get", "items", "keys", "pop",
+        "popitem", "setdefault", "update", "values", NULL};
+    static const char *set_names[] = {
+        "add", "clear", "copy", "difference", "difference_update", "discard",
+        "intersection", "intersection_update", "isdisjoint", "issubset",
+        "issuperset", "pop", "remove", "symmetric_difference",
+        "symmetric_difference_update", "union", "update", NULL};
+    static const char *tuple_names[] = {"count", "index", NULL};
+    const char **names;
+    switch (k) {
+    case DK_STR:
+        names = str_names;
+        break;
+    case DK_LIST:
+        names = list_names;
+        break;
+    case DK_DICT:
+        names = dict_names;
+        break;
+    case DK_SET:
+        names = set_names;
+        break;
+    case DK_TUPLE:
+        names = tuple_names;
+        break;
+    default:
+        return 0;
+    }
+    for (int i = 0; names[i] != NULL; i++) {
+        if (strcmp(names[i], m) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+_Noreturn static void dyn_method_missing(int tag, const char *m) {
+    char msg[192];
+    if (dyn_name_known(dyn_kind(tag), m)) {
+        snprintf(msg, sizeof msg,
+                 "NotImplementedError: '%s' is not supported on a dynamic %s "
+                 "yet; narrow with isinstance first",
+                 m, dyn_type_name(tag));
+    } else {
+        snprintf(msg, sizeof msg,
+                 "AttributeError: '%s' object has no attribute '%s'",
+                 dyn_type_name(tag), m);
+    }
+    pyrs_die(msg);
+}
+
+_Noreturn static void dyn_method_arity(int tag, const char *m, int want,
+                                       int got) {
+    char msg[192];
+    if (want == 0) {
+        snprintf(msg, sizeof msg,
+                 "TypeError: %s.%s() takes no arguments (%d given)",
+                 dyn_type_name(tag), m, got);
+    } else if (want == 1) {
+        snprintf(msg, sizeof msg,
+                 "TypeError: %s.%s() takes exactly one argument (%d given)",
+                 dyn_type_name(tag), m, got);
+    } else {
+        snprintf(msg, sizeof msg, "TypeError: %s expected %d arguments, got %d",
+                 m, want, got);
+    }
+    pyrs_die(msg);
+}
+
+static const PyrsStr *dyn_str_arg(const char *m, int tag, long long pay) {
+    if (dyn_kind(tag) != DK_STR) {
+        char msg[192];
+        /* CPython words this three ways depending on the method. */
+        if (!strcmp(m, "startswith") || !strcmp(m, "endswith")) {
+            snprintf(msg, sizeof msg,
+                     "TypeError: %s first arg must be str or a tuple of str, "
+                     "not %s",
+                     m, dyn_type_name(tag));
+        } else if (!strcmp(m, "find") || !strcmp(m, "rfind")
+                   || !strcmp(m, "count") || !strcmp(m, "index")) {
+            snprintf(msg, sizeof msg,
+                     "TypeError: %s() argument 1 must be str, not %s", m,
+                     dyn_type_name(tag));
+        } else {
+            snprintf(msg, sizeof msg,
+                     "TypeError: %s() argument must be str, not %s", m,
+                     dyn_type_name(tag));
+        }
+        pyrs_die(msg);
+    }
+    return (const PyrsStr *)(uintptr_t)pay;
+}
+
+static long long dyn_int_arg(const char *m, int tag, long long pay) {
+    long long v;
+    if (!dyn_as_int(tag, pay, &v)) {
+        char msg[160];
+        (void)m;
+        /* CPython reports the operand, not the method, for an integer slot. */
+        snprintf(msg, sizeof msg,
+                 "TypeError: '%s' object cannot be interpreted as an integer",
+                 dyn_type_name(tag));
+        pyrs_die(msg);
+    }
+    return pyrs_int_as_i64(v);
+}
+
+/* A method call on a value whose type is not known until run time.
+ *
+ * Arguments arrive as parallel tag/payload arrays so the call site never has
+ * to box, and the result leaves as a payload plus a tag written through
+ * `out_tag`, the same shape the operator kernel uses. */
+long long pyrs_dyn_method(int tag, long long pay, const PyrsStr *name, int argc,
+                          const int *argtags, const long long *argpays,
+                          int *out_tag) {
+    check_ref(name);
+    char m[64];
+    if (name->len >= (long long)sizeof m) {
+        dyn_method_missing(tag, "<name too long>");
+    }
+    memcpy(m, name->data, (size_t)name->len);
+    m[name->len] = '\0';
+    PyrsDynKind k = dyn_kind(tag);
+
+#define ARITY(n)                                                               \
+    do {                                                                       \
+        if (argc != (n)) {                                                     \
+            dyn_method_arity(tag, m, (n), argc);                                    \
+        }                                                                      \
+    } while (0)
+#define RET_STR(e) return dyn_result(out_tag, TAG_STR, (long long)(uintptr_t)(e))
+#define RET_BOOL(e) return dyn_result(out_tag, TAG_BOOL, (e) ? 1 : 0)
+#define RET_INT(e) return dyn_result(out_tag, TAG_INT, pyrs_int_from_i64(e))
+#define RET_NONE() return dyn_result(out_tag, -1, 0)
+
+    if (k == DK_STR) {
+        const PyrsStr *sv = (const PyrsStr *)(uintptr_t)pay;
+        /* no argument, str result */
+        if (!strcmp(m, "upper")) { ARITY(0); RET_STR(pyrs_str_upper(sv)); }
+        if (!strcmp(m, "lower")) { ARITY(0); RET_STR(pyrs_str_lower(sv)); }
+        if (!strcmp(m, "title")) { ARITY(0); RET_STR(pyrs_str_title(sv)); }
+        if (!strcmp(m, "capitalize")) { ARITY(0); RET_STR(pyrs_str_capitalize(sv)); }
+        if (!strcmp(m, "casefold")) { ARITY(0); RET_STR(pyrs_str_casefold(sv)); }
+        if (!strcmp(m, "swapcase")) { ARITY(0); RET_STR(pyrs_str_swapcase(sv)); }
+        /* strip family: no argument, or a str of characters */
+        if (!strcmp(m, "strip") || !strcmp(m, "lstrip") || !strcmp(m, "rstrip")) {
+            if (argc == 0) {
+                if (!strcmp(m, "strip")) RET_STR(pyrs_str_strip(sv));
+                if (!strcmp(m, "lstrip")) RET_STR(pyrs_str_lstrip(sv));
+                RET_STR(pyrs_str_rstrip(sv));
+            }
+            if (argc != 1) dyn_method_arity(tag, m, 1, argc);
+            const PyrsStr *c = dyn_str_arg(m, argtags[0], argpays[0]);
+            if (!strcmp(m, "strip")) RET_STR(pyrs_str_strip_chars(sv, c));
+            if (!strcmp(m, "lstrip")) RET_STR(pyrs_str_lstrip_chars(sv, c));
+            RET_STR(pyrs_str_rstrip_chars(sv, c));
+        }
+        /* no argument, bool result */
+        if (!strcmp(m, "isdigit")) { ARITY(0); RET_BOOL(pyrs_str_isdigit(sv)); }
+        if (!strcmp(m, "isalpha")) { ARITY(0); RET_BOOL(pyrs_str_isalpha(sv)); }
+        if (!strcmp(m, "isspace")) { ARITY(0); RET_BOOL(pyrs_str_isspace(sv)); }
+        if (!strcmp(m, "isupper")) { ARITY(0); RET_BOOL(pyrs_str_isupper(sv)); }
+        if (!strcmp(m, "islower")) { ARITY(0); RET_BOOL(pyrs_str_islower(sv)); }
+        if (!strcmp(m, "isalnum")) { ARITY(0); RET_BOOL(pyrs_str_isalnum(sv)); }
+        if (!strcmp(m, "isascii")) { ARITY(0); RET_BOOL(pyrs_str_isascii(sv)); }
+        if (!strcmp(m, "isdecimal")) { ARITY(0); RET_BOOL(pyrs_str_isdecimal(sv)); }
+        if (!strcmp(m, "isnumeric")) { ARITY(0); RET_BOOL(pyrs_str_isnumeric(sv)); }
+        if (!strcmp(m, "istitle")) { ARITY(0); RET_BOOL(pyrs_str_istitle(sv)); }
+        if (!strcmp(m, "isprintable")) { ARITY(0); RET_BOOL(pyrs_str_isprintable(sv)); }
+        if (!strcmp(m, "isidentifier")) { ARITY(0); RET_BOOL(pyrs_str_isidentifier(sv)); }
+        /* one str argument */
+        if (!strcmp(m, "startswith")) {
+            ARITY(1);
+            RET_BOOL(pyrs_str_startswith(sv, dyn_str_arg(m, argtags[0], argpays[0])));
+        }
+        if (!strcmp(m, "endswith")) {
+            ARITY(1);
+            RET_BOOL(pyrs_str_endswith(sv, dyn_str_arg(m, argtags[0], argpays[0])));
+        }
+        if (!strcmp(m, "removeprefix")) {
+            ARITY(1);
+            RET_STR(pyrs_str_removeprefix(sv, dyn_str_arg(m, argtags[0], argpays[0])));
+        }
+        if (!strcmp(m, "removesuffix")) {
+            ARITY(1);
+            RET_STR(pyrs_str_removesuffix(sv, dyn_str_arg(m, argtags[0], argpays[0])));
+        }
+        if (!strcmp(m, "find")) {
+            ARITY(1);
+            RET_INT(pyrs_str_find(sv, dyn_str_arg(m, argtags[0], argpays[0])));
+        }
+        if (!strcmp(m, "rfind")) {
+            ARITY(1);
+            RET_INT(pyrs_str_rfind(sv, dyn_str_arg(m, argtags[0], argpays[0])));
+        }
+        if (!strcmp(m, "count")) {
+            ARITY(1);
+            RET_INT(pyrs_str_count(sv, dyn_str_arg(m, argtags[0], argpays[0])));
+        }
+        if (!strcmp(m, "split")) {
+            PyrsList *r = argc == 0
+                              ? pyrs_str_split_ws(sv, -1)
+                              : pyrs_str_split(
+                                    sv, dyn_str_arg(m, argtags[0], argpays[0]), -1);
+            if (argc > 1) dyn_method_arity(tag, m, 1, argc);
+            return dyn_result(out_tag, 4 + 8 * TAG_STR, (long long)(uintptr_t)r);
+        }
+        if (!strcmp(m, "join")) {
+            ARITY(1);
+            if (dyn_kind(argtags[0]) != DK_LIST) {
+                pyrs_die("TypeError: join() argument must be a list of str");
+            }
+            RET_STR(pyrs_str_join(sv, (const PyrsList *)(uintptr_t)argpays[0]));
+        }
+        if (!strcmp(m, "zfill")) {
+            ARITY(1);
+            RET_STR(pyrs_str_zfill(sv, dyn_int_arg(m, argtags[0], argpays[0])));
+        }
+        dyn_method_missing(tag, m);
+    }
+
+    if (k == DK_LIST) {
+        PyrsList *lv = (PyrsList *)(uintptr_t)pay;
+        int elem = any_elem_tag(tag);
+        if (!strcmp(m, "append")) {
+            ARITY(1);
+            if (argtags[0] != elem) {
+                pyrs_die("TypeError: appending a different element type to a "
+                         "dynamic list is not supported yet; narrow with "
+                         "isinstance first");
+            }
+            pyrs_list_push(lv, argpays[0]);
+            RET_NONE();
+        }
+        if (!strcmp(m, "clear")) { ARITY(0); pyrs_list_clear(lv); RET_NONE(); }
+        if (!strcmp(m, "reverse")) { ARITY(0); pyrs_list_reverse(lv); RET_NONE(); }
+        if (!strcmp(m, "copy")) {
+            ARITY(0);
+            return dyn_result(out_tag, tag,
+                              (long long)(uintptr_t)pyrs_list_copy(lv));
+        }
+        if (!strcmp(m, "count")) {
+            ARITY(1);
+            RET_INT(pyrs_list_count(lv, argpays[0], argtags[0]));
+        }
+        if (!strcmp(m, "pop")) {
+            long long i = argc == 0 ? lv->len - 1
+                                    : dyn_int_arg(m, argtags[0], argpays[0]);
+            if (argc > 1) dyn_method_arity(tag, m, 1, argc);
+            return dyn_result(out_tag, elem, pyrs_list_pop(lv, i));
+        }
+        if (!strcmp(m, "insert")) {
+            ARITY(2);
+            if (argtags[1] != elem) {
+                pyrs_die("TypeError: inserting a different element type into a "
+                         "dynamic list is not supported yet; narrow with "
+                         "isinstance first");
+            }
+            pyrs_list_insert(lv, dyn_int_arg(m, argtags[0], argpays[0]), argpays[1]);
+            RET_NONE();
+        }
+        dyn_method_missing(tag, m);
+    }
+
+    if (k == DK_DICT) {
+        PyrsDict *dv = (PyrsDict *)(uintptr_t)pay;
+        if (!strcmp(m, "clear")) { ARITY(0); pyrs_dict_clear(dv); RET_NONE(); }
+        if (!strcmp(m, "copy")) {
+            ARITY(0);
+            return dyn_result(out_tag, TAG_DICT,
+                              (long long)(uintptr_t)pyrs_dict_copy(dv));
+        }
+        if (!strcmp(m, "keys")) {
+            ARITY(0);
+            return dyn_result(out_tag, 4 + 8 * TAG_STR,
+                              (long long)(uintptr_t)pyrs_any_dict_keys(
+                                  (long long)(uintptr_t)pyrs_union_box_new(tag, pay)));
+        }
+        if (!strcmp(m, "get")) {
+            if (argc != 1 && argc != 2) dyn_method_arity(tag, m, 1, argc);
+            long long out = 0;
+            if (pyrs_dict_get_default(dv, argpays[0], argtags[0], &out)) {
+                /* `out` is the raw slot, not a boxed value. Every insert
+                 * stamps the value tag from the dict's static value type, so
+                 * any full slot answers for the dict -- the same rule
+                 * `pyrs_any_dict_get` relies on. */
+                int vtag = TAG_UNION;
+                if (dv->order_len > 0) {
+                    vtag = dv->table[dv->order[0]].val_tag;
+                }
+                if (vtag == TAG_UNION) {
+                    const PyrsUnionBox *b = any_box(out);
+                    return dyn_result(out_tag, b->print_tag, b->payload);
+                }
+                return dyn_result(out_tag, vtag, out);
+            }
+            if (argc == 2) {
+                return dyn_result(out_tag, argtags[1], argpays[1]);
+            }
+            RET_NONE();
+        }
+        dyn_method_missing(tag, m);
+    }
+
+    if (k == DK_SET) {
+        PyrsSet *sv = (PyrsSet *)(uintptr_t)pay;
+        if (!strcmp(m, "add")) { ARITY(1); pyrs_set_add(sv, argpays[0], argtags[0]); RET_NONE(); }
+        if (!strcmp(m, "discard")) { ARITY(1); pyrs_set_discard(sv, argpays[0], argtags[0]); RET_NONE(); }
+        if (!strcmp(m, "remove")) { ARITY(1); pyrs_set_remove(sv, argpays[0], argtags[0]); RET_NONE(); }
+        if (!strcmp(m, "clear")) { ARITY(0); pyrs_set_clear(sv); RET_NONE(); }
+        if (!strcmp(m, "copy")) {
+            ARITY(0);
+            return dyn_result(out_tag, TAG_SET,
+                              (long long)(uintptr_t)pyrs_set_copy(sv));
+        }
+        dyn_method_missing(tag, m);
+    }
+
+    dyn_method_missing(tag, m);
+#undef ARITY
+#undef RET_STR
+#undef RET_BOOL
+#undef RET_INT
+#undef RET_NONE
+}
+
 /* `v[i]` where `v` is a dynamic list or tuple. Returns an `Any`. A tuple
  * carries a tag per slot, so its elements come back exactly typed even though
  * the tuple as a whole has no element type. */

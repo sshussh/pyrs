@@ -866,6 +866,23 @@ pub enum ExprKind {
         value: Box<Expr>,
         op: DynUnOp,
     },
+    /// A method call on a value whose type is not known until run time. The
+    /// runtime looks the name up against the type the tag names, and reports
+    /// CPython's `AttributeError` when that type has no such method.
+    /// Result is [`Ty::Any`].
+    DynMethod {
+        receiver: Box<Expr>,
+        name: String,
+        args: Vec<Expr>,
+    },
+    /// `x in v` / `x not in v` where the container's type is not known until
+    /// run time. Result is Bool.
+    DynContains {
+        elem: Box<Expr>,
+        container: Box<Expr>,
+        /// When true, this is `not in`.
+        not: bool,
+    },
     /// Unbox [`Ty::Any`] to a concrete type (`expr.ty`) with a runtime tag check
     /// (TypeError on mismatch). Class targets accept subclasses via type_id.
     FromAny {
