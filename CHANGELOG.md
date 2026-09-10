@@ -1,3 +1,23 @@
+## 0.145.0 — `sorted()` on a dynamic value
+
+`sorted(v)` on an `object` was a compile error, with a diagnostic that named
+the real reason: sorting needs an ordering per element pair. That ordering is
+exactly what `pyrs_dyn_compare` already provides.
+
+The new kernel takes the iterable as a tag/payload pair, materializes a
+`list[Any]` of boxed elements, and insertion-sorts it with
+`pyrs_dyn_compare(..., PYRS_DYN_LT)`. reverse-sort-reverse is CPython's stable
+descending sort, so `True` and `1` keep their input order. The result is
+`list[Any]`.
+
+Covered: a dynamic list of ints, of strs, and of floats; a dynamic dict
+(keys); a dynamic tuple, str or set; `list[object]`, which is a different
+encoding from an `object` holding a list; `reverse=` as a constant or a
+runtime bool. A mixed list raises CPython's `'<' not supported between
+instances of ...` with the operand order the comparison actually hit. A
+non-iterable raises CPython's `'int' object is not iterable`. `key=` still
+names itself as unimplemented rather than borrowing a CPython error.
+
 ## 0.144.0 — method calls and `in` on a dynamic value
 
 The other half of the generic kernel. `a.upper()`, `xs.append(1)`, `d.get("k")`

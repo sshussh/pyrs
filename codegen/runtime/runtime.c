@@ -8807,6 +8807,112 @@ long long pyrs_any_iter_get(long long v, long long index) {
     return 0;
 }
 
+/* Stable insertion sort of a `list[Any]`. qsort is not stable, and equal
+ * values of different kinds (True and 1) have to keep their input order. */
+static void dyn_sort_list_any(PyrsList *l) {
+    for (long long i = 1; i < l->len; i++) {
+        long long cur = l->data[i];
+        const PyrsUnionBox *cb = (const PyrsUnionBox *)(uintptr_t)cur;
+        long long j = i;
+        while (j > 0) {
+            const PyrsUnionBox *pb = (const PyrsUnionBox *)(uintptr_t)l->data[j - 1];
+            if (!pyrs_dyn_compare(cb->print_tag, cb->payload, pb->print_tag,
+                                  pb->payload, PYRS_DYN_LT)) {
+                break;
+            }
+            l->data[j] = l->data[j - 1];
+            j--;
+        }
+        l->data[j] = cur;
+    }
+}
+
+static void dyn_sorted_push(PyrsList *out, int tag, long long payload) {
+    pyrs_list_push(out, any_from_slot(payload, tag));
+}
+
+/* `sorted(v)` where `v` is dynamic. Operands arrive as a tag/payload pair;
+ * the result is a `list[Any]` of boxed elements. reverse-sort-reverse is
+ * CPython's stable descending sort. */
+long long pyrs_dyn_sorted(int tag, long long payload, int reverse, int *out_tag) {
+    PyrsDynKind k = dyn_kind(tag);
+    PyrsList *out;
+    switch (k) {
+    case DK_LIST: {
+        const PyrsList *src = (const PyrsList *)(uintptr_t)payload;
+        int elem = any_elem_tag(tag);
+        out = pyrs_list_new(src->len);
+        for (long long i = 0; i < src->len; i++) {
+            dyn_sorted_push(out, elem, src->data[i]);
+        }
+        break;
+    }
+    case DK_TUPLE: {
+        const PyrsTuple *t = (const PyrsTuple *)(uintptr_t)payload;
+        out = pyrs_list_new(t->len);
+        for (long long i = 0; i < t->len; i++) {
+            dyn_sorted_push(out, t->tags[i], t->data[i]);
+        }
+        break;
+    }
+    case DK_DICT: {
+        const PyrsDict *d = (const PyrsDict *)(uintptr_t)payload;
+        out = pyrs_list_new(d->order_len);
+        for (long long i = 0; i < d->order_len; i++) {
+            const DictSlot *e = &d->table[d->order[i]];
+            dyn_sorted_push(out, e->key_tag, e->key);
+        }
+        break;
+    }
+    case DK_SET: {
+        const PyrsSet *s = (const PyrsSet *)(uintptr_t)payload;
+        out = pyrs_list_new(s->len);
+        for (long long i = 0; i < s->order_len; i++) {
+            const SetSlot *e = &s->table[s->order[i]];
+            if (e->state == 1) {
+                dyn_sorted_push(out, e->key_tag, e->key);
+            }
+        }
+        break;
+    }
+    case DK_STR: {
+        const PyrsStr *str = (const PyrsStr *)(uintptr_t)payload;
+        out = pyrs_list_new(str->cplen);
+        for (long long i = 0; i < str->cplen; i++) {
+            PyrsStr *ch = pyrs_str_index(str, i);
+            dyn_sorted_push(out, TAG_STR, (long long)(uintptr_t)ch);
+        }
+        break;
+    }
+    case DK_INT:
+    case DK_FLOAT:
+    case DK_BOOL:
+    case DK_NONE: {
+        char msg[96];
+        snprintf(msg, sizeof msg, "TypeError: '%s' object is not iterable",
+                 dyn_type_name(tag));
+        pyrs_die(msg);
+    }
+    default: {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "NotImplementedError: sorted() of a dynamic %s is not "
+                 "supported yet; narrow with isinstance first, or build a "
+                 "typed list",
+                 dyn_type_name(tag));
+        pyrs_die(msg);
+    }
+    }
+    if (reverse) {
+        pyrs_list_reverse(out);
+    }
+    dyn_sort_list_any(out);
+    if (reverse) {
+        pyrs_list_reverse(out);
+    }
+    return dyn_result(out_tag, 4 + 8 * TAG_UNION, (long long)(uintptr_t)out);
+}
+
 /* `v.keys()` where `v` is a dynamic dict with str keys, in insertion order. */
 PyrsList *pyrs_any_dict_keys(long long v) {
     const PyrsUnionBox *b = any_box(v);

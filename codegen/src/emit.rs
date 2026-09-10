@@ -490,6 +490,10 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
             container: right,
             ..
         }
+        | DynSorted {
+            value: left,
+            reverse: right,
+        }
         | AnyIterGet {
             base: left,
             index: right,
@@ -794,9 +798,12 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
     match &e.kind {
         Block { stmts, result } => count_yields_in_stmts(stmts) + count_yields_in_expr(result),
         Let { value, body, .. } => count_yields_in_expr(value) + count_yields_in_expr(body),
-        Binary { left, right, .. } | IsIdentity { left, right, .. } => {
-            count_yields_in_expr(left) + count_yields_in_expr(right)
-        }
+        Binary { left, right, .. }
+        | IsIdentity { left, right, .. }
+        | DynSorted {
+            value: left,
+            reverse: right,
+        } => count_yields_in_expr(left) + count_yields_in_expr(right),
         Unary { operand, .. }
         | ToBool(operand)
         | Abs(operand)
@@ -1007,6 +1014,7 @@ impl Emitter {
         out.push_str("declare i64 @pyrs_dyn_unary(i32, i64, i32, ptr)\n");
         out.push_str("declare i64 @pyrs_dyn_method(i32, i64, ptr, i32, ptr, ptr, ptr)\n");
         out.push_str("declare i32 @pyrs_dyn_contains(i32, i64, i32, i64)\n");
+        out.push_str("declare i64 @pyrs_dyn_sorted(i32, i64, i32, ptr)\n");
         out.push_str("declare void @pyrs_print_sep()\n");
         out.push_str("declare void @pyrs_print_end()\n");
         out.push_str("declare void @pyrs_die(ptr)\n");
@@ -4244,6 +4252,22 @@ impl Emitter {
                 let tag = self.tmp();
                 self.line(format!("{tag} = load i32, ptr {slot}"));
                 self.build_any(&tag, &pay)
+            }
+            ExprKind::DynSorted { value, reverse } => {
+                let v = self.emit_expr(value);
+                let (vt, vp) = self.emit_any_unpack(&v);
+                let rev = self.emit_expr(reverse);
+                let rev_i32 = self.tmp();
+                self.line(format!("{rev_i32} = zext i1 {rev} to i32"));
+                let slot = self.dyn_tag_slot();
+                let pay = self.tmp();
+                self.line(format!(
+                    "{pay} = call i64 @pyrs_dyn_sorted(i32 {vt}, i64 {vp}, i32 {rev_i32}, \
+                     ptr {slot})"
+                ));
+                let t = self.tmp();
+                self.line(format!("{t} = inttoptr i64 {pay} to ptr"));
+                t
             }
             ExprKind::FromAny { value } => {
                 let v = self.emit_expr(value);

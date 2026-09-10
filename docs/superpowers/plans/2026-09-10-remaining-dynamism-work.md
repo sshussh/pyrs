@@ -127,6 +127,8 @@ codegen/runtime → tests → docs. Commit subjects are lowercase, describe the
 
 ## 2. Item A — `sorted()` on a dynamic value
 
+**Status: implemented in 0.145.0.**
+
 **Size: small.** Currently refused at `semantic/src/lib.rs`, in the `sorted()`
 lowering, with a diagnostic that names the real reason.
 

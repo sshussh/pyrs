@@ -24125,6 +24125,13 @@ fn const_str(s: &str) -> ir::Expr {
     }
 }
 
+fn const_bool(v: bool) -> ir::Expr {
+    ir::Expr {
+        ty: ir::Ty::Bool,
+        kind: ir::ExprKind::ConstBool(v),
+    }
+}
+
 /// Parsed `key=` / `reverse=` / `default=` kwargs for sorted / list.sort / min / max.
 struct SortKeywords<'a> {
     key: Option<&'a ast::Expr>,
@@ -24795,22 +24802,58 @@ fn lower_sorted_expr(
         ));
     }
     let arg = materialize_iterable_arg(args[0], ctx)?;
-    let elem = match arg.ty {
-        ir::Ty::List(e) => *e,
-        // A dynamic value is iterable -- `for x in v` works -- so the generic
-        // "expects an iterable" wording would be wrong about why this fails.
-        // Sorting needs an ordering per element pair, which means threading the
-        // dynamic comparison kernel through the sort.
-        ir::Ty::Any => {
+    // `[]` is provisionally `list[Any]`; with `key=` the existing keyed path
+    // still infers from the callable. Without `key=`, that list is a real
+    // dynamic container and uses the comparison kernel.
+    let dyn_sorted = matches!(arg.ty, ir::Ty::Any)
+        || (sk.key.is_none() && matches!(arg.ty, ir::Ty::List(e) if *e == ir::Ty::Any));
+    if dyn_sorted {
+        if sk.key.is_some() {
             return Err(err(
-                "sorted() on a dynamic value is not supported yet: sorting \
-                 needs an ordering for each pair of elements, and a dynamic \
-                 value carries its type per value rather than per container. \
-                 Narrow with isinstance first, or build a typed list"
+                "sorted() with key= on a dynamic value is not supported yet: \
+                 a key function needs a typed element, and a dynamic value \
+                 carries its type per value. Narrow with isinstance first, \
+                 or build a typed list"
                     .to_string(),
                 args[0].span,
             ));
         }
+        let (rev_mode, rev_bind) = resolve_reverse_flag(sk.reverse, ctx)?;
+        let reverse = match rev_mode {
+            ReverseMode::Never => const_bool(false),
+            ReverseMode::Always => const_bool(true),
+            ReverseMode::Cond(e) => e,
+        };
+        let value = if arg.ty == ir::Ty::Any {
+            arg
+        } else {
+            ir::Expr {
+                ty: ir::Ty::Any,
+                kind: ir::ExprKind::ToAny {
+                    value: Box::new(arg),
+                },
+            }
+        };
+        let sorted = ir::Expr {
+            ty: ir::list_of(ir::Ty::Any),
+            kind: ir::ExprKind::DynSorted {
+                value: Box::new(value),
+                reverse: Box::new(reverse),
+            },
+        };
+        if rev_bind.is_empty() {
+            return Ok(sorted);
+        }
+        return Ok(ir::Expr {
+            ty: sorted.ty,
+            kind: ir::ExprKind::Block {
+                stmts: rev_bind,
+                result: Box::new(sorted),
+            },
+        });
+    }
+    let elem = match arg.ty {
+        ir::Ty::List(e) => *e,
         other => {
             return Err(err(
                 format!("sorted() expects an iterable, found {other}"),
@@ -31406,6 +31449,36 @@ print(f(B()))
         };
         assert_eq!(value.ty, ir::list_of(ir::Ty::Int));
         assert!(matches!(value.kind, ir::ExprKind::Block { .. }));
+    }
+
+    #[test]
+    fn sorted_of_a_dynamic_value_lowers_to_dyn_sorted() {
+        let m = analyze_ok("a: object = [3, 1]\nys = sorted(a)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!("expected sorted assign, got {:?}", entry.body[1]);
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Any));
+        assert!(
+            matches!(value.kind, ir::ExprKind::DynSorted { .. }),
+            "expected DynSorted, got {:?}",
+            value.kind
+        );
+    }
+
+    #[test]
+    fn sorted_of_list_any_lowers_to_dyn_sorted() {
+        let m = analyze_ok("xs: list[object] = [3, 1]\nys = sorted(xs)\n");
+        let entry = find_func(&m, ENTRY_NAME);
+        let ir::Stmt::GlobalAssign { value, .. } = &entry.body[1] else {
+            panic!("expected sorted assign, got {:?}", entry.body[1]);
+        };
+        assert_eq!(value.ty, ir::list_of(ir::Ty::Any));
+        assert!(
+            matches!(value.kind, ir::ExprKind::DynSorted { .. }),
+            "expected DynSorted, got {:?}",
+            value.kind
+        );
     }
 
     #[test]

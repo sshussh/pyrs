@@ -1043,14 +1043,18 @@ def clamp(x: float, lo: float, hi: float) -> float:
   operand type(s) for +`, `can only concatenate str (not "int") to str`, and
   `'<' not supported between instances of`). `bool` counts as an int, floored
   division keeps Python's signs, and `==` / `!=` never raise where `<` would.
-  Still refused: `sorted()` of a dynamic value and `str % args`, both of which
-  name themselves as unimplemented rather than reporting an error CPython would
-  not raise.
+  Still refused: `str % args` on a dynamic str, which names itself as
+  unimplemented rather than reporting an error CPython would not raise.
 - **Methods and `in` work on a dynamic value** (0.144). The runtime looks a
   method up against the type the value's tag names, and a dynamic call
   allocates nothing. `in` works over a dynamic str, list, tuple, dict or set.
   A name the type does not have reports CPython's `AttributeError`; a name it
   has that is not implemented yet says so instead.
+- **`sorted()` works on a dynamic value** (0.145). A dynamic list, tuple,
+  dict (keys), set or str is materialized as `list[Any]` and ordered with
+  the comparison kernel, including `reverse=`. A mixed list raises CPython's
+  ordering TypeError; a non-iterable raises CPython's `'…' object is not
+  iterable`. `key=` still names itself as unimplemented.
 - **A dynamic container reads without narrowing** (0.140). `len(v)`, `v[i]`,
   `v[k]`, `v.keys()` and `for x in v` work on an `object` whose contents are
   only known at run time, reading it through the tag it already carries — so
@@ -1323,7 +1327,7 @@ exclusive subclass-only fields after a multi-class peel use a runtime
 | `min(a, b[, c…])` / `max(…)` | int, float, bool, homogeneous str, orderable tuple, orderable list, or class with `__lt__`/`__gt__` (2+ args) | numeric: common type via `bool` → `int` → `float`; str/tuple/list: lexicographic; class: virtual `<` (may reflect to `__gt__`); optional monomorphic `key=` over homogeneous positionals; no `default=` |
 | `min(xs[, key=f][, default=d])` / `max(...)` | `list[int\|float\|bool\|str\|orderable tuple\|orderable list\|class with __lt__ or __gt__]` without `key=`; any `list[T]` with monomorphic `key=` | element type, or `join(elem, default)` when `default=` set; empty without default → `ValueError`; empty with default → default; no `reverse=` |
 | `sum(xs[, start])` | `list[int]` or `list[float]`; optional numeric `start` (positional or `start=`) | `elem ⊔ start` (`bool`→`int`→`float`); empty yields `start` (default `0` / `0.0`) |
-| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str\|orderable tuple\|orderable list\|class with __lt__ or __gt__]`; with monomorphic `key=`: any `list[T]`; `key=` may be free/nested/lambda or bare `len` (incl. class `__len__`)/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list; stable reverse-sort-reverse; class path is a `<` insertion sort; keyed path materializes a GC-managed keys list |
+| `sorted(xs)` / `sorted(xs, key=f)` / `sorted(..., reverse=…)` | without `key=`: `list[int\|float\|bool\|str\|orderable tuple\|orderable list\|class with __lt__ or __gt__]`, `object` (any iterable the kernel can walk), or `list[object]`; with monomorphic `key=`: any `list[T]` (not on a dynamic value); `key=` may be free/nested/lambda or bare `len` (incl. class `__len__`)/`abs`/`int`/`float`/`bool`/`str`; `reverse=` is truthy (bool/int/str/…) | new sorted list (`list[Any]` when the input is dynamic); stable reverse-sort-reverse; class path is a `<` insertion sort; keyed path materializes a GC-managed keys list |
 | `list.sort()` / `list.sort(key=f)` / `list.sort(reverse=…)` | without `key=`: sortable elem (incl. orderable tuples/lists and classes with `__lt__` or `__gt__`); with monomorphic `key=`: any `list[T]`; same bare-builtin `key=` surface as `sorted`; `reverse=` is truthy | in-place (statement only); same key/reverse surface as `sorted` |
 | `next(it[, default])` | class with `__next__`, or generator | next value; exhausted without default → `StopIteration`; with default → default |
 | `range(...)` | 1–3 ints | `for` and comprehensions; not a first-class value |

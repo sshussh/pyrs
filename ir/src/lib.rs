@@ -883,6 +883,12 @@ pub enum ExprKind {
         /// When true, this is `not in`.
         not: bool,
     },
+    /// `sorted(v)` where `v` is a dynamic value. Materializes a `list[Any]`
+    /// and orders it with the dynamic comparison kernel. `reverse` is Bool.
+    DynSorted {
+        value: Box<Expr>,
+        reverse: Box<Expr>,
+    },
     /// Unbox [`Ty::Any`] to a concrete type (`expr.ty`) with a runtime tag check
     /// (TypeError on mismatch). Class targets accept subclasses via type_id.
     FromAny {

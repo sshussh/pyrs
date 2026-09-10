@@ -185,8 +185,7 @@ fn sequences_concatenate_and_repeat() {
 fn set_algebra_on_dynamic_sets() {
     matches_python(
         "sets",
-        // Only the length is checked. `sorted()` and `in` over a dynamic
-        // container are separate gaps, and set printing order is unstable.
+        // Only the length is checked. Set printing order is unstable.
         "p: object = {1, 2, 3}\nq: object = {2}\nd: object = p - q\n\
          e: object = p - p\nprint(len(d), len(e))\n",
     );
@@ -485,11 +484,95 @@ fn an_unimplemented_method_is_named_not_disguised_as_missing() {
     );
 }
 
-/// `sorted()` of a dynamic value stays refused, but the diagnostic must not
-/// claim the value is not iterable -- `for x in v` works.
 #[test]
-fn sorted_of_a_dynamic_value_names_the_real_reason() {
-    let dir = temp_source("sorted-dyn", "a: object = [3, 1]\nprint(sorted(a))\n");
+fn sorted_of_a_dynamic_list_matches_python() {
+    matches_python(
+        "sorted-ints",
+        "a: object = [3, 1, 2]\nprint(sorted(a))\nys = sorted(a)\nprint(ys)\n",
+    );
+    matches_python(
+        "sorted-strs",
+        "a: object = [\"c\", \"a\", \"b\"]\nprint(sorted(a))\n",
+    );
+    matches_python(
+        "sorted-floats",
+        "a: object = [2.5, 1.0, 3.25]\nprint(sorted(a))\n",
+    );
+}
+
+#[test]
+fn sorted_of_a_dynamic_dict_yields_keys() {
+    matches_python(
+        "sorted-dict",
+        "a: object = {\"b\": 1, \"a\": 2}\nprint(sorted(a))\n",
+    );
+}
+
+#[test]
+fn sorted_of_a_dynamic_tuple_str_and_set() {
+    matches_python("sorted-tuple", "a: object = (3, 1, 2)\nprint(sorted(a))\n");
+    matches_python("sorted-str", "a: object = \"cab\"\nprint(sorted(a))\n");
+    matches_python("sorted-set", "a: object = {3, 1, 2}\nprint(sorted(a))\n");
+}
+
+#[test]
+fn sorted_of_list_any_matches_python() {
+    // list[object] is a different encoding from object holding a list, and
+    // assignment is a different lowering path from print.
+    matches_python(
+        "sorted-listany",
+        "xs: list[object] = [3, 1, 2]\nys = sorted(xs)\nprint(ys)\nprint(sorted(xs))\n",
+    );
+}
+
+#[test]
+fn sorted_reverse_on_a_dynamic_value() {
+    matches_python(
+        "sorted-rev",
+        concat!(
+            "a: object = [3, 1, 2]\n",
+            "print(sorted(a, reverse=True))\n",
+            "print(sorted(a, reverse=False))\n",
+            "print(sorted(a, reverse=1))\n",
+            "print(sorted(a, reverse=0))\n",
+            "flag: bool = True\n",
+            "print(sorted(a, reverse=flag))\n",
+        ),
+    );
+}
+
+#[test]
+fn sorted_keeps_equal_elements_stable() {
+    matches_python(
+        "sorted-stable",
+        "a: object = [True, 1, False, 0]\nprint(sorted(a))\n",
+    );
+}
+
+#[test]
+fn mixed_dynamic_sorted_raises_cpythons_ordering_error() {
+    fails_like_python("sorted-mixed", "a: object = [1, \"a\"]\nprint(sorted(a))\n");
+    fails_like_python(
+        "sorted-mixed-rev",
+        "a: object = [\"a\", 1]\nprint(sorted(a))\n",
+    );
+}
+
+#[test]
+fn sorted_of_a_non_iterable_matches_python() {
+    fails_like_python("sorted-int", "a: object = 1\nprint(sorted(a))\n");
+    fails_like_python("sorted-none", "a: object = None\nprint(sorted(a))\n");
+    fails_like_python("sorted-float", "a: object = 1.5\nprint(sorted(a))\n");
+    fails_like_python("sorted-bool", "a: object = True\nprint(sorted(a))\n");
+}
+
+/// `key=` on a dynamic value is a gap, not a CPython TypeError.
+#[test]
+fn sorted_key_on_a_dynamic_value_names_the_gap() {
+    let dir = temp_source(
+        "sorted-key-dyn",
+        "a: object = [3, 1, 2]\nprint(sorted(a, key=lambda x: x))\n",
+    );
     let out = Command::new(PYRS)
         .args(["run", "-i", "prog.py"])
         .current_dir(&dir.0)
@@ -498,8 +581,5 @@ fn sorted_of_a_dynamic_value_names_the_real_reason() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not supported yet"), "{stderr}");
-    assert!(
-        !stderr.contains("expects an iterable"),
-        "a dynamic value IS iterable; the message must not say otherwise: {stderr}"
-    );
+    assert!(stderr.contains("key="), "the gap must name key=: {stderr}");
 }
