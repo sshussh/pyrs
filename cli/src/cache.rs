@@ -11,10 +11,10 @@
 //! 2. **Programs** — a whole executable keyed on its inputs, so an unchanged
 //!    `pyrs run` skips compilation entirely.
 //!
-//! The cache is global rather than per-project (`$XDG_CACHE_HOME/pyrs`),
-//! because the runtime objects depend only on the compiler and the embedded
-//! sources: every project on the machine wants the same ones. It is also what
-//! lets an explicit `pyrs run -i prog.py`, which has no project, still hit.
+//! A discovered project stores its cache in its `target/` directory, alongside
+//! its build output, so `pyrs clean` removes both just as `cargo clean` does.
+//! Invocations without a discovered project use the global fallback
+//! (`$XDG_CACHE_HOME/pyrs`), and `PYRS_CACHE_DIR` overrides either location.
 //!
 //! **A stale entry is worse than a slow build.** It is a wrong answer that
 //! looks like a right one, so: keys cover everything that can change the
@@ -40,9 +40,12 @@ const FORMAT: u32 = 1;
 
 /// Root of the cache, or `None` when no cache directory can be determined
 /// (a cache is an optimization; not having one is not an error).
-pub fn root() -> Option<PathBuf> {
+pub fn root(project_target: Option<&Path>) -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("PYRS_CACHE_DIR") {
         return Some(PathBuf::from(dir));
+    }
+    if let Some(target) = project_target {
+        return Some(target.to_path_buf());
     }
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
         return Some(PathBuf::from(dir).join("pyrs"));
@@ -90,9 +93,9 @@ fn which(cc: &str) -> Option<PathBuf> {
 /// Asking the compiler costs two subprocesses, which is more than a warm
 /// build should spend on anything, so the answer is recorded under a cheap
 /// stamp of the binary and only recomputed when that binary changes.
-fn toolchain_identity(cc: &str) -> String {
+fn toolchain_identity(cc: &str, root: Option<&Path>) -> String {
     let stamp = toolchain_stamp(cc);
-    let recorded = root().map(|r| r.join("toolchain").join(&stamp));
+    let recorded = root.map(|r| r.join("toolchain").join(&stamp));
     if let Some(path) = &recorded
         && let Ok(cached) = fs::read_to_string(path)
         && cached.len() == 64
@@ -240,13 +243,14 @@ pub fn runtime_objects(
     cc: &str,
     src_dir: &Path,
     work_dir: &Path,
+    root: Option<&Path>,
     use_cache: bool,
 ) -> Result<Runtime, String> {
     if !use_cache {
         let objects = compile_objects(cc, src_dir, work_dir)?;
         return Ok(Runtime::Separate(RuntimeObjects { objects }));
     }
-    let Some(root) = root() else {
+    let Some(root) = root else {
         return Ok(Runtime::Inline);
     };
     let Some(pp) = preprocessed(cc, src_dir, &["runtime.c", "gc.c", "unicode_data.c"]) else {
@@ -258,7 +262,7 @@ pub fn runtime_objects(
     let mut h = Sha256::new();
     h.field(&FORMAT.to_le_bytes());
     h.field(BUILD_FINGERPRINT.trim().as_bytes());
-    h.field(toolchain_identity(cc).as_bytes());
+    h.field(toolchain_identity(cc, Some(root)).as_bytes());
     h.field(b"-O2 -Wno-format-truncation");
     h.field(extra_flags("PYRS_CFLAGS").join(" ").as_bytes());
     h.field(&pp);
@@ -327,12 +331,13 @@ pub fn program_key(
     opt_level: u8,
     cc: &str,
     target_cpu: &str,
+    root: Option<&Path>,
 ) -> String {
     let mut h = Sha256::new();
     h.field(&FORMAT.to_le_bytes());
     h.field(BUILD_FINGERPRINT.trim().as_bytes());
     h.field(&[opt_level]);
-    h.field(toolchain_identity(cc).as_bytes());
+    h.field(toolchain_identity(cc, root).as_bytes());
     h.field(std::env::consts::ARCH.as_bytes());
     // The *resolved* CPU and feature string, not the request: two hosts both
     // asking for "native" resolve it differently, and a cache shared between
@@ -349,8 +354,8 @@ pub fn program_key(
 }
 
 /// Path of a cached program, if one is present and intact.
-pub fn program_lookup(key: &str) -> Option<PathBuf> {
-    let entry = root()?.join("programs").join(key);
+pub fn program_lookup(key: &str, root: Option<&Path>) -> Option<PathBuf> {
+    let entry = root?.join("programs").join(key);
     let binary = entry.join("program");
     let recorded = fs::read_to_string(entry.join("checksum")).ok()?;
     if file_digest(&binary).as_deref() == Some(recorded.trim()) {
@@ -363,8 +368,8 @@ pub fn program_lookup(key: &str) -> Option<PathBuf> {
 
 /// Publish a freshly built program. Failure is silent: the build succeeded,
 /// and an unwritable cache must not turn that into an error.
-pub fn program_store(key: &str, built: &Path) -> Option<PathBuf> {
-    let root = root()?;
+pub fn program_store(key: &str, built: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    let root = root?;
     let dir = root.join("programs");
     let staging = dir.join(format!(".staging-{}-{}", std::process::id(), &key[..16]));
     fs::create_dir_all(&staging).ok()?;
@@ -620,11 +625,11 @@ fn configured_limit() -> Option<u64> {
 ///
 /// Silent and best-effort throughout: a build that succeeded must not be
 /// reported as failed because housekeeping could not run.
-pub fn maintain(added: u64) {
+pub fn maintain(root: Option<&Path>, added: u64) {
     let Some(limit) = configured_limit() else {
         return;
     };
-    let Some(root) = root() else {
+    let Some(root) = root else {
         return;
     };
 

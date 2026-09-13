@@ -1,3 +1,12 @@
+## 0.151.0 — project-local build state
+
+Discovered projects now keep compiled programs, runtime objects and toolchain
+identity under `target/`, alongside their build output. `pyrs clean` therefore
+removes the complete project build state, like `cargo clean`. `pyrs cache` and
+`pyrs doctor` resolve the same active project cache; non-project invocations
+retain the XDG cache fallback, and `PYRS_CACHE_DIR` still overrides either
+location.
+
 ## 0.150.0 — types as values, and pay-per-use shapes
 
 A class name is a value: `k = C`, `k()`, `type(x)` on a class instance,

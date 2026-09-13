@@ -101,9 +101,11 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     };
     let mut compat = cmd.compat;
     let mut import_root: Option<PathBuf> = None;
+    let mut project_target: Option<PathBuf> = None;
     let mut manifest_python: Option<PathBuf> = None;
     if let Some(path) = &project {
         let m = manifest::load(path)?;
+        project_target = Some(m.target_path());
         import_root = Some(m.root_path());
         if let Some(entry) = m.entry_path() {
             input = Some(entry);
@@ -186,16 +188,24 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
         )
     };
     let opt_level = cmd.opt_level.unwrap_or(2);
+    let cache_root = cache::root(project_target.as_deref());
     // The manifest was folded into `cmd` above, alongside -O.
     let target_cpu = resolve_target_cpu(cmd.target_cpu.as_deref(), None, Purpose::ThisMachine);
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let key = (!cmd.no_cache)
-        .then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc, &target_cpu));
+    let key = (!cmd.no_cache).then(|| {
+        cache::program_key(
+            &program_sources(&loaded),
+            opt_level,
+            &cc,
+            &target_cpu,
+            cache_root.as_deref(),
+        )
+    });
 
     // A hit skips analysis and code generation as well as the C compile:
     // the program is unchanged, so there is nothing left to decide about it.
     if let Some(key) = &key
-        && let Some(cached) = cache::program_lookup(key)
+        && let Some(cached) = cache::program_lookup(key, cache_root.as_deref())
     {
         let mut process = process::Command::new(&cached);
         process.args(&cmd.args);
@@ -220,12 +230,16 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
         &target_cpu,
         false,
         !cmd.no_cache,
+        cache_root.as_deref(),
         &codegen::EmitOptions::default(),
     )
     .and_then(|()| {
         if let Some(key) = &key {
-            cache::program_store(key, &exe);
-            cache::maintain(fs::metadata(&exe).map(|m| m.len()).unwrap_or(0));
+            cache::program_store(key, &exe, cache_root.as_deref());
+            cache::maintain(
+                cache_root.as_deref(),
+                fs::metadata(&exe).map(|m| m.len()).unwrap_or(0),
+            );
         }
         let mut process = process::Command::new(&exe);
         process.args(&cmd.args);
@@ -311,11 +325,15 @@ fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
         .unwrap_or(2);
     let target_cpu = resolve_target_cpu(cmd.target_cpu.as_deref(), m.as_ref(), Purpose::Artifact);
 
+    let project_target = m.as_ref().map(|m| m.target_path());
+    let cache_root = cache::root(project_target.as_deref());
+
     let started = std::time::Instant::now();
     let outcome = compile(
         &input,
         &output,
         m.as_ref().map(|m| m.root_path()),
+        cache_root.as_deref(),
         opt_level,
         &target_cpu,
         cmd.emit_llvm,
@@ -422,7 +440,17 @@ fn profile_command(mut cmd: cli::ProfileCommand) -> Result<i32, String> {
     };
     let workdir = temp_workdir()?;
     let exe = workdir.join("program");
-    compile_module(&module, &exe, opt_level, &target_cpu, false, false, &emit)?;
+    compile_module(
+        &module,
+        &exe,
+        opt_level,
+        &target_cpu,
+        false,
+        false,
+        None,
+        &emit,
+    )?;
+
     let status = process::Command::new(&exe)
         .env("PYRS_PROFILE_OUT", &output)
         .args(&cmd.args)
@@ -458,6 +486,7 @@ fn compile(
     input: &Path,
     output: &Path,
     import_root: Option<PathBuf>,
+    cache_root: Option<&Path>,
     opt_level: u8,
     target_cpu: &str,
     emit_llvm: bool,
@@ -481,10 +510,17 @@ fn compile(
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     // `--emit-llvm` asks for a side artifact the cache does not hold, so it
     // always rebuilds rather than silently not producing the .ll file.
-    let key = (use_cache && !emit_llvm && consume_profile.is_none())
-        .then(|| cache::program_key(&program_sources(&loaded), opt_level, &cc, target_cpu));
+    let key = (use_cache && !emit_llvm && consume_profile.is_none()).then(|| {
+        cache::program_key(
+            &program_sources(&loaded),
+            opt_level,
+            &cc,
+            target_cpu,
+            cache_root,
+        )
+    });
     if let Some(key) = &key
-        && let Some(cached) = cache::program_lookup(key)
+        && let Some(cached) = cache::program_lookup(key, cache_root)
     {
         fs::copy(&cached, output)
             .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
@@ -498,11 +534,15 @@ fn compile(
         ..Default::default()
     };
     compile_module(
-        &module, output, opt_level, target_cpu, emit_llvm, use_cache, &emit,
+        &module, output, opt_level, target_cpu, emit_llvm, use_cache, cache_root, &emit,
     )?;
+
     if let Some(key) = &key {
-        cache::program_store(key, output);
-        cache::maintain(fs::metadata(output).map(|m| m.len()).unwrap_or(0));
+        cache::program_store(key, output, cache_root);
+        cache::maintain(
+            cache_root,
+            fs::metadata(output).map(|m| m.len()).unwrap_or(0),
+        );
     }
     Ok(Built::Compiled)
 }
@@ -570,6 +610,7 @@ fn compile_module(
     target_cpu: &str,
     emit_llvm: bool,
     use_cache: bool,
+    cache_root: Option<&Path>,
     emit: &codegen::EmitOptions,
 ) -> Result<(), String> {
     let llvm_ir = codegen::emit_llvm_ir_opts(module, emit);
@@ -610,7 +651,7 @@ fn compile_module(
         // and breaks GC-stat parsing plus `make examples` (which diffs 2>&1).
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
 
-        let runtime_build = cache::runtime_objects(&cc, &workdir, &workdir, use_cache)?;
+        let runtime_build = cache::runtime_objects(&cc, &workdir, &workdir, cache_root, use_cache)?;
         let mut link = process::Command::new(&cc);
         link.arg(&object);
         match &runtime_build {
@@ -716,7 +757,15 @@ fn check_program(cmd: cli::CheckCommand) -> Result<i32, String> {
 /// also throws away the runtime objects that make every build on the machine
 /// fast, to reclaim space held by programs.
 fn manage_cache(cmd: cli::CacheCommand) -> Result<i32, String> {
-    let root = cache::root().ok_or_else(|| {
+    let project_target = match std::env::current_dir() {
+        Ok(dir) => match manifest::discover(&dir)? {
+            Some(path) => Some(manifest::load(&path)?.target_path()),
+            None => None,
+        },
+        Err(_) => None,
+    };
+
+    let root = cache::root(project_target.as_deref()).ok_or_else(|| {
         "no cache directory: set PYRS_CACHE_DIR, XDG_CACHE_HOME or HOME".to_string()
     })?;
 
@@ -932,6 +981,8 @@ fn run_tests(cmd: cli::TestCommand) -> Result<i32, String> {
         .opt_level
         .or_else(|| m.as_ref().and_then(|m| m.opt_level))
         .unwrap_or(2);
+    let project_target = m.as_ref().map(|m| m.target_path());
+    let cache_root = cache::root(project_target.as_deref());
     let target_cpu =
         resolve_target_cpu(cmd.target_cpu.as_deref(), m.as_ref(), Purpose::ThisMachine);
     compile_module(
@@ -941,6 +992,7 @@ fn run_tests(cmd: cli::TestCommand) -> Result<i32, String> {
         &target_cpu,
         false,
         !cmd.no_cache,
+        cache_root.as_deref(),
         &codegen::EmitOptions::default(),
     )?;
 
@@ -1114,10 +1166,9 @@ impl TreePrinter<'_> {
 
 /// `pyrs clean`: remove this project's build output directory.
 ///
-/// Scoped to the project, not the machine. The global build cache is
-/// `pyrs cache clean` — conflating the two would mean that clearing one
-/// project's outputs slowed down every build on the system, which is
-/// exactly the confusion `cargo clean` avoids by owning only `target/`.
+/// Scoped to the project, like `cargo clean`: `target/` contains both build
+/// output and the project's cache, so removing it resets the whole project
+/// build state.
 fn clean_project(cmd: cli::CleanCommand) -> Result<i32, String> {
     let project = match std::env::current_dir() {
         Ok(dir) => manifest::discover(&dir)?,
@@ -1126,7 +1177,7 @@ fn clean_project(cmd: cli::CleanCommand) -> Result<i32, String> {
     let Some(path) = project else {
         return Err(
             "not in a PyRs project: 'clean' removes the [tool.pyrs] target directory \
-             (for the shared build cache, use 'pyrs cache clean')"
+                (for the global fallback cache, use 'pyrs cache clean')"
                 .to_string(),
         );
     };
@@ -1209,8 +1260,14 @@ fn doctor() -> Result<i32, String> {
             println!("               only --compat and build-extension need one");
         }
     }
+    let project = std::env::current_dir().ok().map(|d| manifest::discover(&d));
 
-    match cache::root() {
+    let project_target = match &project {
+        Some(Ok(Some(path))) => manifest::load(path).ok().map(|m| m.target_path()),
+        _ => None,
+    };
+
+    match cache::root(project_target.as_deref()) {
         Some(root) => {
             let total: u64 = cache::stats(&root).iter().map(|s| s.bytes).sum();
             println!(
@@ -1222,7 +1279,7 @@ fn doctor() -> Result<i32, String> {
         None => println!("  cache        none (set PYRS_CACHE_DIR, XDG_CACHE_HOME or HOME)"),
     }
 
-    match std::env::current_dir().ok().map(|d| manifest::discover(&d)) {
+    match project {
         Some(Ok(Some(path))) => {
             println!("  project      {}", path.display());
             match manifest::load(&path) {

@@ -41,7 +41,7 @@ milestone; reaching a particular minor version is not a readiness claim. No
 stable release or tag exists yet. See the [roadmap](docs/ROADMAP.md) for what
 1.0 requires.
 
-Current milestone: **v0.150.0**.
+Current milestone: **v0.151.0**.
 
 Correctness is measured rather than asserted: language features are
 differentially tested against CPython 3.14 at `-O0`, `-O2` and `-O3`, and the
@@ -96,8 +96,9 @@ opt-level = 2
 README, pinned `.python-version` and repository `cargo new` and `uv init` both
 produce — and adds only the table when a `pyproject.toml` already exists.
 Inside a project, `pyrs build` compiles the entry through the declared import
-root to `target/`, `pyrs clean` removes it, and `pyrs cache` inspects and
-prunes the machine-wide build cache. See [TOOLING.md](docs/TOOLING.md) for the
+root to `target/`, which also holds that project's build cache. `pyrs clean`
+removes the whole directory, like `cargo clean`, while `pyrs cache` inspects
+and prunes the active project cache. See [TOOLING.md](docs/TOOLING.md) for the
 manifest, project layout, build caching and interpreter resolution.
 
 ## The language
@@ -296,8 +297,8 @@ benchmarks and a release workflow.
   section as its notes. So a milestone releases itself once its version bump
   lands.
 
-Pushing a tag by hand still works and takes the same path — `git tag v0.150.0
-&& git push origin v0.150.0`. Nothing is ever published from a commit whose CI
+Pushing a tag by hand still works and takes the same path — `git tag v0.151.0
+&& git push origin v0.151.0`. Nothing is ever published from a commit whose CI
 did not pass.
 
 Linux x86_64 is the released build. macOS arm64 and Windows x86_64 are in the

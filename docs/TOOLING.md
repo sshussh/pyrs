@@ -2,16 +2,16 @@
 
 PyRs source is **valid Python**, not a dialect. That is a constraint the
 project protects rather than a coincidence, and it decides most of what PyRs
-does *not* build: formatting, linting, packaging, environments and project
+does _not_ build: formatting, linting, packaging, environments and project
 creation are all done well by tools that already operate on valid Python.
 
-| Concern | Owner |
-|---|---|
-| Formatting, linting | `ruff`, `black`, `uv format`, `uv check` |
-| Interpreter, virtual environment, packages | `uv` (or pip, or nothing) |
-| Project creation | `uv init` |
-| Modules and packages | Python's own model, implemented by PyRs |
-| Compilation, runtime, build caching | PyRs |
+| Concern                                    | Owner                                    |
+| ------------------------------------------ | ---------------------------------------- |
+| Formatting, linting                        | `ruff`, `black`, `uv format`, `uv check` |
+| Interpreter, virtual environment, packages | `uv` (or pip, or nothing)                |
+| Project creation                           | `uv init`                                |
+| Modules and packages                       | Python's own model, implemented by PyRs  |
+| Compilation, runtime, build caching        | PyRs                                     |
 
 The cargo analogy, with the correction that matters: cargo owns the project
 and rustc owns the compilation, so uv owns the **CPython environment** and
@@ -118,12 +118,12 @@ appended and nothing else touched.
 when it provisions the environment — writing only the first left uv free to
 pick its own default.
 
-| Flag | Effect |
-|---|---|
-| `--name NAME` | Project name; defaults to the directory's. A package directory must be a Python identifier, so `my-app` produces `src/my_app/` |
-| `--entry PATH` | Entry module to record. An entry under `src/` implies `root = "src"` |
-| `--script` | A flat `main.py` instead of the `src/` layout, for a single-file program |
-| `--vcs git\|none` | `git init` unless told not to; never nested inside an existing repository |
+| Flag              | Effect                                                                                                                         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `--name NAME`     | Project name; defaults to the directory's. A package directory must be a Python identifier, so `my-app` produces `src/my_app/` |
+| `--entry PATH`    | Entry module to record. An entry under `src/` implies `root = "src"`                                                           |
+| `--script`        | A flat `main.py` instead of the `src/` layout, for a single-file program                                                       |
+| `--vcs git\|none` | `git init` unless told not to; never nested inside an existing repository                                                      |
 
 A scaffolded project also gets `tests/test_<module>.py`, so `pyrs test`
 passes in a fresh project without editing anything. `--script` produces a
@@ -160,13 +160,14 @@ $ pyrs build
 `--quiet` suppresses that. `pyrs run` prints no summary at all: it stands in
 for `python3` and is compared against it byte for byte.
 
-`pyrs clean` removes the project's target directory and nothing else. The
-machine-wide build cache is `pyrs cache clean`: conflating them would mean
-clearing one project's outputs slowed down every build on the system.
+`pyrs clean` removes the project's complete `target/` directory, including
+build output and cached programs, runtime objects, and toolchain identity —
+the same lifecycle as `cargo clean`. `pyrs cache` inspects or selectively
+cleans layers within that active project cache.
 
 ## `pyrs doctor`
 
-`make doctor` checks that a machine can build the *compiler*. `pyrs doctor`
+`make doctor` checks that a machine can build the _compiler_. `pyrs doctor`
 answers the different question a user has — can this binary compile my
 program, and which interpreter will `--compat` use:
 
@@ -176,7 +177,7 @@ pyrs 0.144.0
   target       x86_64-linux
   C compiler   cc (cc (GCC) 16.2.1)
   interpreter  python3 (python3 on PATH, Python 3.14)
-  cache        /home/you/.cache/pyrs (1.3 GiB)
+  cache        /home/you/app/target (1.3 GiB)
   project      /home/you/app/pyproject.toml
                entry src/app/main.py, root /home/you/app/src, target /home/you/app/target
 
@@ -212,9 +213,10 @@ pyrs clean            # remove target/
 `target/main`. An explicit `-o` always wins, and outside a project the
 default is still `a.out`.
 
-`pyrs clean` removes the target directory and nothing else. The shared build
-cache is `pyrs cache clean`; conflating the two would mean clearing one
-project's outputs slowed down every build on the machine.
+`pyrs clean` removes the project's complete `target/` directory, including
+build output and cached programs, runtime objects, and toolchain identity —
+the same lifecycle as `cargo clean`. `pyrs cache` inspects or selectively
+cleans layers within that active project cache.
 
 ## Checking the toolchain
 
@@ -273,7 +275,7 @@ a file pytest handles fine would make `pyrs test` unusable beside it. Any
 exception fails its test, not just `AssertionError`, and one failure does not
 stop the rest. A project with no tests exits 0.
 
-The runner is a *generated program*, not a runtime feature: PyRs is
+The runner is a _generated program_, not a runtime feature: PyRs is
 closed-world with no reflection, so the driver parses the modules it found,
 emits a `__main__` calling each test inside a `try`, and compiles that like
 any other program. Results go to a file rather than stdout, so a test's own
@@ -352,15 +354,15 @@ up when something Unicode- or compatibility-shaped disagrees.
 
 ## Build caching
 
-Compiled C runtime objects and whole programs are cached in
-`$XDG_CACHE_HOME/pyrs` (override with `PYRS_CACHE_DIR`), so an unchanged
+A discovered project caches compiled C runtime objects and whole programs in
+its `target/` directory, alongside its build output, so an unchanged
 `pyrs run` compiles nothing. `--no-cache` on `run` and `compile` reuses and
 publishes nothing.
 
-The cache is global rather than per-project: the runtime objects depend only
-on the compiler and PyRs's embedded sources, so every project on the machine
-wants the same ones, and an explicit `pyrs run -i prog.py` with no project
-still benefits.
+`pyrs clean` removes the complete project `target/` directory, including its
+cache, just as `cargo clean` does. Invocations without a discovered project
+use the global fallback (`$XDG_CACHE_HOME/pyrs`), while `PYRS_CACHE_DIR`
+overrides either location.
 
 Keys cover everything that can change the output bytes — the compiler's own
 fingerprint, the C toolchain's identity, the optimization level, the target,
@@ -370,7 +372,7 @@ looks like a right one, which is worse than a slow build.
 
 `CC` is honored, and so are `PYRS_CFLAGS` and `PYRS_LDFLAGS` — both are
 part of the key, so changing one invalidates rather than silently reuses.
-They are deliberately *not* spelled `CFLAGS`: that is a make convention, is
+They are deliberately _not_ spelled `CFLAGS`: that is a make convention, is
 routinely set machine-wide for unrelated builds, and `cc` does not read it on
 its own, so adopting it would change PyRs's output because of a setting aimed
 at something else.
@@ -392,10 +394,10 @@ pyrs cache prune --max-size 2GiB   # or --older-than 7d
 ```
 
 `--programs` and `--runtime` narrow any of them, and `--dry-run` reports what
-would go without removing it. The distinction matters: the runtime objects
-are a few hundred kilobytes shared by every build on the machine, while the
-programs are a few hundred kilobytes *each*, so reclaiming space almost
-always means `--programs`.
+would go without removing it. Runtime objects are a few hundred kilobytes,
+while programs are a few hundred kilobytes _each_, so reclaiming space almost
+always means `--programs`. In a project, all of these layers live beneath
+`target/`; `pyrs clean` removes the entire directory.
 
 Eviction is least-recently-used. Entries carry a `used` stamp refreshed when
 they are reused — at most hourly, so a warm cache pays no write per hit —
@@ -424,11 +426,11 @@ compliant. A time interval keeps the walk rare; it does not bound a cache.
 Releases are produced by `.github/workflows/release.yml`, and never from a
 working copy. There are three ways in and one build path.
 
-| Trigger | What it publishes |
-|---|---|
-| CI passed on `main` | The rolling `nightly` prerelease, always. Plus a real `v<version>` release if that version has no tag yet. |
-| A `v*.*.*` tag pushed | That version's release. |
-| Manual dispatch | A build artifact, or a nightly/version publish if asked. |
+| Trigger               | What it publishes                                                                                          |
+| --------------------- | ---------------------------------------------------------------------------------------------------------- |
+| CI passed on `main`   | The rolling `nightly` prerelease, always. Plus a real `v<version>` release if that version has no tag yet. |
+| A `v*.*.*` tag pushed | That version's release.                                                                                    |
+| Manual dispatch       | A build artifact, or a nightly/version publish if asked.                                                   |
 
 The push path hangs off `workflow_run` on the CI workflow rather than `push`,
 so a commit whose CI failed cannot publish anything. The version comes from
@@ -445,11 +447,11 @@ accumulating, and is marked a prerelease so it never becomes "latest".
 
 ### Platform status
 
-| Target | Runner | State |
-|---|---|---|
-| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | Released. The only target the project has ever built. |
-| `aarch64-apple-darwin` | `macos-14` | **Unproven.** Needs `brew install llvm@18` to provide `llvm-config` and the CMake package that `codegen/build.rs` compiles the C++ shim against. |
-| `x86_64-pc-windows-msvc` | `windows-2022` | **Unproven, and the most likely to need work.** |
+| Target                     | Runner         | State                                                                                                                                            |
+| -------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | Released. The only target the project has ever built.                                                                                            |
+| `aarch64-apple-darwin`     | `macos-14`     | **Unproven.** Needs `brew install llvm@18` to provide `llvm-config` and the CMake package that `codegen/build.rs` compiles the C++ shim against. |
+| `x86_64-pc-windows-msvc`   | `windows-2022` | **Unproven, and the most likely to need work.**                                                                                                  |
 
 Both new targets carry `continue-on-error`, so a failure reports and is
 skipped instead of holding back the Linux release. Drop that flag for a
@@ -462,7 +464,7 @@ block at the top of `codegen/runtime/runtime.c`. The collector's
 `/proc/self/maps` stack discovery was already guarded and falls back to the
 caller-supplied anchor elsewhere.
 
-What is *not* solved for Windows: the driver shells out to `cc` to compile each
+What is _not_ solved for Windows: the driver shells out to `cc` to compile each
 program's runtime, and LLVM development files (`llvm-config`, headers, the
 CMake package) are not reliably available from a Windows runner package. Those
 are the two things to expect to fail first. `os.path` is also POSIX-semantic
