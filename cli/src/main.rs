@@ -102,10 +102,12 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     let mut compat = cmd.compat;
     let mut import_root: Option<PathBuf> = None;
     let mut project_target: Option<PathBuf> = None;
+    let mut project_output: Option<PathBuf> = None;
     let mut manifest_python: Option<PathBuf> = None;
     if let Some(path) = &project {
         let m = manifest::load(path)?;
         project_target = Some(m.target_path());
+        project_output = m.default_output();
         import_root = Some(m.root_path());
         if let Some(entry) = m.entry_path() {
             input = Some(entry);
@@ -207,7 +209,21 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     if let Some(key) = &key
         && let Some(cached) = cache::program_lookup(key, cache_root.as_deref())
     {
-        let mut process = process::Command::new(&cached);
+        let executable = if let Some(output) = &project_output {
+            if let Some(parent) = output.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.exists()
+            {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            }
+            fs::copy(&cached, output)
+                .map_err(|e| format!("failed to write {}: {e}", output.display()))?;
+            output
+        } else {
+            &cached
+        };
+        let mut process = process::Command::new(executable);
         process.args(&cmd.args);
         #[cfg(unix)]
         {
@@ -221,8 +237,21 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
     }
 
     let module = analyze(loaded).map_err(|f| f.render(format))?;
-    let workdir = temp_workdir()?;
-    let exe = workdir.join("program");
+    let (workdir, exe) = match project_output {
+        Some(output) => (None, output),
+        None => {
+            let workdir = temp_workdir()?;
+            let exe = workdir.join("program");
+            (Some(workdir), exe)
+        }
+    };
+    if let Some(parent) = exe.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
     let result = compile_module(
         &module,
         &exe,
@@ -250,7 +279,7 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
         }
         #[cfg(not(unix))]
         let _ = argv0;
-        // Keep the parent alive to clean up the native executable afterwards.
+        // Keep the temporary parent alive until its executable has run.
         process
             .status()
             .map(exit_code)

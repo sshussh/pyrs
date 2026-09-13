@@ -135,15 +135,16 @@ starting point, and `init` on an existing project is a normal thing to do.
 
 ## Building a project
 
-`pyrs build` (or `compile`, the same command) is project-aware in the same
-way `run` is. With no `-i` it builds the manifest's entry through the
-declared import root; with no `-o` it writes `target/NAME`, where `NAME` is
+`pyrs build` (or `compile`, the same command) and project `pyrs run` build
+the manifest's entry through the declared import root. They write
+`target/NAME`, where `NAME` is
 the entry's stem — or its package directory when the entry is `main.py`, so
 `src/app/main.py` builds to `target/app` rather than every project building
 to `target/main`.
 
 ```console
 pyrs build          # -> target/app
+pyrs run            # runs target/app
 pyrs clean          # removes target/
 ```
 

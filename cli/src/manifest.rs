@@ -85,7 +85,7 @@ impl Manifest {
         }
     }
 
-    /// Where `pyrs build` writes when no `-o` is given: the entry module's
+    /// Where `pyrs build` and project `pyrs run` write: the entry module's
     /// stem inside the target directory, so a project builds to a stable,
     /// predictable path instead of `./a.out` in whatever directory the
     /// command happened to run from.

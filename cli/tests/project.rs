@@ -112,8 +112,18 @@ fn init_scaffolds_the_layout_cargo_and_uv_both_produce() {
     assert!(ignore.contains("/target"), "{ignore}");
 
     assert_eq!(ok(&root, &cache, &["run"]), "Hello from proj!\n");
+    let artifact = root.join("target/proj");
+    assert!(artifact.is_file(), "pyrs run did not leave {artifact:?}");
+    // A program-cache hit still restores the stable project artifact before
+    // executing it, matching `cargo run`'s persistent target output.
+    fs::remove_file(&artifact).unwrap();
+    assert_eq!(ok(&root, &cache, &["run"]), "Hello from proj!\n");
+    assert!(
+        artifact.is_file(),
+        "cached pyrs run did not restore {artifact:?}"
+    );
     ok(&root, &cache, &["build"]);
-    assert!(root.join("target/proj").is_file());
+    assert!(artifact.is_file());
     // The loop closes: a fresh project's tests pass without editing
     // anything, the way `cargo new` then `cargo test` does.
     let tested = ok(&root, &cache, &["test"]);
