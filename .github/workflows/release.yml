@@ -263,7 +263,7 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.ref }}
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: incoming
           merge-multiple: true
@@ -303,7 +303,7 @@ jobs:
           ref: ${{ needs.plan.outputs.ref }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: incoming
           merge-multiple: true
