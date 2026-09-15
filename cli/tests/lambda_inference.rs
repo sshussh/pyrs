@@ -71,21 +71,6 @@ fn matches_python(tag: &str, source: &str) {
     }
 }
 
-/// Returns the diagnostic for a program that must be rejected.
-fn rejects(tag: &str, source: &str) -> String {
-    let (_dir, src) = write_prog(tag, source);
-    let out = Command::new(PYRS)
-        .args(["check", "-i"])
-        .arg(&src)
-        .output()
-        .expect("failed to spawn PyRs");
-    assert!(
-        !out.status.success(),
-        "{tag} was accepted, expected an error"
-    );
-    String::from_utf8_lossy(&out.stderr).to_string()
-}
-
 // ---------------------------------------------------------------------------
 // key= — the idiom lambdas exist for
 // ---------------------------------------------------------------------------
@@ -222,13 +207,12 @@ print(add3(4))
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_body_that_constrains_nothing_is_still_rejected() {
-    // No consumer to ask and nothing in the body to go on. A lambda cannot
-    // carry an annotation, so the fix is a `def`.
-    let err = rejects("no-info", "f = lambda x: len(x)\nprint(f(\"ab\"))\n");
-    assert!(
-        err.contains("missing a type annotation") || err.contains("could not infer"),
-        "{err}"
+fn a_body_that_constrains_nothing_runs_dynamically() {
+    // No consumer to ask and nothing in the body to go on: the parameter is
+    // dynamic rather than refused.
+    matches_python(
+        "no-info",
+        "f = lambda x: len(x)\nprint(f(\"ab\"), f([1, 2, 3]))\n",
     );
 }
 

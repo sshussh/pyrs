@@ -78,6 +78,28 @@ fn rejects(tag: &str, source: &str) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// What `pyrs check --show-types` reports for `source`.
+fn show_types(tag: &str, source: &str) -> String {
+    let dir = TempDir(
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("pyrs-infer-{tag}-{}", std::process::id())),
+    );
+    fs::create_dir_all(&dir.0).unwrap();
+    let src = dir.0.join("prog.py");
+    fs::write(&src, source).unwrap();
+    let out = Command::new(PYRS)
+        .args(["check", "--show-types", "-i"])
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{tag}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 #[test]
 fn identity_takes_its_type_from_the_call_site() {
     matches_python(
@@ -188,12 +210,16 @@ print(outer())
 }
 
 #[test]
-fn unconstrained_still_needs_an_annotation() {
-    let err = rejects("unconstrained", "def f(x):\n    return x\n");
-    assert!(
-        err.contains("missing a type annotation") || err.contains("could not infer"),
-        "{err}"
+fn an_unconstrained_parameter_compiles_as_dynamic() {
+    // Nothing calls `f` and its body constrains nothing: an open set of
+    // types, which is what `Any` is. Refusing it made an annotation a
+    // condition of compiling rather than an optimization.
+    matches_python("unconstrained", "def f(x):\n    return x\nprint('ok')\n");
+    let types = show_types(
+        "unconstrained-types",
+        "def f(x):\n    return x\nprint('ok')\n",
     );
+    assert!(types.contains("f(x: Any) -> Any"), "{types}");
 }
 
 /// The case the earlier test missed. `identity(x): return x` puts no
@@ -268,7 +294,7 @@ fn agreeing_call_sites_keep_the_typed_signature() {
     fs::write(
         dir.0.join("prog.py"),
         "def step(x):\n    return x * 2 + 1\nclass K:\n    def step(self, x):\n        return x * 2 + 1\n\
-         k = K()\nprint(step(3), step(4), k.step(3), k.step(True))\n",
+         k = K()\nprint(step(3), step(4), k.step(3), k.step(7))\n",
     )
     .unwrap();
     let out = Command::new(PYRS)
@@ -296,6 +322,17 @@ fn agreeing_call_sites_keep_the_typed_signature() {
     assert!(
         ll.contains("define i64 @pyrs_K.step(ptr %p.self, i64 %p.x)"),
         "{ll}"
+    );
+}
+
+/// `True` fits an `int` parameter as far as `coerce` is concerned, but a
+/// function that prints its argument shows the difference, so an int and a
+/// bool at two call sites are two types.
+#[test]
+fn a_bool_and_an_int_at_call_sites_are_different_types() {
+    matches_python(
+        "bool-int",
+        "def show(x):\n    print(x, x * 2)\nshow(1)\nshow(True)\n",
     );
 }
 
@@ -335,12 +372,15 @@ print(v.x, v.y, v.length_sq())
 /// the layout. Until that ordering changes, the diagnostic must name the
 /// parameter -- not claim the object lacks a field it plainly assigns.
 #[test]
-fn an_uninferable_constructor_parameter_is_named_not_disguised() {
-    let msg = rejects(
-        "ctor-call-site",
-        "class Circle:\n    def __init__(self, r):\n        self.r = r\n\
-         c = Circle(2.5)\nprint(c.r)\n",
+fn a_constructor_call_site_types_its_parameter() {
+    // Evidence from `Circle(2.5)` reaches `__init__` before the class layout
+    // is built, so the field assigned from `r` exists and is a float.
+    let src = "class Circle:\n    def __init__(self, r):\n        self.r = r\n\
+               c = Circle(2.5)\nprint(c.r)\n";
+    matches_python("ctor-call-site", src);
+    let types = show_types("ctor-call-site-types", src);
+    assert!(
+        types.contains("Circle.__init__(self: Circle, r: float)"),
+        "{types}"
     );
-    assert!(msg.contains("parameter 'r'"), "{msg}");
-    assert!(!msg.contains("has no attribute"), "{msg}");
 }

@@ -8274,19 +8274,12 @@ print(check(4))
 }
 
 #[test]
-fn bare_lambda_param_without_default_rejected() {
-    // `lambda x: x + 1` is inferable from the body and now works; what still
-    // cannot be inferred is a body that constrains nothing about the
-    // parameter. Lambdas cannot carry annotations (the first `:` starts the
-    // body), so the fix is to give the consumer a type or use a `def`.
-    let (_, stderr) =
-        run_program_expect_fail("bare_lam", "f = lambda x: len(x)\nprint(f(\"ab\"))\n");
-    assert!(
-        stderr.contains("missing a type annotation")
-            || stderr.contains("lambda parameter")
-            || stderr.contains("could not infer"),
-        "stderr: {stderr}"
-    );
+fn bare_lambda_param_without_default_runs_dynamically() {
+    // A body that constrains nothing about the parameter used to be refused.
+    // With nothing to go on the parameter is dynamic, which is correct for
+    // every argument CPython accepts.
+    let out = run_program("bare_lam", "f = lambda x: len(x)\nprint(f(\"ab\"))\n");
+    assert_eq!(out, "2\n");
 }
 
 #[test]
