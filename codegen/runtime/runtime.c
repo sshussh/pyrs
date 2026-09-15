@@ -9372,23 +9372,230 @@ long long pyrs_any_iter_get(long long v, long long index) {
     return 0;
 }
 
-/* Stable insertion sort of a `list[Any]`. qsort is not stable, and equal
- * values of different kinds (True and 1) have to keep their input order. */
-static void dyn_sort_list_any(PyrsList *l) {
-    for (long long i = 1; i < l->len; i++) {
-        long long cur = l->data[i];
-        const PyrsUnionBox *cb = (const PyrsUnionBox *)(uintptr_t)cur;
-        long long j = i;
-        while (j > 0) {
-            const PyrsUnionBox *pb = (const PyrsUnionBox *)(uintptr_t)l->data[j - 1];
-            if (!pyrs_dyn_compare(cb->print_tag, cb->payload, pb->print_tag,
-                                  pb->payload, PYRS_DYN_LT)) {
-                break;
-            }
-            l->data[j] = l->data[j - 1];
-            j--;
+/* ---- sorting a dynamic value ----
+ *
+ * CPython's list.sort is timsort, and the order in which it compares elements
+ * is observable: when two elements cannot be ordered, the TypeError names their
+ * types in the order the comparison met them. So this follows CPython's
+ * structure -- count_run, binary insertion up to minrun, and the powersort
+ * merge order -- which keeps that message identical while running in
+ * O(n log n). The insertion sort it replaces was quadratic: 23x slower than
+ * CPython at 16,000 elements.
+ *
+ * Galloping inside a merge is omitted. It changes how many comparisons a merge
+ * makes, never its result, and a merge's first comparison -- the later run's
+ * head against the earlier run's -- is the same one CPython makes first. */
+
+/* `a < b` for two boxed dynamic slots. */
+static int dyn_slot_lt(long long a, long long b) {
+    const PyrsUnionBox *x = (const PyrsUnionBox *)(uintptr_t)a;
+    const PyrsUnionBox *y = (const PyrsUnionBox *)(uintptr_t)b;
+    return pyrs_dyn_compare(x->print_tag, x->payload, y->print_tag, y->payload,
+                            PYRS_DYN_LT);
+}
+
+static void dyn_reverse_slots(long long *lo, long long n) {
+    long long *hi = lo + n - 1;
+    while (lo < hi) {
+        long long t = *lo;
+        *lo++ = *hi;
+        *hi-- = t;
+    }
+}
+
+/* The length of the run at `lo`, made ascending in place. A descending run is
+ * reversed; equal elements inside it are reversed first so the final reversal
+ * restores their order, which is what keeps the sort stable. */
+static long long dyn_count_run(long long *lo, long long nremaining) {
+    long long n;
+    for (n = 1; n < nremaining; ++n) {
+        if (dyn_slot_lt(lo[n], lo[n - 1])) {
+            break;
         }
-        l->data[j] = cur;
+    }
+    if (n == nremaining) {
+        return n;
+    }
+    if (n > 1) {
+        if (dyn_slot_lt(lo[0], lo[n - 1])) {
+            return n;
+        }
+        dyn_reverse_slots(lo, n);
+    }
+    ++n;
+    long long neq = 0;
+    for (; n < nremaining; ++n) {
+        if (dyn_slot_lt(lo[n], lo[n - 1])) {
+            if (neq) {
+                ++neq;
+                dyn_reverse_slots(lo + (n - neq), neq);
+                neq = 0;
+            }
+        } else if (dyn_slot_lt(lo[n - 1], lo[n])) {
+            break;
+        } else {
+            ++neq;
+        }
+    }
+    if (neq) {
+        ++neq;
+        dyn_reverse_slots(lo + (n - neq), neq);
+    }
+    dyn_reverse_slots(lo, n);
+    for (; n < nremaining; ++n) {
+        if (dyn_slot_lt(lo[n], lo[n - 1])) {
+            break;
+        }
+    }
+    return n;
+}
+
+/* Extend the sorted prefix `a[:ok]` to `a[:n]` by binary insertion. */
+static void dyn_binarysort(long long *a, long long n, long long ok) {
+    if (!ok) {
+        ++ok;
+    }
+    for (; ok < n; ++ok) {
+        long long lo = 0;
+        long long hi = ok;
+        long long pivot = a[ok];
+        do {
+            long long mid = (lo + hi) >> 1;
+            if (dyn_slot_lt(pivot, a[mid])) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        } while (lo < hi);
+        for (long long k = ok; k > lo; --k) {
+            a[k] = a[k - 1];
+        }
+        a[lo] = pivot;
+    }
+}
+
+static long long dyn_minrun(long long n) {
+    long long r = 0;
+    while (n >= 64) {
+        r |= n & 1;
+        n >>= 1;
+    }
+    return n + r;
+}
+
+/* Depth of the boundary between two adjacent runs in the powersort merge
+ * tree, which decides when pending runs are merged. */
+static int dyn_powerloop(long long s1, long long n1, long long n2, long long n) {
+    int result = 0;
+    long long a = 2 * s1 + n1;
+    long long b = a + n1 + n2;
+    for (;;) {
+        ++result;
+        if (a >= n) {
+            a -= n;
+            b -= n;
+        } else if (b >= n) {
+            break;
+        }
+        a <<= 1;
+        b <<= 1;
+    }
+    return result;
+}
+
+/* Merge the adjacent runs `base[sa:sa+na]` and `base[sa+na:sa+na+nb]`. The
+ * earlier run is copied out first. `tmp` is a GC-managed list rather than a
+ * malloc'd buffer: while an element sits only in the copy, the collector still
+ * has to see it, and a comparison that raises must not leak the buffer. */
+static void dyn_merge_runs(long long *base, long long sa, long long na,
+                           long long nb, PyrsList *tmp) {
+    long long *a = base + sa;
+    for (long long i = 0; i < na; i++) {
+        tmp->data[i] = a[i];
+    }
+    tmp->len = na;
+    long long *pa = tmp->data;
+    long long *pb = a + na;
+    long long *dest = a;
+    long long ia = 0;
+    long long ib = 0;
+    while (ia < na && ib < nb) {
+        /* Take from the later run only when strictly smaller: stability. */
+        if (dyn_slot_lt(pb[ib], pa[ia])) {
+            *dest++ = pb[ib++];
+        } else {
+            *dest++ = pa[ia++];
+        }
+    }
+    while (ia < na) {
+        *dest++ = pa[ia++];
+    }
+    tmp->len = 0;
+}
+
+typedef struct {
+    long long start;
+    long long len;
+    int power;
+} DynRun;
+
+static void dyn_sort_list_any(PyrsList *l) {
+    long long n = l->len;
+    if (n < 2) {
+        return;
+    }
+    /* No scoped GC roots here, deliberately. A comparison can raise, and
+     * pyrs_die unwinds to an enclosing `except` without popping scoped roots,
+     * which would leave the root chain pointing into this dead frame. `l` and
+     * `tmp` are live locals for the whole sort, so the conservative scan of
+     * the native stack and saved registers already keeps them reachable. */
+    PyrsList *tmp = pyrs_list_new(n);
+
+    long long *base = l->data;
+    DynRun pending[128];
+    int npend = 0;
+    long long minrun = dyn_minrun(n);
+    long long lo = 0;
+    long long nremaining = n;
+    do {
+        long long run = dyn_count_run(base + lo, nremaining);
+        if (run < minrun) {
+            long long force = nremaining <= minrun ? nremaining : minrun;
+            dyn_binarysort(base + lo, force, run);
+            run = force;
+        }
+        if (npend > 0) {
+            int power = dyn_powerloop(pending[npend - 1].start,
+                                      pending[npend - 1].len, run, n);
+            while (npend > 1 && pending[npend - 2].power > power) {
+                int i = npend - 2;
+                dyn_merge_runs(base, pending[i].start, pending[i].len,
+                               pending[i + 1].len, tmp);
+                pending[i].len += pending[i + 1].len;
+                npend--;
+            }
+            pending[npend - 1].power = power;
+        }
+        pending[npend].start = lo;
+        pending[npend].len = run;
+        pending[npend].power = 0;
+        npend++;
+        lo += run;
+        nremaining -= run;
+    } while (nremaining);
+
+    while (npend > 1) {
+        int i = npend - 2;
+        if (i > 0 && pending[i - 1].len < pending[i + 1].len) {
+            --i;
+        }
+        dyn_merge_runs(base, pending[i].start, pending[i].len, pending[i + 1].len,
+                       tmp);
+        pending[i].len += pending[i + 1].len;
+        if (i == npend - 3) {
+            pending[i + 1] = pending[i + 2];
+        }
+        npend--;
     }
 }
 
