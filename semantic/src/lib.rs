@@ -6641,6 +6641,243 @@ fn register_all_infer_funcs(
 /// Cap matches [`resolve_params_with_body_infer`].
 const PARAM_FIXPOINT_ROUNDS: usize = 8;
 
+/// Names bound by `name = ClassName(...)` anywhere in a body, mapped to the
+/// class. Flow-insensitive on purpose: this only has to recognise which class
+/// a method call's receiver is, and a name bound to two different classes is
+/// dropped rather than guessed.
+fn constructor_locals(stmts: &[ast::Stmt]) -> HashMap<String, ir::ClassId> {
+    fn walk(stmts: &[ast::Stmt], seen: &mut HashMap<String, Option<ir::ClassId>>) {
+        for st in stmts {
+            match &st.kind {
+                ast::StmtKind::Assign { targets, value, .. } => {
+                    if let ast::ExprKind::Call { func, .. } = &value.kind
+                        && !func.contains('.')
+                        && let Some(id) = lookup_class(func)
+                    {
+                        for t in targets {
+                            if let ast::AssignTarget::Name { name, .. } = t {
+                                let slot = seen.entry(name.clone()).or_insert(Some(id));
+                                if *slot != Some(id) {
+                                    *slot = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                ast::StmtKind::If { branches, orelse } => {
+                    for (_, b) in branches {
+                        walk(b, seen);
+                    }
+                    walk(orelse, seen);
+                }
+                ast::StmtKind::While { body, orelse, .. }
+                | ast::StmtKind::For { body, orelse, .. } => {
+                    walk(body, seen);
+                    walk(orelse, seen);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut seen = HashMap::new();
+    walk(stmts, &mut seen);
+    seen.into_iter()
+        .filter_map(|(k, v)| v.map(|id| (k, id)))
+        .collect()
+}
+
+/// Resolve `receiver.method` to the module and IR name that own the method,
+/// when the receiver's class is known.
+fn resolve_infer_method_callee(
+    func: &str,
+    receivers: &HashMap<String, ir::ClassId>,
+    own_funcs: &HashMap<String, HashMap<String, FuncSig>>,
+) -> Option<(String, String)> {
+    let (recv, method) = func.rsplit_once('.')?;
+    let class_id = *receivers.get(recv)?;
+    let ir_name = resolve_method(class_id, method)?;
+    own_funcs
+        .iter()
+        .find(|(_, funcs)| funcs.contains_key(&ir_name))
+        .map(|(module, _)| (module.clone(), ir_name))
+}
+
+/// Whether a call site's argument type fits a parameter's inferred type
+/// without a runtime check. Anything `coerce` accepts statically fits -- the
+/// numeric promotions, an empty literal, a subclass into its base -- except a
+/// dynamic argument, which `coerce` would accept only by checking its tag at
+/// run time and failing where CPython would not.
+fn call_site_arg_fits(arg: ir::Ty, param: ir::Ty) -> bool {
+    if param == ir::Ty::Any || arg == param {
+        return true;
+    }
+    if arg == ir::Ty::Any {
+        return false;
+    }
+    let placeholder = ir::Expr {
+        ty: arg,
+        kind: ir::ExprKind::ConstNone,
+    };
+    coerce(placeholder, param, Span::default(), "a call-site check").is_ok()
+}
+
+/// An unannotated parameter whose body suggested a type, but which some call
+/// site passes a value of another type, becomes dynamic.
+///
+/// Body inference commits to one type from how a parameter is used, and for a
+/// use like `x + x` that is a guess rather than a constraint: `+` works on
+/// ints, floats, strs and lists alike. The call-graph worklist only visits
+/// parameters the body could not type at all, so without this pass a second
+/// call site with a different type was a compile error --
+/// `def show(x): return x + x` called with `2` and with `"ab"`. CPython runs
+/// that program, so the parameter goes through the generic kernel instead.
+///
+/// Annotated parameters are left alone: an annotation is a contract, and a
+/// mismatch against it is a real error. A function every call site agrees on
+/// keeps its typed, unboxed signature. Widening can make a caller's argument
+/// dynamic, so this iterates, capped like the worklist.
+fn widen_bare_params_on_call_site_conflict(
+    modules: &[ModuleInput],
+    own_funcs: &mut HashMap<String, HashMap<String, FuncSig>>,
+    all_orders: &[Vec<&ast::FuncDef>],
+    method_orders: &HashMap<String, Vec<(String, ir::ClassId, &ast::FuncDef)>>,
+    all_imports: &[HashMap<String, ImportBinding>],
+) {
+    // Which parameters were written without an annotation, per function.
+    let mut unannotated: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for (i, m) in modules.iter().enumerate() {
+        for fdef in &all_orders[i] {
+            let names: HashSet<String> = fdef
+                .params
+                .iter()
+                .filter(|p| p.ty.is_none() && p.name != "self" && p.name != "cls")
+                .map(|p| p.name.clone())
+                .collect();
+            if !names.is_empty() {
+                unannotated.insert((m.name.clone(), fdef.name.clone()), names);
+            }
+        }
+        if let Some(methods) = method_orders.get(&m.name) {
+            for (ir_name, _, def) in methods {
+                let names: HashSet<String> = def
+                    .params
+                    .iter()
+                    .filter(|p| p.ty.is_none() && p.name != "self" && p.name != "cls")
+                    .map(|p| p.name.clone())
+                    .collect();
+                if !names.is_empty() {
+                    unannotated.insert((m.name.clone(), ir_name.clone()), names);
+                }
+            }
+        }
+    }
+    if unannotated.is_empty() {
+        return;
+    }
+
+    for _ in 0..PARAM_FIXPOINT_ROUNDS {
+        register_all_infer_funcs(own_funcs, modules, all_imports);
+        let snapshot = own_funcs.clone();
+        let mut conflicts: HashSet<(String, String, String)> = HashSet::new();
+        let module_receivers: Vec<HashMap<String, ir::ClassId>> = modules
+            .iter()
+            .map(|m| constructor_locals(&m.ast.body))
+            .collect();
+        for (i, m) in modules.iter().enumerate() {
+            let imports = &all_imports[i];
+            let mut visit_from = |caller_params: &HashMap<String, ir::Ty>,
+                                  receivers: &HashMap<String, ir::ClassId>,
+                                  stmts: &[ast::Stmt]| {
+                for_each_call_in_stmts(stmts, &mut |func, args| {
+                    let Some((cm, cn)) = resolve_infer_callee(func, &m.name, imports, &snapshot)
+                        .or_else(|| resolve_infer_method_callee(func, receivers, &snapshot))
+                    else {
+                        return;
+                    };
+                    let Some(bare) = unannotated.get(&(cm.clone(), cn.clone())) else {
+                        return;
+                    };
+                    let Some(sig) = snapshot.get(&cm).and_then(|f| f.get(&cn)) else {
+                        return;
+                    };
+                    // A bound method's receiver is not among the call's arguments.
+                    let offset = usize::from(
+                        sig.params
+                            .first()
+                            .is_some_and(|p| p.name == "self" || p.name == "cls"),
+                    );
+                    for (ai, a) in args.iter().enumerate() {
+                        let ast::PosArg::Pos(e) = a else {
+                            continue;
+                        };
+                        let Some(param) = sig.params.get(ai + offset) else {
+                            break;
+                        };
+                        if !bare.contains(&param.name) || sig.pending_bare.contains(&param.name) {
+                            continue;
+                        }
+                        if let Some(t) = try_type_ast_expr(e, caller_params, &HashMap::new())
+                            && t != ir::Ty::None
+                            && !call_site_arg_fits(t, param.ty)
+                        {
+                            conflicts.insert((cm.clone(), cn.clone(), param.name.clone()));
+                        }
+                    }
+                });
+            };
+            visit_from(&HashMap::new(), &module_receivers[i], &m.ast.body);
+            if let Some(funcs) = snapshot.get(&m.name) {
+                for fdef in &all_orders[i] {
+                    if let Some(sig) = funcs.get(&fdef.name) {
+                        let pm: HashMap<String, ir::Ty> = sig
+                            .params
+                            .iter()
+                            .filter(|p| !sig.pending_bare.contains(&p.name))
+                            .map(|p| (p.name.clone(), p.ty))
+                            .collect();
+                        let mut receivers = module_receivers[i].clone();
+                        receivers.extend(constructor_locals(&fdef.body));
+                        visit_from(&pm, &receivers, &fdef.body);
+                    }
+                }
+                // Method bodies are callers too, and `self` names their class.
+                if let Some(methods) = method_orders.get(&m.name) {
+                    for (ir_name, class_id, def) in methods {
+                        if let Some(sig) = funcs.get(ir_name) {
+                            let pm: HashMap<String, ir::Ty> = sig
+                                .params
+                                .iter()
+                                .filter(|p| !sig.pending_bare.contains(&p.name))
+                                .map(|p| (p.name.clone(), p.ty))
+                                .collect();
+                            let mut receivers = module_receivers[i].clone();
+                            receivers.extend(constructor_locals(&def.body));
+                            receivers.insert("self".to_string(), *class_id);
+                            visit_from(&pm, &receivers, &def.body);
+                        }
+                    }
+                }
+            }
+        }
+        let mut changed = false;
+        for (cm, cn, pname) in conflicts {
+            if let Some(p) = own_funcs
+                .get_mut(&cm)
+                .and_then(|f| f.get_mut(&cn))
+                .and_then(|sig| sig.params.iter_mut().find(|p| p.name == pname))
+                && p.ty != ir::Ty::Any
+            {
+                p.ty = ir::Ty::Any;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    register_all_infer_funcs(own_funcs, modules, all_imports);
+}
+
 fn refine_bare_params(
     modules: &[ModuleInput],
     own_funcs: &mut HashMap<String, HashMap<String, FuncSig>>,
@@ -6918,6 +7155,15 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
         &method_orders,
         &all_imports,
     )?;
+    // After the worklist, before return types are inferred: a parameter the
+    // body gave a type to may still receive another type at a call site.
+    widen_bare_params_on_call_site_conflict(
+        modules,
+        &mut own_funcs,
+        &all_orders,
+        &method_orders,
+        &all_imports,
+    );
     for (i, m) in modules.iter().enumerate() {
         if let Some(funcs) = own_funcs.get_mut(&m.name) {
             pre_infer_module_returns(&all_orders[i], funcs);
