@@ -310,26 +310,14 @@ print(bool(empty), bool(0), bool(""))
     );
 }
 
-/// And what it does not, each refused by name rather than mistranslated.
-/// These are the rows of that table that say "needs narrowing first".
+/// A union value without narrowing dispatches on what it holds, as CPython
+/// does: operators, `str()` and methods all go to the generic kernel.
 #[test]
-fn a_union_value_needs_narrowing_for_operators() {
-    let header = "xs = [1, \"a\"]\nv = xs[0]\n";
-    for (tag, expr, want) in [
-        ("eq", "print(v == 1)", "operator '=='"),
-        ("lt", "print(v < 5)", "operator '<'"),
-        ("add", "print(v + 1)", "operator '+'"),
-        ("str", "print(str(v))", "str() cannot convert"),
-        ("method", "print(v.bit_length())", "has no method"),
-    ] {
-        let msg = rejects(tag, &format!("{header}{expr}\n"));
-        assert!(
-            msg.contains(want),
-            "{tag}: expected a diagnostic naming {want}, got: {msg}"
-        );
-        assert!(
-            msg.contains("int | str"),
-            "{tag}: the union should be named: {msg}"
-        );
-    }
+fn a_union_value_works_without_narrowing() {
+    matches_python(
+        "union-ops",
+        "xs = [1, \"a\"]\nv = xs[0]\nw = xs[1]\n\
+         print(v == 1, v < 5, v + 1, str(v), v.bit_length())\n\
+         print(w == 'a', w + 'b', str(w), w.upper())\n",
+    );
 }

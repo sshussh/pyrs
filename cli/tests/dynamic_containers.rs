@@ -78,23 +78,6 @@ fn matches_python(tag: &str, source: &str) {
     }
 }
 
-/// Run under PyRs alone and compare to recorded output. For the cases where
-/// the value has no CPython spelling, or where the message is ours.
-fn outputs(tag: &str, source: &str, want: &str) {
-    let (_dir, src) = write_prog(tag, source);
-    let actual = Command::new(PYRS)
-        .args(["run", "--no-cache", "-i"])
-        .arg(&src)
-        .output()
-        .unwrap();
-    assert!(
-        actual.status.success(),
-        "PyRs {tag} failed:\n{}",
-        String::from_utf8_lossy(&actual.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&actual.stdout), want, "{tag}");
-}
-
 /// `len` reads the count out of the first i64 of every sized object, which is
 /// why `cplen` leads `PyrsStr`. All four shapes, in both encodings.
 #[test]
@@ -220,31 +203,22 @@ for n in b:
     );
 }
 
-/// `.keys()` yields a `list[str]`, so a dict keyed by anything else has to be
-/// refused rather than read an int slot back as a pointer. Iterating the dict
-/// is the spelling that works for those, and the message says so.
+/// `keys`, `values` and `items` on a dynamic dict, whatever its key type.
 #[test]
-fn keys_is_for_str_keyed_dicts_and_says_so() {
+fn dict_views_on_a_dynamic_dict() {
     matches_python(
-        "keys",
+        "views",
         r#"
 d: dict[str, int] = {"x": 7, "y": 8}
 a: object = d
 for k in a.keys():
     print(k, a[k])
-"#,
-    );
-    outputs(
-        "keys_refused",
-        r#"
-counts: dict[int, str] = {1: "one"}
+counts: dict[int, str] = {1: "one", 2: "two"}
 b: object = counts
-try:
-    print(b.keys())
-except TypeError as exc:
-    print("TypeError:", exc)
+print(list(b.keys()), list(b.values()))
+for k, v in b.items():
+    print(k, v)
 "#,
-        "TypeError: .keys() on a dynamic dict needs str keys\n",
     );
 }
 
@@ -282,11 +256,10 @@ print(size(4))
     );
 }
 
-/// Out of range and the wrong shape raise, rather than reading past the end
-/// or reinterpreting a slot.
+/// A bad read on a dynamic value raises CPython's own error.
 #[test]
 fn a_bad_read_raises() {
-    outputs(
+    matches_python(
         "bad_read",
         r#"
 xs: list[int] = [1, 2]
@@ -306,9 +279,11 @@ try:
     print(n[0])
 except TypeError as exc:
     print("TypeError:", exc)
+
+try:
+    print(a["k"])
+except TypeError as exc:
+    print("TypeError:", exc)
 "#,
-        "IndexError: list index out of range\n\
-         TypeError: object of this dynamic type has no len()\n\
-         TypeError: dynamic value is not a list\n",
     );
 }

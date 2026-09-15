@@ -369,14 +369,20 @@ fn shapes_that_cannot_be_a_closure_value_are_named() {
             "def f(a: int, b: int = 1) -> int:\n    return a + b\ng = f\nprint(g(1))\n",
             "default arguments",
         ),
-        (
-            "mismatched-sigs",
-            "def a(x: int) -> int:\n    return x\n\
-             def b(s: str) -> str:\n    return s\nfs = [a, b]\nprint(len(fs))\n",
-            "share one type",
-        ),
     ] {
         let msg = rejects(tag, src);
         assert!(msg.contains(want), "{tag}: expected {want:?}, got: {msg}");
     }
+}
+
+/// Functions of different types share one list as dynamic values, and each
+/// is called with its own types.
+#[test]
+fn functions_of_different_types_share_a_list() {
+    matches_python(
+        "mixed-functions",
+        "def a(x: int) -> int:\n    return x + 1\n\
+         def b(s: str) -> str:\n    return s * 2\nfs = [a, b]\n\
+         print(len(fs), fs[0](3), fs[1]('s'))\n",
+    );
 }

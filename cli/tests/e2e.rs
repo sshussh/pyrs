@@ -394,6 +394,22 @@ fn run_program_timeout(tag: &str, source: &str, timeout: Duration) -> String {
     }
 }
 
+/// Compile-and-run `source` and compare stdout with CPython's.
+fn matches_cpython(tag: &str, source: &str) {
+    let out = run_program(tag, source);
+    let py = Command::new("python3")
+        .arg("-c")
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "{}",
+        String::from_utf8_lossy(&py.stderr)
+    );
+    assert_eq!(out, String::from_utf8_lossy(&py.stdout), "{tag}");
+}
+
 /// Compile-and-run `source`, expecting failure; returns (exit_code, stderr).
 fn run_program_expect_fail(tag: &str, source: &str) -> (i32, String) {
     let dir = TempDir::new(tag);
@@ -8580,21 +8596,23 @@ def f() -> int:
     );
 }
 
+/// A peel does not survive a rebind to None: the operand is still a union, and
+/// `None + 1` raises CPython's TypeError when it runs.
 #[test]
-fn if_rebind_none_fallthrough_rejected() {
-    let (_, stderr) = run_program_expect_fail(
-        "if_rebind",
+fn if_rebind_none_fallthrough_raises_at_run_time() {
+    matches_cpython(
+        "if_rebind_none_fallthrough_raises_at_run_time",
         "\
 def f() -> int:
     x: int | None = 5
     if True:
         x = None
     return x + 1
+try:
+    print(f())
+except TypeError as e:
+    print(e)
 ",
-    );
-    assert!(
-        stderr.contains("operator '+' is not supported for values of type"),
-        "stderr: {stderr}"
     );
 }
 
@@ -8712,29 +8730,30 @@ print(f(0))
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
+/// Body peels must not survive a zero-trip for (while-style restore).
 #[test]
-fn post_for_zero_trip_rebind_rejected() {
-    // Body peels must not survive a zero-trip for (while-style restore).
-    let (_, stderr) = run_program_expect_fail(
-        "post_for",
+fn post_for_zero_trip_rebind_raises_at_run_time() {
+    matches_cpython(
+        "post_for_zero_trip_rebind_raises_at_run_time",
         "\
 def f() -> int:
     x: int | None = None
     for i in range(0):
         x = 5
     return x + 1
+try:
+    print(f())
+except TypeError as e:
+    print(e)
 ",
-    );
-    assert!(
-        stderr.contains("operator '+' is not supported for values of type"),
-        "stderr: {stderr}"
     );
 }
 
+/// A rebind inside a loop over an empty list leaves the union in place.
 #[test]
-fn post_for_empty_list_rebind_rejected() {
-    let (_, stderr) = run_program_expect_fail(
-        "post_for_list",
+fn post_for_empty_list_rebind_raises_at_run_time() {
+    matches_cpython(
+        "post_for_empty_list_rebind_raises_at_run_time",
         "\
 def f() -> int:
     x: int | None = None
@@ -8742,11 +8761,11 @@ def f() -> int:
     for i in xs:
         x = 5
     return x + 1
+try:
+    print(f())
+except TypeError as e:
+    print(e)
 ",
-    );
-    assert!(
-        stderr.contains("operator '+' is not supported for values of type"),
-        "stderr: {stderr}"
     );
 }
 
@@ -9885,11 +9904,11 @@ print(it.send(None))
     assert_eq!(out, "1\nouter caught x\n50\n3\n");
 }
 
-/// Homogeneous lists of closures require matching capture env shapes.
+/// Closures capturing different environments share a list as dynamic values.
 #[test]
-fn mismatched_capture_env_closures_in_list_rejected() {
-    let (_, stderr) = run_program_expect_fail(
-        "cap_mismatch",
+fn closures_with_different_captures_share_a_list() {
+    matches_cpython(
+        "closures_with_different_captures_share_a_list",
         "\
 def outer(n: int, m: str):
     def a(x: int) -> int:
@@ -9897,12 +9916,8 @@ def outer(n: int, m: str):
     def b(x: int) -> int:
         return x + len(m)
     return [a, b]
-print(outer(1, \"hi\")[0](2))
+print(outer(1, \"hi\")[0](2), outer(1, \"hi\")[1](2))
 ",
-    );
-    assert!(
-        stderr.contains("list elements must share one type"),
-        "stderr: {stderr}"
     );
 }
 
@@ -10266,25 +10281,23 @@ print(outer())
     assert_eq!(out, String::from_utf8_lossy(&py.stdout));
 }
 
-/// while+break must not leave a stale Optional peel on fallthrough.
+/// After break, `x` is still Optional: arithmetic dispatches on the value, so a
+/// non-None `x` computes and a None one raises.
 #[test]
 fn while_break_clears_optional_peel() {
-    // After break, `x` is still Optional — arithmetic must not type-check
-    // as bare int (would be unsound if then-peel leaked past break).
-    let (_, stderr) = run_program_expect_fail(
-        "while_brk_peel",
+    matches_cpython(
+        "while_break_clears_optional_peel",
         "\
 def f(x: int | None) -> int:
     while x is not None:
         break
     return x + 1
 print(f(3))
+try:
+    print(f(None))
+except TypeError as e:
+    print(e)
 ",
-    );
-    assert!(
-        stderr.contains("operator '+' is not supported for values of type")
-            && stderr.contains("None"),
-        "stderr: {stderr}"
     );
 }
 

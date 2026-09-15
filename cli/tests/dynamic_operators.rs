@@ -695,22 +695,17 @@ fn sorted_of_a_non_iterable_matches_python() {
     fails_like_python("sorted-bool", "a: object = True\nprint(sorted(a))\n");
 }
 
-/// `key=` on a dynamic value is a gap, not a CPython TypeError.
+/// `key=` on a dynamic value: the key function sees each dynamic element, and
+/// a key that is itself dynamic orders with the comparison kernel, stably.
 #[test]
-fn sorted_key_on_a_dynamic_value_names_the_gap() {
-    let dir = temp_source(
+fn sorted_key_on_a_dynamic_value() {
+    matches_python(
         "sorted-key-dyn",
-        "a: object = [3, 1, 2]\nprint(sorted(a, key=lambda x: x))\n",
+        "a: object = [3, 1, 2]\nprint(sorted(a, key=lambda x: x))\n\
+         b: object = ['bb', 'a', 'ccc', 'dd']\n\
+         print(sorted(b, key=lambda s: len(s)), sorted(b, key=lambda s: len(s), reverse=True))\n\
+         print(sorted(b, key=len))\n",
     );
-    let out = Command::new(PYRS)
-        .args(["run", "-i", "prog.py"])
-        .current_dir(&dir.0)
-        .output()
-        .expect("failed to spawn PyRs");
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not supported yet"), "{stderr}");
-    assert!(stderr.contains("key="), "the gap must name key=: {stderr}");
 }
 
 // ---------------------------------------------------------------------------
