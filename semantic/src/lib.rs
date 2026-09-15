@@ -28607,10 +28607,13 @@ fn lower_is_none(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
                     | ir::Ty::Exception
                     | ir::Ty::Class(_)
             );
+            // A type object is one per class, so identity is the same question
+            // as equality -- and `type(x) is C` is how Python spells an
+            // exact-type check.
             if !ptr_like
                 && !matches!(
                     l.ty,
-                    ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Union(_)
+                    ir::Ty::Int | ir::Ty::Float | ir::Ty::Bool | ir::Ty::Union(_) | ir::Ty::Type
                 )
             {
                 return Err(err(
