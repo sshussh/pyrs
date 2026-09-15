@@ -10082,6 +10082,29 @@ long long pyrs_dyn_iter_at(int t, long long p, long long i, int *out_tag) {
     return dyn_iter_at(t, p, i, out_tag);
 }
 
+/* `format(v, spec)` / `f"{v:spec}"` with a non-empty spec on a dynamic value. */
+PyrsStr *pyrs_dyn_format(int t, long long p, const PyrsStr *spec) {
+    switch (dyn_kind(t)) {
+    case DK_INT:
+        return pyrs_format_int(p, spec);
+    case DK_BOOL:
+        return pyrs_format_bool(p != 0, spec);
+    case DK_FLOAT: {
+        double d;
+        memcpy(&d, &p, sizeof d);
+        return pyrs_format_float(d, spec);
+    }
+    case DK_STR:
+        return pyrs_format_str((const PyrsStr *)(uintptr_t)p, spec);
+    default: {
+        char msg[192];
+        snprintf(msg, sizeof msg, "TypeError: unsupported format string passed to %s.__format__",
+                 dyn_value_type_name(t, p));
+        pyrs_die(msg);
+    }
+    }
+}
+
 /* `list(v)`: a list of the elements a loop over `v` visits, each boxed with
  * its own tag. */
 long long pyrs_dyn_list(int t, long long p, int *out_tag) {
@@ -10160,27 +10183,30 @@ long long pyrs_dyn_minmax(int t, long long p, int is_max, int *out_tag) {
     return best_p;
 }
 
-/* `sorted(items, key=f)` where the keys are dynamic: `keys[i]` is `f(items[i])`,
- * computed by compiled code. A stable merge sort of positions compares only
- * keys, with the comparison kernel's errors; descending is CPython's
- * reverse-sort-reverse, which keeps equal keys in their original order. */
-long long pyrs_dyn_sort_by_keys(int it, long long ip, int kt, long long kp, long long reverse,
-                                int *out_tag) {
-    (void)it;
-    (void)kt;
-    const PyrsList *items = (const PyrsList *)(uintptr_t)ip;
+/* Sort `items` in place by `keys`, where `keys[i]` is `key(items[i])`, computed
+ * by compiled code. A stable merge sort of positions compares only keys, with
+ * the comparison kernel's semantics and errors, in O(n log n). A descending
+ * sort is the caller's reverse-sort-reverse, as CPython's is. */
+void pyrs_dyn_sort_by_keys(int it, long long ip, int kt, long long kp) {
+    PyrsList *items = (PyrsList *)(uintptr_t)ip;
     const PyrsList *keys = (const PyrsList *)(uintptr_t)kp;
+    (void)it;
+    int ktag = any_elem_tag(kt);
     long long n = items->len;
-    /* Collector-owned scratch, so a comparison that raises leaks nothing. */
-    PyrsList *idx_owner = pyrs_list_new(n > 0 ? n : 1);
-    PyrsList *tmp_owner = pyrs_list_new(n > 0 ? n : 1);
-    /* Volatile, so the owners stay in a stack slot the collector scans while
-     * only their data pointers are in use. */
-    PyrsList *volatile keep_alive[2] = {idx_owner, tmp_owner};
+    if (n < 2) {
+        return;
+    }
+    /* Collector-owned scratch, so a comparison that raises leaks nothing;
+     * volatile, so the owners stay in a scanned stack slot while only their
+     * data pointers are in use. */
+    PyrsList *idx_owner = pyrs_list_new(n);
+    PyrsList *tmp_owner = pyrs_list_new(n);
+    PyrsList *copy_owner = pyrs_list_new(n);
+    PyrsList *volatile keep_alive[3] = {idx_owner, tmp_owner, copy_owner};
     long long *idx = idx_owner->data;
     long long *tmp = tmp_owner->data;
     for (long long i = 0; i < n; i++) {
-        idx[i] = reverse ? n - 1 - i : i;
+        idx[i] = i;
     }
     for (long long width = 1; width < n; width *= 2) {
         for (long long lo = 0; lo < n; lo += 2 * width) {
@@ -10189,8 +10215,8 @@ long long pyrs_dyn_sort_by_keys(int it, long long ip, int kt, long long kp, long
             long long a = lo, b = mid, o = lo;
             while (a < mid && b < hi) {
                 int at = 0, bt = 0;
-                long long ap = dyn_slot_pair(keys->data[idx[a]], TAG_UNION, &at);
-                long long bp = dyn_slot_pair(keys->data[idx[b]], TAG_UNION, &bt);
+                long long ap = dyn_slot_pair(keys->data[idx[a]], ktag, &at);
+                long long bp = dyn_slot_pair(keys->data[idx[b]], ktag, &bt);
                 /* Take the right run only on a strict `<`: stability. */
                 if (pyrs_dyn_compare(bt, bp, at, ap, PYRS_DYN_LT)) {
                     tmp[o++] = idx[b++];
@@ -10209,13 +10235,12 @@ long long pyrs_dyn_sort_by_keys(int it, long long ip, int kt, long long kp, long
         idx = tmp;
         tmp = swap;
     }
-    PyrsList *out = pyrs_list_new(n > 0 ? n : 1);
+    long long *copy = copy_owner->data;
+    memcpy(copy, items->data, (size_t)n * sizeof(long long));
     for (long long j = 0; j < n; j++) {
-        long long k = reverse ? n - 1 - j : j;
-        pyrs_list_push(out, items->data[idx[k]]);
+        items->data[j] = copy[idx[j]];
     }
     (void)keep_alive;
-    return dyn_result(out_tag, 4 + 8 * TAG_UNION, (long long)(uintptr_t)out);
 }
 
 /* `v.keys()` where `v` is a dynamic dict with str keys, in insertion order. */
