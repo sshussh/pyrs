@@ -258,8 +258,10 @@ fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
         opt_level,
         &target_cpu,
         false,
-        !cmd.no_cache,
-        cache_root.as_deref(),
+        CacheUse {
+            enabled: !cmd.no_cache,
+            root: cache_root.as_deref(),
+        },
         &codegen::EmitOptions::default(),
     )
     .and_then(|()| {
@@ -475,8 +477,10 @@ fn profile_command(mut cmd: cli::ProfileCommand) -> Result<i32, String> {
         opt_level,
         &target_cpu,
         false,
-        false,
-        None,
+        CacheUse {
+            enabled: false,
+            root: None,
+        },
         &emit,
     )?;
 
@@ -563,7 +567,16 @@ fn compile(
         ..Default::default()
     };
     compile_module(
-        &module, output, opt_level, target_cpu, emit_llvm, use_cache, cache_root, &emit,
+        &module,
+        output,
+        opt_level,
+        target_cpu,
+        emit_llvm,
+        CacheUse {
+            enabled: use_cache,
+            root: cache_root,
+        },
+        &emit,
     )?;
 
     if let Some(key) = &key {
@@ -632,14 +645,22 @@ fn resolve_target_cpu(
     }
 }
 
+/// Whether a build may use the runtime-object cache, and where it lives. The
+/// two always travel together: a root without permission is not consulted,
+/// and permission without a root has nowhere to look.
+#[derive(Clone, Copy)]
+struct CacheUse<'a> {
+    enabled: bool,
+    root: Option<&'a Path>,
+}
+
 fn compile_module(
     module: &ir::Module,
     output: &Path,
     opt_level: u8,
     target_cpu: &str,
     emit_llvm: bool,
-    use_cache: bool,
-    cache_root: Option<&Path>,
+    cache: CacheUse<'_>,
     emit: &codegen::EmitOptions,
 ) -> Result<(), String> {
     let llvm_ir = codegen::emit_llvm_ir_opts(module, emit);
@@ -680,7 +701,8 @@ fn compile_module(
         // and breaks GC-stat parsing plus `make examples` (which diffs 2>&1).
         let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
 
-        let runtime_build = cache::runtime_objects(&cc, &workdir, &workdir, cache_root, use_cache)?;
+        let runtime_build =
+            cache::runtime_objects(&cc, &workdir, &workdir, cache.root, cache.enabled)?;
         let mut link = process::Command::new(&cc);
         link.arg(&object);
         match &runtime_build {
@@ -1020,8 +1042,10 @@ fn run_tests(cmd: cli::TestCommand) -> Result<i32, String> {
         opt_level,
         &target_cpu,
         false,
-        !cmd.no_cache,
-        cache_root.as_deref(),
+        CacheUse {
+            enabled: !cmd.no_cache,
+            root: cache_root.as_deref(),
+        },
         &codegen::EmitOptions::default(),
     )?;
 

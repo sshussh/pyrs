@@ -657,7 +657,7 @@ pub fn maintain(root: Option<&Path>, added: u64) {
     let _ = fs::write(root.join("last-gc"), b"");
     let _ = fs::write(&pending, "0");
     prune(
-        &root,
+        root,
         &["programs", "runtime"],
         &PruneOptions {
             max_size: Some(limit),
