@@ -4402,24 +4402,12 @@ fn decide_param_from_observed(
     decide_from_observed_set(&observed_param_types_from_body(name, body, params, bare))
 }
 
-/// Ground-truth parameter types for builtins and the supported stdlib.
-/// Lookup is by the name a call site writes (`open`) or a qualified
-/// `module.func` (`math.sqrt`). `Any` is omitted: it is not a seed.
-fn typeshed_params(qual: &str) -> Option<&'static [ir::Ty]> {
-    Some(match qual {
-        "open" => &[ir::Ty::Str],
-        "ord" => &[ir::Ty::Str],
-        "chr" | "hex" | "bin" | "oct" => &[ir::Ty::Int],
-        "range" => &[ir::Ty::Int],
-        "abs" => &[ir::Ty::Int],
-        "math.sqrt" | "math.sin" | "math.cos" | "math.tan" | "math.log" | "math.log10"
-        | "math.exp" | "math.fabs" | "math.floor" | "math.ceil" => &[ir::Ty::Float],
-        "os.path.dirname" | "os.path.basename" | "os.path.exists" | "os.path.isfile"
-        | "os.path.isdir" | "os.path.join" => &[ir::Ty::Str],
-        "json.loads" => &[ir::Ty::Str],
-        _ => return None,
-    })
-}
+// Ground-truth parameter types for builtins and the supported stdlib, generated
+// from typeshed by scripts/gen_typeshed_seeds.py. Each annotation is narrowed to
+// what PyRs can represent, and a parameter is left unseeded -- rather than
+// guessed -- where that does not come down to exactly one type: `abs` takes a
+// protocol, so it seeds nothing.
+include!("typeshed_seeds.rs");
 
 fn callee_param_types(func: &str) -> Vec<ir::Ty> {
     if let Some(sig) = infer_func_lookup(func)
@@ -35011,6 +34999,20 @@ print(f)
         );
         let f = find_func(&m, "f");
         assert_eq!(f.params[0].1, ir::Ty::Str);
+    }
+
+    #[test]
+    fn typeshed_leaves_a_protocol_parameter_unseeded() {
+        // `abs(x: SupportsAbs[_T])` and `math.floor(x: _SupportsFloor[_T])` take
+        // open protocols, so neither may seed a single type. A hand-written
+        // table once seeded `abs` as int, which a float argument then broke.
+        assert!(typeshed_params("abs").is_none());
+        assert!(typeshed_params("math.floor").is_none());
+        // A union that narrows to one PyRs type does seed: `str | bytes`.
+        assert_eq!(typeshed_params("ord"), Some(&[ir::Ty::Str][..]));
+        // `open`'s `int | str | PathLike` seeds str, because PyRs refuses a
+        // file descriptor.
+        assert_eq!(typeshed_params("open").map(|p| p[0]), Some(ir::Ty::Str));
     }
 
     #[test]
