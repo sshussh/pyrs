@@ -418,31 +418,55 @@ fn printf_formatting_errors_match_python() {
     fails_like_python("pct-leftover", "a: object = \"hello\"\nprint(a % 1)\n");
 }
 
-/// Mapping keys and `*` width are accepted by CPython; naming the gap
-/// avoids reporting a TypeError it would not raise.
+/// Mapping keys, `*` width and precision, `%c` and `%a`: the forms that used
+/// to name themselves as unimplemented.
 #[test]
-fn printf_mapping_and_star_width_name_the_gap() {
+fn printf_mapping_star_char_and_ascii_match_cpython() {
+    matches_python(
+        "pct-extended",
+        concat!(
+            "m: object = \"%(k)s-%(j)d|%(k)5s\"\n",
+            "print(m % {\"k\": \"a\", \"j\": 2})\n",
+            "n: object = \"%((k))s\"\n",
+            "print(n % {\"(k)\": 9})\n",
+            "w: object = \"%*d|%-*d|%*d|%.*f|%*.*f|\"\n",
+            "print(w % (5, 42, 5, 42, -5, 42, 2, 3.14159, 8, 2, 3.14159))\n",
+            "c: object = \"%c%c%3c|%-3c|%c\"\n",
+            "print(repr(c % (65, \"z\", 66, \"\u{e9}\", 233)))\n",
+            "a: object = \"%a %a %a %10a| %.3a\"\n",
+            "print(a % (\"h\u{e9}llo\", 5, [1, \"\u{e9}\"], \"x\", \"h\u{e9}llo\"))\n",
+        ),
+    );
+}
+
+#[test]
+fn printf_mapping_star_and_char_errors_match_cpython() {
     for (tag, src) in [
-        ("pct-map", "a: object = \"%(k)s\"\nprint(a % {\"k\": 1})\n"),
-        ("pct-star", "a: object = \"%*d\"\nprint(a % (5, 3))\n"),
-        ("pct-c", "a: object = \"%c\"\nprint(a % 65)\n"),
+        (
+            "pct-map-positional",
+            "a: object = \"%(k)s %s\"\nprint(a % {\"k\": 1})\n",
+        ),
+        (
+            "pct-map-missing",
+            "a: object = \"%(z)s\"\nprint(a % {\"k\": 1})\n",
+        ),
+        ("pct-map-int", "a: object = \"%(k)s\"\nprint(a % 5)\n"),
+        ("pct-map-tuple", "a: object = \"%(k)s\"\nprint(a % (1,))\n"),
+        ("pct-map-list", "a: object = \"%(k)s\"\nprint(a % [1])\n"),
+        (
+            "pct-map-incomplete",
+            "a: object = \"%(k\"\nprint(a % {\"k\": 1})\n",
+        ),
+        (
+            "pct-star-str",
+            "a: object = \"%*d\"\nprint(a % (\"a\", 42))\n",
+        ),
+        ("pct-star-short", "a: object = \"%*d\"\nprint(a % (5,))\n"),
+        ("pct-c-long", "a: object = \"%c\"\nprint(a % \"ab\")\n"),
+        ("pct-c-float", "a: object = \"%c\"\nprint(a % 2.5)\n"),
+        ("pct-c-range", "a: object = \"%c\"\nprint(a % 1114112)\n"),
     ] {
-        let dir = temp_source(tag, src);
-        let out = Command::new(PYRS)
-            .args(["run", "-i", "prog.py"])
-            .current_dir(&dir.0)
-            .output()
-            .expect("failed to spawn PyRs");
-        assert!(!out.status.success(), "{tag} succeeded");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("not supported yet"),
-            "{tag}: gap must name itself: {stderr}"
-        );
-        assert!(
-            !stderr.contains("unsupported operand type(s)"),
-            "{tag}: must not claim a TypeError CPython does not raise: {stderr}"
-        );
+        fails_like_python(tag, src);
     }
 }
 
