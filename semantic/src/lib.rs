@@ -662,6 +662,12 @@ enum Evidence {
     /// A literal that fits several types: `[]`, `{}` or `None`, whose type
     /// is whatever the parameter turns out to be.
     Flexible(ir::Ty),
+    /// A dynamic value passed from inside the function with this interned
+    /// id. It counts only if that function can run: code nothing calls cannot
+    /// pass anything, and a dynamic argument there -- often a parameter of
+    /// that dead function, dynamic for want of callers -- would otherwise
+    /// widen a live function it calls.
+    DynamicFrom(u32),
 }
 
 /// Call-site-driven inference, run as rounds of the real lowering.
@@ -685,7 +691,7 @@ struct InferRounds {
     /// Functions whose value escapes (`f` passed or stored rather than
     /// called): some of their call sites are not visible as calls, so their
     /// evidence is incomplete.
-    escaped: HashSet<ParamKey>,
+    escaped: HashMap<ParamKey, i32>,
     /// Each method's user parameters, so an override and the method it
     /// overrides decide one type per position: virtual dispatch passes the
     /// same arguments to both.
@@ -701,6 +707,91 @@ struct InferRounds {
     /// dynamic value, so only these get an arm in a dynamic dispatch. `None`
     /// (a program that needed no rounds) means every class.
     boxed_known: Option<HashSet<ir::ClassId>>,
+    /// Functions by IR name, interned for the call graph below.
+    fn_ids: HashMap<String, u32>,
+    /// The functions being lowered, innermost last.
+    callers: Vec<u32>,
+    /// Call edges seen while lowering: (caller, callee).
+    edges: HashSet<(u32, u32)>,
+    /// Functions that run without a visible call: module bodies, dunders the
+    /// runtime calls, and any function whose value escapes.
+    roots: HashSet<u32>,
+    /// A library: every function may be called from outside.
+    all_roots: bool,
+}
+
+impl InferRounds {
+    fn fn_id(&mut self, name: &str) -> u32 {
+        let next = self.fn_ids.len() as u32;
+        *self.fn_ids.entry(name.to_string()).or_insert(next)
+    }
+
+    /// The functions that can run, from the roots along the call edges.
+    fn reachable(&self) -> Option<HashSet<u32>> {
+        if self.all_roots {
+            return None;
+        }
+        let mut seen: HashSet<u32> = self.roots.clone();
+        let mut work: Vec<u32> = seen.iter().copied().collect();
+        while let Some(f) = work.pop() {
+            for (a, b) in &self.edges {
+                if *a == f && seen.insert(*b) {
+                    work.push(*b);
+                }
+            }
+        }
+        Some(seen)
+    }
+}
+
+/// Marks a function as being lowered for as long as it lives.
+struct LoweringFunction;
+
+impl LoweringFunction {
+    fn enter(ir_name: &str, root: bool) -> Self {
+        INFER_ROUNDS.with(|r| {
+            let mut r = r.borrow_mut();
+            let id = r.fn_id(ir_name);
+            if root {
+                r.roots.insert(id);
+            }
+            r.callers.push(id);
+        });
+        LoweringFunction
+    }
+}
+
+impl Drop for LoweringFunction {
+    fn drop(&mut self) {
+        INFER_ROUNDS.with(|r| {
+            r.borrow_mut().callers.pop();
+        });
+    }
+}
+
+/// The function being lowered calls (or may dispatch to) `callee`.
+fn record_call_edge(callee: &str) {
+    INFER_ROUNDS.with(|r| {
+        let mut r = r.borrow_mut();
+        let to = r.fn_id(callee);
+        match r.callers.last().copied() {
+            Some(from) => {
+                r.edges.insert((from, to));
+            }
+            None => {
+                r.roots.insert(to);
+            }
+        }
+    });
+}
+
+/// A function that runs with no call the lowering sees.
+fn record_root(ir_name: &str) {
+    INFER_ROUNDS.with(|r| {
+        let mut r = r.borrow_mut();
+        let id = r.fn_id(ir_name);
+        r.roots.insert(id);
+    });
 }
 
 thread_local! {
@@ -720,7 +811,14 @@ fn rounds_seed(key: ParamKey) -> Option<ir::Ty> {
 }
 
 fn record_call_evidence(key: ParamKey, ev: Evidence) {
-    INFER_ROUNDS.with(|r| r.borrow_mut().evidence.entry(key).or_default().push(ev));
+    INFER_ROUNDS.with(|r| {
+        let mut r = r.borrow_mut();
+        let ev = match (ev, r.callers.last()) {
+            (Evidence::Value(ir::Ty::Any), Some(caller)) => Evidence::DynamicFrom(*caller),
+            _ => ev,
+        };
+        r.evidence.entry(key).or_default().push(ev);
+    });
 }
 
 fn record_method_params(class_id: ir::ClassId, method: &str, user_params: &[ParamSig]) {
@@ -787,12 +885,30 @@ fn dynamic_class_candidates() -> Vec<ir::ClassId> {
     })
 }
 
-fn record_escape(params: &[ParamSig]) {
+fn record_escape(params: &[ParamSig], ir_name: &str) {
+    record_root(ir_name);
     INFER_ROUNDS.with(|r| {
         let mut r = r.borrow_mut();
         for p in params {
             if let Some(k) = p.key {
-                r.escaped.insert(k);
+                *r.escaped.entry(k).or_default() += 1;
+            }
+        }
+    });
+}
+
+/// A function value that was about to be counted as escaping is instead used
+/// where its arguments are known -- a `key=` callable receives the elements --
+/// so those are recorded as its call sites and the escape is withdrawn.
+fn record_callback_call(params: &[ParamSig], args: &[ir::Ty], made_closure: bool) {
+    INFER_ROUNDS.with(|r| {
+        let mut r = r.borrow_mut();
+        for (p, t) in params.iter().zip(args) {
+            if let Some(k) = p.key {
+                r.evidence.entry(k).or_default().push(Evidence::Value(*t));
+                if made_closure {
+                    *r.escaped.entry(k).or_default() -= 1;
+                }
             }
         }
     });
@@ -824,11 +940,22 @@ fn evidence_of(arg: &ast::Expr, lowered: &ir::Expr) -> Evidence {
 /// recursive `f(n - 1)` whose `n` was dynamic in the first round -- and
 /// counting it would make that first guess permanent. The final round checks
 /// without it, so a genuinely dynamic argument still widens the parameter.
-fn decide_from_evidence(evidence: &[Evidence], optimistic: bool) -> Option<ir::Ty> {
+fn decide_from_evidence(
+    evidence: &[Evidence],
+    optimistic: bool,
+    reachable: Option<&HashSet<u32>>,
+) -> Option<ir::Ty> {
     let mut values: Vec<ir::Ty> = Vec::new();
     let mut flexible: Vec<ir::Ty> = Vec::new();
     for e in evidence {
-        match *e {
+        let e = match *e {
+            Evidence::DynamicFrom(caller) if reachable.is_none_or(|r| r.contains(&caller)) => {
+                Evidence::Value(ir::Ty::Any)
+            }
+            Evidence::DynamicFrom(_) => continue,
+            other => other,
+        };
+        match e {
             Evidence::Value(ir::Ty::Any) if optimistic => {}
             Evidence::Value(t) if !values.contains(&t) => values.push(t),
             Evidence::Flexible(t) if !flexible.contains(&t) => flexible.push(t),
@@ -1646,7 +1773,7 @@ fn make_closure_expr(info: &NestedFnInfo, span: Span, ctx: &mut FnCtx) -> SResul
         })
         .collect();
     let ty = ir::closure_of_full(&params, info.sig.ret, &capture_tys, &info.ir_name);
-    record_escape(&info.sig.params);
+    record_escape(&info.sig.params, &info.ir_name);
     Ok(ir::Expr {
         ty,
         kind: ir::ExprKind::MakeClosure {
@@ -3067,6 +3194,7 @@ fn lower_method_patch(
                     )));
                 }
             }
+            record_root(&ctx.own_func(fname));
             ir::Expr {
                 ty: slot_ty,
                 kind: ir::ExprKind::MakeClosure {
@@ -4136,6 +4264,12 @@ fn finalize_class_layouts(
                     && ty != ir::Ty::None
                 {
                     param_tys.insert(p.name.clone(), ty);
+                } else if p.ty.is_none() {
+                    // Not typed yet, and perhaps never: nothing may construct
+                    // the class. A field stored from it still exists, and a
+                    // dynamic field holds whatever the parameter turns out to
+                    // be; a later round narrows it from the call sites.
+                    param_tys.insert(p.name.clone(), ir::Ty::Any);
                 }
             }
             // Known returns for self.m() / make() field RHS.
@@ -7770,6 +7904,7 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
                 seeds,
                 boxed_known,
                 closures_known: closures_known.borrow().clone(),
+                all_roots: !executable,
                 ..InferRounds::default()
             }
         });
@@ -7804,20 +7939,29 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
             let r = r.borrow();
             let groups = override_groups(&r.method_params);
             let mut pooled: HashMap<ParamKey, Vec<Evidence>> = HashMap::new();
-            let mut escaped = r.escaped.clone();
+            let escaped_here = |k: &ParamKey| r.escaped.get(k).is_some_and(|n| *n > 0);
+            let mut escaped: HashSet<ParamKey> = r
+                .escaped
+                .keys()
+                .filter(|k| escaped_here(k))
+                .copied()
+                .collect();
             for (k, ev) in &r.evidence {
                 let group = groups.get(k).map_or_else(|| vec![*k], |g| g.clone());
-                if group.iter().any(|g| r.escaped.contains(g)) {
+                if group.iter().any(escaped_here) {
                     escaped.extend(group.iter().copied());
                 }
                 for g in group {
                     pooled.entry(g).or_default().extend(ev.iter().copied());
                 }
             }
+            let reachable = r.reachable();
             pooled
                 .iter()
                 .filter(|(k, _)| !escaped.contains(k))
-                .filter_map(|(k, ev)| decide_from_evidence(ev, optimistic).map(|t| (*k, t)))
+                .filter_map(|(k, ev)| {
+                    decide_from_evidence(ev, optimistic, reachable.as_ref()).map(|t| (*k, t))
+                })
                 .collect::<HashMap<_, _>>()
         })
     };
@@ -8118,6 +8262,10 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
             for (ir_name, class_id, def) in methods {
                 let mut method_def = (*def).clone();
                 let patch = method_patch(*class_id, &def.name);
+                if let Some(p) = &patch {
+                    // Bound to the slot at start-up, whatever calls the method.
+                    record_root(&p.orig);
+                }
                 method_def.name = match &patch {
                     Some(p) => p.orig.clone(),
                     None => ir_name.clone(),
@@ -8447,7 +8595,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                     format!("{}.{}", m.name, fname)
                 };
                 let clos_ty = ir::closure_of_full(&params, sig.ret, &[], &ir_name);
-                record_escape(&sig.params);
+                record_escape(&sig.params, &ir_name);
                 let clos_tmp = format!(".deco.clos.{fname}");
                 deco_locals.push((clos_tmp.clone(), clos_ty));
                 deco_stmts.push(ir::Stmt::Assign {
@@ -9094,6 +9242,17 @@ fn lower_function_inner(
     // Detect generator functions (contain yield / yield from).
     let is_gen = stmts_have_yield(&f.body);
     let short_name = f.name.rsplit('.').next().unwrap_or(&f.name);
+    // For the call graph: module bodies and dunders run without a call the
+    // lowering sees; everything else is reached through calls.
+    let ir_name_for_graph = if f.name == ENTRY_NAME || f.name.contains('.') {
+        f.name.clone()
+    } else {
+        ctx.own_func(&f.name)
+    };
+    let _lowering = LoweringFunction::enter(
+        &ir_name_for_graph,
+        is_entry || (short_name.starts_with("__") && short_name.ends_with("__")),
+    );
     if f.ret.is_none() && short_name != "__init__" {
         if is_gen {
             ctx.yield_key = result_key(f.span, Slot::Yield);
@@ -19396,6 +19555,7 @@ fn lower_instance_method_call_kw(
     let mut unique_funcs: HashSet<String> = HashSet::new();
     for sid in &subs {
         if let Some(func) = resolve_method(*sid, method) {
+            record_call_edge(&func);
             unique_funcs.insert(func.clone());
             candidates.push((*sid, func));
         }
@@ -19909,7 +20069,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 let ty = ir::closure_of_full(&params, sig.ret, &[], &ir_name);
                 // Called through the closure, its arguments are not seen as
                 // calls to `name`, so call sites cannot decide its types.
-                record_escape(&sig.params);
+                record_escape(&sig.params, &ir_name);
                 Ok(ir::Expr {
                     ty,
                     kind: ir::ExprKind::MakeClosure {
@@ -20342,11 +20502,12 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     })?;
                     let user_params: Vec<ir::Ty> =
                         sig.params.iter().skip(1).map(|p| p.ty).collect();
-                    record_escape(&sig.params);
+                    record_escape(&sig.params, &direct);
                     let mut candidates: Vec<(ir::ClassId, String)> = Vec::new();
                     let mut unique: HashSet<String> = HashSet::new();
                     for sid in subclasses_of(id) {
                         if let Some(func) = resolve_method(sid, attr) {
+                            record_root(&func);
                             unique.insert(func.clone());
                             candidates.push((sid, func));
                         }
@@ -23543,6 +23704,7 @@ fn record_constructor_evidence(
     ctx: &FnCtx,
 ) {
     for init in inits {
+        record_call_edge(init);
         let Some(sig) = ctx
             .mctx
             .funcs
@@ -23626,6 +23788,7 @@ fn lower_call_with_sig(
     ctx: &mut FnCtx,
     extra_leading: &[ir::Expr],
 ) -> SResult<ir::Expr> {
+    record_call_edge(&ir_name);
     // Generator function call → MakeGenerator (resume body is `ir_name`).
     // Leading captures (cells/values) become the first frame locals.
     if sig.is_generator {
@@ -26842,9 +27005,13 @@ fn resolve_sort_key(
     {
         if let Some(info) = ctx.nested_funcs.get(name).cloned() {
             let clos = make_closure_expr(&info, key_ast.span, ctx)?;
+            record_callback_call(&info.sig.params, &[elem_ty], true);
+            record_call_edge(&info.ir_name);
             return validate_sort_key_closure(clos, elem_ty, key_ast.span);
         }
         if let Some(sig) = ctx.funcs().get(name).cloned() {
+            record_callback_call(&sig.params, &[elem_ty], false);
+            record_call_edge(&ctx.own_func(name));
             return validate_sort_key_direct(ctx.own_func(name), &sig, elem_ty, key_ast.span);
         }
         // Imported free function: use Direct Call with foreign IR name.
@@ -27027,8 +27194,9 @@ fn validate_sort_key_direct(
     ensure_key_arg_types(elem_ty, param_ty, span)?;
     let ret = sig.ret;
     // Tuples of orderables sort lexicographically, which is what makes the
-    // multi-key idiom `key=lambda p: (-p[1], p[0])` work.
-    if !is_orderable_ty(ret) {
+    // multi-key idiom `key=lambda p: (-p[1], p[0])` work. A dynamic key
+    // orders with the comparison kernel.
+    if !is_orderable_ty(ret) && ret != ir::Ty::Any {
         return Err(err(
             format!(
                 "key= return type must be sortable (int|float|bool|str, or a \
@@ -27066,7 +27234,7 @@ fn validate_sort_key_closure(
     }
     ensure_key_arg_types(elem_ty, params[0], span)?;
     let key_ty = *ret;
-    if !is_orderable_ty(key_ty) {
+    if !is_orderable_ty(key_ty) && key_ty != ir::Ty::Any {
         return Err(err(
             format!(
                 "key= return type must be sortable (int|float|bool|str, or a \
@@ -27307,132 +27475,6 @@ fn lower_sorted_expr(
             ));
         }
     };
-    // Dynamic elements and a key that returns a dynamic value: sort by the
-    // keys with the comparison kernel.
-    if elem == ir::Ty::Any
-        && let Some(key_ast) = sk.key
-        && let ast::ExprKind::Lambda { params, body } = &key_ast.kind
-    {
-        let key_val = lower_lambda_typed(params, body, &[ir::Ty::Any], key_ast.span, ctx)?;
-        if let ir::Ty::Closure {
-            params: kp,
-            ret,
-            capture_tys,
-            func,
-        } = key_val.ty
-            && kp.len() == 1
-            && !is_orderable_ty(*ret)
-        {
-            let (rev_mode, rev_bind) = resolve_reverse_flag(sk.reverse, ctx)?;
-            let reverse = match rev_mode {
-                ReverseMode::Never => const_bool(false),
-                ReverseMode::Always => const_bool(true),
-                ReverseMode::Cond(e) => e,
-            };
-            let list_ty = arg.ty;
-            let items = ctx.fresh_temp("dsort.items", list_ty);
-            let keyf = ctx.fresh_temp("dsort.key", key_val.ty);
-            let n = ctx.fresh_temp("dsort.n", ir::Ty::Int);
-            let keys = ctx.fresh_temp("dsort.keys", list_ty);
-            let i = ctx.fresh_temp("dsort.i", ir::Ty::Int);
-            let load = |name: &String, ty| local_expr(name.clone(), ty);
-            let key_call = ir::Expr {
-                ty: *ret,
-                kind: ir::ExprKind::CallClosure {
-                    closure: Box::new(load(&keyf, key_val.ty)),
-                    args: vec![coerce(
-                        ir::Expr {
-                            ty: ir::Ty::Any,
-                            kind: ir::ExprKind::Index {
-                                base: Box::new(load(&items, list_ty)),
-                                index: Box::new(load(&i, ir::Ty::Int)),
-                            },
-                        },
-                        kp[0],
-                        span,
-                        "a key= argument",
-                    )?],
-                    capture_tys: capture_tys.to_vec(),
-                    func: func.to_string(),
-                },
-            };
-            let mut stmts = rev_bind;
-            stmts.push(ir::Stmt::Assign {
-                name: items.clone(),
-                value: arg,
-            });
-            stmts.push(ir::Stmt::Assign {
-                name: keyf.clone(),
-                value: key_val,
-            });
-            stmts.push(ir::Stmt::Assign {
-                name: n.clone(),
-                value: ir::Expr {
-                    ty: ir::Ty::Int,
-                    kind: ir::ExprKind::Len(Box::new(load(&items, list_ty))),
-                },
-            });
-            stmts.push(ir::Stmt::Assign {
-                name: keys.clone(),
-                value: ir::Expr {
-                    ty: list_ty,
-                    kind: ir::ExprKind::ListNew {
-                        cap: Box::new(load(&n, ir::Ty::Int)),
-                    },
-                },
-            });
-            stmts.push(ir::Stmt::Assign {
-                name: i.clone(),
-                value: int_const(0),
-            });
-            stmts.push(ir::Stmt::While {
-                cond: ir::Expr {
-                    ty: ir::Ty::Bool,
-                    kind: ir::ExprKind::Binary {
-                        op: ir::BinOp::Lt,
-                        left: Box::new(load(&i, ir::Ty::Int)),
-                        right: Box::new(load(&n, ir::Ty::Int)),
-                    },
-                },
-                body: vec![ir::Stmt::ListAppend {
-                    list: load(&keys, list_ty),
-                    value: coerce(key_call, ir::Ty::Any, span, "a key= result")?,
-                }],
-                step: vec![ir::Stmt::Assign {
-                    name: i.clone(),
-                    value: ir::Expr {
-                        ty: ir::Ty::Int,
-                        kind: ir::ExprKind::Binary {
-                            op: ir::BinOp::Add,
-                            left: Box::new(load(&i, ir::Ty::Int)),
-                            right: Box::new(int_const(1)),
-                        },
-                    },
-                }],
-            });
-            let sorted = dyn_kernel(
-                "pyrs_dyn_sort_by_keys",
-                vec![
-                    coerce(load(&items, list_ty), ir::Ty::Any, span, "sorted()")?,
-                    coerce(load(&keys, list_ty), ir::Ty::Any, span, "sorted()")?,
-                    lower_cast(ast::TypeName::Int, reverse, span)?,
-                ],
-                ir::Ty::Any,
-            );
-            return Ok(ir::Expr {
-                ty: list_ty,
-                kind: ir::ExprKind::Block {
-                    stmts,
-                    result: Box::new(ir::Expr {
-                        ty: list_ty,
-                        kind: ir::ExprKind::FromUnion {
-                            value: Box::new(sorted),
-                        },
-                    }),
-                },
-            });
-        }
-    }
     let list_ty = arg.ty;
     let (rev_mode, mut rev_bind) = resolve_reverse_flag(sk.reverse, ctx)?;
 
@@ -27485,14 +27527,10 @@ fn lower_list_sort_key_stmts(
     let keys_t = ctx.fresh_temp("ksort.keys", keys_ty);
     let n_t = ctx.fresh_temp("ksort.n", ir::Ty::Int);
     let i_t = ctx.fresh_temp("ksort.i", ir::Ty::Int);
-    let j_t = ctx.fresh_temp("ksort.j", ir::Ty::Int);
-    let cur_t = ctx.fresh_temp("ksort.cur", elem);
-    let cur_k_t = ctx.fresh_temp("ksort.curk", key_ty);
 
     let keys = local_expr(keys_t.clone(), keys_ty);
     let n = local_expr(n_t.clone(), ir::Ty::Int);
     let i = local_expr(i_t.clone(), ir::Ty::Int);
-    let j = local_expr(j_t.clone(), ir::Ty::Int);
 
     let mut stmts = Vec::new();
     stmts.append(&mut key_bind);
@@ -27557,120 +27595,17 @@ fn lower_list_sort_key_stmts(
         step: vec![],
     });
 
-    // Insertion sort (stable): i from 1..n
-    stmts.push(ir::Stmt::Assign {
-        name: i_t.clone(),
-        value: int_const(1),
-    });
-    let sort_cond = key_cmp(ir::BinOp::Lt, i.clone(), n.clone());
-    let cur_load = ir::Expr {
-        ty: elem,
-        kind: ir::ExprKind::Index {
-            base: Box::new(list.clone()),
-            index: Box::new(i.clone()),
-        },
-    };
-    let cur_key_load = ir::Expr {
-        ty: key_ty,
-        kind: ir::ExprKind::Index {
-            base: Box::new(keys.clone()),
-            index: Box::new(i.clone()),
-        },
-    };
-    // inner: while j > 0 and keys[j-1] > cur_key
-    let j_gt0 = key_cmp(ir::BinOp::Gt, j.clone(), int_const(0));
-    let j_m1 = ir::Expr {
-        ty: ir::Ty::Int,
-        kind: ir::ExprKind::Binary {
-            op: ir::BinOp::Sub,
-            left: Box::new(j.clone()),
-            right: Box::new(int_const(1)),
-        },
-    };
-    let keys_jm1 = ir::Expr {
-        ty: key_ty,
-        kind: ir::ExprKind::Index {
-            base: Box::new(keys.clone()),
-            index: Box::new(j_m1.clone()),
-        },
-    };
-    let key_gt = key_value_cmp(
-        ast::BinOp::Gt,
-        keys_jm1.clone(),
-        local_expr(cur_k_t.clone(), key_ty),
-        key_ty,
-        key_ast.span,
-        ctx,
-    )?;
-    let shift_cond = bool_and(j_gt0, key_gt);
-    let list_jm1 = ir::Expr {
-        ty: elem,
-        kind: ir::ExprKind::Index {
-            base: Box::new(list.clone()),
-            index: Box::new(j_m1.clone()),
-        },
-    };
-    let shift_body = vec![
-        ir::Stmt::IndexAssign {
-            base: list.clone(),
-            index: j.clone(),
-            value: list_jm1,
-        },
-        ir::Stmt::IndexAssign {
-            base: keys.clone(),
-            index: j.clone(),
-            value: keys_jm1,
-        },
-        ir::Stmt::Assign {
-            name: j_t.clone(),
-            value: j_m1,
-        },
-    ];
-    let outer_body = vec![
-        ir::Stmt::Assign {
-            name: cur_t.clone(),
-            value: cur_load,
-        },
-        ir::Stmt::Assign {
-            name: cur_k_t.clone(),
-            value: cur_key_load,
-        },
-        ir::Stmt::Assign {
-            name: j_t.clone(),
-            value: i.clone(),
-        },
-        ir::Stmt::While {
-            cond: shift_cond,
-            body: shift_body,
-            step: vec![],
-        },
-        ir::Stmt::IndexAssign {
-            base: list.clone(),
-            index: j.clone(),
-            value: local_expr(cur_t, elem),
-        },
-        ir::Stmt::IndexAssign {
-            base: keys.clone(),
-            index: j,
-            value: local_expr(cur_k_t, key_ty),
-        },
-        ir::Stmt::Assign {
-            name: i_t.clone(),
-            value: ir::Expr {
-                ty: ir::Ty::Int,
-                kind: ir::ExprKind::Binary {
-                    op: ir::BinOp::Add,
-                    left: Box::new(i),
-                    right: Box::new(int_const(1)),
-                },
-            },
-        },
-    ];
-    stmts.push(ir::Stmt::While {
-        cond: sort_cond,
-        body: outer_body,
-        step: vec![],
-    });
+    // Order the list by its keys: a stable O(n log n) merge sort in the
+    // runtime, comparing keys with the kernel's semantics. (This was an
+    // insertion sort, quadratic in the length of the list.)
+    stmts.push(ir::Stmt::ExprStmt(dyn_kernel(
+        "pyrs_dyn_sort_by_keys",
+        vec![
+            coerce(list.clone(), ir::Ty::Any, key_ast.span, "a keyed sort")?,
+            coerce(keys.clone(), ir::Ty::Any, key_ast.span, "a keyed sort")?,
+        ],
+        ir::Ty::None,
+    )));
 
     Ok(stmts)
 }
@@ -30068,6 +30003,11 @@ fn render_field(
                 } else {
                     lower_cast(ast::TypeName::Str, converted, span)
                 };
+            }
+            // A dynamic value formats as whatever it holds.
+            if matches!(converted.ty, ir::Ty::Any | ir::Ty::Union(_)) {
+                let v = coerce(converted, ir::Ty::Any, span, "a format value")?;
+                return Ok(dyn_kernel("pyrs_dyn_format", vec![v, spec_ir], ir::Ty::Str));
             }
             // Static check: only scalar types we can format.
             match converted.ty {
@@ -34983,7 +34923,7 @@ print(f(B()))
     }
 
     #[test]
-    fn sorted_with_key_desugars_to_block_with_whiles() {
+    fn sorted_with_key_fills_keys_then_sorts_by_them() {
         let m = analyze_ok(
             "\
 def k(x: int) -> int:
@@ -35004,8 +34944,16 @@ ys = sorted([3, 1, 2], key=k)
             .filter(|s| matches!(s, ir::Stmt::While { .. }))
             .count();
         assert!(
-            while_count >= 2,
-            "expected fill + insertion-sort Whiles, stmts={stmts:?}"
+            while_count >= 1,
+            "expected the key-fill While, stmts={stmts:?}"
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(
+                s,
+                ir::Stmt::ExprStmt(ir::Expr { kind: ir::ExprKind::DynKernel { func, .. }, .. })
+                    if func == "pyrs_dyn_sort_by_keys"
+            )),
+            "expected the O(n log n) sort by keys, stmts={stmts:?}"
         );
         assert!(
             stmts.iter().any(|s| matches!(
@@ -35020,7 +34968,7 @@ ys = sorted([3, 1, 2], key=k)
     }
 
     #[test]
-    fn list_sort_with_key_desugars_to_whiles() {
+    fn list_sort_with_key_fills_keys_then_sorts_by_them() {
         let m = analyze_ok(
             "\
 def k(x: int) -> int:
@@ -35037,8 +34985,17 @@ xs.sort(key=k)
             .filter(|s| matches!(s, ir::Stmt::While { .. }))
             .count();
         assert!(
-            while_count >= 2,
-            "expected fill + insertion-sort Whiles, body={:?}",
+            while_count >= 1,
+            "expected the key-fill While, body={:?}",
+            entry.body
+        );
+        assert!(
+            entry.body.iter().any(|s| matches!(
+                s,
+                ir::Stmt::ExprStmt(ir::Expr { kind: ir::ExprKind::DynKernel { func, .. }, .. })
+                    if func == "pyrs_dyn_sort_by_keys"
+            )),
+            "expected the O(n log n) sort by keys, body={:?}",
             entry.body
         );
         assert!(
