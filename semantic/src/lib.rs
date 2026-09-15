@@ -23,7 +23,7 @@
 //! but a zero-parameter `main` is defined, `main()` is called instead.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use common::{Diagnostic, Phase, Span};
 use parser::ast;
@@ -690,6 +690,17 @@ struct InferRounds {
     /// overrides decide one type per position: virtual dispatch passes the
     /// same arguments to both.
     method_params: HashMap<(ir::ClassId, String), Vec<Option<ParamKey>>>,
+    /// Classes whose instances this round stored in a dynamic value.
+    boxed_classes: HashSet<ir::ClassId>,
+    /// Closures this round stored in a dynamic value, by IR function.
+    boxed_closures: BTreeMap<String, ir::Ty>,
+    /// The previous round's `boxed_closures`: what a call of a dynamic value
+    /// can reach.
+    closures_known: BTreeMap<String, ir::Ty>,
+    /// The previous round's `boxed_classes`: only these can be found behind a
+    /// dynamic value, so only these get an arm in a dynamic dispatch. `None`
+    /// (a program that needed no rounds) means every class.
+    boxed_known: Option<HashSet<ir::ClassId>>,
 }
 
 thread_local! {
@@ -719,6 +730,61 @@ fn record_method_params(class_id: ir::ClassId, method: &str, user_params: &[Para
             user_params.iter().map(|p| p.key).collect(),
         );
     });
+}
+
+/// A value of type `ty` is being stored in a dynamic value: any class it can
+/// hold, directly or inside a container, can now come back out of one.
+fn record_boxed_classes(ty: ir::Ty) {
+    fn walk(ty: ir::Ty, out: &mut HashSet<ir::ClassId>) {
+        match ty {
+            ir::Ty::Class(id) => {
+                out.insert(id);
+                for sid in subclasses_of(id) {
+                    out.insert(sid);
+                }
+            }
+            ir::Ty::List(e) | ir::Ty::Set(e) => walk(*e, out),
+            ir::Ty::Dict { key, value } => {
+                walk(*key, out);
+                walk(*value, out);
+            }
+            ir::Ty::Tuple(ms) | ir::Ty::Union(ms) => {
+                for m in ms {
+                    walk(*m, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn closures(ty: ir::Ty, out: &mut BTreeMap<String, ir::Ty>) {
+        match ty {
+            ir::Ty::Closure { func, .. } if !func.is_empty() => {
+                out.insert(func.to_string(), ty);
+            }
+            ir::Ty::List(e) | ir::Ty::Set(e) => closures(*e, out),
+            ir::Ty::Dict { value, .. } => closures(*value, out),
+            ir::Ty::Tuple(ms) | ir::Ty::Union(ms) => {
+                for m in ms {
+                    closures(*m, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    INFER_ROUNDS.with(|r| {
+        let mut r = r.borrow_mut();
+        walk(ty, &mut r.boxed_classes);
+        closures(ty, &mut r.boxed_closures);
+    });
+}
+
+/// The classes a dynamic value may hold, as far as the program shows.
+fn dynamic_class_candidates() -> Vec<ir::ClassId> {
+    let n = with_class_env(|e| e.infos.len()) as ir::ClassId;
+    INFER_ROUNDS.with(|r| match &r.borrow().boxed_known {
+        Some(known) => (0..n).filter(|c| known.contains(c)).collect(),
+        None => (0..n).collect(),
+    })
 }
 
 fn record_escape(params: &[ParamSig]) {
@@ -2830,6 +2896,221 @@ pub fn analyze_library(module: &ast::Module) -> SResult<ir::Module> {
 /// One method extracted from a class body.
 struct ClassMethodAst<'a> {
     def: &'a ast::FuncDef,
+}
+
+/// A method some statement in the program replaces: `C.m = f`.
+#[derive(Debug, Clone)]
+struct MethodPatch {
+    /// The method's own body, lowered under this name.
+    orig: String,
+    /// The module global holding the function currently bound to `C.m`.
+    slot: String,
+}
+
+thread_local! {
+    static METHOD_PATCHES: RefCell<HashMap<(ir::ClassId, String), MethodPatch>> =
+        RefCell::new(HashMap::new());
+}
+
+fn method_patch(class_id: ir::ClassId, method: &str) -> Option<MethodPatch> {
+    METHOD_PATCHES.with(|m| m.borrow().get(&(class_id, method.to_string())).cloned())
+}
+
+/// Find every `ClassName.method = value` in the program.
+///
+/// A patched method keeps its name, so every call site and dispatch table
+/// is unchanged; its body moves aside and the name becomes a trampoline
+/// through a function slot the assignment rewrites. Whole-program analysis
+/// sees every assignment, so a class nothing patches carries no slot and
+/// pays nothing -- the version guard the plan proposed is not needed when the
+/// patch sites are all known.
+fn collect_method_patches(modules: &[ModuleInput], classes: &[ClassAst<'_>]) {
+    fn walk(
+        stmts: &[ast::Stmt],
+        module: &str,
+        classes: &[ClassAst<'_>],
+        out: &mut HashMap<(ir::ClassId, String), MethodPatch>,
+    ) {
+        for st in stmts {
+            match &st.kind {
+                ast::StmtKind::Assign { targets, .. } => {
+                    for t in targets {
+                        if let ast::AssignTarget::Attr { base, attr, .. } = t
+                            && let ast::ExprKind::Name(cls) = &base.kind
+                            && let Some(id) = lookup_class_in_module(module, cls)
+                            && let Some(c) = classes
+                                .iter()
+                                .find(|c| lookup_class_in_module(&c.module, &c.name) == Some(id))
+                            && c.methods
+                                .iter()
+                                .any(|m| m.def.name == *attr && m.def.decorators.is_empty())
+                        {
+                            let ir_name = method_ir_name(&c.module, c.is_root, &c.name, attr);
+                            out.entry((id, attr.clone())).or_insert(MethodPatch {
+                                orig: format!("{ir_name}$orig"),
+                                slot: format!("{ir_name}$slot"),
+                            });
+                        }
+                    }
+                }
+                ast::StmtKind::If { branches, orelse } => {
+                    for (_, b) in branches {
+                        walk(b, module, classes, out);
+                    }
+                    walk(orelse, module, classes, out);
+                }
+                ast::StmtKind::While { body, orelse, .. }
+                | ast::StmtKind::For { body, orelse, .. } => {
+                    walk(body, module, classes, out);
+                    walk(orelse, module, classes, out);
+                }
+                ast::StmtKind::Try {
+                    body,
+                    handlers,
+                    orelse,
+                    finally,
+                } => {
+                    walk(body, module, classes, out);
+                    for h in handlers {
+                        walk(&h.body, module, classes, out);
+                    }
+                    walk(orelse, module, classes, out);
+                    walk(finally, module, classes, out);
+                }
+                ast::StmtKind::With { body, .. } => walk(body, module, classes, out),
+                ast::StmtKind::FuncDef(f) => walk(&f.body, module, classes, out),
+                ast::StmtKind::ClassDef(c) => walk(&c.body, module, classes, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for m in modules {
+        let module = with_class_env(|e| {
+            e.by_key
+                .keys()
+                .find(|(mm, _)| *mm == m.name)
+                .map(|(mm, _)| mm.clone())
+        })
+        .unwrap_or_else(|| m.name.clone());
+        walk(&m.ast.body, &module, classes, &mut out);
+    }
+    METHOD_PATCHES.with(|p| *p.borrow_mut() = out);
+}
+
+/// `C.m = value`: bind the method's slot to a function with its signature.
+fn lower_method_patch(
+    class_id: ir::ClassId,
+    method: &str,
+    patch: &MethodPatch,
+    value: &ast::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    let ir_name = patch.orig.trim_end_matches("$orig").to_string();
+    let sig = method_sig_lookup(&ir_name)
+        .or_else(|| ctx.mctx.funcs.get(&ir_name).cloned())
+        .ok_or_else(|| {
+            err(
+                format!("internal error: no signature for '{ir_name}'"),
+                span,
+            )
+        })?;
+    let tys: Vec<ir::Ty> = sig.params.iter().map(|p| p.ty).collect();
+    let slot_ty = ir::closure_of_full(&tys, sig.ret, &[], "");
+    let class_name = class_info(class_id).map(|c| c.name).unwrap_or_default();
+    let mismatch = |what: String| {
+        err(
+            format!(
+                "the function assigned to '{class_name}.{method}' {what}; PyRs compiles \
+                 every call of the method against the signature it was defined with"
+            ),
+            span,
+        )
+    };
+    let closure = match &value.kind {
+        ast::ExprKind::Name(fname) if ctx.funcs().contains_key(fname) => {
+            let fsig = ctx.funcs().get(fname).cloned().expect("checked");
+            if fsig.params.len() != tys.len() || fsig.vararg.is_some() || fsig.kwarg.is_some() {
+                return Err(mismatch(format!(
+                    "takes {} parameter(s), and the method takes {}",
+                    fsig.params.len(),
+                    tys.len()
+                )));
+            }
+            // The slot calls it with the method's arguments, so those are its
+            // call sites: `self` is an instance of the class.
+            for (p, t) in fsig.params.iter().zip(&tys) {
+                if let Some(key) = p.key {
+                    record_call_evidence(key, Evidence::Value(*t));
+                }
+            }
+            let fits = fsig.params.iter().zip(&tys).all(|(p, t)| p.ty == *t) && fsig.ret == sig.ret;
+            if !fits {
+                if rounds_collecting() {
+                    rounds_tolerate();
+                } else {
+                    return Err(mismatch(format!(
+                        "has type ({}) -> {}, and the method has ({}) -> {}",
+                        fsig.params
+                            .iter()
+                            .map(|p| display_ty(p.ty))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        display_ty(fsig.ret),
+                        tys.iter()
+                            .map(|t| display_ty(*t))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        display_ty(sig.ret)
+                    )));
+                }
+            }
+            ir::Expr {
+                ty: slot_ty,
+                kind: ir::ExprKind::MakeClosure {
+                    func: ctx.own_func(fname),
+                    captures: vec![],
+                    capture_is_cell: vec![],
+                },
+            }
+        }
+        _ => {
+            // A lambda takes the method's parameter types from the slot it fills.
+            let v = match &value.kind {
+                ast::ExprKind::Lambda { params, body } => {
+                    lower_lambda_typed(params, body, &tys, value.span, ctx)?
+                }
+                _ => lower_expr(value, ctx)?,
+            };
+            match v.ty {
+                ir::Ty::Closure {
+                    params,
+                    ret,
+                    capture_tys,
+                    ..
+                } if capture_tys.is_empty() && params == tys.as_slice() && *ret == sig.ret => {
+                    ir::Expr {
+                        ty: slot_ty,
+                        kind: v.kind,
+                    }
+                }
+                other => {
+                    return Err(mismatch(format!(
+                        "is {}, and only a function with the method's own signature and no \
+                         captured variables can replace it yet",
+                        display_ty(other)
+                    )));
+                }
+            }
+        }
+    };
+    out.push(ir::Stmt::GlobalAssign {
+        name: patch.slot.clone(),
+        value: closure,
+    });
+    Ok(())
 }
 
 /// A class definition found at module top level.
@@ -7455,22 +7736,66 @@ fn has_unannotated_params(modules: &[ModuleInput]) -> bool {
             _ => false,
         })
     }
-    modules.iter().any(|m| in_stmts(&m.ast.body, false))
+    // A dynamic annotation (`object`, `Any`) also needs a measuring round: what
+    // a dynamic value can hold is learned from what the program boxes.
+    modules
+        .iter()
+        .any(|m| in_stmts(&m.ast.body, false) || dynamic_annotations(&m.ast.body))
+}
+
+fn dynamic_annotations(stmts: &[ast::Stmt]) -> bool {
+    let dynamic =
+        |t: &Option<ast::TypeName>| t.as_ref().is_some_and(|t| format!("{t:?}").contains("Any"));
+    stmts.iter().any(|st| match &st.kind {
+        ast::StmtKind::FuncDef(f) => {
+            f.params.iter().any(|p| dynamic(&p.ty))
+                || dynamic(&f.ret)
+                || dynamic_annotations(&f.body)
+        }
+        ast::StmtKind::ClassDef(c) => dynamic_annotations(&c.body),
+        ast::StmtKind::Assign { annotation, .. } => dynamic(annotation),
+        _ => false,
+    })
 }
 
 fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> SResult<ir::Module> {
-    let reset = |collecting: bool, seeds: HashMap<ParamKey, ir::Ty>| {
+    let closures_known = std::cell::RefCell::new(BTreeMap::new());
+    let reset = |collecting: bool,
+                 seeds: HashMap<ParamKey, ir::Ty>,
+                 boxed_known: Option<HashSet<ir::ClassId>>| {
         DYNAMIC_FALLBACKS.with(|f| f.borrow_mut().clear());
         INFER_ROUNDS.with(|r| {
             *r.borrow_mut() = InferRounds {
                 collecting,
                 seeds,
+                boxed_known,
+                closures_known: closures_known.borrow().clone(),
                 ..InferRounds::default()
             }
         });
     };
+    // What a round boxed: its classes, and whether it boxed a closure the
+    // round did not know about (which a dynamic call needs an arm for).
+    let boxed_now = || {
+        INFER_ROUNDS.with(|r| {
+            let r = r.borrow();
+            let mut known = closures_known.borrow_mut();
+            let before = known.len();
+            known.extend(r.boxed_closures.iter().map(|(k, v)| (k.clone(), *v)));
+            (r.boxed_classes.clone(), known.len() != before)
+        })
+    };
     if !has_unannotated_params(modules) {
-        reset(false, HashMap::new());
+        reset(false, HashMap::new(), None);
+        let result = analyze_target(modules, executable);
+        // A function stored in a dynamic value can only be called through it
+        // once the program knows it is there; that takes one more round, and
+        // only a program that does it pays for one.
+        let (_, new_closures) = boxed_now();
+        if !new_closures {
+            return result.map_err(|d| explain_dynamic_fallback(d, modules));
+        }
+        reset(false, HashMap::new(), None);
         return analyze_target(modules, executable)
             .map_err(|d| explain_dynamic_fallback(d, modules));
     }
@@ -7497,20 +7822,24 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
         })
     };
     let mut seeds: HashMap<ParamKey, ir::Ty> = HashMap::new();
+    let mut boxed: HashSet<ir::ClassId> = HashSet::new();
     let mut last: Option<(SResult<ir::Module>, bool)> = None;
     // Optimistic rounds: measure, decide, repeat until the decisions settle.
-    for _ in 0..CALL_SITE_ROUNDS {
-        reset(true, seeds.clone());
+    for round in 0..CALL_SITE_ROUNDS {
+        // The first round knows nothing about what is boxed, so every class.
+        reset(true, seeds.clone(), (round > 0).then(|| boxed.clone()));
         let result = analyze_target(modules, executable);
         let tolerated = INFER_ROUNDS.with(|r| r.borrow().tolerated);
+        let (boxed_next, new_closures) = boxed_now();
         let mut next = decide(true);
         // A round that stopped before lowering measured nothing; what it did
         // not measure keeps the type the round before decided.
         for (k, t) in &seeds {
             next.entry(*k).or_insert(*t);
         }
-        let settled = next == seeds;
+        let settled = next == seeds && boxed_next == boxed && !new_closures && round > 0;
         seeds = next;
+        boxed = boxed_next;
         last = Some((result, tolerated));
         if settled {
             break;
@@ -7523,13 +7852,20 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
         let (result, tolerated) = match last.take() {
             Some(prev) => prev,
             None => {
-                reset(true, seeds.clone());
+                reset(true, seeds.clone(), Some(boxed.clone()));
                 let result = analyze_target(modules, executable);
                 (result, INFER_ROUNDS.with(|r| r.borrow().tolerated))
             }
         };
         let strict = decide(false);
         let mut widened = false;
+        // A class boxed this round that the round did not know about needs
+        // its arm in the dynamic dispatches.
+        let (boxed_next, new_closures) = boxed_now();
+        if !boxed_next.is_subset(&boxed) || new_closures {
+            boxed.extend(boxed_next);
+            widened = true;
+        }
         for (k, t) in &strict {
             match seeds.get(k) {
                 Some(seed) if seed == t || *seed == ir::Ty::Any => {}
@@ -7554,7 +7890,7 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
         }
     }
     // The final program, built without tolerance so a real error is reported.
-    reset(false, seeds);
+    reset(false, seeds, Some(boxed));
     analyze_target(modules, executable).map_err(|d| explain_dynamic_fallback(d, modules))
 }
 
@@ -7575,6 +7911,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
     let mut class_asts = collect_class_asts(modules)?;
     register_class_ids(&class_asts)?;
     register_class_consts(&class_asts)?;
+    collect_method_patches(modules, &class_asts);
     inject_class_import_aliases(modules);
     resolve_class_bases(&class_asts)?;
     // Needs resolved bases: whether a class should get a default `__ne__`
@@ -7614,6 +7951,10 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                 let sig =
                     method_func_sig(class_id, &c.name, cm.def, kind).map_err(|d| d.with_file(i))?;
                 register_method_sig(&ir_name, sig.clone());
+                if let Some(patch) = method_patch(class_id, &cm.def.name) {
+                    register_method_sig(&patch.orig, sig.clone());
+                    funcs.insert(patch.orig.clone(), sig.clone());
+                }
                 let skip = usize::from(kind != MethodKind::Static);
                 record_method_params(
                     class_id,
@@ -7772,10 +8113,15 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                 });
             }
         }
+        let mut patch_inits: Vec<ir::Stmt> = Vec::new();
         if let Some(methods) = method_orders.get(&m.name) {
             for (ir_name, class_id, def) in methods {
                 let mut method_def = (*def).clone();
-                method_def.name = ir_name.clone();
+                let patch = method_patch(*class_id, &def.name);
+                method_def.name = match &patch {
+                    Some(p) => p.orig.clone(),
+                    None => ir_name.clone(),
+                };
                 let funcs_view = &own_funcs[&m.name];
                 let mctx_fn = ModuleCtx {
                     module: &m.name,
@@ -7841,6 +8187,54 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                         });
                         s.ret = f.ret;
                         s
+                    });
+                }
+                if let Some(patch) = patch {
+                    // The name every call site uses becomes a call through the
+                    // slot; the program starts with the slot bound to the body.
+                    let tys: Vec<ir::Ty> = f.params.iter().map(|(_, t)| *t).collect();
+                    let slot_ty = ir::closure_of_full(&tys, f.ret, &[], "");
+                    globals_order.push((patch.slot.clone(), slot_ty));
+                    patch_inits.push(ir::Stmt::GlobalAssign {
+                        name: patch.slot.clone(),
+                        value: ir::Expr {
+                            ty: slot_ty,
+                            kind: ir::ExprKind::MakeClosure {
+                                func: patch.orig.clone(),
+                                captures: vec![],
+                                capture_is_cell: vec![],
+                            },
+                        },
+                    });
+                    let call = ir::Expr {
+                        ty: f.ret,
+                        kind: ir::ExprKind::CallClosure {
+                            closure: Box::new(ir::Expr {
+                                ty: slot_ty,
+                                kind: ir::ExprKind::GlobalLoad(patch.slot.clone()),
+                            }),
+                            args: f
+                                .params
+                                .iter()
+                                .map(|(n, t)| local_expr(n.clone(), *t))
+                                .collect(),
+                            capture_tys: vec![],
+                            func: String::new(),
+                        },
+                    };
+                    let body = if f.ret == ir::Ty::None {
+                        vec![ir::Stmt::ExprStmt(call), ir::Stmt::Return(None)]
+                    } else {
+                        vec![ir::Stmt::Return(Some(call))]
+                    };
+                    out_funcs.push(ir::Function {
+                        name: ir_name.clone(),
+                        params: f.params.clone(),
+                        ret: f.ret,
+                        locals: vec![],
+                        body,
+                        is_generator: false,
+                        yield_ty: None,
                     });
                 }
                 out_funcs.push(f);
@@ -8138,6 +8532,9 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
             f.body = body;
         }
 
+        if let Some(f) = init.as_mut() {
+            f.body.splice(0..0, patch_inits);
+        }
         match init {
             Some(f) => out_funcs.push(f),
             None if executable && is_root => {
@@ -13045,6 +13442,17 @@ fn lower_method_stmt(
             lower_instance_method_call_kw(base_ir, id, method, method_span, args, keywords, ctx)?;
         return Ok(ir::Stmt::ExprStmt(call));
     }
+    if base_ir.ty == ir::Ty::Any || matches!(base_ir.ty, ir::Ty::Union(_)) {
+        let v = coerce(base_ir, ir::Ty::Any, method_span, "a dynamic receiver")?;
+        return Ok(ir::Stmt::ExprStmt(lower_any_method_call(
+            v,
+            method,
+            args,
+            keywords,
+            method_span,
+            ctx,
+        )?));
+    }
     // Past this point the base is a builtin type, whose method table has no
     // keyword surface beyond the `sort` case handled by the caller.
     if !keywords.is_empty() {
@@ -13250,21 +13658,14 @@ fn lower_method_stmt(
         }
         // A method call on a dynamic value in statement position. The result is
         // discarded, but a mutating method like `append` is the whole point.
-        ir::Ty::Any => {
-            let mut lowered = Vec::with_capacity(args.len());
-            for a in args {
-                let v = lower_expr(a, ctx)?;
-                lowered.push(coerce(v, ir::Ty::Any, a.span, "a dynamic method argument")?);
-            }
-            Ok(ir::Stmt::ExprStmt(ir::Expr {
-                ty: ir::Ty::Any,
-                kind: ir::ExprKind::DynMethod {
-                    receiver: Box::new(base_ir),
-                    name: method.to_string(),
-                    args: lowered,
-                },
-            }))
-        }
+        ir::Ty::Any => Ok(ir::Stmt::ExprStmt(lower_any_method_call(
+            base_ir,
+            method,
+            args,
+            &[],
+            method_span,
+            ctx,
+        )?)),
         other => Err(err(
             format!("'{other}' has no method '{method}'"),
             method_span,
@@ -13886,6 +14287,16 @@ fn lower_list_ctor(arg: ir::Expr, span: Span, ctx: &mut FnCtx) -> SResult<ir::Ex
                         ty: ir::list_of(first),
                         kind: ir::ExprKind::ListLit(items),
                     }),
+                },
+            })
+        }
+        // A dynamic iterable: its elements, each keeping its own type.
+        ir::Ty::Any | ir::Ty::Union(_) => {
+            let v = coerce(arg, ir::Ty::Any, span, "list()")?;
+            Ok(ir::Expr {
+                ty: ir::list_of(ir::Ty::Any),
+                kind: ir::ExprKind::FromUnion {
+                    value: Box::new(dyn_kernel("pyrs_dyn_list", vec![v], ir::Ty::Any)),
                 },
             })
         }
@@ -14595,6 +15006,15 @@ fn lower_str_method(
                 ));
             }
             let parts = materialize_iterable_arg(&args[0], ctx)?;
+            let dynamic = match parts.ty {
+                ir::Ty::Any | ir::Ty::Union(_) => true,
+                ir::Ty::List(e) => matches!(*e, ir::Ty::Any | ir::Ty::Union(_)),
+                _ => false,
+            };
+            if dynamic {
+                let v = coerce(parts, ir::Ty::Any, args[0].span, "join()")?;
+                return Ok(dyn_kernel("pyrs_dyn_join", vec![base_ir, v], ir::Ty::Str));
+            }
             if parts.ty != ir::list_of(ir::Ty::Str) {
                 return Err(err(
                     format!("join() expects a list[str], found {}", parts.ty),
@@ -15797,6 +16217,18 @@ fn lower_assign(
     ctx: &mut FnCtx,
     out: &mut Vec<ir::Stmt>,
 ) -> SResult<()> {
+    if let ast::AssignTarget::Attr {
+        base,
+        attr,
+        attr_span,
+    } = target
+        && let ast::ExprKind::Name(cls) = &base.kind
+        && !ctx.locals.contains_key(cls)
+        && let Some(id) = lookup_class(cls)
+        && let Some(patch) = method_patch(id, attr)
+    {
+        return lower_method_patch(id, attr, &patch, value, *attr_span, ctx, out);
+    }
     let ann_ty = match annotation {
         Some(t) => Some(resolve_type_checked(t, value.span)?),
         Option::None => Option::None,
@@ -15906,6 +16338,11 @@ fn lower_assign_ir(
             let base_ir = lower_expr(base, ctx)?;
             if let ir::Ty::Class(id) = base_ir.ty {
                 return lower_class_setitem(base_ir, id, index, value_ir, value_span, ctx, out);
+            }
+            if matches!(base_ir.ty, ir::Ty::Any | ir::Ty::Union(_)) {
+                let b = coerce(base_ir, ir::Ty::Any, value_span, "a dynamic item store")?;
+                out.push(lower_any_setitem(b, index, value_ir, value_span, ctx)?);
+                return Ok(());
             }
             let (base_ir, elem, index_ir) = lower_index_target_on(base_ir, index, ctx)?;
             let value_ir = coerce(value_ir, elem, value_span, "item assignment")?;
@@ -16017,6 +16454,10 @@ fn lower_assign_ir(
             // collection; the value is coerced to that type below, so a
             // disagreeing annotation is reported as a value mismatch.
             let base_ir = lower_expr(base, ctx)?;
+            if base_ir.ty == ir::Ty::Any {
+                out.push(lower_any_setattr(base_ir, attr, value_ir, *attr_span, ctx)?);
+                return Ok(());
+            }
             let class_id = match base_ir.ty {
                 ir::Ty::Class(id) => id,
                 other => {
@@ -16393,6 +16834,34 @@ fn lower_unpack(
                     },
                 };
                 lower_assign_ir(t, None, elem, value_span, ctx, out)?;
+            }
+            Ok(())
+        }
+        ir::Ty::Any | ir::Ty::Union(_) => {
+            if star_pos.is_some() {
+                return Err(err(
+                    "starred unpacking of a dynamic value is not supported yet",
+                    value_span,
+                ));
+            }
+            let v = coerce(seq, ir::Ty::Any, value_span, "unpacking")?;
+            let t = ctx.fresh_temp("dyn.unpack", ir::Ty::Any);
+            out.push(ir::Stmt::Assign {
+                name: t.clone(),
+                value: v,
+            });
+            out.push(ir::Stmt::ExprStmt(dyn_kernel(
+                "pyrs_dyn_unpack_check",
+                vec![local_expr(t.clone(), ir::Ty::Any), int_const(n)],
+                ir::Ty::None,
+            )));
+            for (i, target) in targets.iter().enumerate() {
+                let elem = dyn_kernel(
+                    "pyrs_dyn_iter_at",
+                    vec![local_expr(t.clone(), ir::Ty::Any), int_const(i as i64)],
+                    ir::Ty::Any,
+                );
+                lower_assign_ir(target, None, elem, value_span, ctx, out)?;
             }
             Ok(())
         }
@@ -16931,6 +17400,19 @@ fn lower_aug_assign(
         } => {
             // desugar `obj.attr op= v` into `obj.attr = obj.attr op v`
             let base_ir = lower_expr(base, ctx)?;
+            if base_ir.ty == ir::Ty::Any {
+                let base_t = ctx.fresh_temp("aug.obj", ir::Ty::Any);
+                out.push(ir::Stmt::Assign {
+                    name: base_t.clone(),
+                    value: base_ir,
+                });
+                let load = local_expr(base_t, ir::Ty::Any);
+                let current = lower_any_getattr(load.clone(), attr, *attr_span, ctx)?;
+                let right = lower_expr(value, ctx)?;
+                let combined = lower_aug_binary(op, current, right, span, ctx)?;
+                out.push(lower_any_setattr(load, attr, combined, *attr_span, ctx)?);
+                return Ok(());
+            }
             let class_id = match base_ir.ty {
                 ir::Ty::Class(id) => id,
                 other => {
@@ -18189,6 +18671,7 @@ fn coerce(value: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir
     }
     // Concrete → Any (dynamic box).
     if target == ir::Ty::Any {
+        record_boxed_classes(value.ty);
         if !can_box_as_any(value.ty) {
             return Err(err(
                 format!("type mismatch in {what}: cannot store {} in Any", value.ty),
@@ -19583,31 +20066,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 // A dynamic value knows at run time whether it is a list or a
                 // dict; the index type says which one is being asked for, and
                 // the result is dynamic in turn.
-                ir::Ty::Any => {
-                    let key_ir = lower_expr(index, ctx)?;
-                    match key_ir.ty {
-                        // A dynamic key carries its own tag, so it hashes and
-                        // compares as whatever it holds.
-                        ir::Ty::Int | ir::Ty::Bool | ir::Ty::Str | ir::Ty::Any => {}
-                        other => {
-                            return Err(err(
-                                format!(
-                                    "a dynamic value can be indexed by int (list or \
-                                     tuple), str (dict), or another dynamic value \
-                                     (dict), found {}",
-                                    display_ty(other)
-                                ),
-                                index.span,
-                            ));
-                        }
-                    }
-                    Ok(ir::Expr {
-                        ty: ir::Ty::Any,
-                        kind: ir::ExprKind::Index {
-                            base: Box::new(base_ir),
-                            index: Box::new(key_ir),
-                        },
-                    })
+                ir::Ty::Any | ir::Ty::Union(_) => {
+                    let base_any = coerce(base_ir, ir::Ty::Any, base.span, "a dynamic subscript")?;
+                    lower_any_getitem(base_any, index, expr.span, ctx)
                 }
                 other => Err(err(
                     format!("'{}' object is not subscriptable", display_ty(other)),
@@ -19955,6 +20416,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     },
                 });
             }
+            if base_ir.ty == ir::Ty::Any {
+                return lower_any_getattr(base_ir, attr, *attr_span, ctx);
+            }
             Err(err(
                 "attribute access is only supported for instance fields, 'sys.argv', \
                  imported module globals, and method calls",
@@ -20063,6 +20527,12 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     keywords,
                     ctx,
                 );
+            }
+            // A dynamic value, or a union: dispatch on what it holds at run
+            // time, user classes first and then the builtin method kernel.
+            if base_ir.ty == ir::Ty::Any || matches!(base_ir.ty, ir::Ty::Union(_)) {
+                let v = coerce(base_ir, ir::Ty::Any, *method_span, "a dynamic receiver")?;
+                return lower_any_method_call(v, method, &args, keywords, *method_span, ctx);
             }
             // Past this point the base is a builtin type, whose method table
             // has no keyword surface.
@@ -20244,31 +20714,12 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                         *method_span,
                     )),
                 },
-                // A dynamic dict can list its keys; the runtime reads the
-                // insertion order the value already carries. Kept ahead of the
-                // general dynamic path because it returns a typed
-                // `list[str]` rather than a dynamic value.
-                ir::Ty::Any if method == "keys" && args.is_empty() => Ok(ir::Expr {
-                    ty: ir::list_of(ir::Ty::Str),
-                    kind: ir::ExprKind::AnyDictKeys(Box::new(base_ir)),
-                }),
-                // Any other method on a dynamic value: the runtime looks the
-                // name up against the type its tag names, and reports
-                // CPython's AttributeError when that type has no such method.
+                // A method on a dynamic value: a user class that has it is
+                // called directly; otherwise the runtime looks the name up
+                // against the type its tag names, and reports CPython's
+                // AttributeError when that type has no such method.
                 ir::Ty::Any => {
-                    let mut lowered = Vec::with_capacity(args.len());
-                    for a in &args {
-                        let v = lower_expr(a, ctx)?;
-                        lowered.push(coerce(v, ir::Ty::Any, a.span, "a dynamic method argument")?);
-                    }
-                    Ok(ir::Expr {
-                        ty: ir::Ty::Any,
-                        kind: ir::ExprKind::DynMethod {
-                            receiver: Box::new(base_ir),
-                            name: method.clone(),
-                            args: lowered,
-                        },
-                    })
+                    lower_any_method_call(base_ir, method, &args, keywords, *method_span, ctx)
                 }
                 other => Err(err(
                     format!("'{other}' has no method '{method}'"),
@@ -20281,6 +20732,16 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
             let ty = match base_ir.ty {
                 ir::Ty::Str => ir::Ty::Str,
                 ir::Ty::List(e) => ir::Ty::List(e),
+                ir::Ty::Any | ir::Ty::Union(_) => {
+                    let v = coerce(base_ir, ir::Ty::Any, base.span, "a dynamic slice")?;
+                    let (lo_ir, hi_ir, step_ir) =
+                        lower_slice_bounds(lo.as_deref(), hi.as_deref(), step.as_deref(), ctx)?;
+                    return Ok(dyn_kernel(
+                        "pyrs_dyn_slice",
+                        vec![v, lo_ir, hi_ir, step_ir],
+                        ir::Ty::Any,
+                    ));
+                }
                 other => {
                     return Err(err(format!("'{other}' object cannot be sliced"), base.span));
                 }
@@ -22343,15 +22804,24 @@ fn lower_list_lit(
                             // element is a provisional `list[Any]`, so
                             // `[["a"], []]` is a `list[list[str]]` rather than
                             // a type error.
-                            Some(prev) => seed_join(prev, item.ty).ok_or_else(|| {
-                                err(
-                                    format!(
-                                        "list elements must share one type; found {} and {}",
-                                        prev, item.ty
-                                    ),
-                                    *item_span,
-                                )
-                            })?,
+                            // Types with no union between them -- two different
+                            // function types, say -- make the elements dynamic:
+                            // `Any` is the open union, and CPython's list holds both.
+                            Some(prev) => match seed_join(prev, item.ty) {
+                                Some(t) => t,
+                                None if can_box_as_any(prev) && can_box_as_any(item.ty) => {
+                                    ir::Ty::Any
+                                }
+                                None => {
+                                    return Err(err(
+                                        format!(
+                                            "list elements must share one type; found {} and {}",
+                                            prev, item.ty
+                                        ),
+                                        *item_span,
+                                    ));
+                                }
+                            },
                         });
                     }
                     LoweredElem::Star(item, item_span) => {
@@ -22559,12 +23029,19 @@ fn lower_dict_lit(
                 // `dict[str, list[str]]` rather than a type error.
                 vt = seed_join(vt, vr.ty).unwrap_or(vt);
                 if vt != vr.ty {
-                    vt = seed_join(vt, vr.ty).ok_or_else(|| {
-                        err(
-                            format!("dict values must share one type; found {vt} and {}", vr.ty),
-                            *vspan,
-                        )
-                    })?;
+                    vt = match seed_join(vt, vr.ty) {
+                        Some(t) => t,
+                        None if can_box_as_any(vt) && can_box_as_any(vr.ty) => ir::Ty::Any,
+                        None => {
+                            return Err(err(
+                                format!(
+                                    "dict values must share one type; found {vt} and {}",
+                                    vr.ty
+                                ),
+                                *vspan,
+                            ));
+                        }
+                    };
                 }
             }
             (kt, vt)
@@ -22963,10 +23440,18 @@ fn lower_arg_expr(
     what: &str,
     ctx: &mut FnCtx,
 ) -> SResult<ir::Expr> {
-    let a = if let (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) = (&arg.kind, expected) {
-        lower_list_lit(items, Some(*elem), arg.span, ctx)?
-    } else {
-        lower_expr(arg, ctx)?
+    let a = match (&arg.kind, expected) {
+        (ast::ExprKind::ListLit(items), ir::Ty::List(elem)) => {
+            lower_list_lit(items, Some(*elem), arg.span, ctx)?
+        }
+        (ast::ExprKind::DictLit(items), ir::Ty::Dict { key, value }) if items.is_empty() => {
+            lower_dict_lit(items, Some((*key, *value)), arg.span, ctx)?
+        }
+        // `f({})` into a dynamic parameter: an empty dict that can hold anything.
+        (ast::ExprKind::DictLit(items), ir::Ty::Any) if items.is_empty() => {
+            lower_dict_lit(items, Some((ir::Ty::Str, ir::Ty::Any)), arg.span, ctx)?
+        }
+        _ => lower_expr(arg, ctx)?,
     };
     coerce(a, expected, arg.span, what)
 }
@@ -23099,6 +23584,22 @@ fn lower_param_arg(
     let Some(key) = param.key else {
         return lower_arg_expr(arg, param.ty, what, ctx);
     };
+    // An empty dict has no type of its own to measure; it takes the one the
+    // other call sites decide.
+    if matches!(&arg.kind, ast::ExprKind::DictLit(items) if items.is_empty()) {
+        record_call_evidence(
+            key,
+            Evidence::Flexible(ir::dict_of(ir::Ty::Any, ir::Ty::Any)),
+        );
+        return lower_arg_expr(arg, param.ty, what, ctx).or_else(|e| {
+            if rounds_collecting() {
+                rounds_tolerate();
+                Ok(const_none())
+            } else {
+                Err(e)
+            }
+        });
+    }
     let a = lower_expr(arg, ctx)?;
     record_call_evidence(key, evidence_of(arg, &a));
     match coerce(a.clone(), param.ty, arg.span, what) {
@@ -24081,6 +24582,10 @@ fn lower_value_call(
             lower_call_closure_value(&callee, user_args, keywords, kwargs, span, ctx)
         }
         ir::Ty::Type => lower_type_construct(callee, user_args, keywords, kwargs, span, ctx),
+        ir::Ty::Any | ir::Ty::Union(_) if kwargs.is_none() => {
+            let callee = coerce(callee, ir::Ty::Any, span, "a dynamic call")?;
+            lower_any_call(callee, "value", user_args, keywords, span, ctx)
+        }
         other => Err(err(
             format!("'{other}' object is not callable"),
             callee_ast.span,
@@ -24629,6 +25134,19 @@ fn lower_call(
         .get(func)
         .copied()
         .or_else(|| ctx.globals.get(func).copied());
+    if matches!(closure_ty, Some(ir::Ty::Any | ir::Ty::Union(_))) {
+        let ty = closure_ty.expect("matched");
+        let callee = if ctx.locals.contains_key(func) {
+            local_expr(func.to_string(), ty)
+        } else {
+            ir::Expr {
+                ty,
+                kind: ir::ExprKind::GlobalLoad(ctx.own_global(func)),
+            }
+        };
+        let callee = coerce(callee, ir::Ty::Any, span, "a dynamic call")?;
+        return lower_any_call(callee, func, args, keywords, span, ctx);
+    }
     if closure_ty == Some(ir::Ty::Type) {
         let callee = if ctx.locals.contains_key(func) {
             ir::Expr {
@@ -26414,7 +26932,8 @@ fn resolve_builtin_sort_key(
                 | ir::Ty::List(_)
                 | ir::Ty::Tuple(_)
                 | ir::Ty::Dict { .. }
-                | ir::Ty::Set(_) => true,
+                | ir::Ty::Set(_)
+                | ir::Ty::Any => true,
                 ir::Ty::Class(id) => resolve_method(id, "__len__").is_some(),
                 _ => false,
             };
@@ -26730,17 +27249,21 @@ fn lower_sorted_expr(
     // dynamic container and uses the comparison kernel.
     let dyn_sorted = matches!(arg.ty, ir::Ty::Any)
         || (sk.key.is_none() && matches!(arg.ty, ir::Ty::List(e) if *e == ir::Ty::Any));
-    if dyn_sorted {
-        if sk.key.is_some() {
-            return Err(err(
-                "sorted() with key= on a dynamic value is not supported yet: \
-                 a key function needs a typed element, and a dynamic value \
-                 carries its type per value. Narrow with isinstance first, \
-                 or build a typed list"
-                    .to_string(),
-                args[0].span,
-            ));
+    // A dynamic iterable with `key=`: its elements as a `list[Any]`, which the
+    // keyed path sorts with the key applied to each dynamic element.
+    let arg = if matches!(arg.ty, ir::Ty::Any | ir::Ty::Union(_)) && sk.key.is_some() {
+        let v = coerce(arg, ir::Ty::Any, args[0].span, "sorted()")?;
+        ir::Expr {
+            ty: ir::list_of(ir::Ty::Any),
+            kind: ir::ExprKind::FromUnion {
+                value: Box::new(dyn_kernel("pyrs_dyn_list", vec![v], ir::Ty::Any)),
+            },
         }
+    } else {
+        arg
+    };
+    let dyn_sorted = dyn_sorted && sk.key.is_none();
+    if dyn_sorted {
         let (rev_mode, rev_bind) = resolve_reverse_flag(sk.reverse, ctx)?;
         let reverse = match rev_mode {
             ReverseMode::Never => const_bool(false),
@@ -26784,6 +27307,132 @@ fn lower_sorted_expr(
             ));
         }
     };
+    // Dynamic elements and a key that returns a dynamic value: sort by the
+    // keys with the comparison kernel.
+    if elem == ir::Ty::Any
+        && let Some(key_ast) = sk.key
+        && let ast::ExprKind::Lambda { params, body } = &key_ast.kind
+    {
+        let key_val = lower_lambda_typed(params, body, &[ir::Ty::Any], key_ast.span, ctx)?;
+        if let ir::Ty::Closure {
+            params: kp,
+            ret,
+            capture_tys,
+            func,
+        } = key_val.ty
+            && kp.len() == 1
+            && !is_orderable_ty(*ret)
+        {
+            let (rev_mode, rev_bind) = resolve_reverse_flag(sk.reverse, ctx)?;
+            let reverse = match rev_mode {
+                ReverseMode::Never => const_bool(false),
+                ReverseMode::Always => const_bool(true),
+                ReverseMode::Cond(e) => e,
+            };
+            let list_ty = arg.ty;
+            let items = ctx.fresh_temp("dsort.items", list_ty);
+            let keyf = ctx.fresh_temp("dsort.key", key_val.ty);
+            let n = ctx.fresh_temp("dsort.n", ir::Ty::Int);
+            let keys = ctx.fresh_temp("dsort.keys", list_ty);
+            let i = ctx.fresh_temp("dsort.i", ir::Ty::Int);
+            let load = |name: &String, ty| local_expr(name.clone(), ty);
+            let key_call = ir::Expr {
+                ty: *ret,
+                kind: ir::ExprKind::CallClosure {
+                    closure: Box::new(load(&keyf, key_val.ty)),
+                    args: vec![coerce(
+                        ir::Expr {
+                            ty: ir::Ty::Any,
+                            kind: ir::ExprKind::Index {
+                                base: Box::new(load(&items, list_ty)),
+                                index: Box::new(load(&i, ir::Ty::Int)),
+                            },
+                        },
+                        kp[0],
+                        span,
+                        "a key= argument",
+                    )?],
+                    capture_tys: capture_tys.to_vec(),
+                    func: func.to_string(),
+                },
+            };
+            let mut stmts = rev_bind;
+            stmts.push(ir::Stmt::Assign {
+                name: items.clone(),
+                value: arg,
+            });
+            stmts.push(ir::Stmt::Assign {
+                name: keyf.clone(),
+                value: key_val,
+            });
+            stmts.push(ir::Stmt::Assign {
+                name: n.clone(),
+                value: ir::Expr {
+                    ty: ir::Ty::Int,
+                    kind: ir::ExprKind::Len(Box::new(load(&items, list_ty))),
+                },
+            });
+            stmts.push(ir::Stmt::Assign {
+                name: keys.clone(),
+                value: ir::Expr {
+                    ty: list_ty,
+                    kind: ir::ExprKind::ListNew {
+                        cap: Box::new(load(&n, ir::Ty::Int)),
+                    },
+                },
+            });
+            stmts.push(ir::Stmt::Assign {
+                name: i.clone(),
+                value: int_const(0),
+            });
+            stmts.push(ir::Stmt::While {
+                cond: ir::Expr {
+                    ty: ir::Ty::Bool,
+                    kind: ir::ExprKind::Binary {
+                        op: ir::BinOp::Lt,
+                        left: Box::new(load(&i, ir::Ty::Int)),
+                        right: Box::new(load(&n, ir::Ty::Int)),
+                    },
+                },
+                body: vec![ir::Stmt::ListAppend {
+                    list: load(&keys, list_ty),
+                    value: coerce(key_call, ir::Ty::Any, span, "a key= result")?,
+                }],
+                step: vec![ir::Stmt::Assign {
+                    name: i.clone(),
+                    value: ir::Expr {
+                        ty: ir::Ty::Int,
+                        kind: ir::ExprKind::Binary {
+                            op: ir::BinOp::Add,
+                            left: Box::new(load(&i, ir::Ty::Int)),
+                            right: Box::new(int_const(1)),
+                        },
+                    },
+                }],
+            });
+            let sorted = dyn_kernel(
+                "pyrs_dyn_sort_by_keys",
+                vec![
+                    coerce(load(&items, list_ty), ir::Ty::Any, span, "sorted()")?,
+                    coerce(load(&keys, list_ty), ir::Ty::Any, span, "sorted()")?,
+                    lower_cast(ast::TypeName::Int, reverse, span)?,
+                ],
+                ir::Ty::Any,
+            );
+            return Ok(ir::Expr {
+                ty: list_ty,
+                kind: ir::ExprKind::Block {
+                    stmts,
+                    result: Box::new(ir::Expr {
+                        ty: list_ty,
+                        kind: ir::ExprKind::FromUnion {
+                            value: Box::new(sorted),
+                        },
+                    }),
+                },
+            });
+        }
+    }
     let list_ty = arg.ty;
     let (rev_mode, mut rev_bind) = resolve_reverse_flag(sk.reverse, ctx)?;
 
@@ -27058,6 +27707,19 @@ fn lower_min_max_expr(
 
     // Iterable form: any iterable, materialized into a list.
     let arg = materialize_iterable_arg(args[0], ctx)?;
+    let dynamic_elems =
+        matches!(arg.ty, ir::Ty::List(e) if matches!(*e, ir::Ty::Any | ir::Ty::Union(_)));
+    if (matches!(arg.ty, ir::Ty::Any | ir::Ty::Union(_)) || dynamic_elems)
+        && key_ast.is_none()
+        && default_ast.is_none()
+    {
+        let v = coerce(arg, ir::Ty::Any, args[0].span, "an iterable")?;
+        return Ok(dyn_kernel(
+            "pyrs_dyn_minmax",
+            vec![v, int_const(i64::from(func == "max"))],
+            ir::Ty::Any,
+        ));
+    }
     let elem = match arg.ty {
         ir::Ty::List(e) => *e,
         other => {
@@ -27108,6 +27770,57 @@ fn lower_min_max_multi_plain(
     let mut lowered = Vec::with_capacity(args.len());
     for a in args {
         lowered.push(lower_expr(a, ctx)?);
+    }
+    // A dynamic argument: CPython keeps the first extreme value, replacing it
+    // only when a later one compares strictly past it.
+    if lowered
+        .iter()
+        .any(|e| matches!(e.ty, ir::Ty::Any | ir::Ty::Union(_)))
+    {
+        let best = ctx.fresh_temp("dyn.best", ir::Ty::Any);
+        let mut stmts = Vec::new();
+        let mut iter = lowered.into_iter();
+        let first = iter.next().expect("at least two arguments");
+        stmts.push(ir::Stmt::Assign {
+            name: best.clone(),
+            value: coerce(first, ir::Ty::Any, span, "a dynamic argument")?,
+        });
+        for next in iter {
+            let cand = ctx.fresh_temp("dyn.cand", ir::Ty::Any);
+            stmts.push(ir::Stmt::Assign {
+                name: cand.clone(),
+                value: coerce(next, ir::Ty::Any, span, "a dynamic argument")?,
+            });
+            let op = if func == "max" {
+                ast::BinOp::Gt
+            } else {
+                ast::BinOp::Lt
+            };
+            let cond = lower_binary(
+                op,
+                local_expr(cand.clone(), ir::Ty::Any),
+                local_expr(best.clone(), ir::Ty::Any),
+                span,
+                ctx,
+            )?;
+            stmts.push(ir::Stmt::If {
+                branches: vec![(
+                    cond,
+                    vec![ir::Stmt::Assign {
+                        name: best.clone(),
+                        value: local_expr(cand, ir::Ty::Any),
+                    }],
+                )],
+                orelse: vec![],
+            });
+        }
+        return Ok(ir::Expr {
+            ty: ir::Ty::Any,
+            kind: ir::ExprKind::Block {
+                stmts,
+                result: Box::new(local_expr(best, ir::Ty::Any)),
+            },
+        });
     }
     // Homogeneous str / orderable tuple / orderable list: lexicographic Min/Max fold.
     let first_ty = lowered[0].ty;
@@ -27875,6 +28588,23 @@ fn lower_sum_expr(
         ));
     }
     let list = materialize_iterable_arg(args[0], ctx)?;
+    // A dynamic iterable, or a list whose elements are not all one numeric
+    // type, adds with the operator kernel, left to right from `start`.
+    let dynamic = match list.ty {
+        ir::Ty::Any | ir::Ty::Union(_) => true,
+        ir::Ty::List(e) => matches!(*e, ir::Ty::Any | ir::Ty::Union(_) | ir::Ty::Bool),
+        _ => false,
+    };
+    if dynamic {
+        let start = match (args.get(1), start_kw) {
+            (Some(a), _) => lower_expr(a, ctx)?,
+            (None, Some(kw)) => lower_expr(&kw.value, ctx)?,
+            (None, None) => int_const(0),
+        };
+        let v = coerce(list, ir::Ty::Any, args[0].span, "sum()")?;
+        let st = coerce(start, ir::Ty::Any, span, "sum() start")?;
+        return Ok(dyn_kernel("pyrs_dyn_sum", vec![v, st], ir::Ty::Any));
+    }
     let elem = match list.ty {
         ir::Ty::List(e) => *e,
         other => {
@@ -28714,6 +29444,12 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
                     base: Box::new(int_const(10)),
                 },
             }),
+            ir::Ty::Any => Ok(dyn_kernel("pyrs_dyn_to_int", vec![value], ir::Ty::Int)),
+            ir::Ty::Union(_) => Ok(dyn_kernel(
+                "pyrs_dyn_to_int",
+                vec![coerce(value, ir::Ty::Any, span, "int()")?],
+                ir::Ty::Int,
+            )),
             other => Err(err(format!("int() cannot convert {other}"), span)),
         },
         ast::TypeName::Float => match value.ty {
@@ -28736,6 +29472,12 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
                 ty: ir::Ty::Float,
                 kind: ir::ExprKind::StrToFloat(Box::new(value)),
             }),
+            ir::Ty::Any => Ok(dyn_kernel("pyrs_dyn_to_float", vec![value], ir::Ty::Float)),
+            ir::Ty::Union(_) => Ok(dyn_kernel(
+                "pyrs_dyn_to_float",
+                vec![coerce(value, ir::Ty::Any, span, "float()")?],
+                ir::Ty::Float,
+            )),
             other => Err(err(format!("float() cannot convert {other}"), span)),
         },
         ast::TypeName::Bool => match value.ty {
@@ -28794,6 +29536,13 @@ fn lower_cast(ty: ast::TypeName, value: ir::Expr, span: Span) -> SResult<ir::Exp
                 ty: ir::Ty::Str,
                 kind: ir::ExprKind::AnyToStr {
                     value: Box::new(value),
+                    repr: false,
+                },
+            }),
+            ir::Ty::Union(_) => Ok(ir::Expr {
+                ty: ir::Ty::Str,
+                kind: ir::ExprKind::AnyToStr {
+                    value: Box::new(coerce(value, ir::Ty::Any, span, "str()")?),
                     repr: false,
                 },
             }),
@@ -29659,6 +30408,774 @@ fn lower_is_none(op: ast::BinOp, l: ir::Expr, r: ir::Expr, span: Span) -> SResul
     }
 }
 
+/// Dispatch on the user class a dynamic value holds.
+///
+/// Whole-program analysis knows every class, so this is a closed switch on
+/// the object's runtime `type_id` -- the jump table closed-world dispatch
+/// already uses -- with one arm per class that can answer, and `fallback`
+/// for everything else (builtin types, and classes that cannot). An arm
+/// receives the value as its class and returns the result, which is stored
+/// dynamically. Only classes the program actually stores in a dynamic value
+/// get an arm, so a program that never does pays for none.
+fn lower_any_class_switch(
+    value: ir::Expr,
+    classes: Vec<ir::ClassId>,
+    span: Span,
+    ctx: &mut FnCtx,
+    mut arm: impl FnMut(ir::Expr, ir::ClassId, &mut FnCtx) -> SResult<ir::Expr>,
+    fallback: impl FnOnce(ir::Expr, &mut FnCtx) -> SResult<ir::Expr>,
+) -> SResult<ir::Expr> {
+    let obj = ctx.fresh_temp("dyn.obj", ir::Ty::Any);
+    let res = ctx.fresh_temp("dyn.res", ir::Ty::Any);
+    let mut stmts = vec![ir::Stmt::Assign {
+        name: obj.clone(),
+        value,
+    }];
+    let load = || local_expr(obj.clone(), ir::Ty::Any);
+    let mut branches = Vec::new();
+    if !classes.is_empty() {
+        let cid = ctx.fresh_temp("dyn.cid", ir::Ty::Int);
+        stmts.push(ir::Stmt::Assign {
+            name: cid.clone(),
+            value: ir::Expr {
+                ty: ir::Ty::Int,
+                kind: ir::ExprKind::AnyClassId(Box::new(load())),
+            },
+        });
+        for id in classes {
+            let as_class = ir::Expr {
+                ty: ir::Ty::Class(id),
+                kind: ir::ExprKind::FromUnion {
+                    value: Box::new(load()),
+                },
+            };
+            let body = match arm(as_class, id, ctx)
+                .and_then(|r| coerce(r, ir::Ty::Any, span, "a dynamic result"))
+            {
+                Ok(r) => vec![ir::Stmt::Assign {
+                    name: res.clone(),
+                    value: r,
+                }],
+                // This class cannot answer the way the program asks -- the
+                // arguments do not fit the types it was compiled with. CPython
+                // would try, so the gap is named rather than disguised.
+                Err(e) => vec![ir::Stmt::Die(format!(
+                    "NotImplementedError: a dynamic value holding a '{}' reached an \
+                     operation PyRs compiled that class without: {}",
+                    class_info(id).map(|c| c.name).unwrap_or_default(),
+                    e.message
+                ))],
+            };
+            let cond = ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::Binary {
+                    op: ir::BinOp::Eq,
+                    left: Box::new(local_expr(cid.clone(), ir::Ty::Int)),
+                    right: Box::new(int_const(id as i64)),
+                },
+            };
+            branches.push((cond, body));
+        }
+    }
+    let fb =
+        fallback(load(), ctx).and_then(|r| coerce(r, ir::Ty::Any, span, "a dynamic result"))?;
+    let orelse = vec![ir::Stmt::Assign {
+        name: res.clone(),
+        value: fb,
+    }];
+    if branches.is_empty() {
+        stmts.extend(orelse);
+    } else {
+        stmts.push(ir::Stmt::If { branches, orelse });
+    }
+    Ok(ir::Expr {
+        ty: ir::Ty::Any,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(res, ir::Ty::Any)),
+        },
+    })
+}
+
+/// A call into a pair-ABI runtime kernel.
+fn dyn_kernel(func: &str, args: Vec<ir::Expr>, ty: ir::Ty) -> ir::Expr {
+    ir::Expr {
+        ty,
+        kind: ir::ExprKind::DynKernel {
+            func: func.to_string(),
+            args,
+        },
+    }
+}
+
+/// `v[k]` on a dynamic value: a user class's `__getitem__`, else the kernel.
+fn lower_any_getitem(
+    base: ir::Expr,
+    index: &ast::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let key = lower_expr(index, ctx)?;
+    let key_t = ctx.fresh_temp("dyn.key", key.ty);
+    let key_ty = key.ty;
+    let classes: Vec<ir::ClassId> = dynamic_class_candidates()
+        .into_iter()
+        .filter(|&id| resolve_method(id, "__getitem__").is_some())
+        .collect();
+    let key_name = ast::Expr {
+        kind: ast::ExprKind::Name(key_t.clone()),
+        span: index.span,
+    };
+    let switch = lower_any_class_switch(
+        base,
+        classes,
+        span,
+        ctx,
+        |obj, id, ctx| {
+            lower_instance_method_call(
+                obj,
+                id,
+                "__getitem__",
+                span,
+                std::slice::from_ref(&key_name),
+                ctx,
+            )
+        },
+        |v, _| {
+            let k = coerce(
+                local_expr(key_t.clone(), key_ty),
+                ir::Ty::Any,
+                span,
+                "a dynamic key",
+            )?;
+            Ok(dyn_kernel("pyrs_dyn_getitem", vec![v, k], ir::Ty::Any))
+        },
+    )?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Any,
+        kind: ir::ExprKind::Block {
+            stmts: vec![ir::Stmt::Assign {
+                name: key_t,
+                value: key,
+            }],
+            result: Box::new(switch),
+        },
+    })
+}
+
+/// `v[k] = x` on a dynamic value: a user class's `__setitem__`, else the kernel.
+fn lower_any_setitem(
+    base: ir::Expr,
+    index: &ast::Expr,
+    value: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Stmt> {
+    let key = lower_expr(index, ctx)?;
+    let key_t = ctx.fresh_temp("dyn.key", key.ty);
+    let val_t = ctx.fresh_temp("dyn.val", value.ty);
+    let (key_ty, val_ty) = (key.ty, value.ty);
+    let classes: Vec<ir::ClassId> = dynamic_class_candidates()
+        .into_iter()
+        .filter(|&id| resolve_method(id, "__setitem__").is_some())
+        .collect();
+    let name = |t: &String| ast::Expr {
+        kind: ast::ExprKind::Name(t.clone()),
+        span,
+    };
+    let switch = lower_any_class_switch(
+        base,
+        classes,
+        span,
+        ctx,
+        |obj, id, ctx| {
+            lower_instance_method_call(
+                obj,
+                id,
+                "__setitem__",
+                span,
+                &[name(&key_t), name(&val_t)],
+                ctx,
+            )
+        },
+        |v, _| {
+            let k = coerce(
+                local_expr(key_t.clone(), key_ty),
+                ir::Ty::Any,
+                span,
+                "a dynamic key",
+            )?;
+            let x = coerce(
+                local_expr(val_t.clone(), val_ty),
+                ir::Ty::Any,
+                span,
+                "a dynamic value",
+            )?;
+            Ok(ir::Expr {
+                ty: ir::Ty::None,
+                kind: ir::ExprKind::Block {
+                    stmts: vec![ir::Stmt::ExprStmt(dyn_kernel(
+                        "pyrs_dyn_setitem",
+                        vec![v, k, x],
+                        ir::Ty::None,
+                    ))],
+                    result: Box::new(const_none()),
+                },
+            })
+        },
+    )?;
+    Ok(ir::Stmt::ExprStmt(ir::Expr {
+        ty: ir::Ty::Any,
+        kind: ir::ExprKind::Block {
+            stmts: vec![
+                ir::Stmt::Assign {
+                    name: key_t.clone(),
+                    value: key,
+                },
+                ir::Stmt::Assign {
+                    name: val_t.clone(),
+                    value,
+                },
+            ],
+            result: Box::new(switch),
+        },
+    }))
+}
+
+/// `v(args)` on a dynamic value: each function the program stores in a
+/// dynamic value is recognised by its code, and called with its own types.
+fn lower_any_call(
+    callee: ir::Expr,
+    callee_name: &str,
+    args: &[ast::PosArg],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    if !keywords.is_empty() {
+        return Err(err(
+            format!(
+                "calling the dynamic value '{callee_name}' with keyword arguments is not supported yet"
+            ),
+            span,
+        ));
+    }
+    let plain = require_plain_args(args, callee_name, span)?;
+    let mut stmts = Vec::new();
+    let obj = ctx.fresh_temp("dyn.fn", ir::Ty::Any);
+    stmts.push(ir::Stmt::Assign {
+        name: obj.clone(),
+        value: callee,
+    });
+    let mut temps = Vec::new();
+    for a in &plain {
+        let v = lower_expr(a, ctx)?;
+        let t = ctx.fresh_temp("dyn.arg", v.ty);
+        temps.push((t.clone(), v.ty));
+        stmts.push(ir::Stmt::Assign { name: t, value: v });
+    }
+    let res = ctx.fresh_temp("dyn.res", ir::Ty::Any);
+    let candidates: Vec<(String, ir::Ty)> = INFER_ROUNDS.with(|r| {
+        r.borrow()
+            .closures_known
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    });
+    let mut branches = Vec::new();
+    for (func, ty) in candidates {
+        let ir::Ty::Closure {
+            params,
+            ret,
+            capture_tys,
+            ..
+        } = ty
+        else {
+            continue;
+        };
+        let shown = match func.rsplit('.').next().unwrap_or(&func) {
+            n if n.starts_with("lambda") || n.is_empty() => "<lambda>".to_string(),
+            n => n.to_string(),
+        };
+        let body = if params.len() != temps.len() {
+            vec![ir::Stmt::Die(format!(
+                "TypeError: {shown}() takes {} positional argument{} but {} {} given",
+                params.len(),
+                if params.len() == 1 { "" } else { "s" },
+                temps.len(),
+                if temps.len() == 1 { "was" } else { "were" }
+            ))]
+        } else {
+            let coerced: SResult<Vec<ir::Expr>> = temps
+                .iter()
+                .zip(params.iter())
+                .map(|((t, ty), want)| {
+                    coerce(
+                        local_expr(t.clone(), *ty),
+                        *want,
+                        span,
+                        "a dynamic call argument",
+                    )
+                })
+                .collect();
+            let call = coerced.and_then(|args| {
+                coerce(
+                    ir::Expr {
+                        ty: *ret,
+                        kind: ir::ExprKind::CallClosure {
+                            closure: Box::new(ir::Expr {
+                                ty,
+                                kind: ir::ExprKind::FromUnion {
+                                    value: Box::new(local_expr(obj.clone(), ir::Ty::Any)),
+                                },
+                            }),
+                            args,
+                            capture_tys: capture_tys.to_vec(),
+                            func: func.clone(),
+                        },
+                    },
+                    ir::Ty::Any,
+                    span,
+                    "a dynamic call result",
+                )
+            });
+            match call {
+                Ok(v) => vec![ir::Stmt::Assign {
+                    name: res.clone(),
+                    value: v,
+                }],
+                Err(e) => vec![ir::Stmt::Die(format!(
+                    "NotImplementedError: a dynamic call reached '{shown}' with arguments PyRs \
+                     compiled it without: {}",
+                    e.message
+                ))],
+            }
+        };
+        branches.push((
+            ir::Expr {
+                ty: ir::Ty::Bool,
+                kind: ir::ExprKind::AnyIsClosure {
+                    value: Box::new(local_expr(obj.clone(), ir::Ty::Any)),
+                    func,
+                },
+            },
+            body,
+        ));
+    }
+    let not_callable = vec![
+        ir::Stmt::ExprStmt(dyn_kernel(
+            "pyrs_dyn_not_callable",
+            vec![local_expr(obj.clone(), ir::Ty::Any)],
+            ir::Ty::None,
+        )),
+        ir::Stmt::Assign {
+            name: res.clone(),
+            value: coerce(const_none(), ir::Ty::Any, span, "a dynamic call result")?,
+        },
+    ];
+    if branches.is_empty() {
+        stmts.extend(not_callable);
+    } else {
+        stmts.push(ir::Stmt::If {
+            branches,
+            orelse: not_callable,
+        });
+    }
+    Ok(ir::Expr {
+        ty: ir::Ty::Any,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(local_expr(res, ir::Ty::Any)),
+        },
+    })
+}
+
+/// `v.name` on a dynamic value.
+fn lower_any_getattr(
+    value: ir::Expr,
+    attr: &str,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let classes: Vec<ir::ClassId> = dynamic_class_candidates()
+        .into_iter()
+        .filter(|&id| {
+            field_index(id, attr).is_some()
+                || resolve_property(id, attr).is_some()
+                || class_const(id, attr).is_some()
+                || resolve_method(id, attr).is_some()
+                || class_info(id).is_some_and(|c| c.open)
+        })
+        .collect();
+    let attr_s = attr.to_string();
+    lower_any_class_switch(
+        value,
+        classes,
+        span,
+        ctx,
+        |obj, id, ctx| {
+            if resolve_property(id, attr).is_some() {
+                return lower_instance_method_call(obj, id, attr, span, &[], ctx);
+            }
+            if let Some((field_index, ty)) = field_index(id, attr) {
+                return Ok(ir::Expr {
+                    ty,
+                    kind: ir::ExprKind::GetField {
+                        object: Box::new(obj),
+                        class_id: id,
+                        field_index,
+                    },
+                });
+            }
+            if let Some(v) = class_const(id, attr) {
+                return Ok(v);
+            }
+            if resolve_method(id, attr).is_some() {
+                return Err(err(
+                    "a bound method taken from a dynamic value is not supported yet; \
+                     call the method directly",
+                    span,
+                ));
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::Any,
+                kind: ir::ExprKind::GetAttr {
+                    object: Box::new(obj),
+                    name: Box::new(const_str(attr)),
+                    class_id: id,
+                },
+            })
+        },
+        |v, _| {
+            Ok(ir::Expr {
+                ty: ir::Ty::Any,
+                kind: ir::ExprKind::DynAttrMissing {
+                    value: Box::new(v),
+                    name: attr_s,
+                },
+            })
+        },
+    )
+}
+
+/// `v.name = x` on a dynamic value.
+fn lower_any_setattr(
+    object: ir::Expr,
+    attr: &str,
+    value: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Stmt> {
+    let val = ctx.fresh_temp("dyn.val", value.ty);
+    let val_ty = value.ty;
+    let classes: Vec<ir::ClassId> = dynamic_class_candidates()
+        .into_iter()
+        .filter(|&id| field_index(id, attr).is_some() || class_info(id).is_some_and(|c| c.open))
+        .collect();
+    let attr_s = attr.to_string();
+    let switch = lower_any_class_switch(
+        object,
+        classes,
+        span,
+        ctx,
+        |obj, id, _ctx| {
+            let v = local_expr(val.clone(), val_ty);
+            let store = if let Some((field_index, ty)) = field_index(id, attr) {
+                ir::Stmt::SetField {
+                    object: obj,
+                    class_id: id,
+                    field_index,
+                    value: coerce(v, ty, span, "a dynamic attribute store")?,
+                }
+            } else {
+                ir::Stmt::ExprStmt(ir::Expr {
+                    ty: ir::Ty::None,
+                    kind: ir::ExprKind::SetAttr {
+                        object: Box::new(obj),
+                        name: Box::new(const_str(attr)),
+                        value: Box::new(coerce(v, ir::Ty::Any, span, "a dynamic attribute store")?),
+                        class_id: id,
+                    },
+                })
+            };
+            Ok(ir::Expr {
+                ty: ir::Ty::None,
+                kind: ir::ExprKind::Block {
+                    stmts: vec![store],
+                    result: Box::new(const_none()),
+                },
+            })
+        },
+        |v, _| {
+            Ok(ir::Expr {
+                ty: ir::Ty::Any,
+                kind: ir::ExprKind::DynAttrMissing {
+                    value: Box::new(v),
+                    name: attr_s,
+                },
+            })
+        },
+    )?;
+    Ok(ir::Stmt::ExprStmt(ir::Expr {
+        ty: ir::Ty::Any,
+        kind: ir::ExprKind::Block {
+            stmts: vec![ir::Stmt::Assign { name: val, value }],
+            result: Box::new(switch),
+        },
+    }))
+}
+
+/// `v.method(args)` on a dynamic value: a user class that has the method is
+/// called directly, anything else goes to the builtin method kernel.
+fn lower_any_method_call(
+    receiver: ir::Expr,
+    method: &str,
+    args: &[ast::Expr],
+    keywords: &[ast::Keyword],
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    // Each argument is evaluated once, before dispatch, whichever arm runs.
+    let mut prelude = Vec::new();
+    let mut arg_names = Vec::new();
+    for a in args {
+        let v = lower_expr(a, ctx)?;
+        let t = ctx.fresh_temp("dyn.arg", v.ty);
+        prelude.push(ir::Stmt::Assign {
+            name: t.clone(),
+            value: v,
+        });
+        arg_names.push(ast::Expr {
+            kind: ast::ExprKind::Name(t),
+            span: a.span,
+        });
+    }
+    let mut kw_names = Vec::new();
+    for k in keywords {
+        let v = lower_expr(&k.value, ctx)?;
+        let t = ctx.fresh_temp("dyn.kw", v.ty);
+        prelude.push(ir::Stmt::Assign {
+            name: t.clone(),
+            value: v,
+        });
+        kw_names.push(ast::Keyword {
+            name: k.name.clone(),
+            name_span: k.name_span,
+            value: ast::Expr {
+                kind: ast::ExprKind::Name(t),
+                span: k.value.span,
+            },
+        });
+    }
+    let classes: Vec<ir::ClassId> = dynamic_class_candidates()
+        .into_iter()
+        .filter(|&id| {
+            resolve_method(id, method).is_some()
+                || matches!(field_index(id, method), Some((_, ir::Ty::Closure { .. })))
+        })
+        .collect();
+    let has_keywords = !keywords.is_empty();
+    let switch = lower_any_class_switch(
+        receiver,
+        classes,
+        span,
+        ctx,
+        |obj, id, ctx| {
+            lower_instance_method_call_kw(obj, id, method, span, &arg_names, &kw_names, ctx)
+        },
+        |v, ctx| {
+            if has_keywords {
+                // Reached only when the value is not one of the user classes
+                // above, which is a run-time fact.
+                return Ok(ir::Expr {
+                    ty: ir::Ty::Any,
+                    kind: ir::ExprKind::Block {
+                        stmts: vec![ir::Stmt::Die(format!(
+                            "NotImplementedError: keyword arguments to '{method}' on a dynamic \
+                             value of a builtin type are not supported yet"
+                        ))],
+                        result: Box::new(coerce(
+                            const_none(),
+                            ir::Ty::Any,
+                            span,
+                            "a dynamic result",
+                        )?),
+                    },
+                });
+            }
+            let mut lowered = Vec::with_capacity(arg_names.len());
+            for a in &arg_names {
+                let x = lower_expr(a, ctx)?;
+                lowered.push(coerce(x, ir::Ty::Any, a.span, "a dynamic method argument")?);
+            }
+            Ok(ir::Expr {
+                ty: ir::Ty::Any,
+                kind: ir::ExprKind::DynMethod {
+                    receiver: Box::new(v),
+                    name: method.to_string(),
+                    args: lowered,
+                },
+            })
+        },
+    )?;
+    Ok(ir::Expr {
+        ty: ir::Ty::Any,
+        kind: ir::ExprKind::Block {
+            stmts: prelude,
+            result: Box::new(switch),
+        },
+    })
+}
+
+/// A binary operator where a dynamic operand may hold a user class that
+/// defines the dunder: CPython's order, the left operand's method first and
+/// then the right operand's reflected one, before the builtin kernel.
+fn lower_dynamic_binary_with_dunders(
+    op: ast::BinOp,
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<Option<ir::Expr>> {
+    let (direct, reflected, is_cmp) = match op {
+        ast::BinOp::Eq => (Some("__eq__"), Some("__eq__"), true),
+        ast::BinOp::NotEq => (Some("__ne__"), Some("__ne__"), true),
+        ast::BinOp::Lt => (Some("__lt__"), Some("__gt__"), true),
+        ast::BinOp::LtEq => (Some("__le__"), Some("__ge__"), true),
+        ast::BinOp::Gt => (Some("__gt__"), Some("__lt__"), true),
+        ast::BinOp::GtEq => (Some("__ge__"), Some("__le__"), true),
+        _ => (
+            class_arith_method(op),
+            class_reflected_arith_method(op),
+            false,
+        ),
+    };
+    let candidates = dynamic_class_candidates();
+    let has = |m: Option<&str>, id: ir::ClassId| m.is_some_and(|m| resolve_method(id, m).is_some());
+    let left_classes: Vec<ir::ClassId> = if l.ty == ir::Ty::Any {
+        candidates
+            .iter()
+            .copied()
+            .filter(|&id| has(direct, id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let right_classes: Vec<ir::ClassId> = if r.ty == ir::Ty::Any {
+        candidates
+            .iter()
+            .copied()
+            .filter(|&id| has(reflected, id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // `!=` with only `__eq__`: negate it, as a class's default `__ne__` does.
+    if left_classes.is_empty() && right_classes.is_empty() {
+        return lower_dynamic_binary(op, &l, &r, span);
+    }
+    let lt = ctx.fresh_temp("dyn.l", ir::Ty::Any);
+    let rt = ctx.fresh_temp("dyn.r", ir::Ty::Any);
+    let mut stmts = vec![
+        ir::Stmt::Assign {
+            name: lt.clone(),
+            value: coerce(l, ir::Ty::Any, span, "a dynamic operator")?,
+        },
+        ir::Stmt::Assign {
+            name: rt.clone(),
+            value: coerce(r, ir::Ty::Any, span, "a dynamic operator")?,
+        },
+    ];
+    let name = |t: &String| ast::Expr {
+        kind: ast::ExprKind::Name(t.clone()),
+        span,
+    };
+    let kernel = lower_dynamic_binary(
+        op,
+        &local_expr(lt.clone(), ir::Ty::Any),
+        &local_expr(rt.clone(), ir::Ty::Any),
+        span,
+    )?
+    .ok_or_else(|| {
+        err(
+            format!("operator '{op}' is not supported for dynamic values"),
+            span,
+        )
+    })?;
+    let result_ty = kernel.ty;
+    // The reflected dispatch sits in the direct dispatch's fallback.
+    let rt_c = rt.clone();
+    let lt_c = lt.clone();
+    let reflected_switch = move |_: ir::Expr, ctx: &mut FnCtx| {
+        lower_any_class_switch(
+            local_expr(rt_c.clone(), ir::Ty::Any),
+            right_classes,
+            span,
+            ctx,
+            |obj, id, ctx| {
+                let call = lower_instance_method_call(
+                    obj,
+                    id,
+                    reflected.expect("filtered"),
+                    span,
+                    &[name(&lt_c)],
+                    ctx,
+                )?;
+                if is_cmp {
+                    to_bool(call, span, ctx)
+                } else {
+                    Ok(call)
+                }
+            },
+            |_, _| Ok(kernel),
+        )
+    };
+    let switch = lower_any_class_switch(
+        local_expr(lt.clone(), ir::Ty::Any),
+        left_classes,
+        span,
+        ctx,
+        |obj, id, ctx| {
+            let call = lower_instance_method_call(
+                obj,
+                id,
+                direct.expect("filtered"),
+                span,
+                &[name(&rt)],
+                ctx,
+            )?;
+            if is_cmp {
+                to_bool(call, span, ctx)
+            } else {
+                Ok(call)
+            }
+        },
+        reflected_switch,
+    )?;
+    let result = if result_ty == ir::Ty::Bool {
+        let t = ctx.fresh_temp("dyn.b", ir::Ty::Any);
+        stmts.push(ir::Stmt::Assign {
+            name: t.clone(),
+            value: switch,
+        });
+        coerce(
+            local_expr(t, ir::Ty::Any),
+            ir::Ty::Bool,
+            span,
+            "a comparison result",
+        )?
+    } else {
+        switch
+    };
+    Ok(Some(ir::Expr {
+        ty: result.ty,
+        kind: ir::ExprKind::Block {
+            stmts,
+            result: Box::new(result),
+        },
+    }))
+}
+
 /// An operator with at least one dynamic operand.
 ///
 /// Returns `None` for the operators the kernel does not implement, so the
@@ -29717,7 +31234,39 @@ fn lower_dynamic_binary(
     Ok(None)
 }
 
+/// A binary operator. A union operand the typed rules cannot use -- `int |
+/// str` has no single machine representation -- goes to the kernel `Any`
+/// already has, which dispatches on whatever the value holds, as CPython does.
 fn lower_binary(
+    op: ast::BinOp,
+    l: ir::Expr,
+    r: ir::Expr,
+    span: Span,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let union_operand = matches!(l.ty, ir::Ty::Union(_)) || matches!(r.ty, ir::Ty::Union(_));
+    if !union_operand || matches!(op, ast::BinOp::Is | ast::BinOp::IsNot) {
+        return lower_binary_typed(op, l, r, span, ctx);
+    }
+    match lower_binary_typed(op, l.clone(), r.clone(), span, ctx) {
+        Ok(e) => Ok(e),
+        Err(typed) => {
+            let la =
+                coerce(l, ir::Ty::Any, span, "a dynamic operand").map_err(|_| typed.clone())?;
+            let ra =
+                coerce(r, ir::Ty::Any, span, "a dynamic operand").map_err(|_| typed.clone())?;
+            if matches!(op, ast::BinOp::In | ast::BinOp::NotIn) {
+                return lower_binary_typed(op, la, ra, span, ctx).map_err(|_| typed);
+            }
+            match lower_dynamic_binary_with_dunders(op, la, ra, span, ctx) {
+                Ok(Some(e)) => Ok(e),
+                _ => Err(typed),
+            }
+        }
+    }
+}
+
+fn lower_binary_typed(
     op: ast::BinOp,
     l: ir::Expr,
     r: ir::Expr,
@@ -29742,7 +31291,7 @@ fn lower_binary(
     // values already carry. This is checked after `in` and `is`, which have
     // their own dynamic paths, and before every typed rule below.
     if (l.ty == ir::Ty::Any || r.ty == ir::Ty::Any)
-        && let Some(e) = lower_dynamic_binary(op, &l, &r, span)?
+        && let Some(e) = lower_dynamic_binary_with_dunders(op, l.clone(), r.clone(), span, ctx)?
     {
         return Ok(e);
     }
