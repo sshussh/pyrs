@@ -1172,6 +1172,34 @@ pub enum ExprKind {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+    /// A call into a pair-ABI runtime kernel by name. An `Any` argument is
+    /// passed as `(i32 tag, i64 payload)`, an `Int` as a machine `i64`
+    /// (`i64::MIN` passes through, as a slice bound's "missing"), a `Str` as
+    /// `ptr`. The result is `expr.ty`: `Any` returns its payload and writes
+    /// its tag through the function's out-slot, `Int` is a tagged int,
+    /// `Float` a double, `Str` a pointer, `None` nothing.
+    DynKernel {
+        func: String,
+        args: Vec<Expr>,
+    },
+    /// Whether a dynamic value holds a closure whose code is the IR function
+    /// `func`. Result is Bool. The switch a call of a dynamic value
+    /// dispatches through.
+    AnyIsClosure {
+        value: Box<Expr>,
+        func: String,
+    },
+    /// The runtime `type_id` of a dynamic value holding a user class
+    /// instance, or -1 for any other value. Result is Int. The switch a
+    /// dynamic attribute or method dispatches through.
+    AnyClassId(Box<Expr>),
+    /// `v.name` where `v` is dynamic and holds no user class that has
+    /// `name`: CPython's `AttributeError`, named for the value's own type.
+    /// Result is [`Ty::Any`] (it never returns).
+    DynAttrMissing {
+        value: Box<Expr>,
+        name: String,
+    },
     /// `v.keys()` where `v` is dynamic and holds a dict with str keys.
     /// Yields `list[str]` in insertion order.
     AnyDictKeys(Box<Expr>),
