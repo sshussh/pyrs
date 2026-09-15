@@ -8264,12 +8264,142 @@ static PyrsStr *dyn_percent_text(int tag, long long payload, int minus, int widt
     return dyn_percent_pad(s, minus, width);
 }
 
+/* The next positional argument. A tuple supplies them in order; any other
+ * value is the single argument. Once a mapping key has been used there are no
+ * positional arguments left to give, which is how CPython reports
+ * `"%(k)s %s" % {"k": 1}`. */
+static void dyn_percent_next(int is_tuple, const PyrsTuple *tup, int rt,
+                             long long rp, long long nargs, long long *next,
+                             int used_mapping, int *atag, long long *apay) {
+    if (used_mapping || *next >= nargs) {
+        pyrs_die("TypeError: not enough arguments for format string");
+    }
+    if (is_tuple) {
+        *atag = tup->tags[*next];
+        *apay = tup->data[*next];
+    } else {
+        *atag = rt;
+        *apay = rp;
+    }
+    (*next)++;
+}
+
+/* `*` width or precision: the next positional argument, which must be an int. */
+static int dyn_percent_star(int is_tuple, const PyrsTuple *tup, int rt,
+                            long long rp, long long nargs, long long *next,
+                            int used_mapping) {
+    int atag;
+    long long apay;
+    dyn_percent_next(is_tuple, tup, rt, rp, nargs, next, used_mapping, &atag,
+                     &apay);
+    long long v;
+    if (!dyn_as_int(atag, apay, &v)) {
+        pyrs_die("TypeError: * wants int");
+    }
+    return (int)pyrs_int_as_i64(v);
+}
+
+/* `%c`: an int code point, or a one-character str. */
+static PyrsStr *dyn_percent_char(int tag, long long payload, int minus,
+                                 int width) {
+    PyrsStr *ch;
+    long long v;
+    if (dyn_as_int(tag, payload, &v)) {
+        if (!pyrs_int_is_small(v) || pyrs_int_small_val(v) < 0
+            || pyrs_int_small_val(v) > 0x10ffff) {
+            pyrs_die("OverflowError: %c arg not in range(0x110000)");
+        }
+        ch = pyrs_chr(v);
+    } else if (dyn_kind(tag) == DK_STR) {
+        PyrsStr *sv = (PyrsStr *)(uintptr_t)payload;
+        long long cps = sv->cplen;
+        if (cps != 1) {
+            char msg[160];
+            snprintf(msg, sizeof msg,
+                     "TypeError: %%c requires an int or a unicode character, "
+                     "not a string of length %lld",
+                     cps);
+            pyrs_die(msg);
+        }
+        ch = sv;
+    } else {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "TypeError: %%c requires an int or a unicode character, not %s",
+                 dyn_type_name(tag));
+        pyrs_die(msg);
+    }
+    return dyn_percent_pad(ch, minus, width);
+}
+
+/* `%a`: ascii(), which is repr() with every non-ASCII character escaped. */
+static PyrsStr *dyn_percent_ascii(int tag, long long payload, int minus,
+                                  int width, int prec) {
+    PyrsStr *s;
+    switch (dyn_kind(tag)) {
+    case DK_STR:
+        s = pyrs_str_ascii((const PyrsStr *)(uintptr_t)payload);
+        break;
+    case DK_LIST:
+        s = pyrs_ascii_list((const PyrsList *)(uintptr_t)payload,
+                            any_elem_tag(tag));
+        break;
+    case DK_TUPLE:
+        s = pyrs_ascii_tuple((const PyrsTuple *)(uintptr_t)payload);
+        break;
+    case DK_DICT:
+        s = pyrs_ascii_dict((const PyrsDict *)(uintptr_t)payload);
+        break;
+    case DK_SET:
+        s = pyrs_ascii_set((const PyrsSet *)(uintptr_t)payload);
+        break;
+    default:
+        /* numbers, bools and None have no non-ASCII repr */
+        s = dyn_repr_of(tag, payload);
+        break;
+    }
+    s = dyn_percent_trunc(s, prec);
+    return dyn_percent_pad(s, minus, width);
+}
+
+/* `%(key)` looks the key up in a dict argument. */
+static void dyn_percent_lookup(int rt, long long rp, const char *key,
+                               long long klen, int *atag, long long *apay) {
+    PyrsDynKind k = dyn_kind(rt);
+    if (k == DK_LIST) {
+        pyrs_die("TypeError: list indices must be integers or slices, not str");
+    }
+    if (k != DK_DICT) {
+        pyrs_die("TypeError: format requires a mapping");
+    }
+    PyrsDict *d = (PyrsDict *)(uintptr_t)rp;
+    PyrsStr *name = str_alloc(klen);
+    memcpy(name->data, key, (size_t)klen);
+    name = str_done_scan(name);
+    long long out = 0;
+    if (!pyrs_dict_get_default(d, (long long)(uintptr_t)name, TAG_STR, &out)) {
+        die_keyerror((long long)(uintptr_t)name, TAG_STR);
+    }
+    /* Every insert stamps the value tag from the dict's static value type, so
+     * any full slot answers for the dict; a union value is boxed. */
+    int vtag = d->table[d->order[0]].val_tag;
+    if (vtag == TAG_UNION) {
+        const PyrsUnionBox *b = any_box(out);
+        *atag = b->print_tag;
+        *apay = b->payload;
+    } else {
+        *atag = vtag;
+        *apay = out;
+    }
+}
+
 static PyrsStr *dyn_percent_format(const PyrsStr *fmt, int rt, long long rp) {
     check_ref(fmt);
     int is_tuple = dyn_kind(rt) == DK_TUPLE;
     const PyrsTuple *tup = is_tuple ? (const PyrsTuple *)(uintptr_t)rp : NULL;
     long long nargs = is_tuple ? tup->len : 1;
     long long next = 0;
+    int used_mapping = 0;
 
     StrBuf b;
     sb_init(&b, fmt->len);
@@ -8291,10 +8421,27 @@ static PyrsStr *dyn_percent_format(const PyrsStr *fmt, int rt, long long rp) {
             i++;
             continue;
         }
+        int have_key = 0;
+        int ktag = 0;
+        long long kpay = 0;
         if (i < n && s[i] == '(') {
-            pyrs_die("NotImplementedError: mapping keys in '%' formatting on "
-                     "a dynamic str are not supported yet; use an f-string, "
-                     "or narrow with isinstance first");
+            /* Parentheses nest inside a key, as CPython counts them. */
+            long long depth = 1;
+            long long kstart = ++i;
+            while (i < n && depth > 0) {
+                if (s[i] == '(') {
+                    depth++;
+                } else if (s[i] == ')') {
+                    depth--;
+                }
+                i++;
+            }
+            if (depth > 0) {
+                pyrs_die("ValueError: incomplete format key");
+            }
+            dyn_percent_lookup(rt, rp, s + kstart, i - 1 - kstart, &ktag, &kpay);
+            have_key = 1;
+            used_mapping = 1;
         }
         int minus = 0, plus = 0, space = 0, zero = 0, hash = 0;
         while (i < n) {
@@ -8314,13 +8461,17 @@ static PyrsStr *dyn_percent_format(const PyrsStr *fmt, int rt, long long rp) {
             }
             i++;
         }
-        if (i < n && s[i] == '*') {
-            pyrs_die("NotImplementedError: '*' width in '%' formatting on a "
-                     "dynamic str is not supported yet; use an f-string, or "
-                     "narrow with isinstance first");
-        }
         int width = -1;
-        if (i < n && s[i] >= '1' && s[i] <= '9') {
+        if (i < n && s[i] == '*') {
+            width = dyn_percent_star(is_tuple, tup, rt, rp, nargs, &next,
+                                     used_mapping);
+            /* A negative `*` width means left-align, as the `-` flag does. */
+            if (width < 0) {
+                minus = 1;
+                width = -width;
+            }
+            i++;
+        } else if (i < n && s[i] >= '1' && s[i] <= '9') {
             width = 0;
             while (i < n && s[i] >= '0' && s[i] <= '9') {
                 width = width * 10 + (s[i] - '0');
@@ -8331,11 +8482,15 @@ static PyrsStr *dyn_percent_format(const PyrsStr *fmt, int rt, long long rp) {
         if (i < n && s[i] == '.') {
             i++;
             if (i < n && s[i] == '*') {
-                pyrs_die("NotImplementedError: '*' precision in '%' formatting "
-                         "on a dynamic str is not supported yet; use an "
-                         "f-string, or narrow with isinstance first");
+                prec = dyn_percent_star(is_tuple, tup, rt, rp, nargs, &next,
+                                        used_mapping);
+                if (prec < 0) {
+                    prec = 0;
+                }
+                i++;
+            } else {
+                prec = 0;
             }
-            prec = 0;
             while (i < n && s[i] >= '0' && s[i] <= '9') {
                 prec = prec * 10 + (s[i] - '0');
                 i++;
@@ -8350,19 +8505,15 @@ static PyrsStr *dyn_percent_format(const PyrsStr *fmt, int rt, long long rp) {
         long long conv_at = i;
         char conv = s[i];
         i++;
-        if (next >= nargs) {
-            pyrs_die("TypeError: not enough arguments for format string");
-        }
         int atag;
         long long apay;
-        if (is_tuple) {
-            atag = tup->tags[next];
-            apay = tup->data[next];
+        if (have_key) {
+            atag = ktag;
+            apay = kpay;
         } else {
-            atag = rt;
-            apay = rp;
+            dyn_percent_next(is_tuple, tup, rt, rp, nargs, &next, used_mapping,
+                             &atag, &apay);
         }
-        next++;
         PyrsStr *piece;
         switch (conv) {
         case 's':
@@ -8390,15 +8541,11 @@ static PyrsStr *dyn_percent_format(const PyrsStr *fmt, int rt, long long rp) {
                                       width, prec, conv);
             break;
         case 'c':
-        case 'a': {
-            char msg[192];
-            snprintf(msg, sizeof msg,
-                     "NotImplementedError: '%%%c' formatting on a dynamic str "
-                     "is not supported yet; use an f-string, or narrow with "
-                     "isinstance first",
-                     conv);
-            pyrs_die(msg);
-        }
+            piece = dyn_percent_char(atag, apay, minus, width);
+            break;
+        case 'a':
+            piece = dyn_percent_ascii(atag, apay, minus, width, prec);
+            break;
         default: {
             char msg[96];
             snprintf(msg, sizeof msg,
@@ -8410,7 +8557,8 @@ static PyrsStr *dyn_percent_format(const PyrsStr *fmt, int rt, long long rp) {
         }
         sb_put_pystr(&b, piece);
     }
-    if (next < nargs) {
+    /* A dict used through its keys is not a leftover positional argument. */
+    if (!used_mapping && next < nargs) {
         pyrs_die("TypeError: not all arguments converted during string "
                  "formatting");
     }
