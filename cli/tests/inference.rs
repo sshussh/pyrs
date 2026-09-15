@@ -195,3 +195,117 @@ fn unconstrained_still_needs_an_annotation() {
         "{err}"
     );
 }
+
+/// The case the earlier test missed. `identity(x): return x` puts no
+/// constraint on `x`, so it never reached body inference; `x + x` does, and
+/// body inference commits to one type for it. A second call site with another
+/// type has to win, because CPython runs this program.
+#[test]
+fn a_call_site_conflict_overrides_a_body_inferred_type() {
+    matches_python(
+        "poly-body",
+        r#"
+def show(x):
+    return x + x
+def scale(x):
+    return x * 2
+print(show(2), show("ab"))
+print(scale(2), scale("ab"), scale([1]), scale(2.5))
+"#,
+    );
+}
+
+/// Widening propagates: when `outer` becomes dynamic, what it passes to
+/// `inner` is dynamic too.
+#[test]
+fn widening_propagates_through_the_call_graph() {
+    matches_python(
+        "poly-chain",
+        r#"
+def inner(v):
+    return v + v
+def outer(x):
+    return inner(x)
+print(outer(3), outer("z"))
+"#,
+    );
+}
+
+/// Methods, through a constructed local, through `self`, and inherited.
+#[test]
+fn a_call_site_conflict_widens_a_method_parameter() {
+    matches_python(
+        "poly-method",
+        r#"
+class Base:
+    def twice(self, x):
+        return x + x
+    def mixed(self):
+        return str(self.twice(1)) + self.twice("s")
+class Sub(Base):
+    pass
+b = Base()
+s = Sub()
+print(b.twice(1), b.twice("q"), b.mixed(), s.twice(4), s.twice("w"))
+def run():
+    k = Base()
+    return str(k.twice(5)) + k.twice("r")
+print(run())
+"#,
+    );
+}
+
+/// The conflict only fires on a real disagreement: a function every call site
+/// agrees on keeps its unboxed signature, and a numeric promotion is not a
+/// conflict.
+#[test]
+fn agreeing_call_sites_keep_the_typed_signature() {
+    let dir = TempDir(
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("pyrs-infer-poly-mono-{}", std::process::id())),
+    );
+    fs::create_dir_all(&dir.0).unwrap();
+    fs::write(
+        dir.0.join("prog.py"),
+        "def step(x):\n    return x * 2 + 1\nclass K:\n    def step(self, x):\n        return x * 2 + 1\n\
+         k = K()\nprint(step(3), step(4), k.step(3), k.step(True))\n",
+    )
+    .unwrap();
+    let out = Command::new(PYRS)
+        .args([
+            "compile",
+            "--no-cache",
+            "--emit-llvm",
+            "-O",
+            "0",
+            "-i",
+            "prog.py",
+            "-o",
+            "out",
+        ])
+        .current_dir(&dir.0)
+        .output()
+        .expect("failed to spawn PyRs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ll = fs::read_to_string(dir.0.join("out.ll")).expect("no LLVM output");
+    assert!(ll.contains("define i64 @pyrs_step(i64 %p.x)"), "{ll}");
+    assert!(
+        ll.contains("define i64 @pyrs_K.step(ptr %p.self, i64 %p.x)"),
+        "{ll}"
+    );
+}
+
+/// An annotation is a contract, so a mismatch against one stays an error
+/// rather than widening.
+#[test]
+fn an_annotated_parameter_does_not_widen() {
+    let msg = rejects(
+        "poly-annotated",
+        "def strict(x: int):\n    return x + x\nprint(strict(2), strict(\"ab\"))\n",
+    );
+    assert!(msg.contains("type mismatch"), "{msg}");
+}
