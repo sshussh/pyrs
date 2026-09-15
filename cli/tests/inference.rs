@@ -309,3 +309,38 @@ fn an_annotated_parameter_does_not_widen() {
     );
     assert!(msg.contains("type mismatch"), "{msg}");
 }
+
+/// `self.x: float = x` writes the parameter's type down beside it. The value
+/// is printed, so an int where CPython keeps the float would show.
+#[test]
+fn an_annotated_field_assignment_types_its_parameter() {
+    matches_python(
+        "field-annotation",
+        r#"
+class Vec2:
+    def __init__(self, x, y):
+        self.x: float = x
+        self.y: float = y
+    def length_sq(self):
+        return self.x * self.x + self.y * self.y
+v = Vec2(1.5, 2.5)
+print(v.x, v.y, v.length_sq())
+"#,
+    );
+}
+
+/// A constructor's call site is not yet used as evidence for `__init__`
+/// parameters: class layouts are finalized before any call site is visited,
+/// so a field assigned from a parameter typed that late would be missing from
+/// the layout. Until that ordering changes, the diagnostic must name the
+/// parameter -- not claim the object lacks a field it plainly assigns.
+#[test]
+fn an_uninferable_constructor_parameter_is_named_not_disguised() {
+    let msg = rejects(
+        "ctor-call-site",
+        "class Circle:\n    def __init__(self, r):\n        self.r = r\n\
+         c = Circle(2.5)\nprint(c.r)\n",
+    );
+    assert!(msg.contains("parameter 'r'"), "{msg}");
+    assert!(!msg.contains("has no attribute"), "{msg}");
+}
