@@ -582,6 +582,15 @@ fn resolve_param_ty_opt(p: &ast::Param) -> SResult<Option<ir::Ty>> {
     Ok(None)
 }
 
+/// The element type of `*args` or value type of `**kwargs`: unannotated, any
+/// value may arrive.
+fn resolve_star_param_ty(p: &ast::Param) -> SResult<ir::Ty> {
+    if p.ty.is_none() {
+        return Ok(ir::Ty::Any);
+    }
+    resolve_param_ty(p)
+}
+
 /// Resolve a parameter's type, requiring annotation/default (no body inference).
 fn resolve_param_ty(p: &ast::Param) -> SResult<ir::Ty> {
     match resolve_param_ty_opt(p)? {
@@ -597,16 +606,332 @@ fn resolve_param_ty(p: &ast::Param) -> SResult<ir::Ty> {
     }
 }
 
-/// Error when bare-param body inference fails.
-fn bare_param_infer_err(p: &ast::Param) -> Diagnostic {
-    err(
+/// An unannotated formal parameter, identified by where it is written: the
+/// module it belongs to and its span there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ParamKey {
+    module: u64,
+    start: usize,
+    end: usize,
+    /// What at that span: a parameter, or a function's yield or return type.
+    slot: Slot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Slot {
+    Param,
+    Yield,
+    Return,
+}
+
+fn module_hash() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    with_class_env(|e| e.current_module.hash(&mut h));
+    h.finish()
+}
+
+/// The yield or return type of an unannotated function defined at `span`.
+/// Synthesized functions (module inits) have no span and no key.
+fn result_key(span: Span, slot: Slot) -> Option<ParamKey> {
+    (span != Span::default()).then(|| ParamKey {
+        module: module_hash(),
+        start: span.start,
+        end: span.end,
+        slot,
+    })
+}
+
+fn param_key(p: &ast::Param) -> Option<ParamKey> {
+    if p.ty.is_some() || synth_param_ty(&p.name).is_some() || p.span == Span::default() {
+        return None;
+    }
+    Some(ParamKey {
+        module: module_hash(),
+        start: p.span.start,
+        end: p.span.end,
+        slot: Slot::Param,
+    })
+}
+
+/// What one call site passed to an unannotated parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// A value of this type.
+    Value(ir::Ty),
+    /// A literal that fits several types: `[]`, `{}` or `None`, whose type
+    /// is whatever the parameter turns out to be.
+    Flexible(ir::Ty),
+}
+
+/// Call-site-driven inference, run as rounds of the real lowering.
+///
+/// The compiler's own typer knows every argument's type at every call --
+/// constructors, methods on any receiver, operators, comprehensions -- where
+/// a separate pre-pass over the AST sees only the shapes it was taught. A round
+/// lowers the program with the current seeds and records what each call site
+/// passed to each unannotated parameter; the next round seeds from that.
+#[derive(Default)]
+struct InferRounds {
+    /// Collecting evidence rather than producing the final program: a call
+    /// whose argument does not fit a guessed parameter type is recorded, not
+    /// an error, and a function that fails to lower is skipped.
+    collecting: bool,
+    /// Set when a collecting round tolerated something it would have refused.
+    tolerated: bool,
+    evidence: HashMap<ParamKey, Vec<Evidence>>,
+    /// Parameter types decided from the previous round's evidence.
+    seeds: HashMap<ParamKey, ir::Ty>,
+    /// Functions whose value escapes (`f` passed or stored rather than
+    /// called): some of their call sites are not visible as calls, so their
+    /// evidence is incomplete.
+    escaped: HashSet<ParamKey>,
+    /// Each method's user parameters, so an override and the method it
+    /// overrides decide one type per position: virtual dispatch passes the
+    /// same arguments to both.
+    method_params: HashMap<(ir::ClassId, String), Vec<Option<ParamKey>>>,
+}
+
+thread_local! {
+    static INFER_ROUNDS: RefCell<InferRounds> = RefCell::new(InferRounds::default());
+}
+
+fn rounds_collecting() -> bool {
+    INFER_ROUNDS.with(|r| r.borrow().collecting)
+}
+
+fn rounds_tolerate() {
+    INFER_ROUNDS.with(|r| r.borrow_mut().tolerated = true);
+}
+
+fn rounds_seed(key: ParamKey) -> Option<ir::Ty> {
+    INFER_ROUNDS.with(|r| r.borrow().seeds.get(&key).copied())
+}
+
+fn record_call_evidence(key: ParamKey, ev: Evidence) {
+    INFER_ROUNDS.with(|r| r.borrow_mut().evidence.entry(key).or_default().push(ev));
+}
+
+fn record_method_params(class_id: ir::ClassId, method: &str, user_params: &[ParamSig]) {
+    INFER_ROUNDS.with(|r| {
+        r.borrow_mut().method_params.insert(
+            (class_id, method.to_string()),
+            user_params.iter().map(|p| p.key).collect(),
+        );
+    });
+}
+
+fn record_escape(params: &[ParamSig]) {
+    INFER_ROUNDS.with(|r| {
+        let mut r = r.borrow_mut();
+        for p in params {
+            if let Some(k) = p.key {
+                r.escaped.insert(k);
+            }
+        }
+    });
+}
+
+/// The evidence one argument expression contributes, from its lowered form.
+fn evidence_of(arg: &ast::Expr, lowered: &ir::Expr) -> Evidence {
+    match &arg.kind {
+        ast::ExprKind::NoneLit => Evidence::Flexible(ir::Ty::None),
+        ast::ExprKind::ListLit(items) if items.is_empty() => {
+            Evidence::Flexible(ir::list_of(ir::Ty::Any))
+        }
+        ast::ExprKind::DictLit(items) if items.is_empty() => {
+            Evidence::Flexible(ir::dict_of(ir::Ty::Any, ir::Ty::Any))
+        }
+        _ => Evidence::Value(lowered.ty),
+    }
+}
+
+/// The one type every recorded argument has, if there is one.
+///
+/// Exactness is the point: an `int` and a `float` do not decide `float`, as
+/// `coerce` would, because converting the `int` changes what the program
+/// prints. Two types decide `Any` -- the observed set is the specialization
+/// plan, and the generic kernel is correct for both.
+///
+/// `optimistic` drops dynamic arguments. While rounds are still collecting, a
+/// dynamic argument is most often a parameter nothing has typed *yet* -- a
+/// recursive `f(n - 1)` whose `n` was dynamic in the first round -- and
+/// counting it would make that first guess permanent. The final round checks
+/// without it, so a genuinely dynamic argument still widens the parameter.
+fn decide_from_evidence(evidence: &[Evidence], optimistic: bool) -> Option<ir::Ty> {
+    let mut values: Vec<ir::Ty> = Vec::new();
+    let mut flexible: Vec<ir::Ty> = Vec::new();
+    for e in evidence {
+        match *e {
+            Evidence::Value(ir::Ty::Any) if optimistic => {}
+            Evidence::Value(t) if !values.contains(&t) => values.push(t),
+            Evidence::Flexible(t) if !flexible.contains(&t) => flexible.push(t),
+            _ => {}
+        }
+    }
+    let none = flexible.contains(&ir::Ty::None) || values.contains(&ir::Ty::None);
+    values.retain(|t| *t != ir::Ty::None);
+    let mut decided = match values.as_slice() {
+        [] if none && flexible.iter().all(|f| *f == ir::Ty::None) => return Some(ir::Ty::None),
+        [] => return None,
+        [t] => *t,
+        many => {
+            if many.contains(&ir::Ty::Any) {
+                ir::Ty::Any
+            } else if let Some(base) = common_class(many) {
+                base
+            } else {
+                ir::Ty::Any
+            }
+        }
+    };
+    if decided != ir::Ty::Any {
+        for f in &flexible {
+            let fits = matches!(
+                (*f, decided),
+                (ir::Ty::None, _)
+                    | (ir::Ty::List(_), ir::Ty::List(_))
+                    | (ir::Ty::Dict { .. }, ir::Ty::Dict { .. })
+            );
+            if !fits {
+                decided = ir::Ty::Any;
+                break;
+            }
+        }
+    }
+    if none && decided != ir::Ty::Any {
+        decided = ir::optional_of(decided);
+    }
+    Some(decided)
+}
+
+/// For every method parameter, the parameters at the same position of the
+/// methods it overrides and that override it.
+fn override_groups(
+    method_params: &HashMap<(ir::ClassId, String), Vec<Option<ParamKey>>>,
+) -> HashMap<ParamKey, Vec<ParamKey>> {
+    let mut groups: HashMap<ParamKey, Vec<ParamKey>> = HashMap::new();
+    for ((cid, name), keys) in method_params {
+        let mut cur = class_info(*cid).and_then(|c| c.parent);
+        let mut hops = 0;
+        while let Some(pid) = cur {
+            if let Some(parent_keys) = method_params.get(&(pid, name.clone())) {
+                for (a, b) in keys.iter().zip(parent_keys) {
+                    if let (Some(a), Some(b)) = (a, b)
+                        && a != b
+                    {
+                        groups.entry(*a).or_insert_with(|| vec![*a]).push(*b);
+                        groups.entry(*b).or_insert_with(|| vec![*b]).push(*a);
+                    }
+                }
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            cur = class_info(pid).and_then(|c| c.parent);
+        }
+    }
+    // Close over transitive links (grandparent through parent).
+    loop {
+        let mut changed = false;
+        let snapshot = groups.clone();
+        for members in groups.values_mut() {
+            let mut extra = Vec::new();
+            for m in members.iter() {
+                for n in snapshot.get(m).into_iter().flatten() {
+                    if !members.contains(n) && !extra.contains(n) {
+                        extra.push(*n);
+                    }
+                }
+            }
+            if !extra.is_empty() {
+                members.extend(extra);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    groups
+}
+
+/// The one class among `tys` that every other is a subclass of.
+fn common_class(tys: &[ir::Ty]) -> Option<ir::Ty> {
+    let ids: Vec<ir::ClassId> = tys
+        .iter()
+        .map(|t| match t {
+            ir::Ty::Class(id) => Some(*id),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    ids.iter()
+        .find(|base| ids.iter().all(|c| class_is_subclass(*c, **base)))
+        .map(|id| ir::Ty::Class(*id))
+}
+
+thread_local! {
+    /// Unannotated parameters nothing in the program could type, compiled as
+    /// dynamic values instead of refused: (module, parameter, span). Consulted
+    /// only when the program then fails to compile.
+    static DYNAMIC_FALLBACKS: RefCell<Vec<(String, String, Span)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A parameter with no evidence at all is an open set of types, which is what
+/// `Any` means. Compiling it through the generic kernel is correct for every
+/// argument CPython accepts; an annotation is an optimization, not a condition.
+fn dynamic_fallback(p: &ast::Param) -> ir::Ty {
+    let module = with_class_env(|e| e.current_module.clone());
+    DYNAMIC_FALLBACKS.with(|f| {
+        let mut f = f.borrow_mut();
+        if !f.iter().any(|(m, _, s)| *m == module && *s == p.span) {
+            f.push((module, p.name.clone(), p.span));
+        }
+    });
+    ir::Ty::Any
+}
+
+/// An unannotated parameter defaulting to `None` also admits `None`.
+fn with_none_default(p_default: Option<&ast::Expr>, ty: ir::Ty) -> ir::Ty {
+    match p_default.map(|d| &d.kind) {
+        Some(ast::ExprKind::NoneLit) if ty != ir::Ty::Any && ty != ir::Ty::None => {
+            ir::optional_of(ty)
+        }
+        Some(ast::ExprKind::NoneLit) if ty == ir::Ty::None => ir::Ty::Any,
+        _ => ty,
+    }
+}
+
+/// When a program with dynamic-fallback parameters fails because a dynamic
+/// value reached an operation the kernel does not cover, the parameter is the
+/// actionable place to point: an annotation resolves it.
+fn explain_dynamic_fallback(d: Diagnostic, modules: &[ModuleInput]) -> Diagnostic {
+    let mentions_dynamic = d.message.contains("Any") || d.message.contains("dynamic");
+    if !mentions_dynamic {
+        return d;
+    }
+    let file_module = modules.get(d.file).map(|m| m.name.clone());
+    let pick = DYNAMIC_FALLBACKS.with(|f| {
+        let f = f.borrow();
+        f.iter()
+            .filter(|(m, _, s)| Some(m) == file_module.as_ref() && s.start <= d.span.start)
+            .max_by_key(|(_, _, s)| s.start)
+            .cloned()
+    });
+    let Some((_, name, span)) = pick else {
+        return d;
+    };
+    let mut out = err(
         format!(
-            "parameter '{}' is missing a type annotation; could not infer a unique \
-             type from the function body (add e.g. '{}: int')",
-            p.name, p.name
+            "parameter '{name}' is missing a type annotation, and nothing in the program \
+             determines its type; compiled as a dynamic value it fails: {} (add e.g. '{name}: int')",
+            d.message
         ),
-        p.span,
-    )
+        span,
+    );
+    out.file = d.file;
+    out
 }
 
 thread_local! {
@@ -805,14 +1130,39 @@ fn resolve_params_with_body_infer(
                 p.span,
             ));
         }
+        let none_default = p.ty.is_none()
+            && p.default
+                .as_ref()
+                .is_some_and(|d| matches!(d.kind, ast::ExprKind::NoneLit));
+        let key = param_key(p);
         let ty = match synth_param_ty(&p.name) {
             Some(t) => t,
-            Option::None => match resolve_param_ty_opt(p)? {
-                Some(t) => t,
-                Option::None => {
+            // What the call sites passed, measured by the previous round, is
+            // proof rather than a guess from how the body uses the name.
+            Option::None if key.and_then(rounds_seed).is_some() => {
+                match key.and_then(rounds_seed).expect("checked") {
+                    // Only ever passed `None`: nothing else constrains it.
+                    ir::Ty::None => ir::Ty::Any,
+                    t => t,
+                }
+            }
+            // `def f(x=None)` says only that `None` is one of the types; the
+            // rest comes from the body and the call sites, like a bare name.
+            Option::None if none_default => {
+                bare_idxs.push(params.len());
+                ir::Ty::Int // placeholder
+            }
+            Option::None => match resolve_param_ty_opt(p) {
+                Ok(Some(t)) => t,
+                // No annotation, and a default too complex to type on its
+                // own: the call sites, which include the uses of the default,
+                // decide.
+                Ok(Option::None) | Err(_) if p.ty.is_none() => {
                     bare_idxs.push(params.len());
                     ir::Ty::Int // placeholder
                 }
+                Ok(Option::None) => unreachable!("an annotated parameter resolves"),
+                Err(e) => return Err(e),
             },
         };
         if ty == ir::Ty::None {
@@ -825,6 +1175,7 @@ fn resolve_params_with_body_infer(
             name: p.name.clone(),
             ty,
             default: p.default.clone(),
+            key,
         });
     }
     let mut pending = Vec::new();
@@ -841,6 +1192,7 @@ fn resolve_params_with_body_infer(
             for &i in &bare_idxs {
                 let name = params[i].name.clone();
                 if let Some(ty) = try_infer_param_from_body(&name, body, &param_map, &bare_names) {
+                    let ty = with_none_default(formals[i].default.as_ref(), ty);
                     if params[i].ty != ty {
                         params[i].ty = ty;
                         changed = true;
@@ -858,7 +1210,7 @@ fn resolve_params_with_body_infer(
             if let Some(ty) =
                 try_infer_param_from_body(&params[i].name, body, &param_map, &HashSet::new())
             {
-                params[i].ty = ty;
+                params[i].ty = with_none_default(formals[i].default.as_ref(), ty);
                 continue;
             }
             // Conflict is a specialization plan, not a failure: the observed
@@ -866,11 +1218,12 @@ fn resolve_params_with_body_infer(
             if let Some(ty) =
                 decide_param_from_observed(&params[i].name, body, &param_map, &HashSet::new())
             {
-                params[i].ty = ty;
+                params[i].ty = with_none_default(formals[i].default.as_ref(), ty);
                 continue;
             }
             if fail_unresolved {
-                return Err(bare_param_infer_err(&formals[i]));
+                params[i].ty = dynamic_fallback(&formals[i]);
+                continue;
             }
             pending.push(params[i].name.clone());
         }
@@ -1105,6 +1458,10 @@ struct ParamSig {
     ty: ir::Ty,
     /// Cloned AST default; lowered at each call site when the arg is omitted.
     default: Option<ast::Expr>,
+    /// Identity of an unannotated formal, which call sites record the
+    /// argument types they pass under. `None` for an annotated or
+    /// synthesized parameter.
+    key: Option<ParamKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -1223,6 +1580,7 @@ fn make_closure_expr(info: &NestedFnInfo, span: Span, ctx: &mut FnCtx) -> SResul
         })
         .collect();
     let ty = ir::closure_of_full(&params, info.sig.ret, &capture_tys, &info.ir_name);
+    record_escape(&info.sig.params);
     Ok(ir::Expr {
         ty,
         kind: ir::ExprKind::MakeClosure {
@@ -2460,7 +2818,7 @@ pub fn analyze(module: &ast::Module) -> SResult<ir::Module> {
 /// Analyze a library without requiring or automatically calling `main()`.
 /// Initialization IR is retained for an adapter to invoke explicitly.
 pub fn analyze_library(module: &ast::Module) -> SResult<ir::Module> {
-    analyze_target(
+    analyze_with_call_site_rounds(
         &[ModuleInput {
             name: ENTRY_NAME.to_string(),
             ast: module,
@@ -3491,7 +3849,11 @@ fn finalize_class_layouts(
             let mut param_tys: HashMap<String, ir::Ty> = HashMap::new();
             param_tys.insert(self_name.to_string(), ir::Ty::Class(id));
             for p in init.def.params.iter().skip(1) {
-                if let Ok(Some(ty)) = resolve_param_ty_opt(p) {
+                if let Some(ty) = param_key(p).and_then(rounds_seed) {
+                    param_tys.insert(p.name.clone(), ty);
+                } else if let Ok(Some(ty)) = resolve_param_ty_opt(p)
+                    && ty != ir::Ty::None
+                {
                     param_tys.insert(p.name.clone(), ty);
                 }
             }
@@ -3665,28 +4027,30 @@ fn method_func_sig(
     }
 
     let vararg = if let Some(p) = &f.vararg {
-        let ty = resolve_param_ty(p)?;
+        let ty = resolve_star_param_ty(p)?;
         Some(ParamSig {
             name: p.name.clone(),
             ty,
             default: None,
+            key: None,
         })
     } else {
         None
     };
     let kwarg = if let Some(p) = &f.kwarg {
-        let ty = resolve_param_ty(p)?;
+        let ty = resolve_star_param_ty(p)?;
         Some(ParamSig {
             name: p.name.clone(),
             ty,
             default: None,
+            key: None,
         })
     } else {
         None
     };
     let mut ret = match f.ret {
         Some(t) => resolve_type_checked(t, f.span)?,
-        Option::None => ir::Ty::None,
+        Option::None => seeded_return(f).unwrap_or(ir::Ty::None),
     };
     // __init__ always returns None (CPython TypeError on non-None).
     if f.name == "__init__" {
@@ -3724,7 +4088,7 @@ fn method_func_sig(
                 f.span,
             ));
         }
-    } else if f.ret.is_none() {
+    } else if f.ret.is_none() && seeded_return(f).is_none() {
         // Pre-infer unannotated returns from body (same as free functions).
         let param_map: HashMap<String, ir::Ty> =
             params.iter().map(|p| (p.name.clone(), p.ty)).collect();
@@ -3946,7 +4310,7 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
             let (params, pending_bare) = resolve_params_with_body_infer(&f.params, &f.body, false)?;
             let mut seen_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
             let vararg = if let Some(p) = &f.vararg {
-                let ty = resolve_param_ty(p)?;
+                let ty = resolve_star_param_ty(p)?;
                 if ty == ir::Ty::None {
                     return Err(err(
                         format!("*{} cannot have element type None", p.name),
@@ -3963,12 +4327,13 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                     name: p.name.clone(),
                     ty,
                     default: None,
+                    key: None,
                 })
             } else {
                 None
             };
             let kwarg = if let Some(p) = &f.kwarg {
-                let ty = resolve_param_ty(p)?;
+                let ty = resolve_star_param_ty(p)?;
                 if ty == ir::Ty::None {
                     return Err(err(
                         format!("**{} cannot have value type None", p.name),
@@ -3985,13 +4350,14 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                     name: p.name.clone(),
                     ty,
                     default: None,
+                    key: None,
                 })
             } else {
                 None
             };
             let mut ret = match f.ret {
                 Some(t) => resolve_type_checked(t, f.span)?,
-                Option::None => ir::Ty::None,
+                Option::None => seeded_return(f).unwrap_or(ir::Ty::None),
             };
             let is_generator = stmts_have_yield(&f.body);
             let yield_ty = if is_generator {
@@ -3999,7 +4365,7 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                 // otherwise infer from the first yield. These must agree with
                 // lower_function, or a call site sees a different element type
                 // than the body produced.
-                let y = generator_yield_ty(&f.name, ret, &f.body, &f.params);
+                let y = generator_yield_ty(&f.name, f.span, ret, &f.body, &f.params);
                 ret = ir::generator_of(y);
                 Some(y)
             } else {
@@ -4059,8 +4425,8 @@ fn pre_infer_module_returns(order: &[&ast::FuncDef], funcs: &mut HashMap<String,
         let known_rets: HashMap<String, ir::Ty> =
             funcs.iter().map(|(n, s)| (n.clone(), s.ret)).collect();
         for f in order {
-            if f.ret.is_some() {
-                continue; // explicit annotation
+            if f.ret.is_some() || seeded_return(f).is_some() {
+                continue; // explicit annotation, or measured by a previous round
             }
             let Some(sig) = funcs.get(&f.name) else {
                 continue;
@@ -6760,12 +7126,16 @@ fn widen_bare_params_on_call_site_conflict(
 ) {
     // Which parameters were written without an annotation, per function.
     let mut unannotated: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    // A parameter the call-site rounds seeded is typed by proof, not by a
+    // guess this pass could correct.
+    let unseeded = |p: &ast::Param| param_key(p).and_then(rounds_seed).is_none();
     for (i, m) in modules.iter().enumerate() {
+        set_class_current_module(&m.name);
         for fdef in &all_orders[i] {
             let names: HashSet<String> = fdef
                 .params
                 .iter()
-                .filter(|p| p.ty.is_none() && p.name != "self" && p.name != "cls")
+                .filter(|p| p.ty.is_none() && p.name != "self" && p.name != "cls" && unseeded(p))
                 .map(|p| p.name.clone())
                 .collect();
             if !names.is_empty() {
@@ -6777,7 +7147,9 @@ fn widen_bare_params_on_call_site_conflict(
                 let names: HashSet<String> = def
                     .params
                     .iter()
-                    .filter(|p| p.ty.is_none() && p.name != "self" && p.name != "cls")
+                    .filter(|p| {
+                        p.ty.is_none() && p.name != "self" && p.name != "cls" && unseeded(p)
+                    })
                     .map(|p| p.name.clone())
                     .collect();
                 if !names.is_empty() {
@@ -7009,7 +7381,7 @@ fn refine_bare_params(
                     if let Some(ty) = decide_from_observed_set(&uniq)
                         && let Some(p) = sig.params.iter_mut().find(|p| p.name == pname)
                     {
-                        p.ty = ty;
+                        p.ty = with_none_default(p.default.as_ref(), ty);
                         sig.pending_bare.retain(|n| n != &pname);
                         changed = true;
                     }
@@ -7020,33 +7392,35 @@ fn refine_bare_params(
             break;
         }
     }
-    register_all_infer_funcs(own_funcs, modules, all_imports);
+    // Whatever is still pending has no evidence anywhere in the program.
     for (i, m) in modules.iter().enumerate() {
-        for fdef in &all_orders[i] {
-            let pending = own_funcs[&m.name][&fdef.name].pending_bare.clone();
-            if let Some(pname) = pending.first() {
-                let p = fdef
-                    .params
-                    .iter()
-                    .find(|p| p.name == *pname)
-                    .unwrap_or(&fdef.params[0]);
-                return Err(bare_param_infer_err(p).with_file(i));
-            }
-        }
-        if let Some(methods) = method_orders.get(&m.name) {
-            for (ir_name, _, def) in methods {
-                let pending = own_funcs[&m.name][ir_name].pending_bare.clone();
-                if let Some(pname) = pending.first() {
-                    let p = def
-                        .params
-                        .iter()
-                        .find(|p| p.name == *pname)
-                        .unwrap_or(&def.params[0]);
-                    return Err(bare_param_infer_err(p).with_file(i));
+        set_class_current_module(&m.name);
+        let defs = all_orders[i]
+            .iter()
+            .map(|f| (f.name.clone(), *f))
+            .chain(
+                method_orders
+                    .get(&m.name)
+                    .into_iter()
+                    .flatten()
+                    .map(|(ir_name, _, def)| (ir_name.clone(), *def)),
+            )
+            .collect::<Vec<_>>();
+        for (name, def) in defs {
+            let Some(sig) = own_funcs.get_mut(&m.name).and_then(|f| f.get_mut(&name)) else {
+                continue;
+            };
+            for pname in std::mem::take(&mut sig.pending_bare) {
+                let Some(formal) = def.params.iter().find(|p| p.name == pname) else {
+                    continue;
+                };
+                if let Some(p) = sig.params.iter_mut().find(|p| p.name == pname) {
+                    p.ty = dynamic_fallback(formal);
                 }
             }
         }
     }
+    register_all_infer_funcs(own_funcs, modules, all_imports);
     Ok(())
 }
 
@@ -7054,7 +7428,134 @@ fn refine_bare_params(
 /// `modules` is in topological order (dependencies first, root last);
 /// diagnostics are tagged with the module index as their file id.
 pub fn analyze_program(modules: &[ModuleInput]) -> SResult<ir::Module> {
-    analyze_target(modules, true)
+    analyze_with_call_site_rounds(modules, true)
+}
+
+/// Rounds of lowering allowed to measure call sites before the result is
+/// taken as it stands. Each round resolves one more level of a call chain
+/// whose arguments are themselves parameters.
+const CALL_SITE_ROUNDS: usize = 6;
+
+/// Whether any function in the program has a parameter written without an
+/// annotation. A fully annotated program pays for no extra rounds.
+fn has_unannotated_params(modules: &[ModuleInput]) -> bool {
+    fn in_stmts(stmts: &[ast::Stmt], in_class: bool) -> bool {
+        stmts.iter().any(|st| match &st.kind {
+            ast::StmtKind::FuncDef(f) => {
+                f.params
+                    .iter()
+                    .enumerate()
+                    .any(|(i, p)| p.ty.is_none() && !(in_class && i == 0))
+                    || in_stmts(&f.body, false)
+            }
+            ast::StmtKind::ClassDef(c) => in_stmts(&c.body, true),
+            ast::StmtKind::If { branches, orelse } => {
+                branches.iter().any(|(_, b)| in_stmts(b, in_class)) || in_stmts(orelse, in_class)
+            }
+            _ => false,
+        })
+    }
+    modules.iter().any(|m| in_stmts(&m.ast.body, false))
+}
+
+fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> SResult<ir::Module> {
+    let reset = |collecting: bool, seeds: HashMap<ParamKey, ir::Ty>| {
+        DYNAMIC_FALLBACKS.with(|f| f.borrow_mut().clear());
+        INFER_ROUNDS.with(|r| {
+            *r.borrow_mut() = InferRounds {
+                collecting,
+                seeds,
+                ..InferRounds::default()
+            }
+        });
+    };
+    if !has_unannotated_params(modules) {
+        reset(false, HashMap::new());
+        return analyze_target(modules, executable)
+            .map_err(|d| explain_dynamic_fallback(d, modules));
+    }
+    let decide = |optimistic: bool| {
+        INFER_ROUNDS.with(|r| {
+            let r = r.borrow();
+            let groups = override_groups(&r.method_params);
+            let mut pooled: HashMap<ParamKey, Vec<Evidence>> = HashMap::new();
+            let mut escaped = r.escaped.clone();
+            for (k, ev) in &r.evidence {
+                let group = groups.get(k).map_or_else(|| vec![*k], |g| g.clone());
+                if group.iter().any(|g| r.escaped.contains(g)) {
+                    escaped.extend(group.iter().copied());
+                }
+                for g in group {
+                    pooled.entry(g).or_default().extend(ev.iter().copied());
+                }
+            }
+            pooled
+                .iter()
+                .filter(|(k, _)| !escaped.contains(k))
+                .filter_map(|(k, ev)| decide_from_evidence(ev, optimistic).map(|t| (*k, t)))
+                .collect::<HashMap<_, _>>()
+        })
+    };
+    let mut seeds: HashMap<ParamKey, ir::Ty> = HashMap::new();
+    let mut last: Option<(SResult<ir::Module>, bool)> = None;
+    // Optimistic rounds: measure, decide, repeat until the decisions settle.
+    for _ in 0..CALL_SITE_ROUNDS {
+        reset(true, seeds.clone());
+        let result = analyze_target(modules, executable);
+        let tolerated = INFER_ROUNDS.with(|r| r.borrow().tolerated);
+        let mut next = decide(true);
+        // A round that stopped before lowering measured nothing; what it did
+        // not measure keeps the type the round before decided.
+        for (k, t) in &seeds {
+            next.entry(*k).or_insert(*t);
+        }
+        let settled = next == seeds;
+        seeds = next;
+        last = Some((result, tolerated));
+        if settled {
+            break;
+        }
+    }
+    // Strict rounds: a dynamic argument, ignored above, now counts. A seed some
+    // call site contradicts becomes dynamic, which every argument fits; that
+    // only ever widens, so this settles.
+    for _ in 0..=CALL_SITE_ROUNDS {
+        let (result, tolerated) = match last.take() {
+            Some(prev) => prev,
+            None => {
+                reset(true, seeds.clone());
+                let result = analyze_target(modules, executable);
+                (result, INFER_ROUNDS.with(|r| r.borrow().tolerated))
+            }
+        };
+        let strict = decide(false);
+        let mut widened = false;
+        for (k, t) in &strict {
+            match seeds.get(k) {
+                Some(seed) if seed == t || *seed == ir::Ty::Any => {}
+                // Measured but never seeded: only a dynamic argument, which
+                // the optimistic rounds dropped, could leave it so.
+                _ => {
+                    let widest = if seeds.contains_key(k) {
+                        ir::Ty::Any
+                    } else {
+                        *t
+                    };
+                    seeds.insert(*k, widest);
+                    widened = true;
+                }
+            }
+        }
+        if !widened {
+            if !tolerated && let Ok(module) = result {
+                return Ok(module);
+            }
+            break;
+        }
+    }
+    // The final program, built without tolerance so a real error is reported.
+    reset(false, seeds);
+    analyze_target(modules, executable).map_err(|d| explain_dynamic_fallback(d, modules))
 }
 
 fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Module> {
@@ -7113,6 +7614,12 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                 let sig =
                     method_func_sig(class_id, &c.name, cm.def, kind).map_err(|d| d.with_file(i))?;
                 register_method_sig(&ir_name, sig.clone());
+                let skip = usize::from(kind != MethodKind::Static);
+                record_method_params(
+                    class_id,
+                    &cm.def.name,
+                    &sig.params[skip.min(sig.params.len())..],
+                );
                 register_method_kind(&ir_name, kind);
                 if kind == MethodKind::Property {
                     register_property(class_id, &cm.def.name, &ir_name);
@@ -7133,7 +7640,14 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
         assigned_names.insert(m.name.clone(), names);
     }
     // Override ABI: reject incompatible ret/arity after all method sigs exist.
-    check_override_compatibility(&class_asts)?;
+    // A collecting round measures anyway: the seeds that settle an override's
+    // parameter types come from exactly the calls this would stop.
+    if let Err(e) = check_override_compatibility(&class_asts) {
+        if !rounds_collecting() {
+            return Err(e);
+        }
+        rounds_tolerate();
+    }
     // pass 1b: export surface includes package re-exports; last-binding map
     let export_funcs = expand_export_funcs(modules, &own_funcs);
     let export_values = expand_export_values(modules, &assigned_names, &export_funcs, &submodules);
@@ -7177,6 +7691,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
         &all_imports,
     );
     for (i, m) in modules.iter().enumerate() {
+        set_class_current_module(&m.name);
         if let Some(funcs) = own_funcs.get_mut(&m.name) {
             pre_infer_module_returns(&all_orders[i], funcs);
         }
@@ -7277,15 +7792,22 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                     reexport_origins: &reexport_origins,
                     partial_reexports: &partial_reexports,
                 };
-                let (f, nested) = lower_function_with_class(
+                let lowered = lower_function_with_class(
                     &method_def,
                     &mctx_fn,
                     &mut globals,
                     &mut globals_order,
                     false,
                     Some(*class_id),
-                )
-                .map_err(|d| d.with_file(i))?;
+                );
+                let (f, nested) = match lowered {
+                    Ok(v) => v,
+                    Err(_) if rounds_collecting() => {
+                        rounds_tolerate();
+                        continue;
+                    }
+                    Err(d) => return Err(d.with_file(i)),
+                };
                 // Patch inferred return type (same as free functions).
                 if !f.is_generator {
                     if let Some(sig) = own_funcs.get_mut(&m.name).and_then(|m| m.get_mut(ir_name)) {
@@ -7305,6 +7827,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                                     name: n.clone(),
                                     ty: *t,
                                     default: None,
+                                    key: None,
                                 })
                                 .collect(),
                             vararg: None,
@@ -7345,8 +7868,14 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                     partial_reexports: &partial_reexports,
                 };
                 let (f, nested) =
-                    lower_function(fd, &mctx_fn, &mut globals, &mut globals_order, false)
-                        .map_err(|d| d.with_file(i))?;
+                    match lower_function(fd, &mctx_fn, &mut globals, &mut globals_order, false) {
+                        Ok(v) => v,
+                        Err(_) if rounds_collecting() => {
+                            rounds_tolerate();
+                            continue;
+                        }
+                        Err(d) => return Err(d.with_file(i)),
+                    };
                 let name = fd.name.clone();
                 if let Some(d) = fd.decorators.first() {
                     free_decorators.push((name.clone(), d.name.clone(), d.span));
@@ -7524,6 +8053,7 @@ fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Modu
                     format!("{}.{}", m.name, fname)
                 };
                 let clos_ty = ir::closure_of_full(&params, sig.ret, &[], &ir_name);
+                record_escape(&sig.params);
                 let clos_tmp = format!(".deco.clos.{fname}");
                 deco_locals.push((clos_tmp.clone(), clos_ty));
                 deco_stmts.push(ir::Stmt::Assign {
@@ -7971,6 +8501,11 @@ struct FnCtx<'a> {
     /// When lowering a `@classmethod`, `(cls_param_name, class_id)` so
     /// `cls(...)` constructs that class.
     classmethod_cls: Option<(String, ir::ClassId)>,
+    /// For an unannotated function, where its `return` values are recorded
+    /// for call-site-driven inference.
+    ret_key: Option<ParamKey>,
+    /// For an unannotated generator, where its `yield` values are recorded.
+    yield_key: Option<ParamKey>,
 }
 
 impl FnCtx<'_> {
@@ -8138,6 +8673,8 @@ fn lower_function_inner(
         current_class,
         self_param,
         classmethod_cls,
+        ret_key: None,
+        yield_key: None,
     };
 
     // Nonlocals declared in nested defs — free captures of these use cells.
@@ -8159,13 +8696,24 @@ fn lower_function_inner(
 
     // Detect generator functions (contain yield / yield from).
     let is_gen = stmts_have_yield(&f.body);
+    let short_name = f.name.rsplit('.').next().unwrap_or(&f.name);
+    if f.ret.is_none() && short_name != "__init__" {
+        if is_gen {
+            ctx.yield_key = result_key(f.span, Slot::Yield);
+        } else {
+            ctx.ret_key = result_key(f.span, Slot::Return);
+            if let Some(seed) = seeded_return(f) {
+                ctx.ret = seed;
+            }
+        }
+    }
     let mut gen_yield_ty: Option<ir::Ty> = None;
     if is_gen {
         // Yield type: a non-None return annotation names it directly.
         // Without one, take the first `yield` of a literal or an annotated
         // parameter -- defaulting to Int made `def g(): yield "a"` a hard
         // error, so an unannotated generator could only ever yield ints.
-        let yty = generator_yield_ty(&f.name, ctx.ret, &f.body, &f.params);
+        let yty = generator_yield_ty(&f.name, f.span, ctx.ret, &f.body, &f.params);
         ctx.yield_ty = Some(yty);
         gen_yield_ty = Some(yty);
         // The *callable* appears to return Generator[Y]; resume IR uses i32.
@@ -8231,7 +8779,7 @@ fn lower_function_inner(
             params.push((p.name.clone(), p.ty));
         }
         if let Some(p) = &f.vararg {
-            let elem = resolve_param_ty(p)?;
+            let elem = resolve_star_param_ty(p)?;
             let ty = ir::list_of(elem);
             if ctx.locals.insert(p.name.clone(), ty).is_some() {
                 return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
@@ -8239,7 +8787,7 @@ fn lower_function_inner(
             params.push((p.name.clone(), ty));
         }
         if let Some(p) = &f.kwarg {
-            let val = resolve_param_ty(p)?;
+            let val = resolve_star_param_ty(p)?;
             let ty = ir::dict_of(ir::Ty::Str, val);
             if ctx.locals.insert(p.name.clone(), ty).is_some() {
                 return Err(err(format!("duplicate parameter '{}'", p.name), p.span));
@@ -8457,6 +9005,21 @@ fn lower_function_inner(
         b
     };
 
+    // An unannotated function that can reach its end returns None there.
+    let mut body = body;
+    if let Some(key) = ctx.ret_key
+        && !block_returns(&body)
+    {
+        record_call_evidence(key, Evidence::Flexible(ir::Ty::None));
+        if ctx.ret != ir::Ty::None
+            && let Ok(none) = coerce(const_none(), ctx.ret, f.span, "return value")
+        {
+            body.push(ir::Stmt::Return(Some(none)));
+        } else if ctx.ret != ir::Ty::None && rounds_collecting() {
+            rounds_tolerate();
+            body.push(ir::Stmt::Return(None));
+        }
+    }
     // every path through a value-returning function must return
     // (generators end by falling off the end → StopIteration; no check)
     if !is_gen && ctx.ret != ir::Ty::None && !block_returns(&body) {
@@ -8512,12 +9075,18 @@ fn stmts_have_yield(stmts: &[ast::Stmt]) -> bool {
 /// agree, or a call site sees a different element type than the body produces.
 fn generator_yield_ty(
     name: &str,
+    span: Span,
     ret: ir::Ty,
     body: &[ast::Stmt],
     params: &[ast::Param],
 ) -> ir::Ty {
     if let Some(t) = synth_yield_ty(name) {
         return t;
+    }
+    if ret == ir::Ty::None
+        && let Some(seed) = result_key(span, Slot::Yield).and_then(rounds_seed)
+    {
+        return seed;
     }
     match ret {
         ir::Ty::Generator { yield_ty } => *yield_ty,
@@ -8646,7 +9215,15 @@ fn expr_has_yield(e: &ast::Expr) -> bool {
 fn lower_block(stmts: &[ast::Stmt], ctx: &mut FnCtx) -> SResult<Vec<ir::Stmt>> {
     let mut out = Vec::new();
     for stmt in stmts {
-        lower_stmt(stmt, ctx, &mut out)?;
+        if let Err(e) = lower_stmt(stmt, ctx, &mut out) {
+            // A statement a guessed type made ill-typed still leaves the call
+            // sites after it worth measuring.
+            if rounds_collecting() {
+                rounds_tolerate();
+                continue;
+            }
+            return Err(e);
+        }
     }
     Ok(out)
 }
@@ -8705,34 +9282,36 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     let (params, _) = resolve_params_with_body_infer(&f.params, &f.body, true)?;
     let mut seen: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     let vararg = if let Some(p) = &f.vararg {
-        let ty = resolve_param_ty(p)?;
+        let ty = resolve_star_param_ty(p)?;
         seen.insert(p.name.clone());
         Some(ParamSig {
             name: p.name.clone(),
             ty,
             default: None,
+            key: None,
         })
     } else {
         None
     };
     let kwarg = if let Some(p) = &f.kwarg {
-        let ty = resolve_param_ty(p)?;
+        let ty = resolve_star_param_ty(p)?;
         seen.insert(p.name.clone());
         Some(ParamSig {
             name: p.name.clone(),
             ty,
             default: None,
+            key: None,
         })
     } else {
         None
     };
     let mut ret = match f.ret {
         Some(t) => resolve_type_checked(t, f.span)?,
-        Option::None => ir::Ty::None,
+        Option::None => seeded_return(f).unwrap_or(ir::Ty::None),
     };
     let is_generator = stmts_have_yield(&f.body);
     let yield_ty = if is_generator {
-        let y = generator_yield_ty(&f.name, ret, &f.body, &f.params);
+        let y = generator_yield_ty(&f.name, f.span, ret, &f.body, &f.params);
         ret = ir::generator_of(y);
         Some(y)
     } else {
@@ -9133,7 +9712,7 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     let (params, _) = resolve_params_with_body_infer(&f.params, &f.body, true)?;
     let mut seen: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     let vararg = if let Some(p) = &f.vararg {
-        let ty = resolve_param_ty(p)?;
+        let ty = resolve_star_param_ty(p)?;
         if !seen.insert(p.name.clone()) {
             return Err(err(
                 format!("duplicate parameter name '{}'", p.name),
@@ -9144,12 +9723,13 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
             name: p.name.clone(),
             ty,
             default: None,
+            key: None,
         })
     } else {
         None
     };
     let kwarg = if let Some(p) = &f.kwarg {
-        let ty = resolve_param_ty(p)?;
+        let ty = resolve_star_param_ty(p)?;
         if !seen.insert(p.name.clone()) {
             return Err(err(
                 format!("duplicate parameter name '{}'", p.name),
@@ -9160,17 +9740,18 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
             name: p.name.clone(),
             ty,
             default: None,
+            key: None,
         })
     } else {
         None
     };
     let mut ret = match f.ret {
         Some(t) => resolve_type_checked(t, f.span)?,
-        Option::None => ir::Ty::None,
+        Option::None => seeded_return(f).unwrap_or(ir::Ty::None),
     };
     let is_generator = stmts_have_yield(&f.body);
     let yield_ty = if is_generator {
-        let y = generator_yield_ty(&f.name, ret, &f.body, &f.params);
+        let y = generator_yield_ty(&f.name, f.span, ret, &f.body, &f.params);
         ret = ir::generator_of(y);
         Some(y)
     } else {
@@ -10726,6 +11307,9 @@ fn lower_stmt(stmt: &ast::Stmt, ctx: &mut FnCtx, out: &mut Vec<ir::Stmt>) -> SRe
                     out.push(ir::Stmt::Return(None));
                 }
                 return Ok(());
+            }
+            if let Some(key) = ctx.ret_key {
+                return lower_recorded_return(key, value.as_ref(), stmt.span, ctx, out);
             }
             match (value, ctx.ret) {
                 (None, ir::Ty::None) => out.push(ir::Stmt::Return(None)),
@@ -14776,6 +15360,9 @@ fn class_equality_accepts(
 ) -> bool {
     match lookup_method_sig(class_id, method, ctx) {
         Some(sig) => match sig.params.get(1) {
+            // Unannotated, the dunder accepts what CPython would pass it; the
+            // call site then decides the parameter's type.
+            Some(p) if p.key.is_some() => true,
             Some(p) => ty_can_pass_as(arg_ty, p.ty),
             None => sig.vararg.is_some(),
         },
@@ -17930,10 +18517,18 @@ fn lower_classmethod_construct(
                 span,
             ));
         }
+        let mut inits: Vec<String> = subclasses_of(defining_id)
+            .into_iter()
+            .filter_map(|sid| resolve_method(sid, "__init__"))
+            .collect();
+        inits.push(init_name.clone());
+        inits.sort();
+        inits.dedup();
         for (i, a) in plain.iter().enumerate() {
             let v = lower_expr(a, ctx)?;
+            record_constructor_evidence(&inits, i, a, &v, ctx);
             let want = user_sig.params[i].ty;
-            user_args.push(coerce(v, want, a.span, "cls(...) argument")?);
+            user_args.push(tolerant_coerce(v, want, a.span, "cls(...) argument")?);
         }
         // Fill defaults for remaining params.
         for p in user_sig.params.iter().skip(plain.len()) {
@@ -18829,6 +19424,9 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                 let params: Vec<ir::Ty> = sig.params.iter().map(|p| p.ty).collect();
                 let ir_name = ctx.own_func(name);
                 let ty = ir::closure_of_full(&params, sig.ret, &[], &ir_name);
+                // Called through the closure, its arguments are not seen as
+                // calls to `name`, so call sites cannot decide its types.
+                record_escape(&sig.params);
                 Ok(ir::Expr {
                     ty,
                     kind: ir::ExprKind::MakeClosure {
@@ -19283,6 +19881,7 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     })?;
                     let user_params: Vec<ir::Ty> =
                         sig.params.iter().skip(1).map(|p| p.ty).collect();
+                    record_escape(&sig.params);
                     let mut candidates: Vec<(ir::ClassId, String)> = Vec::new();
                     let mut unique: HashSet<String> = HashSet::new();
                     for sid in subclasses_of(id) {
@@ -19883,7 +20482,24 @@ fn lower_expr(expr: &ast::Expr, ctx: &mut FnCtx) -> SResult<ir::Expr> {
                     expr.span,
                 ));
             };
-            let val = coerce(val, yty, expr.span, "yield value")?;
+            let val = match ctx.yield_key {
+                Some(key) => {
+                    let ev = match v {
+                        Some(e) => evidence_of(e, &val),
+                        None => Evidence::Flexible(ir::Ty::None),
+                    };
+                    record_call_evidence(key, ev);
+                    match coerce(val.clone(), yty, expr.span, "yield value") {
+                        Ok(c) => c,
+                        Err(_) if rounds_collecting() => {
+                            rounds_tolerate();
+                            val
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                None => coerce(val, yty, expr.span, "yield value")?,
+            };
             // Yield suspends then resumes with send/next value as Optional[Y].
             let sent_ty = ir::optional_of(yty);
             Ok(ir::Expr {
@@ -22355,6 +22971,146 @@ fn lower_arg_expr(
     coerce(a, expected, arg.span, what)
 }
 
+/// The return type a previous round measured for an unannotated, ordinary
+/// function. Generators and `__init__` are typed elsewhere.
+fn seeded_return(f: &ast::FuncDef) -> Option<ir::Ty> {
+    let short_name = f.name.rsplit('.').next().unwrap_or(&f.name);
+    if f.ret.is_some()
+        || short_name == "__init__"
+        || f.span == Span::default()
+        || stmts_have_yield(&f.body)
+    {
+        return None;
+    }
+    // A function that always raises never produces a value, so any type is
+    // its return type; the dynamic one lets every call site use it.
+    if ast_block_always_raises(&f.body) {
+        return Some(ir::Ty::Any);
+    }
+    result_key(f.span, Slot::Return).and_then(rounds_seed)
+}
+
+/// `return` in an unannotated function: record what is returned, then lower
+/// it against the return type the previous round decided (or, in the first
+/// round, the first value returned).
+fn lower_recorded_return(
+    key: ParamKey,
+    value: Option<&ast::Expr>,
+    span: Span,
+    ctx: &mut FnCtx,
+    out: &mut Vec<ir::Stmt>,
+) -> SResult<()> {
+    let lowered = match value {
+        Some(e) => {
+            let v = lower_expr(e, ctx)?;
+            record_call_evidence(key, evidence_of(e, &v));
+            Some(v)
+        }
+        None => {
+            record_call_evidence(key, Evidence::Flexible(ir::Ty::None));
+            None
+        }
+    };
+    if ctx.ret == ir::Ty::None {
+        match lowered {
+            None => out.push(ir::Stmt::Return(None)),
+            Some(v) if v.ty == ir::Ty::None => {
+                out.push(ir::Stmt::ExprStmt(v));
+                out.push(ir::Stmt::Return(None));
+            }
+            Some(v) => {
+                if rounds_seed(key).is_some() {
+                    // Decided `None`, yet a value is returned: a later round
+                    // corrects it; this one only measures.
+                    if !rounds_collecting() {
+                        return Err(err(
+                            format!("function '{}' returns a value", ctx.fn_name),
+                            span,
+                        ));
+                    }
+                    rounds_tolerate();
+                }
+                ctx.ret = v.ty;
+                out.push(ir::Stmt::Return(Some(v)));
+            }
+        }
+        return Ok(());
+    }
+    let v = lowered.unwrap_or_else(const_none);
+    match coerce(v.clone(), ctx.ret, span, "return value") {
+        Ok(c) => out.push(ir::Stmt::Return(Some(c))),
+        Err(_) if rounds_collecting() => {
+            rounds_tolerate();
+            out.push(ir::Stmt::Return(Some(v)));
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// A constructor chosen at run time receives the same arguments whichever class
+/// it turns out to be, so each candidate `__init__` records them.
+fn record_constructor_evidence(
+    inits: &[String],
+    index: usize,
+    arg: &ast::Expr,
+    lowered: &ir::Expr,
+    ctx: &FnCtx,
+) {
+    for init in inits {
+        let Some(sig) = ctx
+            .mctx
+            .funcs
+            .get(init)
+            .cloned()
+            .or_else(|| method_sig_lookup(init))
+        else {
+            continue;
+        };
+        if let Some(key) = method_user_sig(&sig).params.get(index).and_then(|p| p.key) {
+            record_call_evidence(key, evidence_of(arg, lowered));
+        }
+    }
+}
+
+/// `coerce`, except that a collecting round keeps an argument its guessed
+/// target does not accept: the round's program is discarded, and the call
+/// sites after it are still worth measuring.
+fn tolerant_coerce(v: ir::Expr, target: ir::Ty, span: Span, what: &str) -> SResult<ir::Expr> {
+    match coerce(v.clone(), target, span, what) {
+        Ok(c) => Ok(c),
+        Err(_) if rounds_collecting() => {
+            rounds_tolerate();
+            Ok(v)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Lower an argument bound to `param`. An unannotated parameter records the
+/// argument's own type first, for call-site inference, and a collecting round
+/// tolerates an argument its guessed type does not accept.
+fn lower_param_arg(
+    arg: &ast::Expr,
+    param: &ParamSig,
+    what: &str,
+    ctx: &mut FnCtx,
+) -> SResult<ir::Expr> {
+    let Some(key) = param.key else {
+        return lower_arg_expr(arg, param.ty, what, ctx);
+    };
+    let a = lower_expr(arg, ctx)?;
+    record_call_evidence(key, evidence_of(arg, &a));
+    match coerce(a.clone(), param.ty, arg.span, what) {
+        Ok(v) => Ok(v),
+        Err(_) if rounds_collecting() => {
+            rounds_tolerate();
+            Ok(a)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Type-check and lower a call to a function with a known signature.
 /// `extra_leading`: capture values for nested functions (prepended to IR args).
 #[allow(clippy::too_many_arguments)]
@@ -22382,14 +23138,13 @@ fn lower_call_with_sig(
         for (i, a) in args.iter().enumerate() {
             match a {
                 ast::PosArg::Pos(e) => {
-                    let expected = sig
+                    let param = sig
                         .params
                         .get(i)
-                        .map(|p| p.ty)
                         .ok_or_else(|| err("too many arguments for generator", span))?;
-                    arg_irs.push(lower_arg_expr(
+                    arg_irs.push(lower_param_arg(
                         e,
-                        expected,
+                        param,
                         &format!("argument {} of '{display}'", i + 1),
                         ctx,
                     )?);
@@ -22407,7 +23162,11 @@ fn lower_call_with_sig(
             // fill defaults
             for p in sig.params.iter().skip(user_args) {
                 if let Some(d) = &p.default {
-                    arg_irs.push(lower_expr(d, ctx)?);
+                    let v = lower_expr(d, ctx)?;
+                    if let Some(key) = p.key {
+                        record_call_evidence(key, evidence_of(d, &v));
+                    }
+                    arg_irs.push(v);
                 } else {
                     return Err(err(
                         format!(
@@ -22458,10 +23217,9 @@ fn lower_call_with_sig(
         match arg {
             ast::PosArg::Pos(e) => {
                 if positional_count < positional_limit {
-                    let expected = sig.params[positional_count].ty;
-                    let a = lower_arg_expr(
+                    let a = lower_param_arg(
                         e,
-                        expected,
+                        &sig.params[positional_count],
                         &format!("argument {} of '{display}'", positional_count + 1),
                         ctx,
                     )?;
@@ -22589,6 +23347,9 @@ fn lower_call_with_sig(
                     star_prelude.push(check);
                     for i in 0..remaining_fixed {
                         let expected = sig.params[positional_count].ty;
+                        if let Some(key) = sig.params[positional_count].key {
+                            record_call_evidence(key, Evidence::Value(elem));
+                        }
                         if elem != expected
                             && !(expected == ir::Ty::Float
                                 && matches!(elem, ir::Ty::Int | ir::Ty::Bool))
@@ -22690,10 +23451,9 @@ fn lower_call_with_sig(
                     kw.name_span,
                 ));
             }
-            let expected = sig.params[idx].ty;
-            let a = lower_arg_expr(
+            let a = lower_param_arg(
                 &kw.value,
-                expected,
+                &sig.params[idx],
                 &format!("argument '{name}' of '{display}'", name = kw.name),
                 ctx,
             )?;
@@ -22770,10 +23530,13 @@ fn lower_call_with_sig(
                                 ty: ir::Ty::Str,
                                 kind: ir::ExprKind::ConstStr(p.name.clone()),
                             };
+                            if let Some(key) = p.key {
+                                record_call_evidence(key, Evidence::Value(*value));
+                            }
                             if let Some(def) = &p.default {
-                                let def_v = lower_arg_expr(
+                                let def_v = lower_param_arg(
                                     def,
-                                    p.ty,
+                                    p,
                                     &format!("default for parameter '{}' of '{display}'", p.name),
                                     ctx,
                                 )?;
@@ -22822,10 +23585,13 @@ fn lower_call_with_sig(
                             ty: ir::Ty::Str,
                             kind: ir::ExprKind::ConstStr(p.name.clone()),
                         };
+                        if let Some(key) = p.key {
+                            record_call_evidence(key, Evidence::Value(*value));
+                        }
                         if let Some(def) = &p.default {
-                            let def_v = lower_arg_expr(
+                            let def_v = lower_param_arg(
                                 def,
-                                p.ty,
+                                p,
                                 &format!("default for parameter '{}' of '{display}'", p.name),
                                 ctx,
                             )?;
@@ -22868,9 +23634,9 @@ fn lower_call_with_sig(
             continue;
         }
         if let Some(def) = &p.default {
-            let a = lower_arg_expr(
+            let a = lower_param_arg(
                 def,
-                p.ty,
+                p,
                 &format!(
                     "default for parameter '{name}' of '{display}'",
                     name = p.name
@@ -23539,9 +24305,11 @@ fn lower_type_construct(
         ));
     }
     let mut user_args = Vec::new();
+    let inits: Vec<String> = matches.iter().filter_map(|(_, _, i)| i.clone()).collect();
     for (i, a) in plain.iter().enumerate() {
         let v = lower_expr(a, ctx)?;
-        user_args.push(coerce(v, tys0[i], a.span, "constructor argument")?);
+        record_constructor_evidence(&inits, i, a, &v, ctx);
+        user_args.push(tolerant_coerce(v, tys0[i], a.span, "constructor argument")?);
     }
     let result_ty = ir::Ty::Class(matches[0].0);
     let candidates = matches
@@ -34947,7 +35715,7 @@ def f(x):
     if isinstance(x, (int, float)):
         return x + 1
     return 0
-print(f(3))
+print(f(3), f(2.5))
 ",
         );
         let f = find_func(&m, "f");
@@ -35056,18 +35824,16 @@ print(f(3))
     }
 
     #[test]
-    fn bare_param_still_errors_when_unconstrained() {
-        let e = analyze_err(
+    fn bare_param_is_dynamic_when_unconstrained() {
+        let m = analyze_ok(
             "\
 def f(x):
     return x
+print(1)
 ",
         );
-        assert!(
-            e.message.contains("missing a type annotation"),
-            "{}",
-            e.message
-        );
+        let f = find_func(&m, "f");
+        assert_eq!(f.params[0].1, ir::Ty::Any);
     }
 
     #[test]
