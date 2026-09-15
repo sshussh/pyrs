@@ -233,7 +233,7 @@ fn a_monomorphic_int_add_emits_a_guard() {
 }
 
 #[test]
-fn a_polymorphic_site_calls_the_kernel() {
+fn a_polymorphic_site_caches_its_typed_pairs_and_keeps_the_kernel() {
     let src = concat!(
         "def add(x: object, y: object) -> object:\n",
         "    return x + y\n",
@@ -265,8 +265,14 @@ fn a_polymorphic_site_calls_the_kernel() {
     );
     assert_eq!(String::from_utf8_lossy(&ran.stdout), "3\nab\n");
     let ll = fs::read_to_string(dir.0.join("prog.ll")).unwrap();
+    // A polymorphic inline cache: a guarded arm for the typed pair the
+    // profile saw (int + int), and the kernel for everything else (str + str).
     assert!(
-        !ll.contains("dyn.fast"),
+        ll.contains("dyn.fast"),
+        "expected an arm for int + int:\n{ll}"
+    );
+    assert!(
+        ll.contains("@pyrs_dyn_binop"),
         "a site that saw two tags must keep the kernel:\n{ll}"
     );
 }
@@ -392,5 +398,91 @@ fn a_profiled_method_and_contains_still_dispatch() {
             );
             assert_eq!(ran.status.code(), expected.status.code());
         }
+    }
+}
+
+/// The polymorphic inline cache is an optimization, never a behaviour: trained
+/// on ints and floats, the binary runs on strs, lists, big ints, NaNs and zero
+/// divisors and must answer exactly as CPython does. A float division arm that
+/// skipped the zero check would print `inf` instead of raising.
+#[test]
+fn a_polymorphic_cache_trained_on_numbers_runs_anything_like_cpython() {
+    let src = r#"import sys
+def f(a: object, b: object) -> object:
+    return a / b
+def g(a: object, b: object) -> object:
+    return a + b
+def h(a: object) -> object:
+    return -a
+def lt(a: object, b: object) -> bool:
+    return a < b
+mode = sys.argv[1]
+if mode == "train":
+    for i in range(1000):
+        f(i, 2.0)
+        f(1.5, i + 1)
+        g(i, 1)
+        g(0.5, 2.5)
+        h(i)
+        h(0.5)
+        lt(i, 3)
+        lt(0.5, 1.5)
+else:
+    print(g("x", "y"), g([1], [2]), g(2**70, 1), g(2**70, 0.5))
+    try:
+        print(f(1.0, 0.0))
+    except ZeroDivisionError as e:
+        print("ZeroDivisionError:", e)
+    try:
+        print(f(3, 0))
+    except ZeroDivisionError as e:
+        print("ZeroDivisionError:", e)
+    print(f(float("nan"), 2), h(4), h(-0.0), h(2**70), lt(float("nan"), 1.0), lt(2**70, 3), lt("a", "b"))
+"#;
+    let dir = temp_source("pic-miss", src);
+    let prof = dir.0.join("prog.prof");
+    let collected = Command::new(PYRS)
+        .args(["profile", "-o"])
+        .arg(&prof)
+        .args(["-i", "prog.py", "train"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        collected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&collected.stderr)
+    );
+    let compiled = Command::new(PYRS)
+        .args(["compile", "--no-cache", "--emit-llvm", "--profile"])
+        .arg(&prof)
+        .args(["-i", "prog.py", "-o", "prog"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let ll = fs::read_to_string(dir.0.join("prog.ll")).unwrap();
+    assert!(ll.contains("dyn.fast"), "expected cached arms:\n{ll}");
+    let expected = Command::new("python3")
+        .args(["prog.py", "run"])
+        .current_dir(&dir.0)
+        .output()
+        .unwrap();
+    for stress in ["0", "1"] {
+        let ran = Command::new(dir.0.join("prog"))
+            .arg("run")
+            .env("PYRS_GC_STRESS", stress)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&expected.stdout),
+            "GC stress {stress}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
     }
 }
