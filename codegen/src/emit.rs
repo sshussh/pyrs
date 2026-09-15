@@ -2536,14 +2536,106 @@ impl Emitter {
         "%.dyn.tag".to_string()
     }
 
-    fn profile_hit(&mut self, tag: &str) -> Option<i32> {
+    /// The tags a profile saw at this operand, most frequent first (at most
+    /// four). Empty without a profile.
+    fn profile_hit(&mut self, tag: &str) -> Vec<(i32, u64)> {
         let id = self.profile_site;
         self.profile_site += 1;
         if self.instrument_profile {
             self.line(format!("call void @pyrs_profile_hit(i32 {id}, i32 {tag})"));
         }
-        let hits = self.profile_sites.get(&id)?;
-        (hits.len() == 1).then_some(hits[0].0)
+        let mut hits = self.profile_sites.get(&id).cloned().unwrap_or_default();
+        hits.sort_by_key(|h| std::cmp::Reverse(h.1));
+        hits
+    }
+
+    /// A polymorphic inline cache: one guarded arm per operand-tag pair the
+    /// profile saw and a typed path exists for, most frequent first, then
+    /// the kernel. Each arm leaves its payload and stores its result tag;
+    /// `fast` returns `None` when a runtime check inside the arm (a small-int
+    /// test, a zero divisor) sends it to the kernel instead.
+    #[allow(clippy::type_complexity)]
+    fn emit_pic(
+        &mut self,
+        arms: &[(Vec<(String, i32)>, i32)],
+        mut fast: impl FnMut(&mut Self, usize, &str) -> String,
+        slow: impl FnOnce(&mut Self) -> String,
+        result_is_i1: bool,
+    ) -> (String, bool) {
+        let join_l = self.fresh_block("pic.join");
+        let slow_l = self.fresh_block("pic.slow");
+        let mut incoming: Vec<(String, String)> = Vec::new();
+        for (k, (tests, _)) in arms.iter().enumerate() {
+            let hit_l = self.fresh_block("dyn.fast");
+            let next_l = if k + 1 == arms.len() {
+                slow_l.clone()
+            } else {
+                self.fresh_block("pic.next")
+            };
+            let mut cond: Option<String> = None;
+            for (tag, want) in tests {
+                let c = self.tmp();
+                self.line(format!("{c} = icmp eq i32 {tag}, {want}"));
+                cond = Some(match cond {
+                    None => c,
+                    Some(prev) => {
+                        let both = self.tmp();
+                        self.line(format!("{both} = and i1 {prev}, {c}"));
+                        both
+                    }
+                });
+            }
+            let cond = cond.expect("an arm tests at least one tag");
+            self.line(format!("br i1 {cond}, label %{hit_l}, label %{next_l}"));
+            self.start_block(&hit_l);
+            let v = fast(self, k, &slow_l);
+            let end = self.cur_block.clone();
+            self.line(format!("br label %{join_l}"));
+            incoming.push((v, end));
+            if next_l != slow_l {
+                self.start_block(&next_l);
+            }
+        }
+        self.start_block(&slow_l);
+        let sv = slow(self);
+        let send = self.cur_block.clone();
+        self.line(format!("br label %{join_l}"));
+        incoming.push((sv, send));
+        self.start_block(&join_l);
+        let t = self.tmp();
+        let ty = if result_is_i1 { "i1" } else { "i64" };
+        let preds: Vec<String> = incoming
+            .iter()
+            .map(|(v, b)| format!("[ {v}, %{b} ]"))
+            .collect();
+        self.line(format!("{t} = phi {ty} {}", preds.join(", ")));
+        (t, true)
+    }
+
+    /// A small tagged int as a double, or a jump to `slow` for a big one.
+    fn emit_small_int_to_double(&mut self, tagged: &str, slow: &str) -> String {
+        let low = self.tmp();
+        self.line(format!("{low} = and i64 {tagged}, 1"));
+        let small = self.tmp();
+        self.line(format!("{small} = icmp eq i64 {low}, 1"));
+        let ok = self.fresh_block("pic.small");
+        self.line(format!("br i1 {small}, label %{ok}, label %{slow}"));
+        self.start_block(&ok);
+        let v = self.tmp();
+        self.line(format!("{v} = ashr i64 {tagged}, 1"));
+        let d = self.tmp();
+        self.line(format!("{d} = sitofp i64 {v} to double"));
+        d
+    }
+
+    fn emit_double_operand(&mut self, tag: i32, payload: &str, slow: &str) -> String {
+        if tag == 1 {
+            let d = self.tmp();
+            self.line(format!("{d} = bitcast i64 {payload} to double"));
+            d
+        } else {
+            self.emit_small_int_to_double(payload, slow)
+        }
     }
 
     fn emit_int_arith(&mut self, name: &'static str, l: &str, r: &str) -> String {
@@ -2563,8 +2655,8 @@ impl Emitter {
         lp: &str,
         rt: &str,
         rp: &str,
-        lexp: Option<i32>,
-        rexp: Option<i32>,
+        lexp: Vec<(i32, u64)>,
+        rexp: Vec<(i32, u64)>,
     ) -> String {
         let slot = self.dyn_tag_slot();
         let int_name = match op {
@@ -2582,71 +2674,74 @@ impl Emitter {
             DynBinOp::Div => Some("fdiv"),
             _ => None,
         };
-        if lexp == Some(0)
-            && rexp == Some(0)
-            && let Some(name) = int_name
-        {
-            let (fast_l, slow_l, join_l) = self.branch_if_tags(lt, 0, rt, 0);
-            self.start_block(&fast_l);
-            let fr = self.emit_int_arith(name, lp, rp);
-            self.line(format!("store i32 0, ptr {slot}"));
-            self.line(format!("br label %{join_l}"));
-            self.start_block(&slow_l);
-            let sr = self.tmp();
-            self.line(format!(
+        // Every operand pair the profile saw that has a typed path, weighted by
+        // how often each operand held its tag.
+        let mut pairs: Vec<(i32, i32, u64)> = Vec::new();
+        for &(a, ca) in &lexp {
+            for &(b, cb) in &rexp {
+                let typed = match (a, b) {
+                    (0, 0) => int_name.is_some(),
+                    (0 | 1, 0 | 1) => float_instr.is_some(),
+                    _ => false,
+                };
+                if typed {
+                    pairs.push((a, b, ca.saturating_mul(cb)));
+                }
+            }
+        }
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.2));
+        pairs.truncate(4);
+        let kernel = |me: &mut Self| {
+            let sr = me.tmp();
+            me.line(format!(
                 "{sr} = call i64 @pyrs_dyn_binop(i32 {lt}, i64 {lp}, i32 {rt}, \
                  i64 {rp}, i32 {}, ptr {slot})",
                 op as i32
             ));
-            self.line(format!("br label %{join_l}"));
-            self.start_block(&join_l);
-            let pay = self.tmp();
-            self.line(format!(
-                "{pay} = phi i64 [ {fr}, %{fast_l} ], [ {sr}, %{slow_l} ]"
-            ));
+            sr
+        };
+        if pairs.is_empty() {
+            let pay = kernel(self);
             let tag = self.tmp();
             self.line(format!("{tag} = load i32, ptr {slot}"));
             return self.build_any(&tag, &pay);
         }
-        if lexp == Some(1)
-            && rexp == Some(1)
-            && let Some(instr) = float_instr
-        {
-            let (fast_l, slow_l, join_l) = self.branch_if_tags(lt, 1, rt, 1);
-            self.start_block(&fast_l);
-            let ld = self.tmp();
-            let rd = self.tmp();
-            self.line(format!("{ld} = bitcast i64 {lp} to double"));
-            self.line(format!("{rd} = bitcast i64 {rp} to double"));
-            let fv = self.tmp();
-            self.line(format!("{fv} = {instr} double {ld}, {rd}"));
-            let fr = self.tmp();
-            self.line(format!("{fr} = bitcast double {fv} to i64"));
-            self.line(format!("store i32 1, ptr {slot}"));
-            self.line(format!("br label %{join_l}"));
-            self.start_block(&slow_l);
-            let sr = self.tmp();
-            self.line(format!(
-                "{sr} = call i64 @pyrs_dyn_binop(i32 {lt}, i64 {lp}, i32 {rt}, \
-                 i64 {rp}, i32 {}, ptr {slot})",
-                op as i32
-            ));
-            self.line(format!("br label %{join_l}"));
-            self.start_block(&join_l);
-            let pay = self.tmp();
-            self.line(format!(
-                "{pay} = phi i64 [ {fr}, %{fast_l} ], [ {sr}, %{slow_l} ]"
-            ));
-            let tag = self.tmp();
-            self.line(format!("{tag} = load i32, ptr {slot}"));
-            return self.build_any(&tag, &pay);
-        }
-        let pay = self.tmp();
-        self.line(format!(
-            "{pay} = call i64 @pyrs_dyn_binop(i32 {lt}, i64 {lp}, i32 {rt}, \
-             i64 {rp}, i32 {}, ptr {slot})",
-            op as i32
-        ));
+        let arms: Vec<(Vec<(String, i32)>, i32)> = pairs
+            .iter()
+            .map(|&(a, b, _)| (vec![(lt.to_string(), a), (rt.to_string(), b)], a))
+            .collect();
+        let (pay, _) = self.emit_pic(
+            &arms,
+            |me, k, slow| {
+                let (a, b, _) = pairs[k];
+                if (a, b) == (0, 0) {
+                    let r = me.emit_int_arith(int_name.expect("filtered"), lp, rp);
+                    me.line(format!("store i32 0, ptr {slot}"));
+                    return r;
+                }
+                let ld = me.emit_double_operand(a, lp, slow);
+                let rd = me.emit_double_operand(b, rp, slow);
+                if op == DynBinOp::Div {
+                    // A zero divisor raises in CPython; the kernel says so.
+                    let zero = me.tmp();
+                    me.line(format!("{zero} = fcmp oeq double {rd}, 0.0"));
+                    let ok = me.fresh_block("pic.div");
+                    me.line(format!("br i1 {zero}, label %{slow}, label %{ok}"));
+                    me.start_block(&ok);
+                }
+                let fv = me.tmp();
+                me.line(format!(
+                    "{fv} = {} double {ld}, {rd}",
+                    float_instr.expect("filtered")
+                ));
+                let fr = me.tmp();
+                me.line(format!("{fr} = bitcast double {fv} to i64"));
+                me.line(format!("store i32 1, ptr {slot}"));
+                fr
+            },
+            kernel,
+            false,
+        );
         let tag = self.tmp();
         self.line(format!("{tag} = load i32, ptr {slot}"));
         self.build_any(&tag, &pay)
@@ -2660,8 +2755,8 @@ impl Emitter {
         lp: &str,
         rt: &str,
         rp: &str,
-        lexp: Option<i32>,
-        rexp: Option<i32>,
+        lexp: Vec<(i32, u64)>,
+        rexp: Vec<(i32, u64)>,
     ) -> String {
         let name = match op {
             DynCmpOp::Lt => "lt",
@@ -2671,93 +2766,146 @@ impl Emitter {
             DynCmpOp::Eq => "eq",
             DynCmpOp::Ne => "ne",
         };
-        if lexp == Some(0) && rexp == Some(0) {
-            let (fast_l, slow_l, join_l) = self.branch_if_tags(lt, 0, rt, 0);
-            self.start_block(&fast_l);
-            let fr = self.tmp();
-            match self.int_fast(name) {
-                Some(sym) => self.line(format!("{fr} = call i1 {sym}(i64 {lp}, i64 {rp})")),
-                None => {
-                    let c = self.tmp();
-                    self.line(format!("{c} = call i32 @pyrs_int_cmp(i64 {lp}, i64 {rp})"));
-                    let pred = match op {
-                        DynCmpOp::Lt => "slt",
-                        DynCmpOp::Le => "sle",
-                        DynCmpOp::Gt => "sgt",
-                        DynCmpOp::Ge => "sge",
-                        DynCmpOp::Eq => "eq",
-                        DynCmpOp::Ne => "ne",
-                    };
-                    self.line(format!("{fr} = icmp {pred} i32 {c}, 0"));
+        // Same-type pairs only: an int and a float compare exactly in CPython,
+        // which a double cannot do past 2**53.
+        let mut pairs: Vec<(i32, u64)> = Vec::new();
+        for &(a, ca) in &lexp {
+            for &(b, cb) in &rexp {
+                if a == b && (a == 0 || a == 1) {
+                    pairs.push((a, ca.saturating_mul(cb)));
                 }
             }
-            self.line(format!("br label %{join_l}"));
-            self.start_block(&slow_l);
-            let sc = self.tmp();
-            self.line(format!(
-                "{sc} = call i32 @pyrs_dyn_compare(i32 {lt}, i64 {lp}, i32 {rt}, \
+        }
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.1));
+        let kernel = |me: &mut Self| {
+            let c = me.tmp();
+            me.line(format!(
+                "{c} = call i32 @pyrs_dyn_compare(i32 {lt}, i64 {lp}, i32 {rt}, \
                  i64 {rp}, i32 {})",
                 op as i32
             ));
-            let sr = self.tmp();
-            self.line(format!("{sr} = icmp ne i32 {sc}, 0"));
-            self.line(format!("br label %{join_l}"));
-            self.start_block(&join_l);
-            let t = self.tmp();
-            self.line(format!(
-                "{t} = phi i1 [ {fr}, %{fast_l} ], [ {sr}, %{slow_l} ]"
-            ));
-            return t;
+            let t = me.tmp();
+            me.line(format!("{t} = icmp ne i32 {c}, 0"));
+            t
+        };
+        if pairs.is_empty() {
+            return kernel(self);
         }
-        let c = self.tmp();
-        self.line(format!(
-            "{c} = call i32 @pyrs_dyn_compare(i32 {lt}, i64 {lp}, i32 {rt}, \
-             i64 {rp}, i32 {})",
-            op as i32
-        ));
-        let t = self.tmp();
-        self.line(format!("{t} = icmp ne i32 {c}, 0"));
+        let arms: Vec<(Vec<(String, i32)>, i32)> = pairs
+            .iter()
+            .map(|&(a, _)| (vec![(lt.to_string(), a), (rt.to_string(), a)], a))
+            .collect();
+        let (t, _) = self.emit_pic(
+            &arms,
+            |me, k, _slow| {
+                let fr = me.tmp();
+                if pairs[k].0 == 0 {
+                    match me.int_fast(name) {
+                        Some(sym) => me.line(format!("{fr} = call i1 {sym}(i64 {lp}, i64 {rp})")),
+                        None => {
+                            let c = me.tmp();
+                            me.line(format!("{c} = call i32 @pyrs_int_cmp(i64 {lp}, i64 {rp})"));
+                            let pred = match op {
+                                DynCmpOp::Lt => "slt",
+                                DynCmpOp::Le => "sle",
+                                DynCmpOp::Gt => "sgt",
+                                DynCmpOp::Ge => "sge",
+                                DynCmpOp::Eq => "eq",
+                                DynCmpOp::Ne => "ne",
+                            };
+                            me.line(format!("{fr} = icmp {pred} i32 {c}, 0"));
+                        }
+                    }
+                } else {
+                    let ld = me.tmp();
+                    let rd = me.tmp();
+                    me.line(format!("{ld} = bitcast i64 {lp} to double"));
+                    me.line(format!("{rd} = bitcast i64 {rp} to double"));
+                    // Ordered predicates, and unordered `!=`: a NaN is unequal
+                    // to everything and compares false otherwise.
+                    let pred = match op {
+                        DynCmpOp::Lt => "olt",
+                        DynCmpOp::Le => "ole",
+                        DynCmpOp::Gt => "ogt",
+                        DynCmpOp::Ge => "oge",
+                        DynCmpOp::Eq => "oeq",
+                        DynCmpOp::Ne => "une",
+                    };
+                    me.line(format!("{fr} = fcmp {pred} double {ld}, {rd}"));
+                }
+                fr
+            },
+            kernel,
+            true,
+        );
         t
     }
 
-    fn emit_dyn_unary(&mut self, op: DynUnOp, vt: &str, vp: &str, vexp: Option<i32>) -> String {
+    fn emit_dyn_unary(&mut self, op: DynUnOp, vt: &str, vp: &str, vexp: Vec<(i32, u64)>) -> String {
         let slot = self.dyn_tag_slot();
-        if vexp == Some(0) {
-            let (fast_l, slow_l, join_l) = self.branch_if_tag(vt, 0);
-            self.start_block(&fast_l);
-            let fr = match op {
-                DynUnOp::Pos => vp.to_string(),
-                DynUnOp::Neg => self.emit_int_arith_unary("neg", vp),
-                DynUnOp::Invert => self.emit_int_arith_unary("invert", vp),
-                DynUnOp::Abs => {
-                    let t = self.tmp();
-                    self.line(format!("{t} = call i64 @pyrs_int_abs(i64 {vp})"));
-                    t
-                }
-            };
-            self.line(format!("store i32 0, ptr {slot}"));
-            self.line(format!("br label %{join_l}"));
-            self.start_block(&slow_l);
-            let sr = self.tmp();
-            self.line(format!(
+        let tags: Vec<i32> = vexp
+            .iter()
+            .map(|&(t, _)| t)
+            .filter(|t| *t == 0 || (*t == 1 && op != DynUnOp::Invert))
+            .collect();
+        let kernel = |me: &mut Self| {
+            let sr = me.tmp();
+            me.line(format!(
                 "{sr} = call i64 @pyrs_dyn_unary(i32 {vt}, i64 {vp}, i32 {}, ptr {slot})",
                 op as i32
             ));
-            self.line(format!("br label %{join_l}"));
-            self.start_block(&join_l);
-            let pay = self.tmp();
-            self.line(format!(
-                "{pay} = phi i64 [ {fr}, %{fast_l} ], [ {sr}, %{slow_l} ]"
-            ));
+            sr
+        };
+        if tags.is_empty() {
+            let pay = kernel(self);
             let tag = self.tmp();
             self.line(format!("{tag} = load i32, ptr {slot}"));
             return self.build_any(&tag, &pay);
         }
-        let pay = self.tmp();
-        self.line(format!(
-            "{pay} = call i64 @pyrs_dyn_unary(i32 {vt}, i64 {vp}, i32 {}, ptr {slot})",
-            op as i32
-        ));
+        let arms: Vec<(Vec<(String, i32)>, i32)> = tags
+            .iter()
+            .map(|&t| (vec![(vt.to_string(), t)], t))
+            .collect();
+        let (pay, _) = self.emit_pic(
+            &arms,
+            |me, k, _slow| {
+                if tags[k] == 0 {
+                    let fr = match op {
+                        DynUnOp::Pos => {
+                            let t = me.tmp();
+                            me.line(format!("{t} = add i64 {vp}, 0"));
+                            t
+                        }
+                        DynUnOp::Neg => me.emit_int_arith_unary("neg", vp),
+                        DynUnOp::Invert => me.emit_int_arith_unary("invert", vp),
+                        DynUnOp::Abs => {
+                            let t = me.tmp();
+                            me.line(format!("{t} = call i64 @pyrs_int_abs(i64 {vp})"));
+                            t
+                        }
+                    };
+                    me.line(format!("store i32 0, ptr {slot}"));
+                    return fr;
+                }
+                let d = me.tmp();
+                me.line(format!("{d} = bitcast i64 {vp} to double"));
+                let r = me.tmp();
+                match op {
+                    DynUnOp::Pos => me.line(format!("{r} = fadd double {d}, -0.0")),
+                    DynUnOp::Neg => me.line(format!("{r} = fneg double {d}")),
+                    DynUnOp::Abs => {
+                        me.line(format!("{r} = call double @llvm.fabs.f64(double {d})"))
+                    }
+                    DynUnOp::Invert => unreachable!("filtered"),
+                }
+                let out = me.tmp();
+                me.line(format!("{out} = bitcast double {r} to i64"));
+                me.line(format!("store i32 1, ptr {slot}"));
+                out
+            },
+            kernel,
+            false,
+        );
         let tag = self.tmp();
         self.line(format!("{tag} = load i32, ptr {slot}"));
         self.build_any(&tag, &pay)
@@ -2770,36 +2918,6 @@ impl Emitter {
             None => self.line(format!("{t} = call i64 @pyrs_int_{name}(i64 {v})")),
         }
         t
-    }
-
-    fn branch_if_tags(
-        &mut self,
-        lt: &str,
-        lexp: i32,
-        rt: &str,
-        rexp: i32,
-    ) -> (String, String, String) {
-        let fast_l = self.fresh_block("dyn.fast");
-        let slow_l = self.fresh_block("dyn.slow");
-        let join_l = self.fresh_block("dyn.join");
-        let ol = self.tmp();
-        let oright = self.tmp();
-        let both = self.tmp();
-        self.line(format!("{ol} = icmp eq i32 {lt}, {lexp}"));
-        self.line(format!("{oright} = icmp eq i32 {rt}, {rexp}"));
-        self.line(format!("{both} = and i1 {ol}, {oright}"));
-        self.line(format!("br i1 {both}, label %{fast_l}, label %{slow_l}"));
-        (fast_l, slow_l, join_l)
-    }
-
-    fn branch_if_tag(&mut self, tag: &str, expected: i32) -> (String, String, String) {
-        let fast_l = self.fresh_block("dyn.fast");
-        let slow_l = self.fresh_block("dyn.slow");
-        let join_l = self.fresh_block("dyn.join");
-        let ok = self.tmp();
-        self.line(format!("{ok} = icmp eq i32 {tag}, {expected}"));
-        self.line(format!("br i1 {ok}, label %{fast_l}, label %{slow_l}"));
-        (fast_l, slow_l, join_l)
     }
 
     /// Assemble a dynamic value from a print tag and a payload word.
