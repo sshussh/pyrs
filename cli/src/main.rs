@@ -797,8 +797,70 @@ fn check_program(cmd: cli::CheckCommand) -> Result<i32, String> {
         None => modules::load_program(&input),
     };
     let format = cmd.message_format;
-    analyze(loaded.map_err(|e| fail(e, format))?).map_err(|f| f.render(format))?;
+    let module = analyze(loaded.map_err(|e| fail(e, format))?).map_err(|f| f.render(format))?;
+    if cmd.show_types {
+        print!("{}", signatures(&module));
+    }
     Ok(0)
+}
+
+/// One line per user function: the parameter and return types it was compiled
+/// with, which for an unannotated function is what inference decided.
+fn signatures(module: &ir::Module) -> String {
+    fn render(ty: ir::Ty, module: &ir::Module) -> String {
+        match ty {
+            ir::Ty::Class(id) => module
+                .classes
+                .get(id as usize)
+                .map_or_else(|| ty.to_string(), |c| c.name.clone()),
+            ir::Ty::List(e) => format!("list[{}]", render(*e, module)),
+            ir::Ty::Set(e) => format!("set[{}]", render(*e, module)),
+            ir::Ty::Dict { key, value } => {
+                format!("dict[{}, {}]", render(*key, module), render(*value, module))
+            }
+            ir::Ty::Tuple(elems) if !elems.is_empty() => format!(
+                "tuple[{}]",
+                elems
+                    .iter()
+                    .map(|e| render(*e, module))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            ir::Ty::Union(members) => members
+                .iter()
+                .map(|m| render(*m, module))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            ir::Ty::Generator { yield_ty } => format!("Iterator[{}]", render(*yield_ty, module)),
+            ir::Ty::Closure { params, ret, .. } => format!(
+                "Callable[[{}], {}]",
+                params
+                    .iter()
+                    .map(|p| render(*p, module))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                render(*ret, module)
+            ),
+            other => other.to_string(),
+        }
+    }
+    let mut out = String::new();
+    for f in &module.funcs {
+        if f.name == module.entry || f.name.starts_with('.') || f.name.contains(['<', '$']) {
+            continue;
+        }
+        let params: Vec<String> = f
+            .params
+            .iter()
+            .map(|(n, t)| format!("{n}: {}", render(*t, module)))
+            .collect();
+        let ret = match f.yield_ty {
+            Some(y) if f.is_generator => format!("Iterator[{}]", render(y, module)),
+            _ => render(f.ret, module),
+        };
+        out.push_str(&format!("{}({}) -> {ret}\n", f.name, params.join(", ")));
+    }
+    out
 }
 
 /// `pyrs cache`: inspect, clean and prune the build cache.

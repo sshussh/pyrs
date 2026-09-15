@@ -469,6 +469,11 @@ pub struct CheckCommand {
     /// How to print diagnostics
     #[arg(long, value_name = "FORMAT", default_value = "human")]
     pub message_format: crate::diagnostics::Format,
+
+    /// Print the signature every function was compiled with, inferred types
+    /// included
+    #[arg(long)]
+    pub show_types: bool,
 }
 
 #[derive(Debug, Args)]
