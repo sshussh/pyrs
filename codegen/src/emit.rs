@@ -286,6 +286,8 @@ struct Emitter {
     /// interned string constants: content → global name
     strings: HashMap<String, String>,
     string_defs: String,
+    /// `declare` lines for the runtime kernels `DynKernel` calls, by name.
+    kernel_decls: BTreeMap<String, String>,
     /// module-level variable definitions (@g.<name>)
     global_defs: String,
     tmp: usize,
@@ -366,6 +368,7 @@ impl Default for Emitter {
             body: String::new(),
             strings: HashMap::new(),
             string_defs: String::new(),
+            kernel_decls: BTreeMap::new(),
             global_defs: String::new(),
             tmp: 0,
             blk: 0,
@@ -522,6 +525,7 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
     match &e.kind {
         Block { stmts, result } => max_try_depth_in_stmts(stmts).max(max_try_depth_in_expr(result)),
         Let { value, body, .. } => max_try_depth_in_expr(value).max(max_try_depth_in_expr(body)),
+        DynKernel { args, .. } => args.iter().map(max_try_depth_in_expr).max().unwrap_or(0),
         DynMethod { receiver, args, .. } => max_try_depth_in_expr(receiver)
             .max(args.iter().map(max_try_depth_in_expr).max().unwrap_or(0)),
         Binary { left, right, .. }
@@ -564,6 +568,9 @@ fn max_try_depth_in_expr(e: &Expr) -> usize {
         | StrRepr(operand)
         | StrAscii(operand)
         | AnyDictKeys(operand)
+        | AnyClassId(operand)
+        | AnyIsClosure { value: operand, .. }
+        | DynAttrMissing { value: operand, .. }
         | ContainerRepr(operand)
         | ContainerAscii(operand)
         | IsNone { value: operand, .. }
@@ -851,6 +858,7 @@ fn count_yields_in_stmt(s: &Stmt) -> i64 {
 fn count_yields_in_expr(e: &Expr) -> i64 {
     use ExprKind::*;
     match &e.kind {
+        DynKernel { args, .. } => args.iter().map(count_yields_in_expr).sum(),
         Block { stmts, result } => count_yields_in_stmts(stmts) + count_yields_in_expr(result),
         Let { value, body, .. } => count_yields_in_expr(value) + count_yields_in_expr(body),
         Binary { left, right, .. }
@@ -882,6 +890,9 @@ fn count_yields_in_expr(e: &Expr) -> i64 {
         | StrRepr(operand)
         | StrAscii(operand)
         | AnyDictKeys(operand)
+        | AnyClassId(operand)
+        | AnyIsClosure { value: operand, .. }
+        | DynAttrMissing { value: operand, .. }
         | ContainerRepr(operand)
         | ContainerAscii(operand)
         | IsNone { value: operand, .. }
@@ -1370,6 +1381,7 @@ impl Emitter {
         out.push_str("declare void @pyrs_print_type(i64)\n");
         out.push_str("declare ptr @pyrs_str_from_type(i64)\n");
         out.push_str("declare i64 @pyrs_shape_get(ptr, ptr, ptr, ptr)\n");
+        out.push_str("declare void @pyrs_dyn_attr_missing(i32, i64, ptr)\n");
         out.push_str("declare void @pyrs_shape_set(ptr, ptr, i32, i64)\n");
         out.push_str("declare i32 @pyrs_shape_has(ptr, ptr)\n");
         out.push_str("declare ptr @pyrs_str_from_object(ptr)\n");
@@ -1406,6 +1418,9 @@ impl Emitter {
         }
         out.push_str(&self.global_defs);
         out.push_str(&self.string_defs);
+        for decl in self.kernel_decls.values() {
+            out.push_str(decl);
+        }
         out.push('\n');
         out.push_str(&self.funcs);
         out
@@ -1660,6 +1675,12 @@ impl Emitter {
         self.body.push_str(":\n");
         self.cur_block = label.to_string();
         self.terminated = false;
+    }
+
+    fn declare_extern(&mut self, func: &str, ret: &str, params: &[&str]) {
+        self.kernel_decls
+            .entry(func.to_string())
+            .or_insert_with(|| format!("declare {ret} @{func}({})\n", params.join(", ")));
     }
 
     /// A string constant as a `{ i64 codepoints, i64 bytes, [n x i8] }`
@@ -5443,6 +5464,12 @@ impl Emitter {
             ExprKind::Block { stmts, result } => {
                 for stmt in stmts {
                     self.emit_stmt(stmt);
+                    // A statement that never falls through (a `Die`) still
+                    // leaves the block's result to emit, which needs a block.
+                    if self.terminated {
+                        let dead = self.fresh_block("block.dead");
+                        self.start_block(&dead);
+                    }
                 }
                 self.emit_expr(result)
             }
@@ -5456,6 +5483,136 @@ impl Emitter {
                     "{t} = call i64 @pyrs_any_iter_get(i64 {b}, i64 {i})"
                 ));
                 self.any_unbox(&t)
+            }
+            ExprKind::DynKernel { func, args } => {
+                let mut parts: Vec<String> = Vec::new();
+                let mut decl: Vec<&str> = Vec::new();
+                for a in args {
+                    match a.ty {
+                        Ty::Any => {
+                            let v = self.emit_expr(a);
+                            let (t, p) = self.emit_any_unpack(&v);
+                            parts.push(format!("i32 {t}"));
+                            parts.push(format!("i64 {p}"));
+                            decl.push("i32");
+                            decl.push("i64");
+                        }
+                        Ty::Int => {
+                            let v = self.emit_slice_bound(a);
+                            parts.push(format!("i64 {v}"));
+                            decl.push("i64");
+                        }
+                        Ty::Str => {
+                            let v = self.emit_expr(a);
+                            parts.push(format!("ptr {v}"));
+                            decl.push("ptr");
+                        }
+                        other => unreachable!("DynKernel argument of type {other:?}"),
+                    }
+                }
+                let tag_slot = self.dyn_tag_slot();
+                if expr.ty == Ty::Any {
+                    parts.push(format!("ptr {tag_slot}"));
+                    decl.push("ptr");
+                }
+                let ret = match expr.ty {
+                    Ty::Any | Ty::Int => "i64",
+                    Ty::Float => "double",
+                    Ty::Str => "ptr",
+                    Ty::None => "void",
+                    other => unreachable!("DynKernel result of type {other:?}"),
+                };
+                self.declare_extern(func, ret, &decl);
+                let call = format!("@{func}({})", parts.join(", "));
+                match expr.ty {
+                    Ty::None => {
+                        self.line(format!("call void {call}"));
+                        "0".to_string()
+                    }
+                    Ty::Any => {
+                        let pay = self.tmp();
+                        self.line(format!("{pay} = call i64 {call}"));
+                        let tag = self.tmp();
+                        self.line(format!("{tag} = load i32, ptr {tag_slot}"));
+                        self.build_any(&tag, &pay)
+                    }
+                    _ => {
+                        let t = self.tmp();
+                        self.line(format!("{t} = call {ret} {call}"));
+                        t
+                    }
+                }
+            }
+            ExprKind::AnyIsClosure { value, func } => {
+                let v = self.emit_expr(value);
+                let (tag, pay) = self.emit_any_unpack(&v);
+                let is_closure = self.tmp();
+                self.line(format!("{is_closure} = icmp eq i32 {tag}, 9"));
+                let entry = self.cur_block.clone();
+                let load_l = self.fresh_block("anyfn.load");
+                let done_l = self.fresh_block("anyfn.done");
+                self.line(format!(
+                    "br i1 {is_closure}, label %{load_l}, label %{done_l}"
+                ));
+                self.start_block(&load_l);
+                let c = self.tmp();
+                self.line(format!("{c} = inttoptr i64 {pay} to ptr"));
+                let code = self.tmp();
+                self.line(format!("{code} = call ptr @pyrs_closure_code(ptr {c})"));
+                let same = self.tmp();
+                self.line(format!("{same} = icmp eq ptr {code}, @{}", mangle(func)));
+                let load_end = self.cur_block.clone();
+                self.line(format!("br label %{done_l}"));
+                self.start_block(&done_l);
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = phi i1 [ false, %{entry} ], [ {same}, %{load_end} ]"
+                ));
+                t
+            }
+            ExprKind::AnyClassId(inner) => {
+                let v = self.emit_expr(inner);
+                let (tag, pay) = self.emit_any_unpack(&v);
+                // A class instance's tag is 13 + 8 * (its static class id);
+                // the object header holds the class it really is.
+                let at_least = self.tmp();
+                self.line(format!("{at_least} = icmp sge i32 {tag}, 13"));
+                let offset = self.tmp();
+                self.line(format!("{offset} = sub i32 {tag}, 13"));
+                let low = self.tmp();
+                self.line(format!("{low} = and i32 {offset}, 7"));
+                let aligned = self.tmp();
+                self.line(format!("{aligned} = icmp eq i32 {low}, 0"));
+                let is_obj = self.tmp();
+                self.line(format!("{is_obj} = and i1 {at_least}, {aligned}"));
+                let entry = self.cur_block.clone();
+                let load_l = self.fresh_block("anycls.load");
+                let done_l = self.fresh_block("anycls.done");
+                self.line(format!("br i1 {is_obj}, label %{load_l}, label %{done_l}"));
+                self.start_block(&load_l);
+                let obj = self.tmp();
+                self.line(format!("{obj} = inttoptr i64 {pay} to ptr"));
+                let id = self.tmp();
+                self.line(format!("{id} = load i64, ptr {obj}"));
+                let tagged = self.emit_box_i64(&id);
+                let load_end = self.cur_block.clone();
+                self.line(format!("br label %{done_l}"));
+                self.start_block(&done_l);
+                // -1 as a tagged small int is (-1 << 1) | 1, which is -1.
+                let t = self.tmp();
+                self.line(format!(
+                    "{t} = phi i64 [ -1, %{entry} ], [ {tagged}, %{load_end} ]"
+                ));
+                t
+            }
+            ExprKind::DynAttrMissing { value, name } => {
+                let v = self.emit_expr(value);
+                let (tag, pay) = self.emit_any_unpack(&v);
+                let name_g = self.intern_string(name);
+                self.line(format!(
+                    "call void @pyrs_dyn_attr_missing(i32 {tag}, i64 {pay}, ptr {name_g})"
+                ));
+                self.build_any("-1", "0")
             }
             ExprKind::AnyDictKeys(inner) => {
                 let v = self.emit_expr(inner);

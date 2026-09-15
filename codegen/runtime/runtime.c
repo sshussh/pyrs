@@ -7752,13 +7752,18 @@ static const PyrsUnionBox *any_box(long long v) {
 
 /* `len(v)` where `v` is dynamic. Every sized object keeps its count in the
  * first i64, which is why `cplen` leads `PyrsStr`. */
+static const char *dyn_value_type_name(int tag, long long pay);
+
 long long pyrs_any_len(long long v) {
     const PyrsUnionBox *b = any_box(v);
     int tag = b->print_tag;
     int sized = (tag == TAG_STR) || (tag == TAG_TUPLE) || (tag == TAG_DICT)
                 || (tag == TAG_SET) || (tag >= 4 && ((tag - 4) % 8) == 0);
     if (!sized || b->payload == 0) {
-        pyrs_die("TypeError: object of this dynamic type has no len()");
+        char msg[160];
+        snprintf(msg, sizeof msg, "TypeError: object of type '%s' has no len()",
+                 dyn_value_type_name(tag, b->payload));
+        pyrs_die(msg);
     }
     return *(const long long *)(uintptr_t)b->payload;
 }
@@ -7899,6 +7904,57 @@ static const char *dyn_type_name(int tag) {
     default:
         return "object";
     }
+}
+
+/* `type(v).__name__` for a dynamic value, which for a user class instance is
+ * the class the object really is, read from its header. */
+static const char *dyn_value_type_name(int tag, long long pay) {
+    if (tag >= TAG_CLASS_BASE && ((tag - TAG_CLASS_BASE) % 8) == 0 && pay != 0) {
+        long long tid = *(long long *)(uintptr_t)pay;
+        if (g_class_names != NULL && tid >= 0 && tid < g_class_n
+            && g_class_names[tid] != NULL) {
+            const char *dot = strrchr(g_class_names[tid], '.');
+            return dot != NULL ? dot + 1 : g_class_names[tid];
+        }
+    }
+    switch (tag) {
+    case TAG_CLOSURE:
+        return "function";
+    case TAG_GENERATOR:
+        return "generator";
+    default:
+        return dyn_type_name(tag);
+    }
+}
+
+/* `v(...)` where `v` holds nothing the program can call. */
+void pyrs_dyn_not_callable(int tag, long long pay) {
+    char msg[192];
+    snprintf(msg, sizeof msg, "TypeError: '%s' object is not callable",
+             dyn_value_type_name(tag, pay));
+    pyrs_die(msg);
+}
+
+/* `v.name` found nothing: no user class in the program with that attribute
+ * matched the value. */
+static int dyn_name_known(PyrsDynKind k, const char *m);
+
+void pyrs_dyn_attr_missing(int tag, long long pay, const PyrsStr *name) {
+    check_ref(name);
+    char msg[256];
+    char attr[128];
+    snprintf(attr, sizeof attr, "%.*s", (int)name->len, name->data);
+    if (dyn_name_known(dyn_kind(tag), attr)) {
+        /* It exists in CPython; PyRs has not implemented reading it here. */
+        snprintf(msg, sizeof msg,
+                 "NotImplementedError: '%s' is not supported on a dynamic %s yet; "
+                 "narrow with isinstance first",
+                 attr, dyn_type_name(tag));
+    } else {
+        snprintf(msg, sizeof msg, "AttributeError: '%s' object has no attribute '%s'",
+                 dyn_value_type_name(tag, pay), attr);
+    }
+    pyrs_die(msg);
 }
 
 static const char *dyn_binop_symbol(int op) {
@@ -8963,8 +9019,23 @@ static int dyn_name_known(PyrsDynKind k, const char *m) {
         "issuperset", "pop", "remove", "symmetric_difference",
         "symmetric_difference_update", "union", "update", NULL};
     static const char *tuple_names[] = {"count", "index", NULL};
+    /* Methods and attributes together: `v.real` and `v.bit_length()` both
+     * exist, so neither may be reported as missing. */
+    static const char *int_names[] = {
+        "as_integer_ratio", "bit_count", "bit_length", "conjugate", "denominator",
+        "from_bytes", "imag", "is_integer", "numerator", "real", "to_bytes", NULL};
+    static const char *float_names[] = {
+        "as_integer_ratio", "conjugate", "from_number", "fromhex", "hex", "imag",
+        "is_integer", "real", NULL};
     const char **names;
     switch (k) {
+    case DK_INT:
+    case DK_BOOL:
+        names = int_names;
+        break;
+    case DK_FLOAT:
+        names = float_names;
+        break;
     case DK_STR:
         names = str_names;
         break;
@@ -8991,7 +9062,7 @@ static int dyn_name_known(PyrsDynKind k, const char *m) {
     return 0;
 }
 
-_Noreturn static void dyn_method_missing(int tag, const char *m) {
+_Noreturn static void dyn_method_missing(int tag, long long pay, const char *m) {
     char msg[192];
     if (dyn_name_known(dyn_kind(tag), m)) {
         snprintf(msg, sizeof msg,
@@ -9001,7 +9072,7 @@ _Noreturn static void dyn_method_missing(int tag, const char *m) {
     } else {
         snprintf(msg, sizeof msg,
                  "AttributeError: '%s' object has no attribute '%s'",
-                 dyn_type_name(tag), m);
+                 dyn_value_type_name(tag, pay), m);
     }
     pyrs_die(msg);
 }
@@ -9073,7 +9144,7 @@ long long pyrs_dyn_method(int tag, long long pay, const PyrsStr *name, int argc,
     check_ref(name);
     char m[64];
     if (name->len >= (long long)sizeof m) {
-        dyn_method_missing(tag, "<name too long>");
+        dyn_method_missing(tag, pay, "<name too long>");
     }
     memcpy(m, name->data, (size_t)name->len);
     m[name->len] = '\0';
@@ -9089,6 +9160,30 @@ long long pyrs_dyn_method(int tag, long long pay, const PyrsStr *name, int argc,
 #define RET_BOOL(e) return dyn_result(out_tag, TAG_BOOL, (e) ? 1 : 0)
 #define RET_INT(e) return dyn_result(out_tag, TAG_INT, pyrs_int_from_i64(e))
 #define RET_NONE() return dyn_result(out_tag, -1, 0)
+
+    if (k == DK_INT || k == DK_BOOL) {
+        long long tagged = 0;
+        (void)dyn_as_int(tag, pay, &tagged);
+        if (pyrs_int_is_small(tagged)) {
+            long long v = pyrs_int_as_i64(tagged);
+            unsigned long long mag = v < 0 ? (unsigned long long)(-(v + 1)) + 1 : (unsigned long long)v;
+            if (!strcmp(m, "bit_length")) {
+                ARITY(0);
+                RET_INT(mag == 0 ? 0 : 64 - __builtin_clzll(mag));
+            }
+            if (!strcmp(m, "bit_count")) { ARITY(0); RET_INT(__builtin_popcountll(mag)); }
+        }
+        if (!strcmp(m, "is_integer")) { ARITY(0); RET_BOOL(1); }
+        if (!strcmp(m, "conjugate")) { ARITY(0); return dyn_result(out_tag, TAG_INT, tagged); }
+        dyn_method_missing(tag, pay, m);
+    }
+    if (k == DK_FLOAT) {
+        double d;
+        memcpy(&d, &pay, sizeof d);
+        if (!strcmp(m, "is_integer")) { ARITY(0); RET_BOOL(isfinite(d) && d == floor(d)); }
+        if (!strcmp(m, "conjugate")) { ARITY(0); return dyn_result(out_tag, TAG_FLOAT, pay); }
+        dyn_method_missing(tag, pay, m);
+    }
 
     if (k == DK_STR) {
         const PyrsStr *sv = (const PyrsStr *)(uintptr_t)pay;
@@ -9173,7 +9268,7 @@ long long pyrs_dyn_method(int tag, long long pay, const PyrsStr *name, int argc,
             ARITY(1);
             RET_STR(pyrs_str_zfill(sv, dyn_int_arg(m, argtags[0], argpays[0])));
         }
-        dyn_method_missing(tag, m);
+        dyn_method_missing(tag, pay, m);
     }
 
     if (k == DK_LIST) {
@@ -9216,7 +9311,7 @@ long long pyrs_dyn_method(int tag, long long pay, const PyrsStr *name, int argc,
             pyrs_list_insert(lv, dyn_int_arg(m, argtags[0], argpays[0]), argpays[1]);
             RET_NONE();
         }
-        dyn_method_missing(tag, m);
+        dyn_method_missing(tag, pay, m);
     }
 
     if (k == DK_DICT) {
@@ -9227,11 +9322,34 @@ long long pyrs_dyn_method(int tag, long long pay, const PyrsStr *name, int argc,
             return dyn_result(out_tag, TAG_DICT,
                               (long long)(uintptr_t)pyrs_dict_copy(dv));
         }
-        if (!strcmp(m, "keys")) {
+        /* keys / values / items: a list whose elements carry their own tags,
+         * in insertion order, as the views would iterate. */
+        if (!strcmp(m, "keys") || !strcmp(m, "values") || !strcmp(m, "items")) {
             ARITY(0);
-            return dyn_result(out_tag, 4 + 8 * TAG_STR,
-                              (long long)(uintptr_t)pyrs_any_dict_keys(
-                                  (long long)(uintptr_t)pyrs_union_box_new(tag, pay)));
+            PyrsList *out = pyrs_list_new(dv->order_len > 0 ? dv->order_len : 1);
+            for (long long i = 0; i < dv->order_len; i++) {
+                const DictSlot *e = &dv->table[dv->order[i]];
+                long long slot;
+                if (!strcmp(m, "items")) {
+                    PyrsTuple *pair = pyrs_tuple_new(2);
+                    pair->data[0] = e->key;
+                    pair->tags[0] = e->key_tag;
+                    pair->data[1] = e->val;
+                    pair->tags[1] = e->val_tag;
+                    slot = (long long)(uintptr_t)pyrs_union_box_new(TAG_TUPLE,
+                                                                    (long long)(uintptr_t)pair);
+                } else if (!strcmp(m, "keys")) {
+                    slot = e->key_tag == TAG_UNION
+                               ? e->key
+                               : (long long)(uintptr_t)pyrs_union_box_new(e->key_tag, e->key);
+                } else {
+                    slot = e->val_tag == TAG_UNION
+                               ? e->val
+                               : (long long)(uintptr_t)pyrs_union_box_new(e->val_tag, e->val);
+                }
+                pyrs_list_push(out, slot);
+            }
+            return dyn_result(out_tag, 4 + 8 * TAG_UNION, (long long)(uintptr_t)out);
         }
         if (!strcmp(m, "get")) {
             if (argc != 1 && argc != 2) dyn_method_arity(tag, m, 1, argc);
@@ -9256,7 +9374,7 @@ long long pyrs_dyn_method(int tag, long long pay, const PyrsStr *name, int argc,
             }
             RET_NONE();
         }
-        dyn_method_missing(tag, m);
+        dyn_method_missing(tag, pay, m);
     }
 
     if (k == DK_SET) {
@@ -9270,10 +9388,10 @@ long long pyrs_dyn_method(int tag, long long pay, const PyrsStr *name, int argc,
             return dyn_result(out_tag, TAG_SET,
                               (long long)(uintptr_t)pyrs_set_copy(sv));
         }
-        dyn_method_missing(tag, m);
+        dyn_method_missing(tag, pay, m);
     }
 
-    dyn_method_missing(tag, m);
+    dyn_method_missing(tag, pay, m);
 #undef ARITY
 #undef RET_STR
 #undef RET_BOOL
@@ -9682,6 +9800,421 @@ long long pyrs_dyn_sorted(int tag, long long payload, int reverse, int *out_tag)
     if (reverse) {
         pyrs_list_reverse(out);
     }
+    return dyn_result(out_tag, 4 + 8 * TAG_UNION, (long long)(uintptr_t)out);
+}
+
+/* ---- item access, slicing and conversion on dynamic values ----
+ *
+ * Pair ABI throughout, like the operator kernel: a value is (tag, payload),
+ * and a dynamic result leaves through `out_tag`. Messages are CPython's. */
+
+/* A container slot as a pair. A slot of a union-typed container holds a box. */
+static long long dyn_slot_pair(long long slot, int tag, int *out_tag) {
+    if (tag == TAG_UNION) {
+        if (slot == 0) {
+            *out_tag = -1;
+            return 0;
+        }
+        const PyrsUnionBox *b = (const PyrsUnionBox *)(uintptr_t)slot;
+        *out_tag = b->print_tag;
+        return b->payload;
+    }
+    *out_tag = tag;
+    return slot;
+}
+
+/* A sequence index from a dynamic key: an int or a bool, normalised against
+ * `len`, with CPython's two messages. */
+static long long dyn_seq_index(int kt, long long kp, const char *indices_msg,
+                               long long len, const char *range_msg) {
+    long long tagged;
+    if (!dyn_as_int(kt, kp, &tagged)) {
+        char msg[160];
+        snprintf(msg, sizeof msg, indices_msg, dyn_type_name(kt));
+        pyrs_die(msg);
+    }
+    long long i = pyrs_int_as_i64(tagged);
+    if (i < 0) {
+        i += len;
+    }
+    if (i < 0 || i >= len) {
+        pyrs_die(range_msg);
+    }
+    return i;
+}
+
+long long pyrs_dyn_getitem(int t, long long p, int kt, long long kp, int *out_tag) {
+    switch (dyn_kind(t)) {
+    case DK_LIST: {
+        const PyrsList *l = (const PyrsList *)(uintptr_t)p;
+        long long i = dyn_seq_index(kt, kp, "TypeError: list indices must be integers or slices, not %s",
+                                    l->len, "IndexError: list index out of range");
+        return dyn_slot_pair(l->data[i], any_elem_tag(t), out_tag);
+    }
+    case DK_TUPLE: {
+        const PyrsTuple *tu = (const PyrsTuple *)(uintptr_t)p;
+        long long i = dyn_seq_index(kt, kp, "TypeError: tuple indices must be integers or slices, not %s",
+                                    tu->len, "IndexError: tuple index out of range");
+        return dyn_slot_pair(tu->data[i], tu->tags[i], out_tag);
+    }
+    case DK_STR: {
+        const PyrsStr *sv = (const PyrsStr *)(uintptr_t)p;
+        long long tagged;
+        if (!dyn_as_int(kt, kp, &tagged)) {
+            char msg[160];
+            snprintf(msg, sizeof msg, "TypeError: string indices must be integers, not '%s'",
+                     dyn_type_name(kt));
+            pyrs_die(msg);
+        }
+        return dyn_result(out_tag, TAG_STR,
+                          (long long)(uintptr_t)pyrs_str_index(sv, pyrs_int_as_i64(tagged)));
+    }
+    case DK_DICT: {
+        const PyrsDict *d = (const PyrsDict *)(uintptr_t)p;
+        int found = 0;
+        long long idx = dict_lookup(d, kp, kt, &found);
+        if (!found) {
+            die_keyerror(kp, kt);
+        }
+        return dyn_slot_pair(d->table[idx].val, d->table[idx].val_tag, out_tag);
+    }
+    default: {
+        char msg[160];
+        snprintf(msg, sizeof msg, "TypeError: '%s' object is not subscriptable",
+                 dyn_value_type_name(t, p));
+        pyrs_die(msg);
+    }
+    }
+}
+
+/* Store a pair into a slot of a container compiled with element tag `elem`.
+ * A typed container can take only its own type; CPython would store anything,
+ * so the refusal names the representation rather than borrowing a TypeError. */
+static long long dyn_slot_for(int elem, int vt, long long vp, const char *what) {
+    if (elem == TAG_UNION) {
+        return (long long)(uintptr_t)pyrs_union_box_new(vt, vp);
+    }
+    if (elem == vt) {
+        return vp;
+    }
+    char msg[200];
+    snprintf(msg, sizeof msg,
+             "NotImplementedError: this %s was compiled to hold one element type; "
+             "storing a %s in it needs a dynamic %s",
+             what, dyn_type_name(vt), what);
+    pyrs_die(msg);
+}
+
+void pyrs_dyn_setitem(int t, long long p, int kt, long long kp, int vt, long long vp) {
+    switch (dyn_kind(t)) {
+    case DK_LIST: {
+        PyrsList *l = (PyrsList *)(uintptr_t)p;
+        long long i = dyn_seq_index(kt, kp, "TypeError: list indices must be integers or slices, not %s",
+                                    l->len, "IndexError: list assignment index out of range");
+        l->data[i] = dyn_slot_for(any_elem_tag(t), vt, vp, "list");
+        return;
+    }
+    case DK_DICT: {
+        PyrsDict *d = (PyrsDict *)(uintptr_t)p;
+        if (d->order_len == 0) {
+            pyrs_die("NotImplementedError: storing into an empty dynamic dict is not "
+                     "supported yet: its value type is not known until it holds a value");
+        }
+        const DictSlot *first = &d->table[d->order[0]];
+        pyrs_dict_set(d, kp, kt, dyn_slot_for(first->val_tag, vt, vp, "dict"), first->val_tag);
+        return;
+    }
+    case DK_TUPLE: {
+        pyrs_die("TypeError: 'tuple' object does not support item assignment");
+    }
+    case DK_STR: {
+        pyrs_die("TypeError: 'str' object does not support item assignment");
+    }
+    default: {
+        char msg[160];
+        snprintf(msg, sizeof msg, "TypeError: '%s' object does not support item assignment",
+                 dyn_value_type_name(t, p));
+        pyrs_die(msg);
+    }
+    }
+}
+
+long long pyrs_dyn_slice(int t, long long p, long long lo, long long hi, long long step,
+                         int *out_tag) {
+    switch (dyn_kind(t)) {
+    case DK_LIST:
+        return dyn_result(out_tag, t,
+                          (long long)(uintptr_t)pyrs_list_slice((const PyrsList *)(uintptr_t)p,
+                                                                lo, hi, step));
+    case DK_STR:
+        return dyn_result(out_tag, TAG_STR,
+                          (long long)(uintptr_t)pyrs_str_slice((const PyrsStr *)(uintptr_t)p,
+                                                               lo, hi, step));
+    case DK_TUPLE: {
+        if (step == 0) {
+            pyrs_die("ValueError: slice step cannot be zero");
+        }
+        const PyrsTuple *tu = (const PyrsTuple *)(uintptr_t)p;
+        long long start = resolve_slice_bound(lo, 1, tu->len, step);
+        long long stop = resolve_slice_bound(hi, 0, tu->len, step);
+        long long n = slice_count(start, stop, step);
+        PyrsTuple *r = pyrs_tuple_new(n);
+        for (long long k = 0; k < n; k++) {
+            r->data[k] = tu->data[start + k * step];
+            r->tags[k] = tu->tags[start + k * step];
+        }
+        return dyn_result(out_tag, TAG_TUPLE, (long long)(uintptr_t)r);
+    }
+    default: {
+        char msg[160];
+        snprintf(msg, sizeof msg, "TypeError: '%s' object is not subscriptable",
+                 dyn_value_type_name(t, p));
+        pyrs_die(msg);
+    }
+    }
+}
+
+/* `int(v)`: a tagged int. */
+long long pyrs_dyn_to_int(int t, long long p) {
+    long long tagged;
+    if (dyn_as_int(t, p, &tagged)) {
+        return tagged;
+    }
+    if (dyn_kind(t) == DK_FLOAT) {
+        double d;
+        memcpy(&d, &p, sizeof d);
+        return pyrs_int_from_float(d);
+    }
+    if (dyn_kind(t) == DK_STR) {
+        return pyrs_int_from_pystr((const PyrsStr *)(uintptr_t)p, pyrs_int_from_i64(10));
+    }
+    char msg[200];
+    snprintf(msg, sizeof msg,
+             "TypeError: int() argument must be a string, a bytes-like object or a real "
+             "number, not '%s'",
+             dyn_value_type_name(t, p));
+    pyrs_die(msg);
+}
+
+/* `float(v)`. */
+double pyrs_dyn_to_float(int t, long long p) {
+    double d;
+    if (dyn_as_double(t, p, &d)) {
+        return d;
+    }
+    if (dyn_kind(t) == DK_STR) {
+        return pyrs_float_from_pystr((const PyrsStr *)(uintptr_t)p);
+    }
+    char msg[200];
+    snprintf(msg, sizeof msg,
+             "TypeError: float() argument must be a string or a real number, not '%s'",
+             dyn_value_type_name(t, p));
+    pyrs_die(msg);
+}
+
+/* The elements a `for` loop over a dynamic value would visit, by position:
+ * a list or tuple element, a str character, a dict or set key. */
+static long long dyn_iter_len(int t, long long p, const char *not_iterable) {
+    switch (dyn_kind(t)) {
+    case DK_LIST:
+    case DK_TUPLE:
+    case DK_DICT:
+    case DK_SET:
+        return *(const long long *)(uintptr_t)p;
+    case DK_STR:
+        return ((const PyrsStr *)(uintptr_t)p)->cplen;
+    default: {
+        char msg[160];
+        snprintf(msg, sizeof msg, not_iterable, dyn_value_type_name(t, p));
+        pyrs_die(msg);
+    }
+    }
+}
+
+static long long dyn_iter_at(int t, long long p, long long i, int *out_tag) {
+    switch (dyn_kind(t)) {
+    case DK_LIST: {
+        const PyrsList *l = (const PyrsList *)(uintptr_t)p;
+        return dyn_slot_pair(l->data[i], any_elem_tag(t), out_tag);
+    }
+    case DK_TUPLE: {
+        const PyrsTuple *tu = (const PyrsTuple *)(uintptr_t)p;
+        return dyn_slot_pair(tu->data[i], tu->tags[i], out_tag);
+    }
+    case DK_STR:
+        return dyn_result(out_tag, TAG_STR,
+                          (long long)(uintptr_t)pyrs_str_index((const PyrsStr *)(uintptr_t)p, i));
+    case DK_DICT: {
+        const PyrsDict *d = (const PyrsDict *)(uintptr_t)p;
+        const DictSlot *e = &d->table[d->order[i]];
+        return dyn_slot_pair(e->key, e->key_tag, out_tag);
+    }
+    case DK_SET: {
+        const PyrsSet *st = (const PyrsSet *)(uintptr_t)p;
+        const SetSlot *e = &st->table[st->order[i]];
+        return dyn_slot_pair(e->key, e->key_tag, out_tag);
+    }
+    default:
+        pyrs_die("TypeError: object is not iterable");
+    }
+}
+
+/* `a, b = v`: check the count, CPython's three messages. Elements are then
+ * read with `pyrs_dyn_iter_at`. */
+void pyrs_dyn_unpack_check(int t, long long p, long long expected) {
+    long long n = dyn_iter_len(t, p, "TypeError: cannot unpack non-iterable %s object");
+    char msg[160];
+    if (n < expected) {
+        snprintf(msg, sizeof msg,
+                 "ValueError: not enough values to unpack (expected %lld, got %lld)",
+                 expected, n);
+        pyrs_die(msg);
+    }
+    if (n > expected) {
+        snprintf(msg, sizeof msg,
+                 "ValueError: too many values to unpack (expected %lld, got %lld)",
+                 expected, n);
+        pyrs_die(msg);
+    }
+}
+
+long long pyrs_dyn_iter_at(int t, long long p, long long i, int *out_tag) {
+    return dyn_iter_at(t, p, i, out_tag);
+}
+
+/* `list(v)`: a list of the elements a loop over `v` visits, each boxed with
+ * its own tag. */
+long long pyrs_dyn_list(int t, long long p, int *out_tag) {
+    long long n = dyn_iter_len(t, p, "TypeError: '%s' object is not iterable");
+    PyrsList *out = pyrs_list_new(n > 0 ? n : 1);
+    for (long long i = 0; i < n; i++) {
+        int et = 0;
+        long long ep = dyn_iter_at(t, p, i, &et);
+        pyrs_list_push(out, (long long)(uintptr_t)pyrs_union_box_new(et, ep));
+    }
+    return dyn_result(out_tag, 4 + 8 * TAG_UNION, (long long)(uintptr_t)out);
+}
+
+/* `sep.join(v)`. */
+PyrsStr *pyrs_dyn_join(const PyrsStr *sep, int t, long long p) {
+    check_ref(sep);
+    if (dyn_kind(t) == DK_NONE || dyn_kind(t) == DK_INT || dyn_kind(t) == DK_FLOAT
+        || dyn_kind(t) == DK_BOOL) {
+        pyrs_die("TypeError: can only join an iterable");
+    }
+    long long n = dyn_iter_len(t, p, "TypeError: can only join an iterable");
+    PyrsList *parts = pyrs_list_new(n);
+    for (long long i = 0; i < n; i++) {
+        int et = 0;
+        long long ep = dyn_iter_at(t, p, i, &et);
+        if (dyn_kind(et) != DK_STR) {
+            char msg[160];
+            snprintf(msg, sizeof msg,
+                     "TypeError: sequence item %lld: expected str instance, %s found", i,
+                     dyn_value_type_name(et, ep));
+            pyrs_die(msg);
+        }
+        pyrs_list_push(parts, ep);
+    }
+    return pyrs_str_join(sep, parts);
+}
+
+/* `sum(v, start)`: the operator kernel, left to right, from `start`. */
+long long pyrs_dyn_sum(int t, long long p, int st, long long sp, int *out_tag) {
+    long long n = dyn_iter_len(t, p, "TypeError: '%s' object is not iterable");
+    if (dyn_kind(st) == DK_STR) {
+        pyrs_die("TypeError: sum() can't sum strings [use ''.join(seq) instead]");
+    }
+    int acc_t = st;
+    long long acc_p = sp;
+    for (long long i = 0; i < n; i++) {
+        int et = 0;
+        long long ep = dyn_iter_at(t, p, i, &et);
+        int rt = 0;
+        acc_p = pyrs_dyn_binop(acc_t, acc_p, et, ep, PYRS_DYN_ADD, &rt);
+        acc_t = rt;
+    }
+    *out_tag = acc_t;
+    return acc_p;
+}
+
+/* `max(v)` / `min(v)` over an iterable: the first extreme element wins, as in
+ * CPython, which only replaces on a strict comparison. */
+long long pyrs_dyn_minmax(int t, long long p, int is_max, int *out_tag) {
+    long long n = dyn_iter_len(t, p, "TypeError: '%s' object is not iterable");
+    if (n == 0) {
+        pyrs_die(is_max ? "ValueError: max() iterable argument is empty"
+                        : "ValueError: min() iterable argument is empty");
+    }
+    int best_t = 0;
+    long long best_p = dyn_iter_at(t, p, 0, &best_t);
+    for (long long i = 1; i < n; i++) {
+        int et = 0;
+        long long ep = dyn_iter_at(t, p, i, &et);
+        if (pyrs_dyn_compare(et, ep, best_t, best_p, is_max ? PYRS_DYN_GT : PYRS_DYN_LT)) {
+            best_t = et;
+            best_p = ep;
+        }
+    }
+    *out_tag = best_t;
+    return best_p;
+}
+
+/* `sorted(items, key=f)` where the keys are dynamic: `keys[i]` is `f(items[i])`,
+ * computed by compiled code. A stable merge sort of positions compares only
+ * keys, with the comparison kernel's errors; descending is CPython's
+ * reverse-sort-reverse, which keeps equal keys in their original order. */
+long long pyrs_dyn_sort_by_keys(int it, long long ip, int kt, long long kp, long long reverse,
+                                int *out_tag) {
+    (void)it;
+    (void)kt;
+    const PyrsList *items = (const PyrsList *)(uintptr_t)ip;
+    const PyrsList *keys = (const PyrsList *)(uintptr_t)kp;
+    long long n = items->len;
+    /* Collector-owned scratch, so a comparison that raises leaks nothing. */
+    PyrsList *idx_owner = pyrs_list_new(n > 0 ? n : 1);
+    PyrsList *tmp_owner = pyrs_list_new(n > 0 ? n : 1);
+    /* Volatile, so the owners stay in a stack slot the collector scans while
+     * only their data pointers are in use. */
+    PyrsList *volatile keep_alive[2] = {idx_owner, tmp_owner};
+    long long *idx = idx_owner->data;
+    long long *tmp = tmp_owner->data;
+    for (long long i = 0; i < n; i++) {
+        idx[i] = reverse ? n - 1 - i : i;
+    }
+    for (long long width = 1; width < n; width *= 2) {
+        for (long long lo = 0; lo < n; lo += 2 * width) {
+            long long mid = lo + width < n ? lo + width : n;
+            long long hi = lo + 2 * width < n ? lo + 2 * width : n;
+            long long a = lo, b = mid, o = lo;
+            while (a < mid && b < hi) {
+                int at = 0, bt = 0;
+                long long ap = dyn_slot_pair(keys->data[idx[a]], TAG_UNION, &at);
+                long long bp = dyn_slot_pair(keys->data[idx[b]], TAG_UNION, &bt);
+                /* Take the right run only on a strict `<`: stability. */
+                if (pyrs_dyn_compare(bt, bp, at, ap, PYRS_DYN_LT)) {
+                    tmp[o++] = idx[b++];
+                } else {
+                    tmp[o++] = idx[a++];
+                }
+            }
+            while (a < mid) {
+                tmp[o++] = idx[a++];
+            }
+            while (b < hi) {
+                tmp[o++] = idx[b++];
+            }
+        }
+        long long *swap = idx;
+        idx = tmp;
+        tmp = swap;
+    }
+    PyrsList *out = pyrs_list_new(n > 0 ? n : 1);
+    for (long long j = 0; j < n; j++) {
+        long long k = reverse ? n - 1 - j : j;
+        pyrs_list_push(out, items->data[idx[k]]);
+    }
+    (void)keep_alive;
     return dyn_result(out_tag, 4 + 8 * TAG_UNION, (long long)(uintptr_t)out);
 }
 
