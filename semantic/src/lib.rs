@@ -4457,7 +4457,17 @@ fn collect_param_constraints(
             } => {
                 collect_param_constraints_expr(name, e, params, bare, out);
             }
-            ast::StmtKind::Assign { value, .. } => {
+            ast::StmtKind::Assign {
+                value, annotation, ..
+            } => {
+                // `self.x: float = x` writes the parameter's type down beside
+                // it. That is evidence, not a guess, and it is the most common
+                // shape of an unannotated constructor parameter.
+                if let Some(ty) = annotation
+                    && matches!(&value.kind, ast::ExprKind::Name(n) if n == name)
+                {
+                    out.push(resolve_type(*ty));
+                }
                 collect_param_constraints_expr(name, value, params, bare, out);
             }
             ast::StmtKind::AugAssign { target, value, .. } => {
@@ -6597,7 +6607,24 @@ fn resolve_infer_callee(
             return Some((mod_name.to_string(), fname.to_string()));
         }
     }
+    // `Circle(2.0)` is deliberately NOT resolved to `Circle.__init__` here,
+    // although its arguments are the best evidence a constructor parameter
+    // has. Class layouts are finalized in pass 0, before any call site is
+    // visited, so a field assigned from a parameter typed this late is already
+    // missing from the layout: the actionable "parameter 'r' is missing a type
+    // annotation" became the false "'Circle' object has no attribute 'r'".
+    // Closing it needs layouts finalized after parameter refinement.
     None
+}
+
+/// How many leading signature parameters a call's positional arguments skip:
+/// one for a method's `self` or `cls`, which the call supplies implicitly.
+fn implicit_receiver_params(sig: &FuncSig) -> usize {
+    usize::from(
+        sig.params
+            .first()
+            .is_some_and(|p| p.name == "self" || p.name == "cls"),
+    )
 }
 
 fn register_all_infer_funcs(
@@ -6789,11 +6816,7 @@ fn widen_bare_params_on_call_site_conflict(
                         return;
                     };
                     // A bound method's receiver is not among the call's arguments.
-                    let offset = usize::from(
-                        sig.params
-                            .first()
-                            .is_some_and(|p| p.name == "self" || p.name == "cls"),
-                    );
+                    let offset = implicit_receiver_params(sig);
                     for (ai, a) in args.iter().enumerate() {
                         let ast::PosArg::Pos(e) = a else {
                             continue;
@@ -6891,14 +6914,15 @@ fn refine_bare_params(
                     if sig.pending_bare.is_empty() {
                         return;
                     }
+                    let offset = implicit_receiver_params(sig);
                     for (ai, a) in args.iter().enumerate() {
                         let ast::PosArg::Pos(e) = a else {
                             continue;
                         };
-                        if ai >= sig.params.len() {
+                        if ai + offset >= sig.params.len() {
                             break;
                         }
-                        let pname = &sig.params[ai].name;
+                        let pname = &sig.params[ai + offset].name;
                         if !sig.pending_bare.contains(pname) {
                             continue;
                         }
