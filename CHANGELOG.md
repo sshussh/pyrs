@@ -1,3 +1,58 @@
+## 0.152.0 — the remaining dynamism work, reviewed and finished
+
+0.145.0 through 0.151.1 implemented the six items of the remaining dynamism
+brief. A review of that work found it mostly correct -- the pair ABI followed
+everywhere, guarded specialization correct on a guard miss, shapes
+pay-per-use and GC-safe, printf matching CPython on 41 cases -- and found
+defects that this release fixes.
+
+**`make ci` failed.** Two clippy lints introduced with the project-local cache
+stopped the gate at its second stage, so tests, examples and compatibility
+were not being gated. Fixed without an allowed lint.
+
+**`sorted()` on a dynamic value was quadratic** -- 23x slower than CPython at
+16,000 elements. It now follows CPython's timsort structure: 0.25s for a
+million elements against CPython's 0.23s. The structure, not merely a stable
+merge sort, is what keeps the TypeError for an unorderable pair naming the two
+types in the order CPython meets them; 260 randomized inputs, 80 of them
+raising, are byte-identical with CPython plainly and under GC stress.
+
+**printf on a dynamic str is complete.** Mapping keys, `*` width and
+precision, `%c` and `%a` now format. `"%(k)s" % 5` had reported "not
+supported yet", which is reserved for things CPython accepts; CPython rejects
+it with `format requires a mapping`, and that is now the message.
+
+**`type(x) is C`** works on type values, as an exact-type check.
+
+**A call-site conflict widens a body-inferred parameter.** `def show(x):
+return x + x` called with `2` and with `"ab"` was a type mismatch. 0.149.0's
+test for this used `identity(x): return x`, the one shape that never reached
+body inference. Unannotated parameters now widen to `Any` when a call site
+disagrees, for functions and methods; agreeing call sites keep unboxed
+signatures, and annotated parameters never widen.
+
+**Library parameter seeds come from typeshed.** The "typeshed" table was
+written by hand, and seeded `abs` as int and `math.floor` as float though both
+take protocols. It is now generated from the stubs by
+`scripts/gen_typeshed_seeds.py` and provenance-checked by `make hygiene`: 27
+functions, with `abs`, `math.floor` and `math.ceil` seeding nothing.
+
+**An annotated field assignment types its parameter** (`self.x: float = x`).
+
+### Corrections to earlier entries
+
+- 0.149.0 said "a learned predictor is not justified" without measuring it.
+  Measured now: stripping every parameter and return annotation from the 23
+  annotated programs in `examples/` and `compatibility/cases/` that match
+  CPython, 7 compiled before the inference work and 17 compile after, all 17
+  still matching CPython. The six that remain each have their answer in the
+  source -- an operator site, a method or constructor call site, a typed
+  field -- so the conclusion holds for this corpus, for a different reason
+  than the one given: the residue needs static rules, not a model.
+- 0.148.0 reported the profiled loop as 9x the unprofiled kernel, measured at
+  2M iterations inside process-startup noise. At 50M iterations it is 33x, and
+  the profiled dynamic loop matches the statically typed one.
+
 ## 0.151.1 — project-local build state
 
 Discovered projects now keep compiled programs, runtime objects and toolchain

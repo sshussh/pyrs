@@ -1065,8 +1065,11 @@ def clamp(x: float, lo: float, hi: float) -> float:
   division keeps Python's signs, and `==` / `!=` never raise where `<` would.
   `str % args` on a dynamic str does printf-style formatting (0.146), with
   CPython's conversion letters, flags, width, precision, and its exact
-  error messages. Mapping keys, `*` width and `%c` still name themselves
-  as unimplemented.
+  error messages. Mapping keys (`%(k)s`), `*` width and precision, `%c` and
+  `%a` work too (0.152), including CPython's less obvious errors: a list
+  argument to a mapping key reports `list indices must be integers or slices,
+  not str`, and a positional spec after a mapping key reports `not enough
+  arguments`.
 - **Methods and `in` work on a dynamic value** (0.144). The runtime looks a
   method up against the type the value's tag names, and a dynamic call
   allocates nothing. `in` works over a dynamic str, list, tuple, dict or set.
@@ -1074,9 +1077,11 @@ def clamp(x: float, lo: float, hi: float) -> float:
   has that is not implemented yet says so instead.
 - **`sorted()` works on a dynamic value** (0.145). A dynamic list, tuple,
   dict (keys), set or str is materialized as `list[Any]` and ordered with
-  the comparison kernel, including `reverse=`. A mixed list raises CPython's
-  ordering TypeError; a non-iterable raises CPython's `'…' object is not
-  iterable`. `key=` still names itself as unimplemented.
+  the comparison kernel, including `reverse=`. The sort follows CPython's
+  timsort structure (0.152), so it is O(n log n) and a mixed list raises
+  CPython's ordering TypeError naming the two types in the same order CPython
+  meets them. A non-iterable raises CPython's `'…' object is not iterable`.
+  `key=` still names itself as unimplemented.
 - **A dynamic container reads without narrowing** (0.140). `len(v)`, `v[i]`,
   `v[k]`, `v.keys()` and `for x in v` work on an `object` whose contents are
   only known at run time, reading it through the tag it already carries — so
@@ -1320,7 +1325,8 @@ print(isinstance(d, Animal))  # True
 metaclasses, `__new__`, `__slots__`, nested classes, class decorators,
 stacked custom decorators, two-arg `super()`, class-body attributes,
 dotted bases (`class D(pkg.C)` — import the base first). Class names are
-values (`k = C`, `k()`, `type(x)` on a class instance). `getattr` /
+values (`k = C`, `k()`, `type(x)` on a class instance, and `type(x) is C` as
+an exact-type check). `getattr` /
 `setattr` / `hasattr` on a class instance write an overflow dict only on
 classes the program actually reflects; a class nobody touches keeps
 today's layout. `type()` of a non-class instance still names the gap.

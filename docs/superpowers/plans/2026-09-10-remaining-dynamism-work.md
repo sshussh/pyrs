@@ -1,6 +1,12 @@
 # What is left, and how to build it
 
-**Status: implementation brief.** A handoff spec for the remaining dynamism
+**Status: implemented in 0.145.0–0.150.0, reviewed and corrected in 0.152.0.**
+Per-item records: [A](2026-09-15-sorted-on-a-dynamic-value.md),
+[B](2026-09-15-printf-formatting-on-a-dynamic-str.md),
+[C](2026-09-15-type-profile.md), [D](2026-09-15-guarded-specialization.md),
+[E](2026-09-15-inference-engine.md), [F](2026-09-15-types-as-values-and-shapes.md).
+
+Originally: an implementation brief. A handoff spec for the remaining dynamism
 work. Tiers 1 and 2 are done — see
 [the register-pair representation](2026-09-10-unbox-any.md) (0.142.0) and
 [the operator and method kernels](2026-09-10-dynamic-operators.md)
