@@ -712,3 +712,106 @@ fn sorted_key_on_a_dynamic_value_names_the_gap() {
     assert!(stderr.contains("not supported yet"), "{stderr}");
     assert!(stderr.contains("key="), "the gap must name key=: {stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// sorted() on a dynamic value: timsort's comparison order, at scale
+// ---------------------------------------------------------------------------
+
+/// The incomparable pair in each of these only meets at a different stage of
+/// the sort -- inside the first run, inside binary insertion, or only when two
+/// homogeneous runs merge -- and CPython names the two types in the order that
+/// comparison met them. Each case is caught and printed, and the collector is
+/// churned after each raise.
+#[test]
+fn a_sort_that_cannot_order_its_elements_raises_as_cpython_does() {
+    let mut src = String::from(
+        "def show(v: object) -> None:\n    try:\n        print(sorted(v))\n    \
+         except TypeError as e:\n        print('TypeError:', e)\n\
+         junk: list[str] = []\n",
+    );
+    let cases = [
+        "[1, 'a']",
+        "['a', 1]",
+        "[3, 2, 1, 'x']",
+        "[1, 2, 3, 'x', 0]",
+        "[2.5, 'b', 1]",
+    ];
+    for (i, c) in cases.iter().enumerate() {
+        src.push_str(&format!(
+            "v{i}: object = {c}\nshow(v{i})\njunk.append('x' * 64)\n"
+        ));
+    }
+    // 80 ints then 80 strs: each half sorts cleanly, and the pair meets only in
+    // the merge of the two runs.
+    src.push_str(
+        "halves: list[object] = []\ni: int = 0\nwhile i < 80:\n    halves.append(80 - i)\n    i += 1\n\
+         while i < 160:\n    halves.append('s' + str(i))\n    i += 1\n\
+         hv: object = halves\nshow(hv)\n",
+    );
+    matches_python("sort-errors", &src);
+}
+
+/// Stability across runs and merges: equal values of different kinds keep
+/// their input order, on inputs long enough to take the merge path.
+#[test]
+fn sorted_is_stable_through_runs_and_merges() {
+    matches_python(
+        "sort-stable",
+        concat!(
+            "xs: list[object] = []\n",
+            "i: int = 0\n",
+            "while i < 300:\n",
+            "    k = (i * 37) % 5\n",
+            "    if i % 3 == 0:\n",
+            "        xs.append(float(k))\n",
+            "    elif i % 3 == 1:\n",
+            "        xs.append(k)\n",
+            "    else:\n",
+            "        xs.append(k == 1)\n",
+            "    i += 1\n",
+            "v: object = xs\n",
+            "print(sorted(v))\n",
+            "print(sorted(v, reverse=True))\n",
+        ),
+    );
+}
+
+/// The quadratic insertion sort this replaced took 0.27s at 16,000 elements
+/// and extrapolated to minutes at a million. Timsort does 100,000 in tens of
+/// milliseconds; a second is a bound only a regression to O(n^2) would miss.
+#[test]
+fn sorting_a_large_dynamic_list_is_not_quadratic() {
+    let dir = temp_source(
+        "sort-scale",
+        concat!(
+            "xs: list[object] = []\n",
+            "i: int = 0\n",
+            "while i < 100000:\n",
+            "    xs.append((i * 7919) % 100000)\n",
+            "    i += 1\n",
+            "v: object = xs\n",
+            "r = sorted(v)\n",
+            "print(len(r), r[0], r[99999])\n",
+        ),
+    );
+    let bin = dir.0.join("prog");
+    let build = Command::new(PYRS)
+        .args(["compile", "-O", "2", "-i", "prog.py", "-o"])
+        .arg(&bin)
+        .current_dir(&dir.0)
+        .output()
+        .expect("failed to spawn PyRs");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let start = std::time::Instant::now();
+    let out = Command::new(&bin).output().expect("failed to run");
+    let elapsed = start.elapsed();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "100000 0 99999\n");
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "sorting 100,000 dynamic elements took {elapsed:?}; the sort is quadratic again"
+    );
+}
