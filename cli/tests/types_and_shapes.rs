@@ -183,3 +183,34 @@ fn getattr_on_an_int_names_the_gap() {
     let err = rejects("getattr-int", "print(getattr(1, \"x\"))\n");
     assert!(err.contains("class instance"), "{err}");
 }
+
+/// `type(x) is C` is how Python spells an exact-type check. A type object is
+/// one per class, so identity answers the same question equality does -- and a
+/// subclass instance is not `is` its base.
+#[test]
+fn type_identity_is_an_exact_type_check() {
+    matches_python(
+        "type-is",
+        concat!(
+            "class Animal:\n",
+            "    def __init__(self, name: str) -> None:\n",
+            "        self.name: str = name\n",
+            "class Dog(Animal):\n",
+            "    pass\n",
+            "class Cat(Animal):\n",
+            "    pass\n",
+            "d = Dog(\"rex\")\n",
+            "k = Dog\n",
+            "print(type(d) is Dog, type(d) is Animal, type(d) is not Cat, type(d) is k)\n",
+            "print(k is Dog, Dog is Cat, Dog is not Cat)\n",
+            "pets: list[Animal] = [Dog(\"a\"), Cat(\"b\"), Animal(\"c\")]\n",
+            "for p in pets:\n",
+            "    if type(p) is Dog:\n",
+            "        print(\"dog\", p.name)\n",
+            "    elif type(p) is Cat:\n",
+            "        print(\"cat\", p.name)\n",
+            "    else:\n",
+            "        print(\"plain\", p.name)\n",
+        ),
+    );
+}
