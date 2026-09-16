@@ -1,0 +1,13 @@
+# Training dependencies for the type predictors (scripts/infer_eval).
+#
+# Loose here, exact in requirements.txt, which is what the venv installs.
+# Regenerate the lock with:
+#   uv pip compile scripts/infer_eval/requirements.in -o scripts/infer_eval/requirements.txt
+#
+# torch is deliberately unpinned to a build: `uv pip install --torch-backend=auto`
+# resolves the CUDA/ROCm/CPU wheel for whatever is in the machine, so the same
+# lock trains on a GPU box and on a laptop.
+numpy
+scipy
+scikit-learn
+torch

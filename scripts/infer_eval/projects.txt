@@ -1,0 +1,39 @@
+# The projects the type predictors train on: one `name url` per line.
+#
+# Not commits. `make infer-fetch` takes each project's newest commit on its
+# default branch, and records exactly what it got in
+# target/inference-eval/ext/fetched.json, which export_models.py copies into
+# the model manifest. Reproducing an old run is
+# `fetch_projects.py --pinned semantic/models/MANIFEST.json`, not a pin here.
+#
+# Add a project by adding a line: it is training data from the next fetch on.
+
+aiohttp      https://github.com/aio-libs/aiohttp
+attrs        https://github.com/python-attrs/attrs
+black        https://github.com/psf/black
+click        https://github.com/pallets/click
+core         https://github.com/home-assistant/core
+django       https://github.com/django/django
+fastapi      https://github.com/fastapi/fastapi
+flask        https://github.com/pallets/flask
+httpx        https://github.com/encode/httpx
+jinja        https://github.com/pallets/jinja
+mypy         https://github.com/python/mypy
+networkx     https://github.com/networkx/networkx
+packaging    https://github.com/pypa/packaging
+pip          https://github.com/pypa/pip
+poetry       https://github.com/python-poetry/poetry
+pydantic     https://github.com/pydantic/pydantic
+pytest       https://github.com/pytest-dev/pytest
+requests     https://github.com/psf/requests
+rich         https://github.com/Textualize/rich
+scrapy       https://github.com/scrapy/scrapy
+setuptools   https://github.com/pypa/setuptools
+sqlglot      https://github.com/tobymao/sqlglot
+sqlmodel     https://github.com/tiangolo/sqlmodel
+starlette    https://github.com/encode/starlette
+sympy        https://github.com/sympy/sympy
+textual      https://github.com/Textualize/textual
+trio         https://github.com/python-trio/trio
+typer        https://github.com/fastapi/typer
+werkzeug     https://github.com/pallets/werkzeug

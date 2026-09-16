@@ -16,6 +16,18 @@ OUT     ?= $(basename $(notdir $(FILE)))
 O       ?= 2
 # Benchmark repetitions (best-of-N)
 RUNS    ?= 3
+# Type-predictor training: epochs for the transformer, folds for cross-validation,
+# and the device to train on (auto prefers a GPU and falls back to the CPU)
+EPOCHS  ?= 6
+FOLDS   ?= 5
+DEVICE  ?= auto
+# The training venv: uv builds it from scripts/infer_eval/requirements.txt, with
+# the torch build that matches whatever accelerator this machine has.
+UV          ?= uv
+UV_PYTHON   ?= 3.12
+TORCH_BACKEND ?= auto
+VENV    := target/inference-eval/.venv
+VPYTHON := $(VENV)/bin/python
 
 CARGO   := cargo
 PYRS    := target/release/pyrs
@@ -170,6 +182,64 @@ watch: ## Re-run the tests on every change (needs cargo-watch)
 	cargo watch -x 'test --workspace'
 
 # ---------------------------------------------------------------------------
+##@ Type prediction (--infer ml / --infer dl)
+# ---------------------------------------------------------------------------
+
+.PHONY: infer-fetch
+infer-fetch: ## Clone the training projects at their newest commit (records what it got)
+	$(PYTHON) scripts/infer_eval/fetch_projects.py
+
+.PHONY: infer-corpus
+infer-corpus: release ## Build the inference corpus: every repo program that compiles and matches CPython
+	$(PYTHON) scripts/infer_eval/corpus.py
+
+# The training venv, rebuilt whenever the lock changes. `--torch-backend=auto`
+# asks uv to read the machine's driver and install the CUDA, ROCm or CPU build
+# of the pinned torch accordingly -- one lock, GPU box or laptop.
+$(VPYTHON): scripts/infer_eval/requirements.txt
+	@command -v $(UV) >/dev/null \
+	    || { echo 'uv not found; install it from https://docs.astral.sh/uv/'; exit 1; }
+	$(UV) venv --python $(UV_PYTHON) $(VENV)
+	VIRTUAL_ENV=$(abspath $(VENV)) $(UV) pip install --torch-backend=$(TORCH_BACKEND) \
+	    -r scripts/infer_eval/requirements.txt
+	@touch $(VPYTHON)
+
+.PHONY: infer-venv
+infer-venv: $(VPYTHON) ## Create the training venv with uv (GPU torch when the machine has one)
+	@$(VPYTHON) -c 'import torch; print(f"  torch {torch.__version__}  cuda={torch.cuda.is_available()}")'
+
+.PHONY: infer-lock
+infer-lock: ## Re-resolve scripts/infer_eval/requirements.txt from requirements.in
+	$(UV) pip compile scripts/infer_eval/requirements.in \
+	    -o scripts/infer_eval/requirements.txt --python-version $(UV_PYTHON)
+
+.PHONY: infer-train
+infer-train: infer-venv release infer-fetch infer-corpus ## Fetch, train ml + dl on DEVICE, and write semantic/models/
+	$(VPYTHON) scripts/infer_eval/dataset.py
+	$(VPYTHON) scripts/infer_eval/train_ml.py
+	$(VPYTHON) scripts/infer_eval/train_dl.py --epochs $(EPOCHS) --device $(DEVICE)
+	$(VPYTHON) scripts/infer_eval/train_cv.py --folds $(FOLDS) --epochs $(EPOCHS) --device $(DEVICE) --ship
+	$(VPYTHON) scripts/infer_eval/export_models.py
+	@printf '\n\033[1mwrote semantic/models/\033[0m — check the diff before committing it\n'
+	$(PYTHON) scripts/check_hygiene.py --only versions
+
+.PHONY: infer-replay
+infer-replay: ## Re-fetch the exact commits the shipped weights were trained on
+	$(PYTHON) scripts/infer_eval/fetch_projects.py --pinned semantic/models/MANIFEST.json
+
+.PHONY: infer-parity
+infer-parity: release infer-corpus ## Check the compiler's feature extractor against features.py
+	PYRS=$(abspath $(PYRS)) $(PYTHON) scripts/infer_eval/parity.py
+
+.PHONY: infer-eval
+infer-eval: release infer-corpus ## Measure every engine on the corpus, with and without call sites
+	@for engine in static ml dl; do \
+	    PYRS=$(abspath $(PYRS)) $(PYTHON) scripts/infer_eval/evaluate.py "prog-$$engine" --engine $$engine; \
+	    PYRS=$(abspath $(PYRS)) $(PYTHON) scripts/infer_eval/evaluate.py "lib-$$engine" --engine $$engine --library; \
+	done
+	PYRS=$(abspath $(PYRS)) $(PYTHON) scripts/infer_eval/extension_bench.py
+
+# ---------------------------------------------------------------------------
 ##@ Housekeeping
 # ---------------------------------------------------------------------------
 
@@ -195,11 +265,11 @@ clean: ## Remove build artifacts and scratch binaries
 .PHONY: help
 help: ## Show this help
 	@printf '\n\033[1mpyrs\033[0m — Python compiler in Rust\n'
-	@printf '\nVariables: \033[36mFILE\033[0m=%s \033[36mOUT\033[0m=%s \033[36mO\033[0m=%s \033[36mRUNS\033[0m=%s\n' \
-	    '$(FILE)' '$(OUT)' '$(O)' '$(RUNS)'
+	@printf '\nVariables: \033[36mFILE\033[0m=%s \033[36mOUT\033[0m=%s \033[36mO\033[0m=%s \033[36mRUNS\033[0m=%s \033[36mEPOCHS\033[0m=%s \033[36mFOLDS\033[0m=%s \033[36mDEVICE\033[0m=%s\n' \
+	    '$(FILE)' '$(OUT)' '$(O)' '$(RUNS)' '$(EPOCHS)' '$(FOLDS)' '$(DEVICE)'
 	@awk 'BEGIN { FS = ":.*?## " } \
 	    /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next } \
-	    /^[a-zA-Z0-9_-]+:.*?## / { printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2 }' \
+	    /^[a-zA-Z0-9_-]+:.*?## / { printf "  \033[36m%-21s\033[0m %s\n", $$1, $$2 }' \
 	    $(MAKEFILE_LIST)
 	@printf '\nExamples:\n'
 	@printf '  make run FILE=examples/fib.py     compile and run an example\n'
