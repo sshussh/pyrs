@@ -28,6 +28,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use common::{Diagnostic, Phase, Span};
 use parser::ast;
 
+mod predict;
+pub use predict::{Engine, feature_lines, set_engine};
+
 pub fn ping() -> String {
     String::from("pong")
 }
@@ -718,6 +721,18 @@ struct InferRounds {
     roots: HashSet<u32>,
     /// A library: every function may be called from outside.
     all_roots: bool,
+    /// The functions being lowered, as (module, def span start), innermost
+    /// last: where a tolerated error happened.
+    lowering_sites: Vec<(u64, usize)>,
+    /// Functions whose lowering needed tolerance this round.
+    failed_sites: HashSet<(u64, usize)>,
+    /// Parameters a learned predictor typed this round, with their function.
+    predicted: HashMap<ParamKey, (u64, usize)>,
+    /// Predictions an earlier round saw break their function, not offered again.
+    rejected: HashSet<ParamKey>,
+    /// Predictions are off for this analysis: the final program failed with
+    /// them, so it is built with the static engine alone.
+    predictions_off: bool,
 }
 
 impl InferRounds {
@@ -748,7 +763,8 @@ impl InferRounds {
 struct LoweringFunction;
 
 impl LoweringFunction {
-    fn enter(ir_name: &str, root: bool) -> Self {
+    fn enter(ir_name: &str, root: bool, def_span: Span) -> Self {
+        let site = (module_hash(), def_span.start);
         INFER_ROUNDS.with(|r| {
             let mut r = r.borrow_mut();
             let id = r.fn_id(ir_name);
@@ -756,6 +772,7 @@ impl LoweringFunction {
                 r.roots.insert(id);
             }
             r.callers.push(id);
+            r.lowering_sites.push(site);
         });
         LoweringFunction
     }
@@ -764,7 +781,9 @@ impl LoweringFunction {
 impl Drop for LoweringFunction {
     fn drop(&mut self) {
         INFER_ROUNDS.with(|r| {
-            r.borrow_mut().callers.pop();
+            let mut r = r.borrow_mut();
+            r.callers.pop();
+            r.lowering_sites.pop();
         });
     }
 }
@@ -803,7 +822,13 @@ fn rounds_collecting() -> bool {
 }
 
 fn rounds_tolerate() {
-    INFER_ROUNDS.with(|r| r.borrow_mut().tolerated = true);
+    INFER_ROUNDS.with(|r| {
+        let mut r = r.borrow_mut();
+        r.tolerated = true;
+        if let Some(site) = r.lowering_sites.last().copied() {
+            r.failed_sites.insert(site);
+        }
+    });
 }
 
 fn rounds_seed(key: ParamKey) -> Option<ir::Ty> {
@@ -1085,6 +1110,131 @@ fn dynamic_fallback(p: &ast::Param) -> ir::Ty {
     ir::Ty::Any
 }
 
+/// A cached prediction: the label, its probability, and the usage events the
+/// class chooser reads.
+type PredictionEntry = Option<(&'static str, f32, Vec<String>)>;
+
+thread_local! {
+    /// Learned predictions for this analysis, by parameter and engine.
+    static PREDICTIONS: RefCell<HashMap<(ParamKey, predict::Engine), PredictionEntry>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Below this probability a prediction abstains and the static engine decides.
+const PREDICTION_THRESHOLD: f32 = 0.5;
+
+/// A learned predictor's type for an unannotated parameter nothing else
+/// types, if it is confident and PyRs can represent the label.
+fn predicted_param_type(
+    site: PredictSite<'_>,
+    p: &ast::Param,
+    formal_index: usize,
+) -> Option<ir::Ty> {
+    let key = param_key(p)?;
+    let blocked = INFER_ROUNDS.with(|r| {
+        let r = r.borrow();
+        r.predictions_off || r.rejected.contains(&key) || r.seeds.contains_key(&key)
+    });
+    if blocked {
+        return None;
+    }
+    let is_method = site.class.is_some();
+    let is_static = site
+        .func
+        .decorators
+        .iter()
+        .any(|d| d.name == "staticmethod");
+    let offset = usize::from(is_method && !is_static);
+    let user_index = formal_index.checked_sub(offset)?;
+    // Rounds resolve the same signatures again; the prediction depends only on
+    // the source, so it is computed once per analysis.
+    let engine = predict::engine();
+    let cached = PREDICTIONS.with(|c| c.borrow().get(&(key, engine)).cloned());
+    let (label, prob, events) = match cached {
+        Some(hit) => hit?,
+        None => {
+            let fresh = predict::param_evidence(site.func, site.class, user_index)
+                .and_then(|ev| predict::predict_label(&ev, engine).map(|(l, p)| (l, p, ev.events)));
+            PREDICTIONS.with(|c| c.borrow_mut().insert((key, engine), fresh.clone()));
+            fresh?
+        }
+    };
+    if prob < PREDICTION_THRESHOLD {
+        return None;
+    }
+    let base = |l: &str| -> Option<ir::Ty> {
+        Some(match l {
+            "int" => ir::Ty::Int,
+            "float" => ir::Ty::Float,
+            "str" => ir::Ty::Str,
+            "bool" => ir::Ty::Bool,
+            "list[int]" => ir::list_of(ir::Ty::Int),
+            "list[float]" => ir::list_of(ir::Ty::Float),
+            "list[str]" => ir::list_of(ir::Ty::Str),
+            "dict[str,int]" => ir::dict_of(ir::Ty::Str, ir::Ty::Int),
+            "dict[str,str]" => ir::dict_of(ir::Ty::Str, ir::Ty::Str),
+            "dict[str,float]" => ir::dict_of(ir::Ty::Str, ir::Ty::Float),
+            "any" => ir::Ty::Any,
+            "class" => ir::Ty::Class(choose_class(&p.name, &events)?),
+            _ => return None,
+        })
+    };
+    let ty = match label.strip_suffix('?') {
+        Some(inner) => ir::optional_of(base(inner)?),
+        None => base(label)?,
+    };
+    let site_id = (module_hash(), site.func.span.start);
+    INFER_ROUNDS.with(|r| r.borrow_mut().predicted.insert(key, site_id));
+    Some(ty)
+}
+
+/// The class a parameter predicted to be a user class most plausibly is: one
+/// that has every attribute and method the body uses on it -- the most
+/// general such class, so subclasses fit too -- or, with none used, the one
+/// the parameter is named after.
+fn choose_class(param: &str, events: &[String]) -> Option<ir::ClassId> {
+    let used: Vec<&str> = events
+        .iter()
+        .filter_map(|e| {
+            e.strip_prefix("attr:")
+                .or_else(|| e.strip_prefix("meth:"))
+                .or_else(|| e.strip_prefix("setattr:"))
+        })
+        .collect();
+    let n = with_class_env(|e| e.infos.len()) as ir::ClassId;
+    if used.is_empty() {
+        let wanted: String = param
+            .chars()
+            .filter(|c| *c != '_')
+            .collect::<String>()
+            .to_lowercase();
+        let named: Vec<ir::ClassId> = (0..n)
+            .filter(|&id| {
+                class_info(id).is_some_and(|c| {
+                    c.name.rsplit('.').next().unwrap_or(&c.name).to_lowercase() == wanted
+                })
+            })
+            .collect();
+        return (named.len() == 1).then(|| named[0]);
+    }
+    let fits: Vec<ir::ClassId> = (0..n)
+        .filter(|&id| {
+            used.iter().all(|a| {
+                field_index(id, a).is_some()
+                    || resolve_method(id, a).is_some()
+                    || resolve_property(id, a).is_some()
+                    || class_const(id, a).is_some()
+            })
+        })
+        .collect();
+    let roots: Vec<ir::ClassId> = fits
+        .iter()
+        .copied()
+        .filter(|&c| !fits.iter().any(|&o| o != c && class_is_subclass(c, o)))
+        .collect();
+    (roots.len() == 1).then(|| roots[0])
+}
+
 /// An unannotated parameter defaulting to `None` also admits `None`.
 fn with_none_default(p_default: Option<&ast::Expr>, ty: ir::Ty) -> ir::Ty {
     match p_default.map(|d| &d.kind) {
@@ -1308,10 +1458,18 @@ fn synth_yield_ty(name: &str) -> Option<ir::Ty> {
 /// program-level fixpoint. Top-level and methods leave remaining names in
 /// the second return value so `refine_bare_params` can seed them from the
 /// call graph and typeshed.
+/// The function a parameter list belongs to, for a learned predictor to read.
+#[derive(Clone, Copy)]
+struct PredictSite<'a> {
+    func: &'a ast::FuncDef,
+    class: Option<&'a str>,
+}
+
 fn resolve_params_with_body_infer(
     formals: &[ast::Param],
     body: &[ast::Stmt],
     fail_unresolved: bool,
+    site: Option<PredictSite<'_>>,
 ) -> SResult<(Vec<ParamSig>, Vec<String>)> {
     let mut params = Vec::new();
     let mut bare_idxs = Vec::new();
@@ -1369,6 +1527,19 @@ fn resolve_params_with_body_infer(
             ty,
             default: p.default.clone(),
             key,
+        });
+    }
+    // A parameter no call site has typed, where a learned predictor is on:
+    // its prediction stands in for the body's guess.
+    if let Some(site) = site
+        && predict::engine() != predict::Engine::Static
+    {
+        bare_idxs.retain(|&i| {
+            let Some(ty) = predicted_param_type(site, &formals[i], i) else {
+                return true;
+            };
+            params[i].ty = with_none_default(formals[i].default.as_ref(), ty);
+            false
         });
     }
     let mut pending = Vec::new();
@@ -4397,7 +4568,12 @@ fn method_func_sig(
     match kind {
         MethodKind::Static => {
             // No implicit self — all params are user params.
-            let (p, pending) = resolve_params_with_body_infer(&formals, &f.body, false)?;
+            let site = PredictSite {
+                func: f,
+                class: Some(class_short_name),
+            };
+            let (p, pending) =
+                resolve_params_with_body_infer(&formals, &f.body, false, Some(site))?;
             params = p;
             pending_bare = pending;
         }
@@ -4412,7 +4588,12 @@ fn method_func_sig(
             formals[0].ty = Some(ast::TypeName::Class(Box::leak(
                 class_short_name.to_string().into_boxed_str(),
             )));
-            let (p, pending) = resolve_params_with_body_infer(&formals, &f.body, false)?;
+            let site = PredictSite {
+                func: f,
+                class: Some(class_short_name),
+            };
+            let (p, pending) =
+                resolve_params_with_body_infer(&formals, &f.body, false, Some(site))?;
             params = p;
             pending_bare = pending;
             params[0].ty = ir::Ty::Class(class_id);
@@ -4428,7 +4609,12 @@ fn method_func_sig(
             formals[0].ty = Some(ast::TypeName::Class(Box::leak(
                 class_short_name.to_string().into_boxed_str(),
             )));
-            let (p, pending) = resolve_params_with_body_infer(&formals, &f.body, false)?;
+            let site = PredictSite {
+                func: f,
+                class: Some(class_short_name),
+            };
+            let (p, pending) =
+                resolve_params_with_body_infer(&formals, &f.body, false, Some(site))?;
             params = p;
             pending_bare = pending;
             params[0].ty = ir::Ty::Class(class_id);
@@ -4722,7 +4908,12 @@ fn collect_sigs(module: &ast::Module) -> SResult<(HashMap<String, FuncSig>, Vec<
                     f.span,
                 ));
             }
-            let (params, pending_bare) = resolve_params_with_body_infer(&f.params, &f.body, false)?;
+            let site = PredictSite {
+                func: f,
+                class: None,
+            };
+            let (params, pending_bare) =
+                resolve_params_with_body_infer(&f.params, &f.body, false, Some(site))?;
             let mut seen_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
             let vararg = if let Some(p) = &f.vararg {
                 let ty = resolve_star_param_ty(p)?;
@@ -7893,7 +8084,10 @@ fn dynamic_annotations(stmts: &[ast::Stmt]) -> bool {
 }
 
 fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> SResult<ir::Module> {
+    PREDICTIONS.with(|c| c.borrow_mut().clear());
     let closures_known = std::cell::RefCell::new(BTreeMap::new());
+    let rejected: std::cell::RefCell<HashSet<ParamKey>> = std::cell::RefCell::new(HashSet::new());
+    let predictions_off = std::cell::Cell::new(false);
     let reset = |collecting: bool,
                  seeds: HashMap<ParamKey, ir::Ty>,
                  boxed_known: Option<HashSet<ir::ClassId>>| {
@@ -7905,9 +8099,27 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
                 boxed_known,
                 closures_known: closures_known.borrow().clone(),
                 all_roots: !executable,
+                rejected: rejected.borrow().clone(),
+                predictions_off: predictions_off.get(),
                 ..InferRounds::default()
             }
         });
+    };
+    // A prediction is withdrawn when its function needed tolerance to lower,
+    // or when the function's value escapes: called through a closure, its
+    // arguments are never seen, so nothing could contradict a wrong guess.
+    let reject_broken_predictions = || {
+        INFER_ROUNDS.with(|r| {
+            let r = r.borrow();
+            let mut rejected = rejected.borrow_mut();
+            let before = rejected.len();
+            for (key, site) in &r.predicted {
+                if r.failed_sites.contains(site) || r.escaped.get(key).is_some_and(|n| *n > 0) {
+                    rejected.insert(*key);
+                }
+            }
+            rejected.len() != before
+        })
     };
     // What a round boxed: its classes, and whether it boxed a closure the
     // round did not know about (which a dynamic call needs an arm for).
@@ -7975,13 +8187,15 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
         let result = analyze_target(modules, executable);
         let tolerated = INFER_ROUNDS.with(|r| r.borrow().tolerated);
         let (boxed_next, new_closures) = boxed_now();
+        let newly_rejected = reject_broken_predictions();
         let mut next = decide(true);
         // A round that stopped before lowering measured nothing; what it did
         // not measure keeps the type the round before decided.
         for (k, t) in &seeds {
             next.entry(*k).or_insert(*t);
         }
-        let settled = next == seeds && boxed_next == boxed && !new_closures && round > 0;
+        let settled =
+            next == seeds && boxed_next == boxed && !new_closures && !newly_rejected && round > 0;
         seeds = next;
         boxed = boxed_next;
         last = Some((result, tolerated));
@@ -8010,6 +8224,9 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
             boxed.extend(boxed_next);
             widened = true;
         }
+        if reject_broken_predictions() {
+            widened = true;
+        }
         for (k, t) in &strict {
             match seeds.get(k) {
                 Some(seed) if seed == t || *seed == ir::Ty::Any => {}
@@ -8034,8 +8251,28 @@ fn analyze_with_call_site_rounds(modules: &[ModuleInput], executable: bool) -> S
         }
     }
     // The final program, built without tolerance so a real error is reported.
-    reset(false, seeds, Some(boxed));
-    analyze_target(modules, executable).map_err(|d| explain_dynamic_fallback(d, modules))
+    reset(false, seeds.clone(), Some(boxed.clone()));
+    let result = analyze_target(modules, executable);
+    let predicted = INFER_ROUNDS.with(|r| !r.borrow().predicted.is_empty());
+    if result.is_err() && predicted && !predictions_off.get() {
+        // A prediction broke the program in a way the rounds did not isolate:
+        // the static engine alone decides.
+        predictions_off.set(true);
+        return analyze_with_call_site_rounds_static(modules, executable);
+    }
+    result.map_err(|d| explain_dynamic_fallback(d, modules))
+}
+
+/// The analysis with the learned predictors switched off for its duration.
+fn analyze_with_call_site_rounds_static(
+    modules: &[ModuleInput],
+    executable: bool,
+) -> SResult<ir::Module> {
+    let engine = predict::engine();
+    predict::set_engine(predict::Engine::Static);
+    let result = analyze_with_call_site_rounds(modules, executable);
+    predict::set_engine(engine);
+    result
 }
 
 fn analyze_target(modules: &[ModuleInput], executable: bool) -> SResult<ir::Module> {
@@ -9252,6 +9489,7 @@ fn lower_function_inner(
     let _lowering = LoweringFunction::enter(
         &ir_name_for_graph,
         is_entry || (short_name.starts_with("__") && short_name.ends_with("__")),
+        f.span,
     );
     if f.ret.is_none() && short_name != "__init__" {
         if is_gen {
@@ -9327,7 +9565,7 @@ fn lower_function_inner(
             params.push((p.name.clone(), ty));
         }
     } else {
-        let (formals, _) = resolve_params_with_body_infer(&f.params, &f.body, true)?;
+        let (formals, _) = resolve_params_with_body_infer(&f.params, &f.body, true, None)?;
         for p in &formals {
             if ctx.locals.insert(p.name.clone(), p.ty).is_some() {
                 return Err(err(format!("duplicate parameter '{}'", p.name), f.span));
@@ -9835,7 +10073,9 @@ fn pre_register_one_nested_sig(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()>
     if ctx.locals.contains_key(&f.name) {
         return Ok(());
     }
-    let (params, _) = resolve_params_with_body_infer(&f.params, &f.body, true)?;
+    // No prediction for a nested function: it is a closure, called where the
+    // analysis cannot see.
+    let (params, _) = resolve_params_with_body_infer(&f.params, &f.body, true, None)?;
     let mut seen: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     let vararg = if let Some(p) = &f.vararg {
         let ty = resolve_star_param_ty(p)?;
@@ -10265,7 +10505,9 @@ fn lower_nested_func_def(f: &ast::FuncDef, ctx: &mut FnCtx) -> SResult<()> {
     }
 
     // Build nested signature (params / *args / **kwargs) with bare-param infer.
-    let (params, _) = resolve_params_with_body_infer(&f.params, &f.body, true)?;
+    // No prediction for a nested function: it is a closure, called where the
+    // analysis cannot see.
+    let (params, _) = resolve_params_with_body_infer(&f.params, &f.body, true, None)?;
     let mut seen: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
     let vararg = if let Some(p) = &f.vararg {
         let ty = resolve_star_param_ty(p)?;

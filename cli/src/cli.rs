@@ -94,7 +94,8 @@ impl Cli {
                         break;
                     }
                     Some(
-                        "--python" | "-O" | "--opt-level" | "-i" | "--input" | "--message-format",
+                        "--python" | "-O" | "--opt-level" | "-i" | "--input" | "--message-format"
+                        | "--infer",
                     ) => i += 2,
                     Some("--") => break,
                     Some(arg)
@@ -131,6 +132,27 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+/// The inference engine selected with `--infer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InferEngine {
+    /// The compiler's own rules
+    Static,
+    /// A linear model over names and uses
+    Ml,
+    /// A transformer over names and uses
+    Dl,
+}
+
+impl From<InferEngine> for semantic::Engine {
+    fn from(e: InferEngine) -> Self {
+        match e {
+            InferEngine::Static => semantic::Engine::Static,
+            InferEngine::Ml => semantic::Engine::Ml,
+            InferEngine::Dl => semantic::Engine::Dl,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -380,6 +402,12 @@ pub struct CompileCommand {
     #[arg(long, value_name = "FILE")]
     pub profile: Option<path::PathBuf>,
 
+    /// What types an unannotated parameter nothing calls: the compiler's
+    /// rules alone, or a learned predictor (a linear model, or a transformer)
+    /// where those have no evidence
+    #[arg(long, value_enum, value_name = "ENGINE", default_value = "static")]
+    pub infer: InferEngine,
+
     /// How to print diagnostics
     #[arg(long, value_name = "FORMAT", default_value = "human")]
     pub message_format: crate::diagnostics::Format,
@@ -451,6 +479,12 @@ pub struct RunCommand {
     #[arg(long)]
     pub no_cache: bool,
 
+    /// What types an unannotated parameter nothing calls: the compiler's
+    /// rules alone, or a learned predictor (a linear model, or a transformer)
+    /// where those have no evidence
+    #[arg(long, value_enum, value_name = "ENGINE", default_value = "static")]
+    pub infer: InferEngine,
+
     /// How to print diagnostics
     #[arg(long, value_name = "FORMAT", default_value = "human")]
     pub message_format: crate::diagnostics::Format,
@@ -474,6 +508,15 @@ pub struct CheckCommand {
     /// included
     #[arg(long)]
     pub show_types: bool,
+
+    /// What types an unannotated parameter nothing calls (see `compile`)
+    #[arg(long, value_enum, value_name = "ENGINE", default_value = "static")]
+    pub infer: InferEngine,
+
+    /// Print the evidence the learned type predictors read for each
+    /// parameter, one JSON object per line, without analyzing the program
+    #[arg(long, hide = true)]
+    pub show_features: bool,
 }
 
 #[derive(Debug, Args)]
@@ -504,4 +547,10 @@ pub struct ExtensionCommand {
     /// model and ISA extensions, or a specific model name
     #[arg(long, value_name = "CPU")]
     pub target_cpu: Option<String>,
+
+    /// What types an unannotated kernel parameter: nothing calls a kernel
+    /// inside the program, so only a learned predictor has evidence (see
+    /// `compile`)
+    #[arg(long, value_enum, value_name = "ENGINE", default_value = "static")]
+    pub infer: InferEngine,
 }

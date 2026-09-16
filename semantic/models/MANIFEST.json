@@ -1,0 +1,204 @@
+{
+ "generated": "2026-09-15",
+ "labels": [
+  "int",
+  "float",
+  "str",
+  "bool",
+  "list[int]",
+  "list[float]",
+  "list[str]",
+  "list[other]",
+  "dict[str,int]",
+  "dict[str,str]",
+  "dict[str,float]",
+  "dict[other]",
+  "set",
+  "tuple",
+  "callable",
+  "iterator",
+  "class",
+  "int?",
+  "float?",
+  "str?",
+  "bool?",
+  "class?",
+  "other?",
+  "any",
+  "other"
+ ],
+ "features": {
+  "script": "scripts/infer_eval/features.py",
+  "sha256": "68091722dc1927416852cbd849afc825474e7208eec272b9753f10e4b55ed5e7"
+ },
+ "ml": {
+  "model": "multinomial logistic regression over hashed features",
+  "buckets": 16384,
+  "file": "ml.bin",
+  "sha256": "b127c1542136cff16c1856e09f96d5fddf02756f049687bd49df6e3ea1eaa4e2"
+ },
+ "dl": {
+  "model": "hashed embeddings + 2-layer transformer encoder over usage events + MLP",
+  "buckets": 16384,
+  "dim": 64,
+  "layers": 2,
+  "heads": 4,
+  "ff": 128,
+  "file": "dl.bin",
+  "sha256": "d7aae0cab979d6e86d12dfa39a6cc39734d9fc293a92f5cf70441f90d95e6396"
+ },
+ "training_data": {
+  "aiohttp": {
+   "commit": "a9a4317557d5fe3f9e8fbafcd2308c0804f5c01a",
+   "url": "https://github.com/aio-libs/aiohttp"
+  },
+  "attrs": {
+   "commit": "8f767776326faaed11e6c2974798787f6e19b343",
+   "url": "https://github.com/python-attrs/attrs"
+  },
+  "black": {
+   "commit": "20622e1259c29bda81831962ace1348ba1921c84",
+   "url": "https://github.com/psf/black"
+  },
+  "click": {
+   "commit": "6aabf099bfdd4c1e75fe8d0e0d4241372b988ab1",
+   "url": "https://github.com/pallets/click"
+  },
+  "core": {
+   "commit": "ec2a00de1ea269004463a710648079ead65c24b2",
+   "url": "https://github.com/home-assistant/core"
+  },
+  "django": {
+   "commit": "bbf5a998c02b52f1b72474e4b310cff94f24ff36",
+   "url": "https://github.com/django/django"
+  },
+  "fastapi": {
+   "commit": "50113da16fec53b66b80d75e80a89296de4fa5a5",
+   "url": "https://github.com/fastapi/fastapi"
+  },
+  "flask": {
+   "commit": "d73fa1cdcbd8b1465c151db8924ba58b1dd14e35",
+   "url": "https://github.com/pallets/flask"
+  },
+  "httpx": {
+   "commit": "b5addb64f0161ff6bfe94c124ef76f6a1fba5254",
+   "url": "https://github.com/encode/httpx"
+  },
+  "jinja": {
+   "commit": "5ef70112a1ff19c05324ff889dd30405b1002044",
+   "url": "https://github.com/pallets/jinja"
+  },
+  "mypy": {
+   "commit": "539f6e67b6743d39ce1c643f4cea08fa60602093",
+   "url": "https://github.com/python/mypy"
+  },
+  "networkx": {
+   "commit": "4e74880b0da01977da79915167c64e5c2af38b47",
+   "url": "https://github.com/networkx/networkx"
+  },
+  "packaging": {
+   "commit": "10590c194edb33c82f84a127883d6097c56b7840",
+   "url": "https://github.com/pypa/packaging"
+  },
+  "pip": {
+   "commit": "2b28a816d043826f2ba10ff1d22ec3d94d2ed7c5",
+   "url": "https://github.com/pypa/pip"
+  },
+  "poetry": {
+   "commit": "be56ff07db06e9b82574648433ca228e4cac549b",
+   "url": "https://github.com/python-poetry/poetry"
+  },
+  "pydantic": {
+   "commit": "f543f06749b5c0adba7c9a1d31ff229b3d045d1a",
+   "url": "https://github.com/pydantic/pydantic"
+  },
+  "pytest": {
+   "commit": "a453d653f92bfbdbfe47d2af9bfd8801860ff9e3",
+   "url": "https://github.com/pytest-dev/pytest"
+  },
+  "requests": {
+   "commit": "dae7ef63b4df6eded86637f251fc4e3a06c3b479",
+   "url": "https://github.com/psf/requests"
+  },
+  "rich": {
+   "commit": "9d8f9a372cc5916fd4781fec207ced7ddac2f08f",
+   "url": "https://github.com/Textualize/rich"
+  },
+  "scrapy": {
+   "commit": "86bec33cd3e6311b8481eac7d02e3ab0ec06f394",
+   "url": "https://github.com/scrapy/scrapy"
+  },
+  "setuptools": {
+   "commit": "4e612f9e44ecfad130d0b2a27a2dce0740599b4b",
+   "url": "https://github.com/pypa/setuptools"
+  },
+  "sqlglot": {
+   "commit": "e94639635d388cf6b58dd79d643a62082d2305cb",
+   "url": "https://github.com/tobymao/sqlglot"
+  },
+  "sqlmodel": {
+   "commit": "7fec3bcbdbca5b29b21ac4777e3fb341d8a7e4e1",
+   "url": "https://github.com/tiangolo/sqlmodel"
+  },
+  "starlette": {
+   "commit": "03f12b7fcf0a3e21a8da648ca0900c79472e9efe",
+   "url": "https://github.com/encode/starlette"
+  },
+  "sympy": {
+   "commit": "117eaf45237de39c9d4518a3b7c715f0484ccea9",
+   "url": "https://github.com/sympy/sympy"
+  },
+  "textual": {
+   "commit": "06dbeef4bb70fb718236aa418ed658ef4667a126",
+   "url": "https://github.com/Textualize/textual"
+  },
+  "trio": {
+   "commit": "59d94d7ae0dc8af4c9736425c278b04ecd8b1a47",
+   "url": "https://github.com/python-trio/trio"
+  },
+  "typer": {
+   "commit": "a80f6e5ecd74f32b983cca336a2f3cba98d9853a",
+   "url": "https://github.com/fastapi/typer"
+  },
+  "werkzeug": {
+   "commit": "6a604e005d95af8129ee314863be8ad6b240dead",
+   "url": "https://github.com/pallets/werkzeug"
+  }
+ },
+ "held_out_projects": [
+  "black",
+  "flask",
+  "httpx",
+  "rich",
+  "networkx"
+ ],
+ "evaluation": {
+  "held_out": {
+   "n": 3925,
+   "ml_accuracy": 0.6038216560509554,
+   "ml_quantized_accuracy": 0.6033121019108281,
+   "ml_quantized_agreement": 0.9905732484076433,
+   "dl_accuracy": 0.5819108280254777,
+   "dl_quantized_accuracy": 0.5816560509554141,
+   "dl_quantized_agreement": 0.9984713375796178
+  },
+  "corpus": {
+   "n": 468,
+   "ml_accuracy": 0.9935897435897436,
+   "ml_quantized_accuracy": 0.9935897435897436,
+   "ml_quantized_agreement": 1.0,
+   "dl_accuracy": 0.9572649572649573,
+   "dl_quantized_accuracy": 0.9572649572649573,
+   "dl_quantized_agreement": 1.0
+  }
+ },
+ "trained_on_corpus": true,
+ "corpus_cross_validation": {
+  "ml_corpus_out_of_fold": 0.5897435897435898,
+  "dl_corpus_out_of_fold": 0.6752136752136753,
+  "folds": 5,
+  "groups": 69,
+  "ship_held_out_ml": 0.6038216560509554,
+  "ship_held_out_dl": 0.5819108280254777
+ }
+}

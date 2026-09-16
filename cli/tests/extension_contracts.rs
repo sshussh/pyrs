@@ -368,3 +368,26 @@ fn without_a_manifest_or_flags_the_missing_input_is_named() {
         "{err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Signatures
+// ---------------------------------------------------------------------------
+
+/// Nothing inside an extension calls its kernels, so an unannotated parameter
+/// has no evidence of its type. A guess from the body would become a contract
+/// with every CPython caller; the build names the parameter instead.
+#[test]
+fn an_unannotated_kernel_parameter_is_named_not_guessed() {
+    let msg = rejects(
+        "unannotated",
+        "def bmi(weight_kg, height_m: float) -> float:\n    return weight_kg / (height_m * height_m)\n",
+    );
+    assert!(
+        msg.contains("parameter 'weight_kg' needs an annotation"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("--infer"),
+        "the message should offer the predictor: {msg}"
+    );
+}

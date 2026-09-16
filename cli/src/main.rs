@@ -80,6 +80,10 @@ fn run(args: cli::Cli) -> Result<i32, String> {
 }
 
 fn run_program(mut cmd: cli::RunCommand) -> Result<i32, String> {
+    semantic::set_engine(cmd.infer.into());
+    // The build cache is keyed by source, and a predictor changes the program
+    // built from the same source.
+    cmd.no_cache |= cmd.infer != cli::InferEngine::Static;
     let mut input = cmd.input.take().or_else(|| {
         if cmd.code.is_none() && cmd.module.is_none() && !cmd.args.is_empty() {
             Some(PathBuf::from(cmd.args.remove(0)))
@@ -322,7 +326,11 @@ fn execute(command: &mut process::Command) -> Result<i32, io::Error> {
 /// writes `target/NAME` rather than `./a.out` in whatever directory the
 /// command happened to run from. `pyrs build` in a project should mean the
 /// same kind of thing `cargo build` does.
-fn compile_command(cmd: cli::CompileCommand) -> Result<i32, String> {
+fn compile_command(mut cmd: cli::CompileCommand) -> Result<i32, String> {
+    semantic::set_engine(cmd.infer.into());
+    // The build cache is keyed by source, and a predictor changes the program
+    // built from the same source.
+    cmd.no_cache |= cmd.infer != cli::InferEngine::Static;
     let project = if cmd.input.is_none() {
         match std::env::current_dir() {
             Ok(dir) => manifest::discover(&dir)?,
@@ -751,6 +759,7 @@ fn program_sources(loaded: &[modules::Loaded]) -> Vec<(String, String)> {
 /// never be a guess -- especially the interpreter, whose default now depends
 /// on whether uv is installed and whether this is a uv project.
 fn check_program(cmd: cli::CheckCommand) -> Result<i32, String> {
+    semantic::set_engine(cmd.infer.into());
     let project = match std::env::current_dir().ok().map(|d| manifest::discover(&d)) {
         Some(found) => found?,
         None => None,
@@ -797,7 +806,16 @@ fn check_program(cmd: cli::CheckCommand) -> Result<i32, String> {
         None => modules::load_program(&input),
     };
     let format = cmd.message_format;
-    let module = analyze(loaded.map_err(|e| fail(e, format))?).map_err(|f| f.render(format))?;
+    let loaded = loaded.map_err(|e| fail(e, format))?;
+    if cmd.show_features {
+        if let Some(root) = loaded.last() {
+            for line in semantic::feature_lines(&root.ast) {
+                println!("{line}");
+            }
+        }
+        return Ok(0);
+    }
+    let module = analyze(loaded).map_err(|f| f.render(format))?;
     if cmd.show_types {
         print!("{}", signatures(&module));
     }

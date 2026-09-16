@@ -70,6 +70,8 @@ pub fn build(raw: ExtensionCommand) -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         return Err("build-extension currently supports Linux only".into());
     }
+    semantic::set_engine(raw.infer.into());
+    let predicted = raw.infer != crate::cli::InferEngine::Static;
     // `--module` and `-i` were required on every invocation; a project can
     // record them once in [tool.pyrs.extension] instead. Flags still win.
     let cmd = resolve(raw)?;
@@ -95,6 +97,20 @@ pub fn build(raw: ExtensionCommand) -> Result<(), String> {
                 if !f.decorators.is_empty() || f.vararg.is_some() || f.kwarg.is_some()
                     || f.params.iter().any(|p| p.default.is_some()) {
                     return Err(format!("extension function '{}' cannot use decorators, defaults, *args or **kwargs yet", f.name));
+                }
+                // A kernel's signature is a contract with every CPython caller, and
+                // nothing inside the extension calls it, so an unannotated parameter
+                // has no evidence: its type would be a guess from the body. Say so
+                // rather than build a guess -- unless a learned predictor was asked for.
+                if !predicted && !f.name.starts_with('_')
+                    && let Some(p) = f.params.iter().find(|p| p.ty.is_none())
+                {
+                    return Err(format!(
+                        "extension function '{}': parameter '{}' needs an annotation; nothing \
+                         in an extension calls its kernels, so there is no evidence of its type \
+                         (annotate it, or pass --infer ml or --infer dl to use a learned prediction)",
+                        f.name, p.name
+                    ));
                 }
                 validate_body(&f.body, &names)?;
             }
