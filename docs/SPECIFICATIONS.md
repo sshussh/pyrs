@@ -158,7 +158,7 @@ binary; it is not linked into user programs.
   goes through the multi-file path after module load).
 - Resolves names (locals, `global`, module globals, imports).
 - Type-checks with a fixed type after first assignment; parameter
-  annotations are required only when there is no default to infer from;
+  annotations are optional (see inference below);
   return types may be inferred from `return` statements.
 - Applies implicit numeric promotion (`bool → int → float`) and inserts
   **explicit** IR casts.
@@ -350,17 +350,25 @@ programs** link only the object file from the shim plus `runtime.c` and
   promotions allowed; Any→union matches member tags). Not full gradual
   typing (no open setattr on `Any`; class instances may grow an overflow
   dict when the program uses `getattr`/`setattr`).
-- Parameter annotations optional when a default is present; bare params
-  may be inferred from body usage (unique type), from an annotated field they
-  are assigned to (`self.x: float = x`), from an observed set of conflicting
-  uses (`Any`, so the generic kernel applies), from call-site argument types
-  iterated to a named 8-round fixpoint, or from a table of builtin and stdlib
-  signatures generated from typeshed (`scripts/gen_typeshed_seeds.py`). A
-  parameter the body typed but a call site passes an incompatible type widens
-  to `Any`, for functions and for methods; an annotated parameter never
-  widens. An unconstrained parameter still needs an annotation, and a
-  constructor's call site is not yet evidence, because class layouts are
-  finalized before call sites are visited.
+- Annotations optional. Inference runs as rounds of the real lowering: every
+  call -- to a function, a method (virtually dispatched ones included), a
+  constructor, a dunder behind an operator, a `key=` callable -- records the
+  type it passes to each unannotated parameter, and every unannotated
+  function records what it returns and yields; the next round seeds from that.
+  Rounds settle optimistically (a dynamic argument is ignored while it may be
+  a parameter not yet typed), then a strict round widens any seed a dynamic
+  argument contradicts, so a seed is never a guess the program can falsify.
+  Two exact types decide `Any` (an `int` and a `float` do not merge: the
+  conversion would change output); a common base class is kept; `None` makes
+  an optional. An override and the method it overrides pool their evidence; a
+  function whose value escapes keeps body inference; a dynamic argument from
+  a function unreachable from the program's roots (module bodies, dunders,
+  escaping functions) is ignored. A parameter nothing types is dynamic. A
+  fully annotated program runs one round. With `--infer ml` or `--infer dl`
+  a learned predictor (`semantic/src/predict.rs`, weights in
+  `semantic/models/`) types a parameter that has no call-site evidence; a
+  prediction that breaks its function's lowering, or whose function escapes,
+  is withdrawn.
   Return annotation optional (inferred from returns when feasible, else
   “returns nothing”).
 - Homogeneous lists; unannotated empty `[]` defaults to `list[Any]`;

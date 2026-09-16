@@ -121,6 +121,7 @@ $ pyrs compile -i prog.py -o prog [-O 2] [--emit-llvm]
 | `-O, --opt-level` | LLVM optimization level, 0–3 | `2` |
 | `--emit-llvm`  | also write the generated LLVM IR to `<output>.ll` | off |
 | `--profile FILE` | consume a type profile from `pyrs profile` | off |
+| `--infer ENGINE` | what types a parameter no call site reaches: `static`, `ml`, `dl` | `static` |
 
 `--emit-llvm` is the window into the compiler: the `.ll` file is exactly
 what PyRs hands to LLVM, readable and diffable.
@@ -198,6 +199,11 @@ is the module name with CPython's platform/version extension suffix. Use the sam
 environment to import it. This produces native functions that Python can call;
 the surrounding program can run normally or through `pyrs --compat`.
 
+Every kernel parameter needs an annotation. Nothing inside an extension calls
+its kernels, so a bare parameter has no evidence of its type, and its signature
+is a contract with every CPython caller — the build names the parameter instead
+of guessing (or takes a learned guess, with [`--infer`](#learned-type-inference---infer)).
+
 Source is currently limited to numerical function definitions: exact scalar
 arguments, scalar/string results, and read-only `list[float]` inputs. String
 results are decoded from UTF-8 into Python-owned strings; string inputs are not
@@ -209,6 +215,56 @@ are not supported in kernel bodies. Calls retain the GIL and require the importi
 thread. See the [architecture and limitations](INTEROPERABILITY.md),
 [runnable demo](../examples/interop/demo.py), and
 [boundary tests](../compatibility/README.md).
+
+### Learned type inference (`--infer`)
+
+```console
+$ pyrs check --show-types --infer ml -i kernels.py
+$ pyrs build-extension --infer ml -i kernels.py --module kernels_native
+```
+
+`--infer` takes `static` (the default), `ml` or `dl`, on `compile`, `run`,
+`check` and `build-extension`. It changes one thing: what happens to a
+parameter the compiler has **no evidence** about — no call site passes it
+anything, its body commits to nothing, and no builtin signature types it.
+`static` leaves it dynamic. `ml` and `dl` ask a learned predictor, which reads
+the parameter's name, the enclosing function's name, its default, and how the
+body uses it, and answers with a type from a fixed 25-label vocabulary.
+
+Evidence always outranks a prediction: where a call site types a parameter, the
+engine makes no difference, and in a whole program a predictor can only reach
+code nothing calls. A prediction is also never trusted as a proof — one that
+breaks its function's lowering is withdrawn and the round runs again, a
+function whose value escapes keeps none, and a program that fails to compile
+with predictions is compiled again without them. What the flag can change is
+how *fast* such a function is, not what the program does.
+
+The two engines are the same shape of thing at different sizes: `ml` is a
+multinomial logistic regression over hashed features, `dl` a small transformer
+over the sequence of uses. Both are trained offline, shipped as weights inside
+the compiler (`semantic/models/`, 1.8 MB), and run as a deterministic CPU
+forward pass — no framework, no network, nothing read at build time. On
+parameters from projects held out of training they name the annotation the
+author wrote about 60% of the time. Measured where it matters — this
+repository's own programs with every annotation stripped *and* every call site
+removed — `--infer ml` gets 72% of parameters exactly right against `static`'s
+41%. That is a real lift and still **a guess, not a signature**: annotate what
+other people call.
+
+Where it earns its keep is `pyrs build-extension`: nothing inside an extension
+calls its kernels, so every parameter is evidence-free, and an unannotated one
+is rejected by name rather than guessed at:
+
+```console
+$ pyrs build-extension -i kernels.py --module k
+error: extension function 'bmi': parameter 'weight_kg' needs an annotation; …
+       (annotate it, or pass --infer ml or --infer dl to use a learned prediction)
+```
+
+Two practical notes. `--infer ml` and `--infer dl` bypass the build cache,
+because the same source compiles to a different program under them. And
+`pyrs check --show-types --infer ml` is the way to see what a predictor
+decided before building anything.
 
 ### `pyrs lex` / `pyrs parse`
 
@@ -354,13 +410,19 @@ $ make ci                           # format check + clippy + tests + parity
 
 PyRs compiles a statically-typed subset of Python. Valid PyRs programs
 are valid Python programs with the same output — the reverse is not true,
-since PyRs rejects unsupported dynamic features (each with a
-"not supported yet" error naming the feature). Parameter annotations are
-optional when a default value is present (the type is inferred from the
-default); bare parameters may be inferred from body usage, from call
-sites, or from known builtin/stdlib signatures — a unique type stays
-concrete, a conflicting observed set becomes `object`, and an
-unconstrained parameter still needs an annotation.
+since PyRs rejects unsupported features (each with a "not supported yet"
+error naming the feature). Annotations are optional. An unannotated
+parameter takes the type every call site passes it -- measured on the
+program as it is lowered, constructors, methods, operators and callbacks
+included -- and an unannotated function the type it returns. Where call sites
+disagree (an `int` here, a `str` there) the parameter is dynamic (`object`),
+and where nothing calls a function the body and builtin signatures decide, or
+the parameter is dynamic. A dynamic value supports the operations CPython
+gives it, so no program is refused for being too dynamic; an annotation makes
+code faster, not possible. `pyrs check --show-types` prints the signature
+every function was compiled with, and
+[`--infer`](#learned-type-inference---infer) offers a learned prediction where
+the compiler has no evidence at all.
 
 ### Program structure
 
@@ -984,11 +1046,12 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return x
 ```
 
-- Parameter annotations are **optional when a default is present** (type
-  inferred from the default). Bare parameters without defaults still need
-  an annotation. The return annotation is optional: when omitted, the
-  compiler infers a concrete return type from `return` statements when
-  possible; otherwise the function is treated as returning nothing.
+- Parameter and return annotations are **optional**. An unannotated
+  parameter is typed from its call sites (see the start of this section); a
+  default contributes the value it supplies. The return type of an
+  unannotated function is what its `return` statements return, `None`
+  included when it can fall off the end (`int | None`); a function that
+  always raises can be used wherever any value is expected.
 - Default values and keyword arguments work (`def f(a: int, b: int = 1)`
   and `f(1, b=2)`). **When a default is evaluated depends on where the
   function is defined, and only the nested case matches CPython.** A
@@ -1943,24 +2006,17 @@ Container notes:
   `.symmetric_difference_update`; `==` / `!=`; subset operators
   `<` / `<=` / `>` / `>=`; methods `issubset` / `issuperset` / `isdisjoint` / `copy` / `pop`
   (last-inserted; empty → KeyError).
-- **Union values (limited):** a union arises from an annotation
-  (`x: int | str`), from `and` / `or` on mixed operands, from a mixed
-  container literal (0.137), or from a multi-assign join. It is stored as a
-  tag plus a payload slot, and **what you can do with one without narrowing
-  first is a short list**:
+- **Union values:** a union arises from an annotation (`x: int | str`), from
+  `and` / `or` on mixed operands, from a mixed container literal (0.137), or
+  from a multi-assign join. It is stored as a tag plus a payload slot. As of
+  0.153 an operation no static rule accepts on a union -- `x + 1`, `x < y`,
+  `str(x)`, `x.upper()`, `x[i]` -- dispatches on what the value holds, exactly
+  as it would on a dynamic value, and raises CPython's own error when the held
+  type has no such operation (`None + 1` is a `TypeError`).
 
-  | Works on a union value | Needs narrowing first |
-  |---|---|
-  | `print(x)`, and printing a container of them | `str(x)`, `repr(x)`, `f"{x}"` |
-  | `if x:` / `not x` / `bool(x)` | `x == y`, `!=`, `<`, `<=`, `>`, `>=` |
-  | `in` over a container of them | `x + y` and every other operator |
-  | passing to a parameter of that union type | any method call (`x.upper()`) |
-  | returning one; storing one in a list or dict **value** | `len(x)` |
-  | `is None` / `isinstance` narrowing | `sorted(xs, key=...)` over them |
-
-  **Narrow with `isinstance` and the whole list becomes available**, because
-  after the peel the value has one concrete type and every operation is an
-  ordinary static one:
+  **Narrowing with `isinstance` is still worth doing**, because after the peel
+  the value has one concrete type and every operation is an ordinary static
+  one, with no dispatch:
 
   ```python
   for v in [1, "ab", 2.5]:        # list[int | str | float]
@@ -1976,16 +2032,6 @@ Container notes:
   dict key or set element**, because a key must be hashable; `{1: "a", "b": 2}`
   and `{1, "a"}` are refused by name.
 
-  The asymmetries are worth stating plainly, because each looks like an
-  oversight and one was: `print(x)` works where `str(x)` does not, since
-  printing goes through the runtime's tag dispatch and `str()` has no
-  equivalent node yet. `bool(x)` used to be refused where `if x:` was
-  accepted — the cast kept its own list of convertible types and it had
-  drifted; both are one code path as of 0.137.
-
-  General operators on a union need runtime dispatch on the tag, which is
-  tracked with the `Any` runtime-operations work in the
-  [roadmap](ROADMAP.md).
 
 - **Any (limited):** annotation `Any` or **`object`** (0.138.2 — Python's top
   type means the same thing here, and this subset's narrow-before-use rule is

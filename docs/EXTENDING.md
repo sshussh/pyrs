@@ -294,6 +294,69 @@ features.
    that compiles and then disagrees with CPython fails the run unless it is
    listed in `KNOWN_DIVERGENCES` — and a listed one that starts *agreeing*
    fails too, so the README divergence list cannot go stale.
+7. **Type prediction:** [`scripts/infer_eval/`](../scripts/infer_eval) is the
+   offline harness behind `--infer` (see
+   [the record](superpowers/plans/2026-09-16-learned-type-prediction.md)).
+   `corpus.py` collects every repository program that compiles *with* its
+   annotations and matches CPython; `evaluate.py LABEL --engine ml` measures an
+   engine on that corpus with the annotations stripped; `parity.py` checks the
+   compiler's own feature extractor against `features.py`, which is what the
+   models were trained on; `extension_bench.py` measures the kernel boundary.
+   The make targets wrap all of it, and nothing needs a Python environment of
+   your own — `uv` builds the training venv:
+
+   ```console
+   $ make infer-venv      # uv venv + the locked deps, with the torch build this machine can use
+   $ make infer-fetch     # clone the training projects at their newest commit
+   $ make infer-corpus    # build the corpus from this repository's own programs
+   $ make infer-parity    # the compiler's extractor vs features.py
+   $ make infer-eval      # every engine, with and without call sites, plus the kernels
+   $ make infer-train     # venv + fetch + corpus + train ml and dl + write semantic/models/
+   $ make infer-replay    # re-fetch the exact commits the shipped weights were trained on
+   ```
+
+   **The GPU is the default, for both models.** `uv pip install
+   --torch-backend=auto` reads the machine's driver and installs the CUDA, ROCm
+   or CPU build of the pinned torch, and the training scripts then pick `cuda`,
+   `xpu`, `mps` or `cpu` in that order. `DEVICE=cpu` forces the fallback; naming
+   a device that is not there is an error rather than a silent 40× slowdown.
+   `EPOCHS`, `FOLDS`, `UV_PYTHON` and `TORCH_BACKEND` are the other knobs.
+
+   The linear model is `train_ml.LogReg`: the same multinomial logistic
+   regression, solved full-batch with L-BFGS in float64 on the accelerator
+   (the dataset is one `embedding_bag` per step). It replaced scikit-learn's
+   `saga`, which took 144s on the CPU and still stopped at `max_iter` with a
+   ConvergenceWarning — coefficients wherever the optimiser ran out of budget.
+   L-BFGS reaches a gradient of 1e-7 in 1,316 iterations and 22s, and the
+   result is better as well as finished (63.7% against 62.6% held-out). The
+   rejected candidates — the decision tree and gradient boosting — are still
+   scikit-learn on the CPU; they exist to be compared against, not shipped, and
+   `--skip-baselines` leaves them out.
+
+   **The training data is not pinned.** Each project is fetched at the head of
+   its default branch, because retraining on newer code is the point of
+   retraining; `scripts/infer_eval/projects.txt` is the list, and adding a line
+   adds a project. What makes a run reproducible is the record it leaves:
+   `fetch_projects.py` writes every resolved commit to
+   `target/inference-eval/ext/fetched.json`, and `export_models.py` copies into
+   `MANIFEST.json` the commit of every project, the compiler revision, a hash of
+   every script in the pipeline, and the device, seed and library versions that
+   trained the weights. `make infer-replay` fetches those commits back.
+
+   Determinism is `scripts/infer_eval/repro.py`, imported before torch: one
+   seed, deterministic cuDNN and attention kernels, `random_state` on every
+   scikit-learn estimator, a stable hash for the cross-validation folds and a
+   sorted file walk. Two runs of the same commits and scripts on the same device
+   produce bit-identical weights; a GPU and a CPU run differ in the last bits of
+   the float, which is why the device is recorded.
+
+   `infer-train` rewrites `semantic/models/`, so read that diff before
+   committing it.
+
+   None of this is in `make ci` — training downloads gigabytes and takes far
+   longer than a gate should — so what CI checks instead is that the shipped
+   weights still match the extractor, the label table and the provenance they
+   were built from (`make hygiene`).
 
 ---
 
