@@ -4903,6 +4903,33 @@ fn try_infer_ret_from_ast_body(
     acc
 }
 
+/// The types a returned expression can have, pushed one per arm.
+///
+/// `return a if c else b` returns one of two values, so each arm counts as
+/// its own return -- exactly as the `if`/`return` spelling of the same
+/// function does. Typing the arms separately is what lets a recursive call in
+/// one arm stay silent instead of sinking the whole return: the arm the
+/// lightweight typer cannot type contributes nothing, and the base case
+/// decides the type the recursive call then reads.
+fn collect_ret_expr_tys(
+    e: &ast::Expr,
+    params: &HashMap<String, ir::Ty>,
+    known_rets: &HashMap<String, ir::Ty>,
+    out: &mut Vec<ir::Ty>,
+) {
+    match &e.kind {
+        ast::ExprKind::IfExp { body, orelse, .. } => {
+            collect_ret_expr_tys(body, params, known_rets, out);
+            collect_ret_expr_tys(orelse, params, known_rets, out);
+        }
+        _ => {
+            if let Some(t) = try_type_ast_expr(e, params, known_rets) {
+                out.push(t);
+            }
+        }
+    }
+}
+
 fn collect_ast_return_tys(
     stmts: &[ast::Stmt],
     params: &HashMap<String, ir::Ty>,
@@ -4912,9 +4939,7 @@ fn collect_ast_return_tys(
     for st in stmts {
         match &st.kind {
             ast::StmtKind::Return(Some(e)) => {
-                if let Some(t) = try_type_ast_expr(e, params, known_rets) {
-                    out.push(t);
-                }
+                collect_ret_expr_tys(e, params, known_rets, out);
             }
             ast::StmtKind::Return(None) => out.push(ir::Ty::None),
             ast::StmtKind::If { branches, orelse } => {
