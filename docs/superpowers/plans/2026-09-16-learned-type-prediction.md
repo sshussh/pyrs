@@ -1,6 +1,6 @@
 # Learned type prediction, behind `--infer`
 
-**Status: implemented, unreleased (ships in 0.153.0).** Follows
+**Status: implemented in 0.153.0.** Follows
 [the prediction research](2026-09-10-type-prediction-research.md) and
 [the inference engine](2026-09-15-inference-engine.md).
 

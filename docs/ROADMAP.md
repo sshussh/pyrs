@@ -363,12 +363,15 @@ documentation and the relevant gates.
       draining each one first (today `zip(infinite(), [1])` hangs), and a
       generator expression must evaluate its outermost iterable at creation
       as CPython does. One protocol closes both.
-- [ ] Runtime operations for `Any` and mixed containers; call-site inference
-      for unannotated functions and lambdas. Partly closed in 0.136:
-      `isinstance` narrows an `Any` for a single non-container pattern, so a
-      guarded body uses the value directly. Still open: method calls on a bare
-      `Any`, container patterns (no element type is recoverable from the tag)
-      and multi-pattern peels (no member index exists in the box's tag space).
+- [x] Runtime operations for `Any` and mixed containers; call-site inference
+      for unannotated functions and lambdas (0.153). Every operation a static
+      rule refuses on a dynamic value now dispatches on the tag it holds and
+      raises CPython's own error when the held type has no such operation, so
+      no program is refused for being too dynamic. Unannotated parameters take
+      the type their call sites pass, measured on the program as it is lowered;
+      a parameter nothing types is dynamic rather than an error. Where nothing
+      calls a function at all -- a library boundary, an extension kernel -- a
+      learned predictor can fill the gap behind `--infer ml`.
 - [ ] Dynamic-length heterogeneous tuples; general hash/equality protocol;
       `float`/`bool`/`frozenset` keys; dict views. Dict *keys* and set
       elements deliberately stayed restricted when 0.137 let container

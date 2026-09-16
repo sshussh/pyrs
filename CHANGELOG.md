@@ -1,3 +1,87 @@
+## 0.153.0 — nothing is refused for being too dynamic
+
+The dynamism work finishes here. A value whose type the compiler does not know
+is no longer a reason to reject a program: every operation a static rule
+refuses -- `x + 1`, `x < y`, `str(x)`, `x.upper()`, `x[i]`, `len(x)`, printing,
+iteration, membership -- dispatches on the tag the value holds and raises
+CPython's own error when the held type has no such operation. `None + 1` is a
+`TypeError` with CPython's message, not a compile error.
+
+**Call sites decide unannotated types.** Inference runs as rounds of the real
+lowering: every call -- to a function, a method (virtually dispatched ones
+included), a constructor, a dunder behind an operator, a `key=` callable --
+records the type it passes each unannotated parameter, and every unannotated
+function records what it returns and yields. Rounds settle optimistically, then
+a strict round widens any seed a dynamic argument contradicts, so a seed is
+never a guess the program can falsify. Two exact types decide `Any`; a common
+base class is kept; `None` makes an optional. An override and the method it
+overrides pool their evidence. A parameter nothing types is dynamic, not an
+error. A fully annotated program still runs one round.
+
+`pyrs check --show-types` prints the signature every function compiled with.
+
+**Dead code cannot widen a live function's types.** A dynamic argument from a
+function unreachable from the program's roots is ignored, so an unused branch
+no longer boxes a hot path.
+
+**A profiled site caches up to four typed operand pairs.** 0.148's guarded
+specialization handled one type per site; the polymorphic cache covers the
+96.1% of executions four types reach, against 79.5% for one.
+
+**`sorted(xs, key=f)` orders by its keys in O(n log n).** The key was being
+recomputed inside the comparator.
+
+**`--infer ml` and `--infer dl`: a learned type for a parameter no call site
+reaches.** Where nothing calls a function -- a library boundary, and every
+kernel in an extension, since nothing inside one calls them -- there is no
+evidence to read, and until now the answer was "annotate it or get a dynamic
+value". Two predictors trained offline on 29 real projects (a linear model and
+a small transformer, 1.8 MB of weights run as a deterministic CPU forward pass,
+no framework in the compiler) now fill exactly that gap.
+
+The flag is off by default and a prediction is never trusted as a proof: it is
+asked only where the static engine has nothing, it abstains below 0.5
+probability, one that breaks its function's lowering is withdrawn, and a
+program that fails to compile with predictions is compiled again without them.
+A program's behaviour cannot depend on the engine.
+
+Measured on 293 repository programs with every annotation stripped:
+
+| | compiles | params exactly right |
+|---|---:|---:|
+| with call sites, `static` | 99.3% | 89.0% |
+| with call sites, `ml` | 99.3% | 90.2% |
+| no call sites, `static` | 92.5% | 41.3% |
+| no call sites, `ml` | **95.9%** | **72.4%** |
+
+On projects held out of training the linear model names the annotation the
+author wrote 63.7% of the time. An annotation still beats a prediction: of 20
+unannotated numerical kernels built as CPython extensions, the annotated file
+gets 16 working at a geomean 3.94x over pure Python, `--infer ml` gets 4. Every
+mispredicted signature refused its call with a `TypeError` naming the
+parameter; none returned a wrong value.
+
+`make infer-train` retrains and re-exports the weights in a uv venv, on the
+GPU, from each project's newest commit -- recording every commit, the compiler
+revision, a hash of each script and the device, seed and library versions, so
+any shipped weights can be rebuilt (`make infer-replay`).
+
+**An unannotated extension kernel is named, not guessed at.** Its signature
+would become a contract with every CPython caller.
+
+### Fixes
+
+- **A recursive function through a conditional expression.** `def fact(n):
+  return 1 if n <= 1 else n * fact(n - 1)` was rejected -- the recursive call's
+  return type resolved to "returns nothing" while the ternary was being typed
+  -- and, called with an int and a float, compiled to a program that failed
+  with a bogus `UnboundLocalError`. Each arm of a returned conditional is now
+  its own return, and a concrete arm boxes into a dynamic join.
+- **A dynamic call inside a generator.** The result-tag slot every
+  tag-dispatched call reads was only emitted for plain functions, so dispatch
+  reached from a generator expression or a `yield` named a slot its body never
+  allocated and the module failed to parse.
+
 ## 0.152.0 — the remaining dynamism work, reviewed and finished
 
 0.145.0 through 0.151.1 implemented the six items of the remaining dynamism
