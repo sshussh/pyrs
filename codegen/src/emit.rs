@@ -3856,6 +3856,11 @@ impl Emitter {
             self.line(format!("{p} = alloca i32, align 4"));
             self.try_pool.push((e, l, p));
         }
+        // The same result-tag slot a plain function gets. A dynamic call in a
+        // generator body is still a call in this function, so the slot has to
+        // exist here too; the entry block dominates every gstate, and the tag
+        // is read immediately after the kernel returns, never across a yield.
+        self.line("%.dyn.tag = alloca i32, align 4");
         // Already finished → never re-enter body (post-exhaust / post-close /
         // uncaught throw). Close() and send/next rely on this.
         let already = self.tmp();

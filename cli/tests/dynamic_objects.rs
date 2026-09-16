@@ -543,6 +543,94 @@ print([x.v() for x in xs])
     );
 }
 
+/// A generator body is a function of its own, so a dynamic call inside one
+/// needs the same result-tag slot every other function gets. It was only ever
+/// emitted for plain functions, so any tag-dispatched call reached by a
+/// generator -- a genexp, or a `def` that yields -- named a slot that the
+/// generator body never allocated, and the module failed to parse.
+#[test]
+fn dispatching_inside_a_generator() {
+    matches_python(
+        "genexp_dyn_method",
+        r#"
+class Duck:
+    def speak(self): return "quack"
+class Dog:
+    def speak(self): return "woof"
+print(" ".join(a.speak() for a in [Duck(), Dog()]))
+"#,
+    );
+    matches_python(
+        "yield_dyn_method",
+        r#"
+class Duck:
+    def speak(self): return "quack"
+class Dog:
+    def speak(self): return "woof"
+def voices(xs):
+    for a in xs:
+        yield a.speak()
+print(" ".join(voices([Duck(), Dog()])))
+"#,
+    );
+    matches_python(
+        "yield_dyn_across_suspend",
+        r#"
+class Duck:
+    def speak(self): return "quack"
+class Dog:
+    def speak(self): return "woof"
+def gen(xs):
+    for a in xs:
+        t = a.speak()
+        yield t
+        yield t.upper()
+print(" ".join(gen([Duck(), Dog()])))
+"#,
+    );
+    matches_python(
+        "genexp_dyn_nested",
+        r#"
+class Duck:
+    def speak(self): return "quack"
+class Dog:
+    def speak(self): return "woof"
+zs = [Duck(), Dog()]
+print(" ".join(a.speak() + "/" + b.speak() for a in zs for b in zs))
+"#,
+    );
+    matches_python(
+        "genexp_dyn_sum",
+        r#"
+class A:
+    def __init__(self, v): self.v = v
+    def n(self): return self.v
+class B:
+    def __init__(self, v): self.v = v
+    def n(self): return self.v * 2
+print(sum(x.n() for x in [A(2), B(3), A(4)]))
+"#,
+    );
+    // The tag slot shares the generator prologue with the try control pool,
+    // so a `try` in the body has to leave it allocated and dominating.
+    matches_python(
+        "yield_dyn_in_try",
+        r#"
+class Duck:
+    def speak(self): return "quack"
+class Dog:
+    def speak(self): return "woof"
+def g(xs):
+    for a in xs:
+        try:
+            yield a.speak()
+        finally:
+            pass
+print(",".join(g([Duck(), Dog()])))
+"#,
+    );
+}
+
 /// A dynamic operation CPython rejects fails with CPython's own message.
 #[test]
 fn dynamic_errors_are_cpythons() {
