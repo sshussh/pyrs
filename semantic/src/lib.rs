@@ -5094,6 +5094,33 @@ fn try_infer_ret_from_ast_body(
     acc
 }
 
+/// The types a returned expression can have, pushed one per arm.
+///
+/// `return a if c else b` returns one of two values, so each arm counts as
+/// its own return -- exactly as the `if`/`return` spelling of the same
+/// function does. Typing the arms separately is what lets a recursive call in
+/// one arm stay silent instead of sinking the whole return: the arm the
+/// lightweight typer cannot type contributes nothing, and the base case
+/// decides the type the recursive call then reads.
+fn collect_ret_expr_tys(
+    e: &ast::Expr,
+    params: &HashMap<String, ir::Ty>,
+    known_rets: &HashMap<String, ir::Ty>,
+    out: &mut Vec<ir::Ty>,
+) {
+    match &e.kind {
+        ast::ExprKind::IfExp { body, orelse, .. } => {
+            collect_ret_expr_tys(body, params, known_rets, out);
+            collect_ret_expr_tys(orelse, params, known_rets, out);
+        }
+        _ => {
+            if let Some(t) = try_type_ast_expr(e, params, known_rets) {
+                out.push(t);
+            }
+        }
+    }
+}
+
 fn collect_ast_return_tys(
     stmts: &[ast::Stmt],
     params: &HashMap<String, ir::Ty>,
@@ -5103,9 +5130,7 @@ fn collect_ast_return_tys(
     for st in stmts {
         match &st.kind {
             ast::StmtKind::Return(Some(e)) => {
-                if let Some(t) = try_type_ast_expr(e, params, known_rets) {
-                    out.push(t);
-                }
+                collect_ret_expr_tys(e, params, known_rets, out);
             }
             ast::StmtKind::Return(None) => out.push(ir::Ty::None),
             ast::StmtKind::If { branches, orelse } => {
@@ -19989,11 +20014,18 @@ fn lower_if_exp(
     };
 
     // A mixed-numeric join is a union, so each branch is boxed into it and
-    // keeps its own runtime type.
-    let (then_val, else_val) = if matches!(ty, ir::Ty::Union(_)) {
-        (to_union(then_val, ty), to_union(else_val, ty))
-    } else {
-        (then_val, else_val)
+    // keeps its own runtime type. A join to `Any` -- one arm is dynamic, as a
+    // recursive call whose return type is still being decided is -- boxes the
+    // concrete arm for the same reason: the temp holds a tagged pointer, and
+    // assigning a bare `int` to it leaves whatever reads the tag reading a
+    // number as an address.
+    let (then_val, else_val) = match ty {
+        ir::Ty::Union(_) => (to_union(then_val, ty), to_union(else_val, ty)),
+        ir::Ty::Any => (
+            coerce(then_val, ty, body.span, "conditional expression")?,
+            coerce(else_val, ty, orelse.span, "conditional expression")?,
+        ),
+        _ => (then_val, else_val),
     };
 
     let name = ctx.fresh_temp("ifexp", ty);
