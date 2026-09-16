@@ -11,6 +11,8 @@ Run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
 from __future__ import annotations
 
+import hashlib
+import json
 import platform
 import subprocess
 import sys
@@ -27,6 +29,10 @@ ROOT = SCRIPTS.parent
 def write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(textwrap.dedent(text))
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class ExampleGateTests(unittest.TestCase):
@@ -221,7 +227,31 @@ class HygieneGateTests(unittest.TestCase):
             "//\n"
             f"// Derived from typeshed {'a' * 40} for CPython 3.14.7.\n",
         )
+        self.write_models(root)
         return root
+
+    def write_models(self, root: Path, labels: tuple[str, ...] = ("int", "str")) -> None:
+        """A stand-in for the shipped predictors: two weight files, the feature
+        extractor they were trained on, and a manifest stamping all three."""
+        write(root / "semantic/models/ml.bin", "weights\n")
+        write(root / "semantic/models/dl.bin", "weights\n")
+        write(root / "scripts/infer_eval/features.py", "LABELS = []\n")
+        table = ", ".join(f'"{l}"' for l in labels)
+        write(
+            root / "semantic/src/predict.rs",
+            f"pub(crate) const LABELS: [&str; {len(labels)}] = [{table}];\n",
+        )
+        manifest = {
+            "labels": list(labels),
+            "features": {
+                "script": "scripts/infer_eval/features.py",
+                "sha256": sha256(root / "scripts/infer_eval/features.py"),
+            },
+            "ml": {"file": "ml.bin", "sha256": sha256(root / "semantic/models/ml.bin")},
+            "dl": {"file": "dl.bin", "sha256": sha256(root / "semantic/models/dl.bin")},
+            "training_data": {"flask": {"commit": "a" * 40, "url": "https://example/flask"}},
+        }
+        write(root / "semantic/models/MANIFEST.json", json.dumps(manifest, indent=1) + "\n")
 
     def test_typeshed_seeds_must_exist(self) -> None:
         root = self.make_repo()
@@ -307,6 +337,86 @@ class HygieneGateTests(unittest.TestCase):
         done = self.run_gate(root, "versions")
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("gen_unicode_tables.py", done.stdout)
+
+    def test_model_weights_must_match_their_manifest(self) -> None:
+        # Weights are the one shipped artifact nothing else validates: a
+        # truncated or stale file still loads and still predicts.
+        root = self.make_repo()
+        write(root / "semantic/models/ml.bin", "other weights\n")
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("does not match its MANIFEST.json sha256", done.stdout)
+
+    def test_missing_model_weights_are_caught(self) -> None:
+        root = self.make_repo()
+        (root / "semantic/models/dl.bin").unlink()
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("export_models.py", done.stdout)
+
+    def test_feature_extractor_drift_is_caught(self) -> None:
+        # The models read features.py's output. Editing the extractor without
+        # retraining leaves the compiler predicting from a vector the model
+        # never saw -- silently, and only slightly wrong.
+        root = self.make_repo()
+        write(root / "scripts/infer_eval/features.py", "LABELS = []\n# a new feature\n")
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("has changed since the models were trained", done.stdout)
+
+    def test_label_vocabulary_drift_is_caught(self) -> None:
+        # A model's output is an index into this list; reorder it in one place
+        # only and every prediction means a different type.
+        root = self.make_repo()
+        self.write_models(root, labels=("int", "str"))
+        write(
+            root / "semantic/src/predict.rs",
+            'pub(crate) const LABELS: [&str; 2] = ["str", "int"];\n',
+        )
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("LABELS and MANIFEST.json labels disagree", done.stdout)
+
+    def test_incomplete_environment_record_is_caught(self) -> None:
+        # Training data is not pinned, so a run is only reproducible through
+        # what it recorded; a half-written record is worse than none.
+        root = self.make_repo()
+        path = root / "semantic/models/MANIFEST.json"
+        manifest = json.loads(path.read_text())
+        manifest["environment"] = {"device": "cuda", "seed": 0}
+        write(path, json.dumps(manifest) + "\n")
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("device, seed and torch version", done.stdout)
+
+    def test_provenance_must_name_the_compiler_revision(self) -> None:
+        root = self.make_repo()
+        path = root / "semantic/models/MANIFEST.json"
+        manifest = json.loads(path.read_text())
+        manifest["provenance"] = {"scripts": {"features.py": "a" * 64}}
+        write(path, json.dumps(manifest) + "\n")
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("compiler revision", done.stdout)
+
+    def test_a_complete_record_passes(self) -> None:
+        root = self.make_repo()
+        path = root / "semantic/models/MANIFEST.json"
+        manifest = json.loads(path.read_text())
+        manifest["environment"] = {"device": "cuda", "seed": 0, "torch": "2.14.0+cu130"}
+        manifest["provenance"] = {"pyrs_commit": "b" * 40, "scripts": {"features.py": "a" * 64}}
+        write(path, json.dumps(manifest) + "\n")
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 0, done.stdout)
+
+    def test_models_must_record_their_training_data(self) -> None:
+        root = self.make_repo()
+        manifest = json.loads((root / "semantic/models/MANIFEST.json").read_text())
+        del manifest["training_data"]
+        write(root / "semantic/models/MANIFEST.json", json.dumps(manifest) + "\n")
+        done = self.run_gate(root, "versions")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("projects the models were trained on", done.stdout)
 
     def test_consistent_repo_passes(self) -> None:
         done = self.run_gate(self.make_repo(), "versions")

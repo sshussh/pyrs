@@ -20,6 +20,7 @@ selected checks pass.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -202,6 +203,107 @@ def check_links(root: Path) -> list[str]:
     return problems
 
 
+def check_models(root: Path) -> list[str]:
+    """The shipped type predictors must match what trained them.
+
+    `--infer ml` and `--infer dl` run weights trained offline on the features
+    `scripts/infer_eval/features.py` extracts. Nothing in a build would notice
+    if the weights and the extractor drifted apart -- the compiler would keep
+    predicting, from a vector the model was never trained to read. So the
+    manifest stamps both, the way the Unicode tables stamp their interpreter:
+    the weights by content, the extractor by content, and the label vocabulary
+    against `predict.rs`, whose order is what a model's output index means."""
+    models = root / "semantic" / "models"
+    manifest_path = models / "MANIFEST.json"
+    if not manifest_path.exists():
+        return ["semantic/models/MANIFEST.json is missing; run scripts/infer_eval/export_models.py"]
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return [f"semantic/models/MANIFEST.json does not parse: {e}"]
+
+    problems = []
+    for engine in ("ml", "dl"):
+        entry = manifest.get(engine)
+        if not isinstance(entry, dict) or "file" not in entry or "sha256" not in entry:
+            problems.append(f"MANIFEST.json has no {engine} model entry with a file and sha256")
+            continue
+        weights = models / entry["file"]
+        if not weights.exists():
+            problems.append(f"semantic/models/{entry['file']} is missing; run scripts/infer_eval/export_models.py")
+        elif file_sha256(weights) != entry["sha256"]:
+            problems.append(
+                f"semantic/models/{entry['file']} does not match its MANIFEST.json sha256; "
+                f"re-export it rather than editing it"
+            )
+
+    features = manifest.get("features")
+    if not isinstance(features, dict) or "script" not in features or "sha256" not in features:
+        problems.append("MANIFEST.json does not stamp the feature extractor it was trained on")
+    else:
+        script = root / features["script"]
+        if not script.exists():
+            problems.append(f"{features['script']} is missing; the shipped models read its features")
+        elif file_sha256(script) != features["sha256"]:
+            problems.append(
+                f"{features['script']} has changed since the models were trained "
+                f"(MANIFEST.json sha256 differs); retrain and re-export with "
+                f"scripts/infer_eval/export_models.py, or restore the extractor"
+            )
+
+    labels = manifest.get("labels")
+    shipped = predict_labels(root)
+    if not isinstance(labels, list):
+        problems.append("MANIFEST.json has no label vocabulary")
+    elif shipped is None:
+        problems.append("semantic/src/predict.rs has no LABELS table to check the models against")
+    elif shipped != labels:
+        problems.append(
+            "semantic/src/predict.rs LABELS and MANIFEST.json labels disagree; "
+            "a model's output index means a different type in each"
+        )
+
+    if not manifest.get("training_data"):
+        problems.append("MANIFEST.json does not record the projects the models were trained on")
+
+    # The training data is not pinned -- a retrain takes each project's newest
+    # commit -- so a run is reproducible only through what it recorded. Weights
+    # exported before this record existed are grandfathered; once a manifest
+    # carries either block, it has to carry enough of it to act on.
+    env = manifest.get("environment")
+    if env is not None and not all(k in env for k in ("device", "seed", "torch")):
+        problems.append("MANIFEST.json environment does not say device, seed and torch version")
+    prov = manifest.get("provenance")
+    if prov is not None:
+        if not prov.get("pyrs_commit"):
+            problems.append("MANIFEST.json provenance does not name the compiler revision it was built at")
+        if not prov.get("scripts"):
+            problems.append("MANIFEST.json provenance does not hash the training scripts")
+
+    if not problems:
+        n = len(manifest["training_data"])
+        print(f"  type predictors match their manifest: {len(labels)} labels, trained on {n} projects")
+    return problems
+
+
+def file_sha256(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+LABELS_TABLE = re.compile(r"const LABELS: \[&str; [0-9]+\] = \[(.*?)\];", re.S)
+
+
+def predict_labels(root: Path) -> list[str] | None:
+    """The label vocabulary as `semantic/src/predict.rs` declares it."""
+    source = root / "semantic" / "src" / "predict.rs"
+    if not source.exists():
+        return None
+    table = LABELS_TABLE.search(source.read_text(encoding="utf-8"))
+    return re.findall(r'"([^"]*)"', table.group(1)) if table else None
+
+
 def check_typeshed_seeds(root: Path) -> list[str]:
     """The typeshed parameter table must be the generator's output.
 
@@ -294,6 +396,7 @@ def main() -> int:
         problems += check_historical_untouched(root)
         problems += check_unicode_tables(root)
         problems += check_typeshed_seeds(root)
+        problems += check_models(root)
     if args.only in (None, "links"):
         print("documentation links:")
         problems += check_links(root)
