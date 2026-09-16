@@ -19772,11 +19772,18 @@ fn lower_if_exp(
     };
 
     // A mixed-numeric join is a union, so each branch is boxed into it and
-    // keeps its own runtime type.
-    let (then_val, else_val) = if matches!(ty, ir::Ty::Union(_)) {
-        (to_union(then_val, ty), to_union(else_val, ty))
-    } else {
-        (then_val, else_val)
+    // keeps its own runtime type. A join to `Any` -- one arm is dynamic, as a
+    // recursive call whose return type is still being decided is -- boxes the
+    // concrete arm for the same reason: the temp holds a tagged pointer, and
+    // assigning a bare `int` to it leaves whatever reads the tag reading a
+    // number as an address.
+    let (then_val, else_val) = match ty {
+        ir::Ty::Union(_) => (to_union(then_val, ty), to_union(else_val, ty)),
+        ir::Ty::Any => (
+            coerce(then_val, ty, body.span, "conditional expression")?,
+            coerce(else_val, ty, orelse.span, "conditional expression")?,
+        ),
+        _ => (then_val, else_val),
     };
 
     let name = ctx.fresh_temp("ifexp", ty);
