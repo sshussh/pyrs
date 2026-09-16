@@ -384,3 +384,30 @@ fn a_constructor_call_site_types_its_parameter() {
         "{types}"
     );
 }
+
+/// A recursive call in one arm of a conditional expression has no return type
+/// yet, so the arm cannot be typed -- and the whole `return` was dropped with
+/// it, leaving `fact` returning nothing and `n * fact(n - 1)` multiplying by
+/// `None`. Each arm counts as its own return, exactly as the `if`/`return`
+/// spelling of the same function does, so the base case decides.
+#[test]
+fn a_recursive_return_through_a_conditional_expression_is_typed() {
+    let src = "def fact(n):\n    return 1 if n <= 1 else n * fact(n - 1)\nprint(fact(5))\n";
+    matches_python("ternary-recursion", src);
+    let types = show_types("ternary-recursion-types", src);
+    assert!(types.contains("fact(n: int) -> int"), "{types}");
+}
+
+/// The same function reached with an int and a float is dynamic, so the
+/// conditional expression joins a concrete arm with a dynamic one. The join
+/// is `Any`, and the concrete arm has to be boxed into it: assigning a bare
+/// `int` to the dynamic temp had it read back as a pointer, which surfaced as
+/// an `UnboundLocalError` or an operand type nothing in the program mentions.
+#[test]
+fn a_recursive_conditional_boxes_its_arms_when_call_sites_disagree() {
+    let src =
+        "def fact(n):\n    return 1 if n <= 1 else n * fact(n - 1)\nprint(fact(5), fact(2.0))\n";
+    matches_python("ternary-recursion-mixed", src);
+    let types = show_types("ternary-recursion-mixed-types", src);
+    assert!(types.contains("fact(n: Any) -> Any"), "{types}");
+}
