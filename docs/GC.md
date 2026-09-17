@@ -163,10 +163,11 @@ time and locality:
 - **every managed object is an individual `calloc` on one global intrusive
   list**, which is the measured bottleneck rather than a theoretical one: the
   collector walks a cache-cold pointer chain twice per pass and records one
-  range per live object. On the `objects` benchmark that is the whole gap
-  against CPython, 47 ms with `PYRS_GC=none` against 111 ms with the collector
-  on. Size-classed blocks, aligned so a candidate's owner is a mask and a
-  divide, would retire the range array and the granule index along with it;
+  range per live object. On the `objects` benchmark, best of five, the program
+  takes 36 ms with `PYRS_GC=none` and 66 ms with the collector on, against
+  CPython's 78 ms: the mutator is well ahead and the collector gives most of
+  that lead back. Size-classed blocks, aligned so a candidate's owner is a mask
+  and a divide, would retire the range array and the granule index with it;
 - conservative native roots and erased payload slots may delay reclamation;
 - nonmoving sweep can fragment the native allocator;
 - there is no nursery, remembered set, incremental marking, compaction, or

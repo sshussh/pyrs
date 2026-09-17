@@ -573,7 +573,7 @@ documentation and the relevant gates.
 - [x] Measured compile time and runtime; safely cache runtime objects keyed
       on runtime content, compiler, target and options (0.109). Whole
       programs are cached on the same terms, so an unchanged `pyrs run`
-      compiles nothing: 2.6 s to 11 ms, and 84 ms for a new program against a
+      compiles nothing: 2.8 s to 7 ms, and 80 ms for a new program against a
       warm runtime cache.
 - [x] Bound and manage that cache (0.111): `pyrs cache dir/info/clean/prune`,
       least-recently-used eviction against `--older-than` and `--max-size`,

@@ -71,20 +71,31 @@ correctness trap rather than just a slow path.
 more than produce sorted output. CPython's `TypeError` for an unorderable pair
 names the two types in the order its own algorithm happens to meet them, so
 reproducing the message requires reproducing the algorithm's structure. The
-kernel follows CPython's timsort, not merely a stable merge sort, and it
-handles a million elements in 0.25 seconds against CPython's 0.23. An earlier
-quadratic implementation was 23 times slower than CPython at 16,000 elements.
+kernel follows CPython's timsort rather than merely a stable merge sort. A
+whole program that builds and sorts a million dynamic values runs in 0.20s
+against CPython's 0.14s. The implementation this replaced was quadratic, and
+was 23 times slower than CPython at 16,000 elements.
 
 **`key=` sorting.** A `key=` callable is applied once per element, then the
 keys are sorted. Recomputing the key inside the comparator turns an O(n log n)
 sort into O(n log n) key evaluations, which for an expensive key is the whole
 cost of the operation.
 
-**`%` formatting on a dynamic string.** Mapping keys, `*` width and precision,
-`%c` and `%a` are all implemented, and the error for a malformed format is
-CPython's. `"%(k)s" % 5` is not an unsupported feature; it is a `TypeError`
-reading `format requires a mapping`, and reporting it as unsupported would be
-a lie about what the compiler can do.
+**`%` formatting on a dynamic string.** A statically typed `str` needs a
+literal format string, because its conversions are resolved at compile time. A
+dynamic one is formatted at run time instead, with mapping keys, `*` width and
+precision, `%c` and `%a` all implemented, and the error for a malformed format
+is CPython's:
+
+```python
+def pick(n):
+    return "%(k)s" if n > 0 else 5
+
+print(pick(1) % pick(-1))    # TypeError: format requires a mapping
+```
+
+Reporting that as an unsupported feature would be a lie about what the compiler
+can do: CPython rejects it too, with exactly this message.
 
 ## Making it fast
 
@@ -140,16 +151,17 @@ compiled with that profile, then executed with string arguments. The guard
 misses, the kernel takes over, and the output matches CPython, including under
 `PYRS_GC_STRESS=1`.
 
-At 50 million iterations of `total = total + i` with both operands dynamic:
+At 50 million iterations of `total = total + step` with both operands dynamic,
+best of three:
 
 | Path | Time |
 |---|---:|
-| `total: int`, statically typed | 0.046s |
-| dynamic, no profile | 1.290s |
-| dynamic, profiled | 0.039s |
+| `total: int`, statically typed | 0.035s |
+| dynamic, no profile | 0.235s |
+| dynamic, profiled | 0.042s |
 
-The profiled dynamic loop matches the statically typed one within noise, and is
-33 times faster than the unprofiled kernel.
+The profiled dynamic loop comes within 20% of the statically typed one, and is
+5.6 times faster than the unprofiled kernel.
 
 ### 3. Polymorphic caches
 
@@ -181,9 +193,10 @@ The honest summary is a hierarchy:
 2. A profiled monomorphic dynamic operation is the same, behind one tag
    compare.
 3. A polymorphic site with four or fewer types is a short chain of compares.
-4. An unprofiled dynamic operation is a call into a kernel, roughly 30 times
-   slower than the first case, and the call also blocks loop invariant
-   hoisting for the code around it.
+4. An unprofiled dynamic operation is a call into a kernel, roughly 7 times
+   slower than the first case on integer arithmetic, and the call also blocks
+   loop invariant hoisting for the code around it. The multiple is larger for
+   operations whose kernel does more, such as a method lookup on a string.
 
 Annotate the hot path. Leave the rest alone. `pyrs check --show-types` shows
 which functions are dynamic today, and `pyrs profile` turns the worst of them

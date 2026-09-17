@@ -220,10 +220,11 @@ PyRs bugs.
 A discovered project caches compiled C runtime objects and whole programs in its
 `target/` directory, so an unchanged `pyrs run` compiles nothing.
 
-| | Cold | Cached |
-|---|---:|---:|
-| Unchanged program | 2610 ms | 11 ms |
-| New program | 2610 ms | 84 ms |
+| | Time |
+|---|---:|
+| Cold build, `--no-cache` | 2765 ms |
+| Unchanged program, cached | 7 ms |
+| New program, warm runtime cache | 80 ms |
 
 `--no-cache` reuses and publishes nothing. Invocations without a discovered
 project use the global fallback at `$XDG_CACHE_HOME/pyrs`, and `PYRS_CACHE_DIR`

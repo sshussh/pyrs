@@ -6,48 +6,54 @@ and the specific changes that produced them.
 ## Benchmarks
 
 `benchmarks/run.sh` compiles each program with `pyrs -O2`, verifies that its
-output is byte identical to `python3`'s, and only then reports best of five
-wall clock times. A benchmark whose output differs is a failure, not a slow
-result.
+output is byte identical to `python3`'s, and only then reports the best wall
+clock time of `RUNS` runs (3 by default). A benchmark whose output differs is a
+failure, not a slow result.
 
 | Benchmark | Workload | python3 | PyRs | Speedup |
 |---|---|---:|---:|---:|
-| nbody | float and list, 5 body gravity, 100k steps | 0.815s | 0.020s | 41.2x |
-| mandelbrot | float math, 500x500 escape iterations | 0.604s | 0.018s | 33.6x |
-| pipeline | lazy `map` and `filter` over 2M elements | 0.332s | 0.017s | 19.6x |
-| strings | per character iteration, 2.6M comparisons | 0.373s | 0.023s | 16.3x |
-| iteration | `zip` and `enumerate`, 2M paired steps | 0.340s | 0.022s | 15.7x |
-| primes | integer loops, trial division to 300k | 0.430s | 0.031s | 14.0x |
-| matmul | nested lists, 250x250 matrix multiply | 0.552s | 0.042s | 13.0x |
-| fib | recursion, 30M calls (`fib(35)`) | 0.693s | 0.054s | 12.9x |
-| listcomp | comprehensions, 3M element map and filter | 0.481s | 0.046s | 10.4x |
-| sort | list indexing, bubble sort of 5000 | 0.664s | 0.079s | 8.4x |
-| exceptions | 400k calls, 171k raise and catch round trips | 0.103s | 0.016s | 6.5x |
-| objects | 400k small live objects, traced and swept | 0.106s | 0.111s | 1.0x |
-| dicts | 1.2M dict and set operations, string keys | 0.248s | 0.332s | 0.7x |
-| **total** | | 5.741s | 0.811s | 7.1x |
+| nbody | float and list, 5 body gravity, 100k steps | 0.817s | 0.018s | 46.7x |
+| mandelbrot | float math, 500x500 escape iterations | 0.606s | 0.017s | 36.1x |
+| pipeline | lazy `map` and `filter` over 2M elements | 0.298s | 0.014s | 21.2x |
+| strings | per character iteration, 2.6M comparisons | 0.368s | 0.022s | 16.8x |
+| iteration | `zip` and `enumerate`, 2M paired steps | 0.309s | 0.019s | 16.3x |
+| primes | integer loops, trial division to 300k | 0.428s | 0.031s | 13.9x |
+| matmul | nested lists, 250x250 matrix multiply | 0.543s | 0.042s | 12.8x |
+| fib | recursion, 30M calls (`fib(35)`) | 0.682s | 0.054s | 12.6x |
+| listcomp | comprehensions, 3M element map and filter | 0.395s | 0.038s | 10.3x |
+| sort | list indexing, bubble sort of 5000 | 0.655s | 0.077s | 8.5x |
+| exceptions | 400k calls, 171k raise and catch round trips | 0.102s | 0.015s | 6.8x |
+| objects | 400k small live objects, traced and swept | 0.079s | 0.068s | 1.2x |
+| dicts | 1.2M dict and set operations, string keys | 0.242s | 0.272s | 0.9x |
+| **total** | | 5.524s | 0.687s | **8.0x** |
 
-Measured on Linux with LLVM 22 and CPython 3.14, best of seven at a load of
-roughly 3 of 16 cores. Absolute times move with machine load. The speedup
-column is the comparable number, because both engines are timed in the same
-run.
+Measured with `RUNS=5 ./benchmarks/run.sh` on Linux with LLVM 22 and CPython
+3.14. Absolute times move with machine load, so the speedup column is the
+comparable number: both engines are timed in the same run, minutes apart.
 
 ## The two at the bottom
 
-Compute bound code is 6 to 41 times faster. The last two rows are the honest
-exception and they are in the table for that reason: **allocation heavy code is
-not yet faster than CPython.**
+Compute bound code is 7 to 47 times faster. The eleven benchmarks above
+`objects` total 15.0x on their own; the aggregate reads 8.0x because the last
+two are in the table, and they are in the table for a reason: **allocation
+heavy code is where PyRs is weakest.**
 
-`objects` and `dicts` both build hundreds of thousands of short lived objects.
-Every managed object is an individual `calloc` on one global intrusive list.
-With `PYRS_GC=none` the `objects` benchmark runs in 47 ms against 111 ms with
-the collector enabled, so the mutator is already twice CPython's speed and the
-collector is the entire gap. [GC.md](GC.md) describes the size classed block
-design that retires this.
+`objects` and `dicts` both build hundreds of thousands of short lived objects,
+and every managed object is an individual `calloc` on one global intrusive
+list. The collector is the whole of that cost. On `objects`, best of five:
 
-Adding `dicts` is also why the aggregate reads 7.1x rather than the 11.6x of
-the twelve benchmarks before it. A benchmark that exposes a weakness lowers the
-average, and leaving it out would not have made the compiler faster.
+| | Time |
+|---|---:|
+| PyRs, collector on | 66 ms |
+| PyRs, `PYRS_GC=none` | 36 ms |
+| CPython | 78 ms |
+
+The mutator is more than twice CPython's speed and the collector gives most of
+it back. `dicts` is the one benchmark still slower than CPython at 0.9x.
+[GC.md](GC.md) describes the size classed block design that retires this.
+
+A benchmark that exposes a weakness lowers the average, and leaving it out
+would not have made the compiler faster.
 
 ## Why compiled code is fast
 
@@ -123,32 +129,34 @@ short form is:
 | Path | Relative cost |
 |---|---|
 | Statically typed operation | 1 |
-| Profiled monomorphic dynamic operation | roughly 1, behind one tag compare |
+| Profiled monomorphic dynamic operation | roughly 1.2, behind one tag compare |
 | Polymorphic site, four types or fewer | a short chain of compares |
-| Unprofiled dynamic operation | roughly 30, plus lost hoisting |
+| Unprofiled dynamic operation | roughly 7 on integer arithmetic, more when the kernel does more, plus lost hoisting |
 
-At 50 million iterations of a dynamic accumulation loop, the unprofiled kernel
-takes 1.290s, the profiled build takes 0.039s, and the statically typed
-equivalent takes 0.046s.
+At 50 million iterations of a dynamic accumulation loop, best of three, the
+unprofiled kernel takes 0.235s, the profiled build takes 0.042s, and the
+statically typed equivalent takes 0.035s.
 
 ## Compile time
 
 Builds are cached, keyed by source. An unchanged program recompiles nothing.
 
-| | Cold | Cached |
-|---|---:|---:|
-| Unchanged program | 2610 ms | 11 ms |
-| New program | 2610 ms | 84 ms |
+| | Time |
+|---|---:|
+| Cold build, `--no-cache` | 2765 ms |
+| Unchanged program, cached | 7 ms |
+| New program, warm runtime cache | 80 ms |
 
-Type checking alone, which is what `pyrs check` does, runs in roughly 16 to 19
-ms for a typical single file program. Selecting a learned inference engine adds
-about 2 ms for `ml` and about 5 ms for `dl`, and bypasses the cache.
+Type checking alone, which is what `pyrs check` does, takes 6 ms on a trivial
+file and a median of 16 ms across the 293 program corpus. Selecting a learned
+inference engine adds about 2 ms for `ml` and about 5 ms for `dl` to that
+median, and bypasses the build cache.
 
 ## Reproducing any of this
 
 ```console
-./benchmarks/run.sh          # the table above, best of RUNS (default 3)
-make bench RUNS=7            # the same through make
+RUNS=5 ./benchmarks/run.sh   # the table above
+make bench RUNS=5            # the same through make
 make infer-eval              # the inference measurements
 ```
 

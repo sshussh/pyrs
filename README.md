@@ -71,8 +71,8 @@ pyrs test                        # compile and run the project's tests
 pyrs doctor                      # what PyRs found, and whether it is enough
 ```
 
-Builds are cached, so an unchanged `pyrs run` recompiles nothing: 11 ms against
-a cold 2610 ms. Project configuration lives in `pyproject.toml`, the file the
+Builds are cached, so an unchanged `pyrs run` recompiles nothing: 7 ms against
+a cold 2765 ms. Project configuration lives in `pyproject.toml`, the file the
 rest of the Python toolchain already reads:
 
 ```toml
