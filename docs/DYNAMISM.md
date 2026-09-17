@@ -57,6 +57,43 @@ For the garbage collector, a pair in registers is an ordinary conservative
 root, and the payload word is candidate checked like any other erased slot.
 See [GC.md](GC.md).
 
+### Why this was the change worth making
+
+Two measurements decided it, and neither is about type inference.
+
+Across six heavily annotated real projects (31,899 parameters, 25,996 of them
+annotated), the annotations were classified by whether PyRs could represent
+them at all:
+
+| Annotation kind | Share of annotated parameters | Representable |
+|---|---:|---|
+| User class defined in the project | 32.0% | yes |
+| Scalar: `int`, `float`, `str`, `bool` | 26.2% | yes |
+| Union or `Optional` | 14.1% | yes |
+| Container | 9.7% | yes |
+| Named class, enum or protocol | 8.0% | yes |
+| `Any` or `object` | 4.7% | no, must be dynamic |
+| Callable | 0.6% | yes |
+| Other or unresolved | 4.5% | |
+
+**90.8% of annotated parameters fall inside the representation space PyRs
+already had. Only 4.7% are genuinely dynamic.** The compiler did not need a
+richer type vocabulary; it needed to stop paying for the one it had.
+
+The second measurement, on the same 20 million iteration loop at `-O2`, showed
+where the cost actually was:
+
+| Version | Time | Allocated |
+|---|---:|---:|
+| `i: int` | 0.025s | 0 B |
+| `v: int \| str = i` | 0.024s | 0 B |
+| `v: object = i` | 0.591s | 320 MB, 305 collections |
+
+A two member union was already free, because it lowered to a pair in
+registers. `Any` lowered to a heap box with the same two fields, and cost 24
+times as much. Perfect type prediction would not have touched that row. Making
+the dynamic value the same pair the union already used is what did.
+
 ## Kernels
 
 Each operation has one runtime function that takes tagged values and does what

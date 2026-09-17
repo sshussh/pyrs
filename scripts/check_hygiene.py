@@ -61,9 +61,9 @@ VERSION_SITES: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
-# Documents that record what a past milestone shipped. Their version strings
-# are history and must not be rewritten to match the current version.
-HISTORICAL = ("docs/superpowers/plans/", "CHANGELOG.md")
+# The record of what past milestones shipped. Its version strings are history
+# and must not be rewritten to match the current version.
+HISTORICAL = ("CHANGELOG.md",)
 
 LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 FENCED = re.compile(r"```.*?```", re.S)

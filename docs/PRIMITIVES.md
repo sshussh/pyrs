@@ -205,6 +205,41 @@ optional model).
 | **Steady state** | Most modules in **PyRs** | Call builtins/methods + thin `_pyrs` / `_posix` for leftovers |
 | **New C for stdlib?** | Only new **primitive families** | e.g. regex engine, not `pathlib` or JSON grammar in C |
 
+### What a pure PyRs module actually achieved
+
+`json` is the module that proved the policy, so its measured result is the
+reference point for the next one.
+
+**Parity.** 48 valid documents and 44 malformed ones, diffed against CPython's
+`json`: 48 of 48 values identical, including bignums beyond `i64`, astral
+escapes and surrogate pairs, and 41 of 44 error messages byte identical with
+their positions, such as `Expecting ',' delimiter: line 1 column 8 (char 7)`.
+`JSONDecodeError` subclasses `ValueError` as CPython's does, so
+`except ValueError` catches it.
+
+Two behaviours that the grammar does not imply had to be matched to get there.
+CPython scans a maximal valid number and reports the rest as extra data, so
+`01` is the number `0` followed by junk, `1.` is `1` followed by `.`, and `1e`
+is `1` followed by `e`. And a trailing comma has its own message, reported at
+the comma rather than at what follows it.
+
+One difference is deliberate: a lone surrogate escape such as `"\ud800"` with
+no low half is an error here, where CPython yields a lone surrogate. A PyRs
+`str` is well formed UTF-8 and has nowhere to put one. A surrogate pair decodes
+to the astral code point it denotes, which is the case that appears in real
+documents. Nesting is capped at 200 so an adversarial document raises rather
+than overflowing the native stack.
+
+**Speed, both numbers.** On a 20 by 2000 object document, the compiled module
+is 1.8 times faster than CPython running the same PyRs source, and 6.8 times
+slower than CPython's C `json` module. The second number belongs in the record
+as much as the first: a library written in PyRs does not beat a C extension.
+
+1.8x is low against the benchmark corpus, and the reason is the lesson for the
+next module: this workload is dynamic value boxing and hash table inserts, not
+arithmetic. The optimizations that take `nbody` to 46x do not reach it. If
+`json` needs to be faster, the lever is the boxing, not the parser.
+
 ### Example split (current + later)
 
 | Module piece | Implementation | Explanation |

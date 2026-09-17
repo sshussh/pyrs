@@ -120,6 +120,37 @@ Four separate cases, each found by profiling rather than by reading code:
 O(n log n) comparisons into O(n log n) key evaluations. Keys are now computed
 once per element and the sort orders by them.
 
+## Two changes that did not survive measurement
+
+Both were implemented in full and then removed. They are recorded because the
+reasoning that motivated them was sound, and someone will have it again.
+
+**LLVM alias metadata on the runtime.** Disassembling `pyrs_sort` showed the
+length and data pointer loads being reloaded inside the innermost loop, 14
+header loads across the function, although the list is a loop invariant
+parameter. The fix was `!alias.scope` and `!noalias` separating a container
+header from its element buffer, plus `nounwind`, `memory(read)` and
+`willreturn` on the nine runtime functions that provably neither allocate nor
+trap.
+
+The effect was nothing: every benchmark within noise, a purpose built read only
+float loop within noise, and the header load count unchanged at 14. The reason
+is that every loop carries a tagged integer counter whose cold edge calls
+`pyrs_int_add`, which can allocate a bignum and therefore cannot be attributed.
+One such clobber stops loop invariant code motion regardless of what the other
+calls promise. The route that would pay is a machine `i64` induction variable
+for `range` loops with statically small bounds, which removes the clobber
+instead of describing it.
+
+**Retaining the collector's scratch buffers.** `ranges_push` is 15% of the
+`objects` benchmark, and the array does restart at capacity 64 and double its
+way to roughly 600,000 entries every pass, copying up to 14 MB on the way. But
+that is about 56 reallocations against 2.4 million pushes, and removing the
+regrowth measured at nothing: 104 ms against 105 ms. The 15% is the pushes
+themselves, one per live object per collection, which only a different heap
+layout removes. Retaining the buffers would also have pinned the high water
+mark in resident memory.
+
 ## Dynamic code
 
 Everything above concerns code whose types the compiler knows. Code it does not

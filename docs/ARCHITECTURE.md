@@ -185,6 +185,62 @@ integers, floats bit cast, pointers through `ptrtoint` and `inttoptr`. The
 encoding is owned by two helpers, `slot_from_value` and `value_from_slot`, so
 it is defined in exactly one place.
 
+### Integers
+
+`int` is arbitrary precision, so it cannot simply be an `i64`. It is a tagged
+word:
+
+```text
+T(v) = (v << 1) | 1        for v in [-2^62, 2^62 - 1]   (bit 0 set)
+       pointer to PyrsInt  otherwise                    (bit 0 clear)
+```
+
+Two properties of that encoding carry the arithmetic. `T` is strictly
+increasing and never wraps, because its image is exactly `[-2^63 + 1,
+2^63 - 1]`. And `T(v)` always has bit 0 set where a collector pointer does not,
+so `a & b` has bit 0 set precisely when both operands are small.
+
+The overflow check exploits the first property. Rather than untagging, adding,
+and checking the result against the small range, the emitted code computes
+`2s + 1` directly in one `i64` operation and takes the signed overflow flag as
+the range test. Writing `s` for the true mathematical result:
+
+```text
+2s + 1 <=  2^63 - 1   <=>   s <= 2^62 - 1 = SMALL_MAX
+2s + 1 >= -2^63       <=>   s >= -2^62 - 1/2   <=>   s >= -2^62 = SMALL_MIN
+```
+
+The half integer on the lower bound is what makes the test exact rather than
+conservative: `s = SMALL_MIN - 1` gives `2s + 1 = -2^63 - 1`, which does
+overflow. So "no overflow" means exactly "the result is a small int", with no
+slack at either end, in one instruction.
+
+### Strings
+
+A string is UTF-8 with a cached code point count:
+
+```c
+typedef struct {
+    long long cplen;   /* code points, which is what len() returns */
+    long long len;     /* UTF-8 bytes */
+    char data[];
+} PyrsStr;
+```
+
+UTF-8 was kept rather than a PEP 393 style kind tagged buffer because the
+alternative converts at every boundary: `print`'s raw `fwrite`, file I/O, the
+CPython bridge, literals, and every concatenation between kinds. The cost is
+that indexing a non-ASCII string is amortized rather than exactly O(1), which
+is a [documented difference](GUIDE.md#differences-from-cpython).
+
+Two details do most of the work. `cplen` comes first, because codegen's
+`emit_len` loads the first `i64` of every sized object, so putting the Python
+answer there meant `len()` needed no codegen change at all. And the byte count
+keeps the name `len`, because nearly every existing use of `->len` means bytes:
+`memcmp`, `memcpy`, `fwrite`, the substring searches, the bridge's
+`PyUnicode_DecodeUTF8`. The ASCII fast path then needs no flag, since every
+code point being one byte is exactly `cplen == len`.
+
 ## Multi-module compilation
 
 `cli/src/modules.rs` resolves the import graph before analysis begins. Absolute

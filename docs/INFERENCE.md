@@ -76,6 +76,36 @@ A parameter that none of the above reaches is dynamic. That is not an error.
 See [DYNAMISM.md](DYNAMISM.md) for what a dynamic value can do, which is
 everything CPython allows, at a cost.
 
+### Why the order is that way
+
+The ordering is not a preference. It was measured before the engine was built,
+on 12,601 annotated parameters in CPython's own standard library, by asking
+what evidence each parameter offers:
+
+| Evidence available for a parameter | Share |
+|---|---:|
+| Only passed to another call, so it needs the call graph | 43.3% |
+| Stored or passed through, with no local evidence at all | 34.9% |
+| Structural only: an operator, an index, an iteration | 10.5% |
+| Weak | 9.1% |
+| A method unique to one builtin type, which pins it exactly | 2.3% |
+
+Body-local inference, the kind that reasons from `x.upper()`, reaches about 2%
+of real parameters. Close to 80% of the information is in the call graph. An
+engine built the other way round, inferring from bodies and consulting call
+sites as a fallback, would be optimizing the 2% case.
+
+A second experiment set the expectations for what that buys. Hiding every
+annotation across six real projects (17,117 parameters) and iterating a
+worklist seeded only from literals, constructor calls and known builtin
+returns determined 26.1% of them, at 71% agreement with the hidden
+annotations. Seeds, not the propagation, are the bottleneck. Injecting ground
+truth for a fraction of parameters and re-running showed that **a seed buys
+approximately itself**, with declining returns: 5% of parameters seeded gained
+1.03 parameters each, 50% seeded gained 0.78 each. There is no downstream
+amplification to bank on, which is precisely why the learned predictor below is
+judged on its direct hit rate rather than on a cascade.
+
 ## The algorithm: rounds of real lowering
 
 Inference is not a separate pass over the AST. It is the real lowering, run

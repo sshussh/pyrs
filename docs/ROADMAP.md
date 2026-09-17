@@ -48,8 +48,7 @@ that is what the release gates below are for.
 A coverage audit on 2026-09-08 compiled 280 probes and diffed each against
 CPython 3.14.7 on stdout, stderr and exit status. It is the input to the
 breadth-first feature ordering, and it found three defects rather than three
-missing features -- closed in 0.134, see
-[the audit](superpowers/plans/2026-09-09-coverage-audit-and-tier-zero.md).
+missing features, closed in 0.134.
 
 | Surface | PyRs | CPython |
 |---|---:|---:|
@@ -613,7 +612,7 @@ documentation and the relevant gates.
       benchmark now faster than CPython. LTO was considered and rejected, it
       needs matching clang for both halves, makes runtime objects
       non-cacheable, and asks LLVM to rediscover the fast path from opaque C.
-      See [the plan](superpowers/plans/2026-09-08-inline-int-arithmetic.md).
+      See [the integer representation](ARCHITECTURE.md#integers).
 - [x] Narrow the `volatile` local rule (0.127). A function with a `try`
       anywhere marked every local volatile, defeating `mem2reg` function-wide;
       C's rule only covers locals *changed* between the `setjmp` and the

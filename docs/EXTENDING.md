@@ -299,7 +299,7 @@ features.
    fails too, so the README divergence list cannot go stale.
 7. **Type prediction:** [`scripts/infer_eval/`](../scripts/infer_eval) is the
    offline harness behind `--infer` (see
-   [the record](superpowers/plans/2026-09-16-learned-type-prediction.md)).
+   [INFERENCE.md](INFERENCE.md#learned-prediction)).
    `corpus.py` collects every repository program that compiles *with* its
    annotations and matches CPython; `evaluate.py LABEL --engine ml` measures an
    engine on that corpus with the annotations stripped; `parity.py` checks the

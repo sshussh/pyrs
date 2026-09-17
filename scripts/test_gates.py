@@ -215,7 +215,6 @@ class HygieneGateTests(unittest.TestCase):
             """,
         )
         write(root / "CHANGELOG.md", "# Changelog\n")
-        write(root / "docs/superpowers/plans/keep.md", "# history\n")
         write(
             root / "codegen/runtime/unicode_data.h",
             f'#define PYRS_UNIDATA_VERSION "{unicodedata.unidata_version}"\n'

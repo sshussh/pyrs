@@ -32,10 +32,6 @@ executables through LLVM. This directory is the complete documentation.
 | [ROADMAP.md](ROADMAP.md) | Open gaps and what 1.0 requires |
 | [../CHANGELOG.md](../CHANGELOG.md) | What changed in every release |
 
-`superpowers/plans/` holds the design records for individual milestones. They
-are historical documents: each describes the state of the project when it was
-written and is not updated afterwards.
-
 ## Conventions used in these documents
 
 * Code that appears in an example has been run. Output shown next to a program
