@@ -961,7 +961,7 @@ widens one. Homogeneous literals keep their optimized unboxed storage.
 
 More programs compile to a union, so more programs reach what a union cannot
 yet do. That surface was never written down, so it is now — a table in
-[GUIDE section 9](docs/GUIDE.md#9-differences-from-cpython), built by probing
+[GUIDE section 9](docs/GUIDE.md#differences-from-cpython), built by probing
 each operation rather than by reading the source.
 
 Works without narrowing: `print`, truthiness, `in` over a container of them,

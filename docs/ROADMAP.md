@@ -1,20 +1,11 @@
-# PyRs roadmap to 1.0
+# Roadmap to 1.0
 
-Status: implementation in progress. **Not a 1.0 release declaration.**
-Reaching a particular minor version does not establish 1.0 readiness, and no
-stable release or tag has been created.
+What is still missing, in what order, and what shipping 1.0 would require.
+This document is forward looking. What already shipped, and when, is in
+[the changelog](../CHANGELOG.md).
 
-This document is forward-looking: what is still missing, in what order, and
-what shipping 1.0 would require. **What already shipped, and when, is in
-[the changelog](../CHANGELOG.md)** -- this file used to carry a section per
-milestone and a validation table per release, which grew to 70% of its
-length and duplicated the changelog entry for the same work.
-
-It is also the single roadmap. It absorbed the separate `ROADMAP-1.0.md`
-delivery plan in 0.88, because the two had begun to contradict each other:
-one listed exact int/float comparison as an open gap while the other
-recorded it as fixed, and they disagreed about whether to bump minor
-versions per milestone.
+Reaching a particular minor version does not establish 1.0 readiness. No stable
+release or tag has been created.
 
 | Section | Purpose |
 |---------|---------|
@@ -47,7 +38,7 @@ recorded in [the changelog](../CHANGELOG.md). The most recent run:
 | `make compatibility` | native 81 pass / 3 known_gap / 6 skipped; compat 28 pass / 6 skipped. The known gap is `mutable-defaults`, a recorded `mismatch`. The skips are the numpy and pandas cases, absent from this machine rather than excluded from the run |
 | `pyrs --version` | `PyRs 0.152.0` |
 
-Measured on Rust 1.96.1, LLVM 22.1.8, CPython 3.14.7, GCC 16.2.1. CI uses
+Measured on Rust 1.96.1, LLVM 22.1.8; CPython 3.14.7, GCC 16.2.1. CI uses
 Ubuntu 24.04, LLVM 18 and CPython 3.14. **These results do not establish
 clean-machine release portability or complete Python compatibility** --
 that is what the release gates below are for.
@@ -110,9 +101,9 @@ not cover them.
 | Numeric and binding semantics | Closed in 0.86 for mixed int/float comparison and conditionally assigned locals. Closed in 0.89: mixed-numeric list/tuple **literals** keep each element's own type instead of promoting to one. Still open: converting an already-typed `list[int]` into `list[float]`/a union by assignment (only a literal's own elements are joined); dynamic negative integer powers trap; module globals, deletion and static use-before-assignment diagnostics | Fix silent differences in the supported contract or narrow that contract explicitly with diagnostics |
 | Generators and dynamism | `yield from` does not forward `send`/`throw`; generator exhaustion uses Optional None in several paths; `Any`, class attributes, inheritance, and class values remain restricted | Stabilize the intended subset and reject unsupported paths clearly; broader CPython dynamism is separate work |
 | Memory confidence | Conservative roots can retain garbage; abandoned generators do not run user finalizers; collection statistics exclude native/allocator overhead | Continue stress and exception-path tests and measure process memory on sustained workloads; see [GC.md](GC.md) |
-| Example parity gate | Closed in 0.86: `scripts/check_examples.py` compares raw stdout, stderr and exit status as bytes, builds and runs as separate steps, and its own failure paths are tested by `scripts/test_gates.py` | — |
+| Example parity gate | Closed in 0.86: `scripts/check_examples.py` compares raw stdout, stderr and exit status as bytes, builds and runs as separate steps, and its own failure paths are tested by `scripts/test_gates.py` |, |
 | Borrowed CPython buffers | Closed in 0.86 for reallocation: growth sites raise `BufferError` rather than freeing exporter- or `PyMem`-owned memory. Direct element stores are still only prevented by the extension frontend's allowlist | Add a store-side check or a distinct immutable buffer type before the bridge is non-experimental |
-| Failure artifacts | Closed in 0.88: integration tests build under `CARGO_TARGET_TMPDIR` (`target/tmp`, the path CI uploads) and retain their inputs when the thread is panicking | — |
+| Failure artifacts | Closed in 0.88: integration tests build under `CARGO_TARGET_TMPDIR` (`target/tmp`, the path CI uploads) and retain their inputs when the thread is panicking |, |
 | Release delivery | The compiler links system LLVM dynamically; archives have no clean-environment dependency check; manually selected release tags do not control archive version naming | State supported hosts/dependencies and verify extracted archives on clean hosts. Version agreement across crates, lockfile, docs and the binary is checked by `make hygiene` as of 0.88; tag-to-version agreement is not |
 | Documentation checks | Closed in 0.88: `make hygiene` checks version agreement across 20 sites and resolves every relative documentation link, and its own failure paths are tested | Add tag/version agreement at release time |
 | Sanitizers | Closed in 0.88 for reproducibility: `make asan` / `make ubsan` build the adapter, runtime and collector instrumented and run the extension boundary suite. The LLVM-generated kernel object is *not* instrumented, so this is adapter/runtime coverage | Instrument generated code, or state the boundary in release notes |
@@ -133,7 +124,7 @@ why correctness rather than new capability sets the near-term order.
 | `len("héllo")` | `5` | `5` | **closed in 0.90** |
 | `"héllo"[1]` | `é` | `é` | **closed in 0.90** |
 | `"héllo".find("l")` | `2` | `2` | **closed in 0.90** |
-| `len("🐍")` | `1` | `1` | **closed in 0.90** |
+| `len("𝄞")` | `1` | `1` | **closed in 0.90** |
 | `"naïve café".upper()` | `NAÏVE CAFÉ` | `NAÏVE CAFÉ` | **closed in 0.91** |
 | `"ß".upper()` | `SS` | `SS` | **closed in 0.91** |
 | `"é".isalpha()` | `True` | `True` | **closed in 0.91** |
@@ -146,7 +137,7 @@ why correctness rather than new capability sets the near-term order.
 | `e.args[0]` after `d["z"]` | `z` | `z` | **closed in review** |
 | `ascii(["é"])` | `['\xe9']` | `['\xe9']` | **closed in review** |
 | `f"{xs:}"` | `[1, 2]` | `[1, 2]` | **closed in review** |
-| `e.args` display | `('z',)` | `['z']` | **scope decision, 0.121** — see below |
+| `e.args` display | `('z',)` | `['z']` | **scope decision, 0.121**: see below |
 | `str((1, 2))`, `f"{[1, 2]}"` | `(1, 2)`, `[1, 2]` | `(1, 2)`, `[1, 2]` | **closed in 0.108** |
 | `list(zip(infinite(), [1]))` | `[(0, 1)]` | `[(0, 1)]` | **closed in 0.119** |
 | `(x for x in range(bound()))` | `bound()` at creation | `bound()` at creation | **closed in 0.120** |
@@ -186,15 +177,15 @@ rather than rediscovered:
 
 - It is a *display* difference, not a wrong computation. `e.args[0]`,
   `len(e.args)`, iteration and indexing all match CPython, and 0.121 made the
-  length match too — `raise E` gives 0 elements, `raise E("")` gives 1.
+  length match too, `raise E` gives 0 elements, `raise E("")` gives 1.
 - Closing it properly needs variable-length tuples, a type-system change out
   of all proportion to the symptom, and one that would be driven by the
   workload corpus rather than by this row.
-- The alternative — printing a list as though it were a tuple — would put a
+- The alternative, printing a list as though it were a tuple, would put a
   lie in the type system to fix a print.
 
 Treated like set-iteration order below: documented, tested, and closed. It is
-recorded in [the guide](GUIDE.md#9-differences-from-cpython) as a known
+recorded in [the guide](GUIDE.md#differences-from-cpython) as a known
 divergence, and reopens if variable-length tuples ever land.
 
 **With this and `repr(RuntimeError(""))`, release gate 2's outstanding list is
@@ -206,7 +197,7 @@ behind it. New probes append.
 though `print` formatted the same value correctly. The formatting logic was
 right; it was unreachable, because the print routines wrote straight to
 `stdout`. 0.108 routes them through a sink that `str()` can capture, so the
-two now agree by construction. `ascii()` of a container now works — it is the same rendering with non-ASCII
+two now agree by construction. `ascii()` of a container now works; it is the same rendering with non-ASCII
 escaped inside the elements, which the shared printer does under a flag. A
 *non-empty* format spec on a container stays rejected, matching CPython's
 `TypeError`; the **empty** spec (`f"{xs:}"`) was rejected too, which was
@@ -229,13 +220,13 @@ sets are deterministic there (ints hash to themselves) and could be matched by
 replicating CPython's table geometry, but doing so for ints alone would make
 our order depend on element type while still not matching for strings.
 Insertion order is kept, is documented, and programs needing deterministic
-output should use `sorted(s)` — which CPython users need for the same reason.
+output should use `sorted(s)`, which CPython users need for the same reason.
 
 Non-ASCII indexing is no longer O(n) per lookup. The one-entry memo made a
 forward walk amortised O(1) but did nothing for scattered access, which
 rescanned from the start: measured 118 ms against 2 ms for the same loop over
-ASCII, and 12 ms for CPython. The hot string now also gets a sampled index —
-the byte offset of every 32nd code point — so a lookup jumps to the nearest
+ASCII, and 12 ms for CPython. The hot string now also gets a sampled index,
+the byte offset of every 32nd code point, so a lookup jumps to the nearest
 sample and scans at most 32 code points. The same benchmark is now 3 ms, and
 the sequential walk is unchanged.
 
@@ -245,8 +236,8 @@ expressions **materialize their inputs** instead of advancing them lazily.
 `list(zip(infinite_generator(), [1]))` never terminates where CPython returns
 one pair, and any finite generator's side effects all run up front. A
 generator expression is the mirror image: CPython evaluates the *outermost*
-iterable when the genexp is created — `(x for x in range(bound()))` calls
-`bound()` right there — while PyRs leaves it in the synthesized body and calls
+iterable when the genexp is created, `(x for x in range(bound()))` calls
+`bound()` right there, while PyRs leaves it in the synthesized body and calls
 it on first iteration. Both were found by review on the 0.90-0.108 series and
 confirmed against CPython.
 
@@ -261,15 +252,15 @@ exist in half the compiler: comprehensions lowered through `CompIterParts`,
 a compile-time cursor of `{cond, element, step, kind}`, while `for` loops had
 a parallel family of hand-written `lower_for_*` functions and the eager
 builtins had a third path that drained to a list. Composition needed one new
-operation — normalising a cursor into *(statements that try to produce an
-element, test for whether one appeared)* — after which `zip` is those pairs
+operation, normalising a cursor into *(statements that try to produce an
+element, test for whether one appeared)*, after which `zip` is those pairs
 nested inside each other, so component *k+1* is only advanced when component
 *k* produced. `for`, comprehensions and the eager consumers now share it.
 
 **0.120 closed the second.** It needed less than expected. The hoist already
 preferred the eager path and fell back only when `lower_expr` failed, and by
 then `range(...)` was the only iterable still taking that branch. Rather than
-making `range` a first-class value — which needs a reified iterator — the
+making `range` a first-class value, which needs a reified iterator, the
 hoist gained a second form: when the iterable is not a value, its *operands*
 are hoisted and the form is rebuilt inside the synthesized body from
 parameters. `(x for x in range(bound()))` now calls `bound()` at creation
@@ -379,7 +370,7 @@ documentation and the relevant gates.
 - [x] Reading a container inside `Any` without naming its encoding (0.140).
       `Any` can hold a `list[int]` (element tag 4) or a `list[Any]` (tag 68)
       and `isinstance(v, list)` is true for both, so narrowing to a container
-      cannot choose between them — attempted in 0.139 and reverted, because it
+      cannot choose between them, attempted in 0.139 and reverted, because it
       turned `print(v)` on a concretely-typed list into a trap. `len(v)`,
       `v[i]`, `v[k]` (by `str` or by another dynamic value), `v.keys()` and
       `for x in v` instead read the value *through* the tag it already
@@ -424,13 +415,13 @@ documentation and the relevant gates.
       still refused: method calls on a dynamic value, `in` over a dynamic
       container, and `sorted()` of one.
 - [ ] **Operators and conversions on a union value**, measured and documented
-      in [GUIDE section 9](GUIDE.md#9-differences-from-cpython) as of 0.137.
+      in [GUIDE section 9](GUIDE.md#differences-from-cpython) as of 0.137.
       What works without narrowing: `print`, truthiness (`if x:` / `bool(x)`),
       `in` over a container of them, passing/returning one, and storing one as
       a dict value. What needs `isinstance` first: `str`/`repr`/f-string
       interpolation, every comparison and arithmetic operator, method calls,
-      `len`, and `sorted(key=...)`. All of it needs the same thing — runtime
-      dispatch on the union tag — so it is one piece of work with the `Any`
+      `len`, and `sorted(key=...)`. All of it needs the same thing, runtime
+      dispatch on the union tag, so it is one piece of work with the `Any`
       runtime-operations item above, not several.
       `str(x)` is the cheapest and most conspicuous: `print(x)` already
       renders a union through the runtime's tag dispatch, and `ContainerRepr`
@@ -445,7 +436,7 @@ documentation and the relevant gates.
       out because `True == 1` would demand collision with an int key.
 - [x] Positional-only and keyword-only rules, and signature binding for them
       (0.138): `/` and `*` markers with CPython's argument-passing rules,
-      keyword arguments on methods (instance, static, class and virtual — they
+      keyword arguments on methods (instance, static, class and virtual, they
       were refused for *any* method before, which made every
       `df.sort_values(by=...)`-shaped API unreachable), and module-level
       functions as first-class values including dispatch tables.
@@ -497,7 +488,7 @@ documentation and the relevant gates.
       target, which covers construction. **The obstacle for values is aliasing,
       not layout**: every list slot is 8 bytes whatever the element type, but a
       `list[str]` slot holds the string pointer and a `list[Any]` slot a box
-      wrapping it, so the conversion is an O(n) re-box into a fresh list — and
+      wrapping it, so the conversion is an O(n) re-box into a fresh list, and
       after `f.cols["k"] = xs`, an `xs.append(...)` would no longer be visible
       through the frame. Any design has to answer that first.
 - [ ] Complete iterator protocol: lazy `range`/`enumerate`/`zip`/`reversed`/
@@ -529,7 +520,7 @@ documentation and the relevant gates.
       code points, including astral and combining characters and embedded
       NUL. ASCII is recognised as `cplen == len` and keeps the existing byte
       paths. Still open: a reproducible Unicode data version, and
-      lone-surrogate and encoding-error behavior — a lone surrogate reaches
+      lone-surrogate and encoding-error behavior, a lone surrogate reaches
       the CPython bridge today and is rejected there as invalid UTF-8.
 - [x] Unicode case transforms, predicates, whitespace, padding, translation
       and formatting (0.91). `scripts/gen_unicode_tables.py` asks CPython
@@ -550,7 +541,7 @@ documentation and the relevant gates.
 ### E. Imports and libraries
 
 - [ ] Module objects, `__name__`/`__file__`/`__package__`, initialization
-      ordering, cycles, package `__main__`, relative imports, import errors. `__name__` closed in 0.124 —
+      ordering, cycles, package `__main__`, relative imports, import errors. `__name__` closed in 0.124,
       it has a compile-time answer (`__main__` for the entry module, the
       dotted import name otherwise), which the others do not.
 - [ ] Standard-library inventory driven by workload failures. Enumerate each
@@ -565,7 +556,7 @@ documentation and the relevant gates.
       express; its one difference is that `type(x).__name__` has no spelling,
       so the `TypeError` does not name the type. Measured 1.8x/1.9x faster
       than CPython on the same source and 6.8x/3.8x slower than CPython's C
-      module — the workload is `Any` boxing and GC, not arithmetic.
+      module, the workload is `Any` boxing and GC, not arithmetic.
 - [ ] Implement the remaining libraries in PyRs once their primitives exist;
       keep platform operations in the runtime. Reuse upstream tests with
       provenance.
@@ -586,7 +577,7 @@ documentation and the relevant gates.
       warm runtime cache.
 - [x] Bound and manage that cache (0.111): `pyrs cache dir/info/clean/prune`,
       least-recently-used eviction against `--older-than` and `--max-size`,
-      and an opportunistic 2 GiB ceiling. Before this it grew without limit —
+      and an opportunistic 2 GiB ceiling. Before this it grew without limit,
       998 MB in a day of test runs, with a deleted directory as the only
       remedy. `PYRS_CFLAGS`/`PYRS_LDFLAGS` are honored and keyed.
 - [x] Command-line experience (0.112): `pyrs doctor`, `pyrs clean`, shell
@@ -598,7 +589,7 @@ documentation and the relevant gates.
       `pyproject.toml` still gets one table and nothing else.
 - [x] Machine-readable diagnostics (0.114): `--message-format=json` on
       `check`, `build` and `run`, with lex, parse, import and semantic
-      failures all keeping their spans through to the driver — the
+      failures all keeping their spans through to the driver, the
       prerequisite for any editor integration. `pyrs tree` prints the
       resolved import graph.
 - [x] `pyrs test` (0.115): pytest-convention discovery, compiled and run
@@ -619,7 +610,7 @@ documentation and the relevant gates.
       of the integer-benchmark gap. Each operation now has an inline fast path
       on the tagged words with the runtime call kept for the bignum edge:
       `primes` went 0.8x -> 12.4x and the corpus 3.2x -> 9.5x, with every
-      benchmark now faster than CPython. LTO was considered and rejected — it
+      benchmark now faster than CPython. LTO was considered and rejected, it
       needs matching clang for both halves, makes runtime objects
       non-cacheable, and asks LLVM to rediscover the fast path from opaque C.
       See [the plan](superpowers/plans/2026-09-08-inline-int-arithmetic.md).
@@ -631,7 +622,7 @@ documentation and the relevant gates.
       not move, correctly: its loop body is inside the try.
 - [x] Reduce the per-raise cost (0.131). The emitted IR named `@setjmp`, which
       bypasses glibc's `#define setjmp(env) _setjmp(env)` and bound to the
-      signal-mask-saving entry point — 85ns a call against 1.8ns, plus a
+      signal-mask-saving entry point, 85ns a call against 1.8ns, plus a
       matching restore per longjmp. And `pyrs_exc_object()` ran at every
       handler entry, allocating twice for a result only a bound name or a bare
       `raise` reads. `exceptions` 1.3x -> 6.3x.
@@ -641,7 +632,7 @@ documentation and the relevant gates.
       from its element buffer, and `nounwind` / `memory(read)` /
       `willreturn` on the nine runtime functions that provably neither
       allocate nor trap. Measured effect on every benchmark, and on a
-      purpose-built read-only float loop: **none** — within noise, and the
+      purpose-built read-only float loop: **none**, within noise, and the
       header-load count in the hot loop was unchanged. The reason is that
       every loop carries a tagged-int counter whose `pyrs.int.add` cold edge
       calls `pyrs_int_add`, which can allocate a bignum and so cannot be
@@ -678,14 +669,14 @@ documentation and the relevant gates.
 - [x] Measure and fix dict/set lookups (0.133). Nothing in the corpus touched a
       dict, so hashing a string key byte-at-a-time on every lookup was
       invisible; `benchmarks/dicts.py` put it at 0.8x. Slots now cache the top
-      byte of the key's hash in existing padding — the full hash grew the slot
-      and made it slower — and string keys hash eight bytes at a time behind a
+      byte of the key's hash in existing padding, the full hash grew the slot
+      and made it slower, and string keys hash eight bytes at a time behind a
       `fmix64` finalizer, without which a word-at-a-time hash collides
       catastrophically on a `h & mask` bucket index. 314ms -> 282ms.
 - [ ] ~~Retain the collector's scratch buffers across passes.~~ **Tried and
       reverted, 2026-09-08.** `ranges_push` is 15% of `objects`, and the array
       does restart at capacity 64 and double its way to ~600k entries every
-      pass — but that is ~56 reallocations against 2.4M pushes, so removing the
+      pass, but that is ~56 reallocations against 2.4M pushes, so removing the
       regrowth measured at nothing (104ms vs 105ms A/B). The 15% is the pushes
       themselves, one per live object per collection, which only a different
       heap layout removes. Retaining the buffers would also have pinned the
@@ -704,7 +695,7 @@ documentation and the relevant gates.
 - [x] Reduce the per-character cost of string iteration (0.132). `==` computed
       a full three-way `memcmp` ordering to answer a yes/no question about two
       single characters, and `s[i]` was an opaque call per character. Both now
-      decide inline — pointer identity, byte length, then the single byte for
+      decide inline, pointer identity, byte length, then the single byte for
       equality; `cplen == len` then a bounds check and a load for indexing.
       `strings` 3.2x -> 15.9x.
 - [x] Fix an out-of-bounds write in `single_char` (0.132). A non-UTF-8 file

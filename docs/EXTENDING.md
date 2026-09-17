@@ -1,13 +1,14 @@
-# Extending PyRs
+# Contributing to the compiler
 
-A practical guide for anyone who wants to add a language feature, builtin,
-method, or runtime behavior to **PyRs** — a compiler that turns a subset of
-Python into native executables via LLVM.
+A practical guide to adding a language feature, builtin, method or runtime
+behaviour to PyRs.
 
-PyRs aims to be a long-term **drop-in replacement for CPython** for the
-surface it supports. Supported constructs must match CPython
-**byte-for-byte** (stdout, stderr, exit codes) unless a deviation is
-documented in the README and GUIDE.
+The rule every change is measured against: a supported construct must match
+CPython byte for byte on stdout, stderr and exit code, unless the deviation is
+deliberate and documented in the [language reference](GUIDE.md#differences-from-cpython).
+
+Read [ARCHITECTURE.md](ARCHITECTURE.md) first if you have not. It describes the
+phases, the crate boundaries and the IR contract that this guide assumes.
 
 ---
 
@@ -33,15 +34,17 @@ documented in the README and GUIDE.
 18. [Performance](#18-performance-notes)
 19. [Ship checklist](#19-the-ship-checklist)
 
-**Companion docs:**
+**Companion documents:**
 
 | Document | Role |
-|----------|------|
-| [GUIDE.md](GUIDE.md) | Language reference (what exists today) |
-| [SPECIFICATIONS.md](SPECIFICATIONS.md) | Architecture, crates, build/link |
-| [PRIMITIVES.md](PRIMITIVES.md) | Builtin/method/stdlib policy; IR vs C |
-| [ROADMAP.md](ROADMAP.md) | Path to 1.0 and remaining readiness work |
-| [README.md](../README.md) | Overview, feature list, benchmarks |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Phases, crates, the IR contract, layout conventions |
+| [GUIDE.md](GUIDE.md) | The language as it exists today |
+| [SPECIFICATIONS.md](SPECIFICATIONS.md) | The subset stated precisely, and the parity bar |
+| [PRIMITIVES.md](PRIMITIVES.md) | What belongs in LLVM IR, in C, and in PyRs |
+| [INFERENCE.md](INFERENCE.md) | The type inference engine |
+| [DYNAMISM.md](DYNAMISM.md) | Dynamic values, kernels and specialization |
+| [ROADMAP.md](ROADMAP.md) | Open gaps and what 1.0 requires |
 
 ---
 
@@ -55,7 +58,7 @@ This guide assumes you can:
 
 You do **not** need to be a project maintainer. Follow the pipeline order,
 prefer existing patterns, and never invent expected test output from
-memory — always capture it from `python3`.
+memory, always capture it from `python3`.
 
 ---
 
@@ -94,7 +97,7 @@ Vec<(Token, Span)>
 ast::Module                     (syntax only, no types)
    │  semantic/src/lib.rs       names, types, coercions, desugaring
    ▼
-ir::Module                      (ir/src/lib.rs — fully typed, no sugar)
+ir::Module                      (ir/src/lib.rs, fully typed, no sugar)
    │  codegen/src/emit.rs       LLVM IR *text* emission
    ▼
 LLVM IR string
@@ -151,7 +154,7 @@ Before adding something large, decide *which layer* it belongs to
 | Builtin / type method | `len`, `abs`, `str.find`, `list.append` | Compiler + IR and/or C kit |
 | Hot path | list index, `len`, `abs` | Prefer **LLVM IR / intrinsics** |
 | Cold / OS / layouts | `str.split`, `open`, slot mutators | **`runtime.c`** |
-| High-level library | `os.path` and `json` (pure PyRs); interim `math` stubs | **Later: pure PyRs** under `stdlib/` — not unbounded C |
+| High-level library | `os.path` and `json` (pure PyRs); interim `math` stubs | **Later: pure PyRs** under `stdlib/`, not unbounded C |
 
 Do **not** grow the stdlib while the core language is still the priority
 (owner policy: language first, then pure-PyRs libraries). **Classes**
@@ -170,14 +173,14 @@ one.
 
 Five vertical slices:
 
-### 1. `ir/src/lib.rs` — `StrFn` variant
+### 1. `ir/src/lib.rs`, `StrFn` variant
 
 ```rust
 /// `s.isdigit()` → bool
 IsDigit,
 ```
 
-### 2. `semantic/src/lib.rs` — method table in `lower_str_method`
+### 2. `semantic/src/lib.rs`, method table in `lower_str_method`
 
 ```rust
 "isdigit" => (IsDigit, ir::Ty::Bool, 0),
@@ -186,7 +189,7 @@ IsDigit,
 Update the “supported: …” error string for unknown methods so users see
 the new name.
 
-### 3. `codegen/src/emit.rs` — `StrCall` mapping + declare
+### 3. `codegen/src/emit.rs`, `StrCall` mapping + declare
 
 ```rust
 StrFn::IsDigit => ("pyrs_str_isdigit", true, false),
@@ -196,7 +199,7 @@ out.push_str("declare i32 @pyrs_str_isdigit(ptr)\n");
 
 The `true` flag means “C returns `i32`, convert to `i1`.”
 
-### 4. `codegen/runtime/runtime.c` / `gc.c` — implementation
+### 4. `codegen/runtime/runtime.c` / `gc.c`, implementation
 
 Match CPython edge cases first (`"".isdigit()` is `False`):
 
@@ -241,7 +244,7 @@ builtin with an LLVM intrinsic body is wired end-to-end.
 
 ### Pattern for a new builtin
 
-1. If it must not be redefined, add its name to `BUILTINS`.
+1. If it must not be redefined; add its name to `BUILTINS`.
 2. Add a `lower_call` arm: arity, lower args, type-check / promote.
 3. Prefer existing IR nodes; add `ExprKind` only when needed.
 4. Emit IR (inline / intrinsic) **or** call `pyrs_*` in C.
@@ -255,7 +258,7 @@ For something like `while ... else` / `for ... else`:
 
 1. **Parser:** after the loop block, accept optional `else:` suite
    (same pattern as `parse_if`). Extend the AST node with `orelse`.
-2. **Semantic:** desugar into existing IR — typically a hidden
+2. **Semantic:** desugar into existing IR, typically a hidden
    “did we break?” bool temp (`ctx.fresh_temp`), set on `Break`, tested
    after the loop. Study `lower_for_range` and `lower_for`.
 3. **IR/codegen:** only if desugar is impossible. New `Stmt` variants
@@ -292,7 +295,7 @@ features.
    diffed against CPython. It is not in `make ci` (it compiles every probe),
    but run it after any milestone that widens the language surface. A probe
    that compiles and then disagrees with CPython fails the run unless it is
-   listed in `KNOWN_DIVERGENCES` — and a listed one that starts *agreeing*
+   listed in `KNOWN_DIVERGENCES`, and a listed one that starts *agreeing*
    fails too, so the README divergence list cannot go stale.
 7. **Type prediction:** [`scripts/infer_eval/`](../scripts/infer_eval) is the
    offline harness behind `--infer` (see
@@ -303,7 +306,7 @@ features.
    compiler's own feature extractor against `features.py`, which is what the
    models were trained on; `extension_bench.py` measures the kernel boundary.
    The make targets wrap all of it, and nothing needs a Python environment of
-   your own — `uv` builds the training venv:
+   your own, `uv` builds the training venv:
 
    ```console
    $ make infer-venv      # uv venv + the locked deps, with the torch build this machine can use
@@ -326,10 +329,10 @@ features.
    regression, solved full-batch with L-BFGS in float64 on the accelerator
    (the dataset is one `embedding_bag` per step). It replaced scikit-learn's
    `saga`, which took 144s on the CPU and still stopped at `max_iter` with a
-   ConvergenceWarning — coefficients wherever the optimiser ran out of budget.
+   ConvergenceWarning, coefficients wherever the optimiser ran out of budget.
    L-BFGS reaches a gradient of 1e-7 in 1,316 iterations and 22s, and the
    result is better as well as finished (63.7% against 62.6% held-out). The
-   rejected candidates — the decision tree and gradient boosting — are still
+   rejected candidates, the decision tree and gradient boosting, are still
    scikit-learn on the CPU; they exist to be compared against, not shipped, and
    `--skip-baselines` leaves them out.
 
@@ -339,7 +342,7 @@ features.
    adds a project. What makes a run reproducible is the record it leaves:
    `fetch_projects.py` writes every resolved commit to
    `target/inference-eval/ext/fetched.json`, and `export_models.py` copies into
-   `MANIFEST.json` the commit of every project, the compiler revision, a hash of
+   `MANIFEST.json` the commit of every project; the compiler revision, a hash of
    every script in the pipeline, and the device, seed and library versions that
    trained the weights. `make infer-replay` fetches those commits back.
 
@@ -353,8 +356,8 @@ features.
    `infer-train` rewrites `semantic/models/`, so read that diff before
    committing it.
 
-   None of this is in `make ci` — training downloads gigabytes and takes far
-   longer than a gate should — so what CI checks instead is that the shipped
+   None of this is in `make ci`, training downloads gigabytes and takes far
+   longer than a gate should, so what CI checks instead is that the shipped
    weights still match the extractor, the label table and the provenance they
    were built from (`make hygiene`).
 
@@ -362,7 +365,7 @@ features.
 
 ## 10. Gotchas that have bitten before
 
-- **LLVM text requires a NUL-terminated buffer** — handled in the shim via
+- **LLVM text requires a NUL-terminated buffer**: handled in the shim via
   `getMemBufferCopy`; do not “optimize” that away.
 - **`pyrs_die` takes a C string**, but PyRs string constants are
   `{ i64 len, bytes… }`. Codegen skips +8 bytes past the header. Always
@@ -379,7 +382,7 @@ features.
   sub-expression when building phis (guards may open new blocks).
 - **Entry / multi-module:** top-level of the root defines globals;
   dependency modules are namespaced (`module.name` in IR).
-- **rustfmt + clippy in CI** — `make fmt` before committing.
+- **rustfmt + clippy in CI**: `make fmt` before committing.
 - **LLVM version drift:** the C++ shim has small compatibility shims for
   triple APIs across LLVM releases; avoid unrelated C++ churn.
 
@@ -388,13 +391,13 @@ features.
 ## 11. Onboarding walkthrough
 
 This section is **not a backlog**. It is a short path through the tree
-using two features that are **already shipped** — so a new contributor can
+using two features that are **already shipped**, so a new contributor can
 see how a real change is laid out before writing their own.
 
-Worked write-ups of the same features: [§6](#6-worked-example-str-method-sisdigit)
-(`isdigit`) and [§7](#7-worked-example-builtin-absx) (`abs`).
+Worked write-ups of the same features: [section 6](#6-worked-example-str-method-sisdigit)
+(`isdigit`) and [section 7](#7-worked-example-builtin-absx) (`abs`).
 
-### Step 1 — Build and run something known
+### Step 1, Build and run something known
 
 ```console
 $ make doctor
@@ -403,22 +406,22 @@ $ make run FILE=examples/fib.py
 $ python3 examples/fib.py    # same output
 ```
 
-### Step 2 — Trace a str method end-to-end (`isdigit`)
+### Step 2, Trace a str method end-to-end (`isdigit`)
 
 Open these sites in order (or `rg IsDigit` / `rg isdigit`):
 
 | Layer | Where to look |
 |-------|----------------|
-| IR | `ir/src/lib.rs` — `StrFn::IsDigit` |
-| Semantic | `semantic/src/lib.rs` — `"isdigit" =>` in `lower_str_method` |
-| Codegen | `codegen/src/emit.rs` — `StrFn::IsDigit` → `pyrs_str_isdigit` + `declare` |
-| Runtime | `codegen/runtime/runtime.c` — `pyrs_str_isdigit` |
+| IR | `ir/src/lib.rs`, `StrFn::IsDigit` |
+| Semantic | `semantic/src/lib.rs`, `"isdigit" =>` in `lower_str_method` |
+| Codegen | `codegen/src/emit.rs`, `StrFn::IsDigit` → `pyrs_str_isdigit` + `declare` |
+| Runtime | `codegen/runtime/runtime.c`, `pyrs_str_isdigit` |
 | Tests | `semantic` unit test `str_isdigit_*`; e2e `str_isdigit_matches_python` |
 
 Optional: write a two-line program, compile with `--emit-llvm`, and find
 the `call … @pyrs_str_isdigit` in the `.ll` file.
 
-### Step 3 — Trace a builtin end-to-end (`abs`)
+### Step 3, Trace a builtin end-to-end (`abs`)
 
 | Layer | Where to look |
 |-------|----------------|
@@ -428,9 +431,9 @@ the `call … @pyrs_str_isdigit` in the `.ll` file.
 | Codegen | `ExprKind::Abs` → `llvm.abs.i64` / `llvm.fabs.f64` |
 | Tests | `abs_int_float_and_bool`, `abs_matches_python`, wrong-type compile error |
 
-Notice: **no `runtime.c` change** — some primitives are pure LLVM.
+Notice: **no `runtime.c` change**, some primitives are pure LLVM.
 
-### Step 4 — Feel the parity loop
+### Step 4, Feel the parity loop
 
 ```console
 $ python3 -c 'print(abs(-5), abs(-0.0), abs(True))'
@@ -438,33 +441,33 @@ $ target/release/pyrs run -i /tmp/t.py   # after writing the same prints
 ```
 
 Any future feature you add should survive this loop (plus edge cases and
-error paths). See [§9](#9-the-testing-discipline).
+error paths). See [section 9](#9-the-testing-discipline).
 
-### Step 5 — When you open a real PR
+### Step 5, When you open a real PR
 
 1. Prefer cloning an existing pattern (another `StrFn`, another `lower_call`
    arm, another desugar in `lower_for_*`) rather than inventing structure.
 2. Differential test first; then implementation; then docs if the user-
    visible surface moved.
-3. Ship with [§19](#19-the-ship-checklist).
+3. Ship with [section 19](#19-the-ship-checklist).
 
 Language gaps and product direction live in the README / GUIDE / roadmap
-notes — not in this guide as a task list.
+notes, not in this guide as a task list.
 
 ---
 
 ## 12. Crate-by-crate tour
 
-Function names below are real — grep for them.
+Function names below are real, grep for them.
 
-### `common` — spans and diagnostics
+### `common`, spans and diagnostics
 
 `Span { start, end }` is a byte range. `Diagnostic { phase, message, span,
 file }` renders a caret snippet via `render`. `file` is the multi-module
 file id (0 = first loaded module index from the driver). You construct
 diagnostics often and almost never change this crate’s design.
 
-### `lexer` — tokens and indentation
+### `lexer`, tokens and indentation
 
 `Token` is a `logos` enum. The `Lexer` wraps logos with an indent stack
 (visual width), pending `Indent`/`Dedent`, parenthesis depth for line
@@ -473,7 +476,7 @@ joining, and blank/comment suppression. `Token::describe()` feeds errors.
 Adding a token: variant + `describe` / `token_text` + tests. Longest match
 wins (`**=` before `**`).
 
-### `parser` — recursive descent
+### `parser`, recursive descent
 
 Helpers: `peek`, `peek2`, `advance`, `eat`, `expect`, `error`.
 
@@ -491,10 +494,10 @@ parse_expr → parse_or → parse_and → parse_not → parse_comparison
 Unsupported Python should say `"… is not supported yet"` naming the
 feature when recognized.
 
-### `semantic` — the brain
+### `semantic`, the brain
 
 **Single file:** `analyze` → wraps `analyze_program` for one module.  
-**Multi file:** `analyze_program(&[ModuleInput])` — signatures, import
+**Multi file:** `analyze_program(&[ModuleInput])`, signatures, import
 bindings, lower in dependency order, merge into one `ir::Module`.
 
 Per-module context (`ModuleCtx`): import bindings (`sys`, module alias,
@@ -526,12 +529,12 @@ Functions you extend most:
 Reserved builtins (cannot redefine): `print`, `len`, `range`, `input`,
 `open`, `abs`.
 
-### `ir` — the contract
+### `ir`, the contract
 
 Pure data: `Ty`, `Module`, `Function`, `Stmt`, `Expr`, `ExprKind`,
-`BinOp`, `UnOp`, `StrFn`, `FileFn`. See [§13](#13-ir-inventory).
+`BinOp`, `UnOp`, `StrFn`, `FileFn`. See [section 13](#13-ir-inventory).
 
-### `codegen` — LLVM IR text + shim + runtime
+### `codegen`, LLVM IR text + shim + runtime
 
 - **`emit.rs`:** `Emitter` builds textual IR.
 - **`runtime/runtime.c`:** C kit linked into *user* programs.
@@ -547,7 +550,7 @@ Reuse helpers: `line`, `tmp`, `fresh_block` / `start_block`,
 
 New runtime symbols need a `declare` line in `finish()`.
 
-### `cli` — driver
+### `cli`, driver
 
 `compile` / `run` / `lex` / `parse`. Module load lives in `modules.rs`.
 Final user link is roughly:
@@ -556,7 +559,7 @@ Final user link is roughly:
 cc program.o runtime.c gc.c -O2 -lm -o <output>
 ```
 
-Touch CLI for new flags or load rules — not for ordinary language ops.
+Touch CLI for new flags or load rules, not for ordinary language ops.
 
 ---
 
@@ -575,12 +578,12 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 | `If` | if/elif/else | branch tree |
 | `While { cond, body, step }` | all loops; `continue` → `step` | multi-block loop |
 | `Return` | return | `ret` |
-| `ExprStmt` | evaluate, discard | — |
+| `ExprStmt` | evaluate, discard |, |
 | `Print { args, sep, end, flush }` | `print(..., sep=, end=, flush=)` | typed print helpers; `sep`/`end` via `pyrs_print_str`; truthy `flush` → `pyrs_flush_if` |
 | `Die(msg)` | runtime trap | `pyrs_die` + `unreachable` |
 | `Break` / `Continue` | loop control | `br` to loop targets |
 
-### Expressions (`ir::ExprKind`) — selected
+### Expressions (`ir::ExprKind`), selected
 
 | Node | Meaning |
 |------|---------|
@@ -643,11 +646,11 @@ Touch CLI for new flags or load rules — not for ordinary language ops.
 
 | PyRs type | Slot encoding | LLVM |
 |-----------|---------------|------|
-| int | value | — |
+| int | value |, |
 | float | IEEE bits | `bitcast` |
 | bool | 0/1 | `zext` / `trunc` |
 | str, list | pointer | `ptrtoint` / `inttoptr` |
-| file | not stored in lists today | — |
+| file | not stored in lists today |, |
 
 ### Layouts (shared with codegen)
 
@@ -660,8 +663,8 @@ PyrsList { long long len; long long cap; long long *data; }
 `cplen <= len` and `cplen == len` exactly when the string is ASCII
 (`STR_IS_ASCII`). **`cplen` is first because `emit_len` loads the i64 at
 offset 0 for every sized object**, and `len(s)` must be Python's answer.
-Byte-oriented operations — `memcmp`, `memcpy`, `fwrite`, the substring
-searches — keep using `len`. A producer that allocates with `str_alloc`
+Byte-oriented operations, `memcmp`, `memcpy`, `fwrite`, the substring
+searches, keep using `len`. A producer that allocates with `str_alloc`
 must finish with `str_done_ascii` / `str_done_cplen` / `str_done_scan`;
 `cplen` starts at `-1` so a missed site is loud rather than silent.
 
@@ -706,7 +709,7 @@ cases). Tags keep temp directories unique under parallel tests.
 3. **Earlier phases:** `pyrs lex`, `pyrs parse`.
 4. **Bisect divergences:** shrink the program; re-`diff` vs CPython.
 5. **Runtime:** link with `-g` / ASan against `runtime.c` and `gc.c`; printf is fine.
-6. **Types:** temporary `eprintln!("{:?}", expr.ty)` — IR is `Debug`.
+6. **Types:** temporary `eprintln!("{:?}", expr.ty)`, IR is `Debug`.
 
 ---
 
@@ -719,7 +722,7 @@ cases). Tags keep temp directories unique under parallel tests.
 - Unsupported Python: `"… is not supported yet"` with the feature name.
 - Narrowest useful span (the bad argument, not the whole statement).
 - Runtime traps: **byte-identical to CPython** on your `python3` (wording
-  can change across versions — re-check).
+  can change across versions, re-check).
 - Honest phases: if users see `error[codegen]` for bad source, semantic
   is missing a check.
 

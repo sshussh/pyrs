@@ -1,569 +1,187 @@
-# PyRs Compiler Specification & Architecture
+# Specification
 
-Public architecture document for PyRs: goals, technology stack, pipeline,
-crate boundaries, IR contract, runtime ABI, and build/link strategy.
+What PyRs guarantees, what it supports today, and the rules that decide both.
+This document is the precise statement; [GUIDE.md](GUIDE.md) is the readable
+one and [ARCHITECTURE.md](ARCHITECTURE.md) describes the implementation.
 
-**Companion docs:**
+## Versioning
 
-| Document                       | Role                                           |
-| ------------------------------ | ---------------------------------------------- |
-| [`README.md`](../README.md)    | Product overview, language surface, benchmarks |
-| [`GUIDE.md`](GUIDE.md)         | Full language reference and toolchain usage    |
-| [`PRIMITIVES.md`](PRIMITIVES.md) | Builtin/method/stdlib split; primitives kit  |
-| [`EXTENDING.md`](EXTENDING.md) | Contributor guide: how to add features         |
-| [`ROADMAP.md`](ROADMAP.md)     | Path to 1.0 and remaining readiness work       |
+Semantic versioning, MAJOR.MINOR.PATCH, with one number covering the language
+surface, every crate and the CLI (`env!("CARGO_PKG_VERSION")`). While MAJOR is
+0, MINOR advances for a milestone and PATCH for fixes. **1.0.0 is reached when
+PyRs is ready for real world use**, not because the minor number has grown
+large.
 
-**Versioning:** SemVer **MAJOR.MINOR.PATCH**, one number for language
-surface, crates, and CLI (`env!("CARGO_PKG_VERSION")`). While **MAJOR is
-0**, increase **MINOR** for milestones (`0.10.0` → `0.11.0` → …) and
-**PATCH** for fixes. **`1.0.0` only when PyRs is ready for real-world
-use** (not merely because the minor is large). Current milestone:
 **v0.153** / `0.153.0`. Optional release tags: `vX.Y.Z`.
 
----
+`make hygiene` enforces agreement across the seven crate manifests,
+`Cargo.lock`, this document, the README and the compiled binary's `--version`.
+A release whose artifacts disagree about what they are is not releasable.
 
-## 1. Goals
+## Goals
 
-**PyRs** is an ahead-of-time compiler for Python. It turns source into a
-standalone native executable through LLVM. There is no interpreter or VM
-in the compiled program.
+| Goal | Meaning |
+|---|---|
+| Drop-in replacement, long term | Grow the supported surface until PyRs can replace CPython for real workloads |
+| Byte parity, hard rule today | For every supported construct, stdout, stderr and exit code match CPython on the same program, except where a deviation is documented |
+| Native performance | Compute bound code compiles to machine code comparable to C for the same algorithm |
+| Honest errors | An unsupported feature fails at compile time with a diagnostic naming it. Runtime traps reuse CPython's messages where parity is claimed |
 
-| Goal                                | Meaning                                                                                                                                                        |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Drop-in replacement (long-term)** | Grow the supported surface until PyRs can replace CPython for real workloads.                                                                                  |
-| **Byte-parity (hard rule today)**   | For every construct that _is_ supported, stdout, stderr, and exit codes must match CPython on the same program (modulo documented deviations in README/GUIDE). |
-| **Native performance**              | Compute-bound code should compile to machine code comparable to C for the same algorithm.                                                                      |
-| **Honest errors**                   | Unsupported features fail at compile time with a named `"… is not supported yet"` diagnostic; runtime traps reuse CPython's messages where applicable.         |
+Naming: **PyRs** in prose, `pyrs` for the binary and crate, `pyrs_*` for C
+runtime symbols and mangled user functions.
 
-**Naming:**
-
-| Form         | Use                                                     |
-| ------------ | ------------------------------------------------------- |
-| **PyRs**     | Project name in prose and docs                          |
-| **`pyrs`**   | Binary, Cargo package, CLI                              |
-| **`pyrs_*`** | C runtime symbols and mangled user functions in LLVM IR |
-
----
-
-## 2. Technology stack
-
-| Layer                       | Choice                                                                         |
-| --------------------------- | ------------------------------------------------------------------------------ |
-| Frontend / driver           | Rust (edition **2024**)                                                        |
-| LLVM bridge (shim)          | C++ (CMake target standard **C++26**)                                          |
-| Object emission / opt       | LLVM via `llvm-config` (parse → verify → optimize → object)                    |
-| Final link of user programs | System `cc` + small C runtime                                                  |
-| Build                       | Cargo workspace + CMake (shim only)                                            |
-| Lexer                       | [`logos`](https://crates.io/crates/logos) + custom INDENT/DEDENT state machine |
-| Parser                      | Hand-written recursive descent (not a parser combinator library)               |
-| CLI                         | [`clap`](https://crates.io/crates/clap) derive API                             |
-| FFI build glue              | [`cmake`](https://crates.io/crates/cmake) crate from `codegen/build.rs`        |
-
-There is **no** MessagePack (or other binary) serialization of the
-compiler IR across the Rust/C++ boundary. The hand-off is **LLVM IR text**.
-There is no planned dependency on `chumsky` in the current design.
-
-**Host requirements to build the compiler:** Rust toolchain, `llvm-config`
-on `PATH`, CMake, a C/C++ compiler, and `python3` for parity tests and
-benchmarks. `make doctor` checks these.
-
----
-
-## 3. Pipeline and data flow
-
-Strict **unidirectional** flow. Each stage consumes only the previous
-stage's output.
-
-```
-source text
-   │  lexer          logos tokens + INDENT/DEDENT / line joining
-   ▼
-Vec<(Token, Span)>
-   │  parser         recursive descent → syntax-only AST
-   ▼
-ast::Module
-   │  semantic       names, types, coercions, desugaring
-   ▼
-ir::Module           fully typed tree (the contract)
-   │  codegen/emit   LLVM IR as text
-   ▼
-LLVM IR string
-   │  C++ shim       parseIR → verify → opt (O0–O3) → native .o
-   ▼
-object file  +  runtime.c + gc.c  ──cc -lm──►  native executable
-```
-
-**Driver (`cli`):** for `compile` / `run`, resolve the import graph
-(`cli/src/modules.rs`), parse every module, run `semantic::analyze_program`,
-emit LLVM IR, optionally write `<output>.ll`, invoke the shim to produce
-an object file, then compile/link `runtime.c` and `gc.c` with `cc`.
-
-**Invariant:** if codegen must “figure out” a type or desugar a construct,
-the design is wrong — that work belongs in **semantic**.
-
----
-
-## 4. Workspace crates
-
-```
-pyrs/                 Cargo workspace (resolver = "3")
-├── common/           spans, diagnostics
-├── lexer/
-├── parser/           AST + recursive descent
-├── semantic/         typecheck + lower to IR
-├── ir/               pure data structures (no analysis)
-├── codegen/          emit.rs + runtime.c/gc.c + CMake shim
-└── cli/              binary `pyrs`
-```
-
-| Crate          | Role                                                                    | Input                               | Output                  | Depends on               |
-| -------------- | ----------------------------------------------------------------------- | ----------------------------------- | ----------------------- | ------------------------ |
-| **`common`**   | Shared `Span`, `Phase`, `Diagnostic` (with file index for multi-module) | —                                   | types                   | —                        |
-| **`lexer`**    | Tokenize; synthesize `INDENT`/`DEDENT`; handle implicit line joining    | source `&str`                       | `Vec<(Token, Span)>`    | `common`                 |
-| **`parser`**   | Build untyped AST                                                       | source (lexes internally) or tokens | `ast::Module`           | `lexer`, `common`        |
-| **`semantic`** | Resolve names/imports, type-check, lower                                | one or more ASTs                    | `ir::Module`            | `parser`, `ir`, `common` |
-| **`ir`**       | Typed IR contract                                                       | —                                   | data types only         | `common`                 |
-| **`codegen`**  | Emit LLVM IR text; FFI to shim; embed `RUNTIME_C`                       | `ir::Module`                        | IR string / object file | `ir`, CMake, LLVM        |
-| **`cli`**      | Orchestrate pipeline; module load; link user programs                   | `.py` paths                         | executable / dumps      | all crates               |
-
-Dependencies form a DAG. **`ir` does not depend on parser or semantic.**
-The C++ shim is built as a static archive and linked into the **`pyrs`**
-binary; it is not linked into user programs.
-
----
-
-## 5. Phase responsibilities
-
-### 5.1 Lexer
-
-- Wraps **logos** with a visual-width indent stack (`calc_indent`,
-  `indent_stack`), pending `Indent`/`Dedent` queue, and parenthesis depth
-  for implicit line joining.
-- Blank/comment-only lines do not affect indentation.
-- Open blocks are closed with `Dedent` tokens at EOF.
-- Errors are `Diagnostic`s with phase `Lex`, never panics on bad input.
-
-### 5.2 Parser
-
-- Hand-written recursive descent; expression ladder by precedence
-  (`or` → `and` → `not` → comparison → … → primary).
-- AST is **syntax only** — no types, no name resolution.
-- Unsupported Python constructs should produce clear
-  `"… is not supported yet"` errors (not a vague syntax error) when
-  recognized.
-
-### 5.3 Semantic analysis and lowering
-
-- Single-file entry: `analyze`; multi-file: `analyze_program` (driver always
-  goes through the multi-file path after module load).
-- Resolves names (locals, `global`, module globals, imports).
-- Type-checks with a fixed type after first assignment; parameter
-  annotations are optional (see inference below);
-  return types may be inferred from `return` statements.
-- Applies implicit numeric promotion (`bool → int → float`) and inserts
-  **explicit** IR casts.
-- Desugars sugar (e.g. `for` → `while` + step, list comprehensions,
-  `with` for files, comparison chaining with temps).
-- Checks return paths on functions declared to return a value.
-- Emits a single flat `ir::Module` (all functions and globals, entry name
-  `__main__`).
-- **Reserved builtins** (cannot be redefined by `def`): `print`, `len`,
-  `range`, `input`, `open`, `abs`. Casts `int`/`float`/`bool`/`str` are
-  separate syntax/`Cast` paths, not this reserved list.
-- Builtin *calls* are lowered in `lower_call` (and method tables for
-  `str` / `list` / `file`); see [PRIMITIVES.md](PRIMITIVES.md).
-
-### 5.4 IR
-
-Pure data. Every expression carries `ty`. Codegen matches on IR only.
-
-Notable shapes:
-
-- **Types:** `int` (i64), `float` (f64), `bool`, `str`, `list[T]`
-  (interned via `list_of` so `Ty` stays `Copy`), `file`, `None`,
-  unions/Optional, `tuple`, `dict`, `set`, `Closure`, `Cell`,
-  `Generator`. `file` is a runtime handle used for `open` / methods /
-  `with` and may appear in signatures.
-- **Statements:** assign / global assign / index assign, list append
-  (checked and unchecked), `if`, `while` (+ step for desugared `for`),
-  return, print, die, break/continue, expression statements, try/raise,
-  match (desugared), yield-related control.
-- **Expressions:** constants, locals/globals, calls, binary/unary
-  (incl. bitwise), index and slice, `str`/`file` method calls, list/dict/set
-  ops, `MakeClosure` / `CallClosure`, `CellLoad`/`CellStore`,
-  `MakeGenerator` / resume, `Let` temps, `Block`, casts, `len`, `abs`,
-  `input`, `argv`, `open`, etc.
-
-Compiler temps use names starting with `.` (illegal as Python identifiers).
-
-### 5.5 Codegen (Rust)
-
-- `emit_llvm_ir` lowers IR to **textual** LLVM IR.
-- User functions are mangled as `pyrs_<name>` (module symbols may be
-  namespaced in the IR as `module.name` before mangling).
-- Module globals are LLVM globals `@g.<name>`.
-- **Two native styles** (see PRIMITIVES.md performance policy):
-  - **Inline IR / LLVM intrinsics** for hot or simple ops (list index +
-    bounds checks, `len` field load, `abs` → `llvm.abs.i64` /
-    `llvm.fabs.f64`, scalar arithmetic).
-  - **Calls into `runtime.c`** for bulk string/list work, I/O, print,
-    and complex helpers (`pyrs_str_*`, `pyrs_list_*`, `pyrs_open`, …).
-- List values live in **8-byte slots** (int/bool as integers; float
-  bitcast; pointers as `ptrtoint`/`inttoptr`). Helpers
-  `slot_from_value` / `value_from_slot` own the encoding.
-- Runtime traps go through helpers that pass C strings to `pyrs_die`
-  (PyRs string constants are length-prefixed; the die path skips the
-  8-byte header).
-
-### 5.6 C++ shim
-
-- File: `codegen/shim/src/lib.cc` (+ small headers for LLVM version
-  differences, e.g. target-triple APIs across LLVM 18 vs 21+).
-- Export: `pyrs_compile_ir(ir_bytes, len, out_path, opt_level, err_buf, …)`.
-- Parses textual IR with LLVM’s IRReader (**NUL-terminated** buffer via
-  `getMemBufferCopy` — required by the LL lexer).
-- Verifies, runs the standard new pass manager pipeline at O0–O3, emits a
-  PIC object for the host triple.
-- **Language-agnostic:** new PyRs features do not require C++ changes
-  (except when adapting to new LLVM C++ API breaks).
-- Internal C++ symbols use hidden visibility
-  (`CXX_VISIBILITY_PRESET hidden`) to avoid clashing with Rust’s link.
-
-### 5.7 C runtime
-
-- Sources: `codegen/runtime/runtime.c`, `codegen/runtime/gc.c`, and
-  `codegen/runtime/gc.h`, embedded in the `codegen` crate and written to a
-  temporary directory at link time by the driver.
-- Provides Python-faithful printing (float shortest round-trip repr,
-  `True`/`False`, list repr), string and list heap objects, file I/O,
-  `input` / `sys.argv` wiring, arithmetic helpers (e.g. floored float
-  ops, int pow), and trap messages that match CPython where required.
-- Not every language op hits C: some are pure LLVM (e.g. `abs` on
-  int/float). The runtime is the home for layout- and OS-facing work.
-- **Memory:** managed objects use a single-threaded, nonmoving mark–sweep
-  collector. Heap traversal is layout-directed; erased payload slots plus
-  native stack and register roots are candidate-checked conservatively, while
-  emitted globals and exception frames are registered explicitly. See
-  [GC.md](GC.md).
-
-### 5.8 Final link of user programs
-
-The driver runs approximately:
-
-```text
-cc program.o runtime.c gc.c -O2 -lm -o <output>
-```
-
-The **compiler** (`pyrs` binary) links the C++ shim and LLVM; **user
-programs** link only the object file from the shim plus `runtime.c` and
-`gc.c`.
-
----
-
-## 6. Multi-module compilation
-
-**Resolution model (v0.11):**
-
-- Absolute imports search multiple roots (first hit wins; no full CPython
-  `sys.path`):
-  1. **Entry script directory** (user code; shadows everything else)
-  2. **`PYRS_STDLIB`** if set and is a directory (dev/test shadowing)
-  3. Workspace **`stdlib/`** next to the `cli` crate when present (dev only;
-     stacked after env, not XOR — both may appear)
-  4. **Embedded** stdlib sources compiled into the `pyrs` binary
-     (`cli/build.rs` embeds `stdlib/**/*.py`; synthetic display paths like
-     `<stdlib>/os/path.py`)
-- **No split packages:** once a top-level package is found under a given
-  origin (filesystem root or embed), submodules resolve only under that
-  same origin (CPython package `__path__` spirit). An incomplete user
-  `os/` does not pick `os.path` from stdlib/embed.
-- A directory with `__init__.py` is a **package**. `import pkg.mod` loads
-  the package init then the submodule (or a nested package’s `__init__.py`).
-  Intermediate path components must be packages. Embedded packages use the
-  same layout (`os/__init__.py`, `os/path.py`).
-- Supported forms: `import M` / `import M as A`, `import pkg.mod` /
-  `import pkg.mod as m`, `from M import x, y as z`, `from M import (x, y)`
-  (parenthesized, optionally wrapped over lines and ending with a trailing
-  comma), `from pkg.mod import x`, `from pkg import mod` (submodule), and
-  relative imports inside packages (`from . import x`, `from .mod import y`,
-  `from .. import z`).
-- Relative imports are rewritten to absolute names at load time using the
-  importer’s `__package__`. They are illegal in non-packages / top-level
-  scripts (`attempted relative import with no known parent package`).
-- The root module’s synthetic name is **`__main__`** (`ENTRY_NAME` /
-  `ROOT_NAME`); other modules use fully-qualified dotted names
-  (`utils`, `pkg.mod`).
-- `import sys` is special-cased (exposes `sys.argv`); it is not loaded
-  as a file. The first real stdlib package is pure-PyRs **`os.path`**
-  (`join` two-arg POSIX, `dirname`, `basename`); see
-  [PRIMITIVES.md](PRIMITIVES.md).
-- Cycles and missing modules/names are compile errors with spans pointing
-  at the importing file.
-- Package `__init__.py` may import its own submodules (partial package
-  init; not treated as a cycle). Re-exports are visible as package
-  attributes and via `from pkg import name`. **Last top-level binding**
-  decides Module vs value for a name; a `from . import name` does **not**
-  load or bind a submodule when `name` is already a value/function on the
-  package (CPython fromlist `hasattr` short-circuit). Partial init: child
-  **module top level** sees only simple parent assigns/`def`s before the
-  child-loading import; child **function bodies** may use deferred parent
-  attributes/calls after full parent init.
-- Multi-name `import a, b as c` is supported.
-- Namespace packages (PEP 420 subset): directory without `__init__.py` is
-  a package (`ModuleLoc::Namespace`); empty synthetic body; nested dirs;
-  prefer `__init__.py` > `.py` > namespace dir; no multi-path split.
-- `from m import *`: module-level only; expands public names or static
-  `__all__` (list/tuple of string lits); dynamic `__all__` rejected;
-  `from sys import *` unsupported.
-- Still unsupported: multi-path namespace packages, dynamic import.
-  Function-local `import` / `from … import` are supported (local scope;
-  not star). Load-time diagnostics use phase tag `load`.
-
-**Pipeline:**
-
-1. `cli::modules::load_program` parses the root and dependencies (including
-   parent packages), rewrites relative imports, detects cycles, returns
-   modules in **topological order** (dependencies first, root last). The
-   vector index is the diagnostic **file id**.
-2. `semantic::analyze_program` collects signatures and global surfaces,
-   validates import bindings (including package submodules), lowers each
-   module with a per-module namespace (root keeps bare IR names; others
-   use dotted `module.` prefixes, e.g. `pkg.mod.fn`), and merges into one
-   `ir::Module`. Nested attribute chains (`pkg.mod.x`) resolve at compile
-   time.
-3. Module bodies run at the import site (like Python); parent package
-   inits run before children; one linked executable contains the whole
-   program.
-
----
-
-## 7. Type system (current vs direction)
+## The supported subset
 
 **Today (v0.153.0 subset):**
 
-- Storage type is the join of all RHS types (and annotation); bare
-  multi-assign may produce a union (`x = 1; x = "a"` → `int | str`);
-  numeric multi-assign promotes (int then float → float). Annotations
-  fix storage (not silently widened).
-- Limited **`Any`**: annotation + concrete↔Any coerce via heap print-tag
-  box (`i64`); runtime TypeError on bad FromAny (bool→int / int→float
-  promotions allowed; Any→union matches member tags). Not full gradual
-  typing (no open setattr on `Any`; class instances may grow an overflow
-  dict when the program uses `getattr`/`setattr`).
-- Annotations optional. Inference runs as rounds of the real lowering: every
-  call -- to a function, a method (virtually dispatched ones included), a
-  constructor, a dunder behind an operator, a `key=` callable -- records the
-  type it passes to each unannotated parameter, and every unannotated
-  function records what it returns and yields; the next round seeds from that.
-  Rounds settle optimistically (a dynamic argument is ignored while it may be
-  a parameter not yet typed), then a strict round widens any seed a dynamic
-  argument contradicts, so a seed is never a guess the program can falsify.
-  Two exact types decide `Any` (an `int` and a `float` do not merge: the
-  conversion would change output); a common base class is kept; `None` makes
-  an optional. An override and the method it overrides pool their evidence; a
-  function whose value escapes keeps body inference; a dynamic argument from
-  a function unreachable from the program's roots (module bodies, dunders,
-  escaping functions) is ignored. A parameter nothing types is dynamic. A
-  fully annotated program runs one round. With `--infer ml` or `--infer dl`
-  a learned predictor (`semantic/src/predict.rs`, weights in
-  `semantic/models/`) types a parameter that has no call-site evidence; a
-  prediction that breaks its function's lowering, or whose function escapes,
-  is withdrawn.
-  Return annotation optional (inferred from returns when feasible, else
-  “returns nothing”).
-- Homogeneous lists; unannotated empty `[]` defaults to `list[Any]`;
-  later `append`/`insert` in the same function/module body still fixes
-  a more specific element type (`xs = []; xs.append(1)` → `list[int]`;
-  mixed appends join). Module-level empty lists are pre-seeded so nested
-  free reads resolve. Heterogeneous fixed-arity tuples;
-  `dict[K,V]` / `set[T]` with `K`/`T` in `{int, str}`.
-- Implicit promotions: `bool → int → float` in arithmetic, args, returns;
-  subclass → base for class params/returns/list append/unions containing
-  the base.
-- Function-wide local scoping with `global` / `nonlocal`; nested
-  `def`/`lambda` as closures (free vars via cells boxed at outer bind;
-  late free cells unbound until assign; nested assign needs `nonlocal`;
-  defaults freeze at def; homogeneous closures with matching capture env
-  may live in containers); generators (`yield` / `yield from`
-  list/tuple/str/gen including in finally; `return` stops after SE;
-  `try`/`except`/`else`/`finally` with yield, phase and exit restored on
-  resume; `close()` / `send` / `throw`); control-flow narrowing on
-  `is None` / `is not None` and `isinstance` (unions, Optional, class
-  base → subclass for field access; `and` peels compose left-to-right so
-  more-specific isinstance is kept across further peels; mid-expr refine,
-  match-guard refine; post-loop/if rebind clears stale peels; free module
-  Optionals peel; reassignment re-refines subclass RHS into class/union
-  storage); `match`/`case` subset (`as`, `*rest`, `**rest`, or, guards).
-- Minimal exceptions: `raise` + `try`/`except`/`else`/`finally` via setjmp
-  frames (process-global, single-threaded); runtime traps (`pyrs_die`) are
-  catchable. `return`/`break`/`continue` pop the frame and run `finally`.
-  Named traps only: other prefixes match bare `except:` only.
-**User classes (v0.25):** closed-world `Ty::Class(ClassId)`; instance
-  header `{ i64 type_id, fields… }`; methods as IR functions
-  `Class.method`; single inheritance + virtual dispatch; field layout
-  specialized; `isinstance` with parent walk and flow peels to subclass;
-  `BoundMethod` / `BindMethod` / `CallBoundMethod`; classmethod construct
-  via runtime `type_id`; match class patterns; class `with` with
-  `__exit__` suppress; `__contains__`; `__getitem__`/`__setitem__`/`__delitem__`;
-  `__eq__`/`__ne__` and ordering dunders with source-order operands;
-  builtin `next`; no multi-base, open
-  `__dict__`, or fully dynamic attributes.
+### Types and storage
 
-**Direction:**
+* A variable's storage type is the join of every right hand side, plus any
+  annotation. A bare multi-assignment can produce a union (`x = 1; x = "a"`
+  gives `int | str`), and numeric multi-assignment promotes (`int` then `float`
+  gives `float`). An annotation fixes storage and is never silently widened.
+* `int` is arbitrary precision, `float` is IEEE 754 double, `str` is Unicode
+  16.0.0 by code point, `bool`, `None`, fixed arity heterogeneous `tuple`,
+  homogeneous `list[T]`, `dict[K, V]` and `set[T]` with `K` and `T` in
+  `{int, str}`, file handles, closures, generators and class instances.
+* An unannotated empty `[]` defaults to `list[Any]`, and a later `append` or
+  `insert` in the same body still fixes a more specific element type.
+* Implicit promotion is `bool` to `int` to `float` in arithmetic, arguments and
+  returns, plus subclass to base for parameters, returns, list appends and
+  unions containing the base.
+* `Any` and `object` mean the same thing: a tagged value that dispatches at run
+  time. See [DYNAMISM.md](DYNAMISM.md).
 
-- Move toward **full optional typing** and more of CPython’s dynamic
-  semantics over time, without abandoning parity for the supported core.
-- Document every intentional deviation in README/GUIDE until removed.
+### Inference
 
-Documented deviations (non-exhaustive; see GUIDE § Differences): 64-bit
-wrapping ints, `and`/`or` may form unions when operands differ,
-`dict.get` bare form returns `Optional[V]`, ASCII-only string
-case/whitespace rules, conservative native GC roots, dynamic negative int
-`**` traps, etc.
+Annotations are optional. Inference runs as rounds of the real lowering: every
+call, to a function, a method including virtually dispatched ones, a
+constructor, a dunder behind an operator or a `key=` callable, records the type
+it passes to each unannotated parameter, and every unannotated function records
+what it returns and yields. The next round seeds from that.
 
----
+Rounds settle optimistically, ignoring a dynamic argument while it may be a
+parameter not yet typed, and then one strict round widens any seed a dynamic
+argument contradicts, so a seed is never a guess the program can falsify.
 
-## 8. Diagnostics
+Two exact types decide `Any`, and `int` with `float` does not merge because the
+conversion would change output. A common base class is kept. `None` makes an
+optional. An override and the method it overrides pool their evidence. A
+function whose value escapes keeps body inference. A dynamic argument from a
+function unreachable from the program's roots is ignored. A parameter nothing
+types is dynamic. A fully annotated program runs one round.
 
-- Every user-facing failure from lex/parse/semantic is a
-  `common::Diagnostic { phase, message, span, file }`.
-- Rendering produces a labeled error with file:line:col and a caret
-  underline under the span (narrowest useful span preferred).
-- Synthesized or locationless messages may use a default span and print
-  without a snippet.
-- **Phase honesty:** if a bad program can reach codegen, semantic is
-  missing a check. Users should not routinely see `error[codegen]`.
-- Runtime errors print to stderr and `exit(1)` with CPython-compatible
-  text where the runtime claims parity.
+With `--infer ml` or `--infer dl` a learned predictor types a parameter that has
+no call site evidence. A prediction that breaks its function's lowering, or
+whose function escapes, is withdrawn. Full detail in
+[INFERENCE.md](INFERENCE.md).
 
----
+### Scoping, control flow and classes
 
-## 9. Build and linking strategy (compiler binary)
+* Function wide local scoping with `global` and `nonlocal`. Nested `def` and
+  `lambda` become closures, with free variables in cells boxed at the outer
+  bind and defaults frozen at definition.
+* Generators support `yield`, `yield from` over a list, tuple, string or
+  generator, `try` with `finally` across a suspension, and `close`, `send` and
+  `throw`.
+* Flow narrowing on `is None`, `is not None` and `isinstance`, including
+  through unions, optionals and base to subclass, composing left to right
+  through `and`, refining mid expression and in match guards.
+* `match` and `case` for a subset of patterns, including `as`, `*rest`,
+  `**rest`, alternatives and guards.
+* Exceptions are `raise` plus `try`, `except`, `else` and `finally`, built on
+  setjmp frames, single threaded and process global. Runtime traps are
+  catchable. `return`, `break` and `continue` pop the frame and run `finally`.
+* Classes are closed world: an instance is `{ i64 type_id, fields... }`,
+  methods are IR functions, single inheritance with virtual dispatch, field
+  layout specialized per class. Properties, static and class methods, context
+  managers, iterator and comparison protocols, arithmetic and bitwise operator
+  overloading including reflected and in place forms, and user defined
+  exceptions are supported. Multiple inheritance and an open `__dict__` are
+  not, although a program that uses `getattr` or `setattr` gives the classes it
+  reflects on an overflow dictionary.
 
-LLVM is linked into the **`codegen`** crate (and thus the `pyrs` binary)
-from **`codegen/build.rs`**, not a separate `cli/build.rs`.
+### Module resolution
 
-Order of operations:
+Absolute imports search four roots, first hit wins: the entry script's
+directory, `PYRS_STDLIB` when set, the workspace `stdlib/` during development,
+and the standard library embedded in the binary. Once a top level package is
+found under one origin, its submodules resolve only under that origin.
 
-1. **CMake** builds `codegen/shim` → static archive `libcodegen_shim.a`
-   (C++ objects only; **does not** link LLVM into the archive).
-2. Cargo is told `links = "codegen_shim"` so native link flags propagate.
-3. **`llvm-config --libdir`** and **`llvm-config --libs`** for the
-   components the shim needs (`core`, `support`, `native`, `analysis`,
-   `irreader`, `passes`, `target`, `mc`, `bitreader`, `bitwriter`, …).
-   Linking is **dynamic by default** on many distros (`--link-static` is
-   not forced); `build.rs` emits whatever `-l` / `-L` flags
-   `llvm-config` returns.
-4. **`llvm-config --system-libs`** for LLVM’s system dependencies.
-5. Link **`libstdc++`** for the C++ runtime used by the shim.
+Supported forms are `import M`, `import M as A`, `import pkg.mod`,
+`import pkg.mod as m`, `from M import x, y as z`, parenthesized import lists,
+`from pkg.mod import x`, `from pkg import mod`, relative imports inside
+packages, and module level `from m import *` expanding public names or a static
+`__all__`. Namespace packages follow a PEP 420 subset. Function local imports
+work, except star imports. Cycles and missing names are compile errors with
+spans pointing at the importing file.
 
-Symbol visibility for the shim archive is **hidden** so internal C++
-symbols do not collide with the Rust toolchain.
+The root module is `__main__`. Module bodies run at their import site and
+parent package initializers run before their children.
 
-Rebuild triggers: changes under `codegen/shim/` (listed in
-`cargo:rerun-if-changed`).
+## Symbol and layout ABI
 
----
+| Kind | Convention |
+|---|---|
+| User function | `@pyrs_<name>` |
+| Module global | `@g.<name>` |
+| Compiler temporary | local beginning with `.` |
+| Runtime API | `pyrs_*` C functions |
+| String | `{ i64 len, bytes... }`, length prefixed with a trailing NUL |
+| List | `{ i64 len, i64 cap, i64* data }`, 8 byte slots |
+| Print and contains tags | scalars 0 to 3, nested list element tag `4 + 8 * inner` |
+| Dynamic value | `{ i32 tag, i64 payload }` in two registers |
 
-## 10. Symbol and ABI conventions
+Changing any of these requires a coordinated edit of `codegen/src/emit.rs`,
+`codegen/runtime/runtime.c` and the tracing logic in `codegen/runtime/gc.c`.
 
-| Kind                     | Convention                                                                     |
-| ------------------------ | ------------------------------------------------------------------------------ |
-| User function in LLVM    | `@pyrs_<name>` (after IR naming / module prefix)                               |
-| Module global            | `@g.<name>`                                                                    |
-| Compiler temporary local | name starts with `.`                                                           |
-| Runtime API              | C functions `pyrs_*` declared in emitted IR and defined in `runtime.c` / `gc.c` |
-| LLVM intrinsics          | e.g. `llvm.abs.i64`, `llvm.fabs.f64`, `llvm.pow.f64` — no C body               |
-| String layout            | `{ i64 len, bytes… }` length-prefixed (+ trailing NUL for C interop)           |
-| List layout              | `{ i64 len, i64 cap, i64* data }` with 8-byte value slots                      |
-| Print / contains tags    | Scalars 0–3; nested list element tag = `4 + 8 × inner` (Rust and C must agree) |
-| CLI argv                 | `@pyrs_set_args` from generated `main`; `@pyrs_argv` returns `list[str]`       |
-| Program entry in IR      | synthetic function / module name `__main__` for the root script                  |
+## Diagnostics
 
-Changing a layout or tag encoding requires a coordinated edit of
-**emit.rs**, **runtime.c**, and the matching trace logic in **gc.c**.
+Every user facing failure from the lexer, parser or semantic phase is a
+`common::Diagnostic { phase, message, span, file }`, rendered with
+`file:line:column` and a caret underline beneath the narrowest useful span.
 
----
+If a bad program can reach codegen, semantic analysis is missing a check. Users
+should not routinely see `error[codegen]`.
 
-## 11. Compatibility and testing bar
+Runtime errors print to standard error and exit 1, with CPython's text wherever
+the runtime claims parity.
 
-1. **Differential testing:** for each supported feature, the same program
-   under `python3` and `pyrs` must match (stdout and, for traps, message +
-   exit code). Capture expected output from CPython; do not invent it.
-2. **Unit tests** live in each crate; **e2e tests** in `cli/tests/e2e.rs`
-   compile real binaries (including multi-file module projects).
-3. **Local CI gate:** `make ci` → rustfmt check, clippy (`-D warnings`),
-   full workspace tests, example parity vs `python3`.
-4. **`make examples`:** globs `examples/*.py`, `examples/modules/*.py`,
-   and `examples/packages/main.py` (package tree entry point), plus the
-   RiskSim showcase with `examples/risksim/data/balanced.scenario`.
-5. **GitHub Actions:** `.github/workflows/ci.yml` mirrors `make ci` on
-   Ubuntu 24.04 with LLVM 18, the `rust-toolchain.toml` pin, and
-   **CPython 3.14** (deferred annotations so class-body `Any` / `-> P`
-   match the local parity suite). Separate workflows exist for benches,
-   docs, and releases.
-6. **Benchmarks:** `benchmarks/run.sh` verifies byte-identical output
-   before timing; results may be summarized in the README.
+## Parity and testing bar
 
-Parity is a **hard rule** for supported features until the project owner
-documents a deliberate exception.
+1. **Differential testing.** For each supported feature, the same program under
+   `python3` and under `pyrs` must produce the same stdout, the same stderr and
+   the same exit code. Expected output is captured from CPython, never written
+   by hand.
+2. **Unit tests** live in each crate; end to end tests compile real binaries,
+   including multi-file projects.
+3. **`make ci`** runs format, clippy with warnings as errors, the workspace
+   tests, hygiene, example parity and the compatibility probes.
+4. **GitHub Actions** mirrors that gate on Ubuntu with LLVM 18 and CPython
+   3.14, plus separate benchmark, documentation and release workflows.
+5. **Benchmarks** verify byte identical output before timing.
 
----
+Parity is a hard rule for supported features until a deviation is deliberately
+documented.
 
-## 12. Architectural limits and roadmap anchors
+## Documented deviations
 
-These are product constraints that affect design choices:
+Each is recorded with its reason in
+[the language reference](GUIDE.md#differences-from-cpython). The current set
+includes set iteration order, `e.args` as a list, no `is` interning for equal
+integers, amortized rather than exact O(1) indexing of non-ASCII strings,
+mutable default arguments at module level, and an uncaught exception printing
+its type and message without a traceback block.
 
-| Area             | Current                                              | Direction                                                                 |
-| ---------------- | ---------------------------------------------------- | ------------------------------------------------------------------------- |
-| Modules          | Packages, relative imports, namespace pkgs, `import *` | richer package semantics if needed                                      |
-| Memory           | Nonmoving mark–sweep; layout-directed heap tracing + conservative native roots | Moving generational/Immix after precise root representation — see [GC architecture and roadmap](GC.md) |
-| Typing           | Multi-assign join + bare-param body infer + isinstance peels + subclass coercion + limited `Any` | Fuller optional typing + more dynamism                                 |
-| Builtins / kit   | `isinstance` (incl. on `Any`), `any`/`all`, `enumerate`/`zip`/`reversed`, set/dict kit | Finite native kit first — [PRIMITIVES.md](PRIMITIVES.md)                  |
-| stdlib           | Multi-root + embed; pure-PyRs `os.path` subset; `sys` special-case | Grow pure-PyRs modules on the kit; C only for new primitive families      |
-| Language surface | Subset (see [the guide](GUIDE.md)); stay on `0.y` until ready | **1.0** = real-world ready; then grow toward CPython drop-in              |
-| Product version  | `0.153.0` (and later `0.154.0`, …)                      | Do not ship **1.0.0** until memory + readiness bar are met                |
+## Out of scope today
 
-Features explicitly **out of IR/runtime today** (non-exhaustive): full
-CPython class dynamism (v0.20 has closed-world classes + isinstance peels),
-advanced match patterns, full `yield from` send/throw forwarding,
-f-string `{x=}` / grouping / `n`/`c`, and a moving generational/Immix GC. Prefer compile-time rejection with a
-clear message over silent wrong behavior. `*args`/`**kwargs` on defs and
-call-site unpacking, `from m import *`, and namespace packages are supported.
+Not supported, and rejected at compile time by name: `eval` and `exec`,
+monkey patching, metaclasses, `__slots__`, `__new__`, class decorators,
+multiple inheritance, generics, `bytes`, `bytearray` and `memoryview`, codecs
+other than UTF-8, `async` and `await`, `raise X from Y`, `f"{x=}"`, two
+argument `super()`, stacked decorators, and the majority of the standard
+library.
 
-**Strategy:** finish optimized **primitives** (IR + C) for current and new
-core types; grow pure-PyRs **stdlib** modules under repo `stdlib/` (embedded
-into `pyrs`). Do not grow `runtime.c` with high-level libraries.
-
----
-
-## 13. CLI surface (driver contract)
-
-| Command                                               | Behavior                                               |
-| ----------------------------------------------------- | ------------------------------------------------------ |
-| `pyrs compile -i FILE -o OUT [-O 0..3] [--emit-llvm]` | Full pipeline → native executable; optional `.ll` dump |
-| `pyrs run -i FILE [-O N] [-- ARGS…]`                  | Compile to a temp dir, execute, propagate exit code    |
-| `pyrs lex -i FILE`                                    | Token dump (compiler debugging)                        |
-| `pyrs parse -i FILE`                                  | AST dump (compiler debugging)                          |
-
-Default optimization level is **2**. Entry semantics: top-level statements
-run as a script; if there are none, a zero-argument `main` is called when
-present.
-
----
-
-## 14. Design principles (summary)
-
-1. **Unidirectional crates** — no reverse dependencies; IR is the
-   semantic↔codegen contract.
-2. **Python semantics win** on every supported construct.
-3. **Textual LLVM IR** is the only Rust↔C++ payload for codegen.
-4. **Thin shim** — all language knowledge stays in Rust + `runtime.c`
-   (plus LLVM intrinsics emitted from Rust).
-5. **Diagnostics over panics** for user programs.
-6. **Measure parity first**, performance second; never trade silent
-   wrongness for speed. Prefer IR for hot primitives; C for complex/OS.
-7. **Primitives before stdlib** — finite native kit, then PyRs modules
-   ([PRIMITIVES.md](PRIMITIVES.md)).
-8. **Document deviations** until they are removed on the path to drop-in
-   CPython replacement.
+The direction is to move toward fuller optional typing and more of CPython's
+dynamic semantics over time, without giving up parity on the supported core.
+[ROADMAP.md](ROADMAP.md) tracks what 1.0 requires.

@@ -1,15 +1,19 @@
-# Garbage collection
+# Memory management
 
-PyRs ships a tracing garbage collector for managed heap memory. The current
-backend is a **single-threaded, nonmoving mark–sweep collector with
-conservative native roots**. It is the first default collector for PyRs:
-it reclaims unreachable objects and cycles while preserving the stable raw
-addresses expected by generated LLVM and the C runtime.
+PyRs programs are garbage collected. The current backend is a single threaded,
+nonmoving mark and sweep collector with conservative native roots. It reclaims
+unreachable objects and cycles while preserving the stable raw addresses that
+generated LLVM and the C runtime depend on.
 
-This is an important baseline, not the final collector architecture. The
-long-term target is a moving generational/Immix design once the compiler can
-provide precise stack maps, safepoints, write barriers, and an FFI
-pinning/handle protocol.
+This is a deliberate baseline rather than the final design. The long term
+target is a moving generational or Immix collector, which first requires
+precise compiler emitted stack maps, safepoints; write barriers and an explicit
+policy for pointers passed to C. The last section of this document explains why
+those come first.
+
+See [PERFORMANCE.md](PERFORMANCE.md) for where the collector currently costs
+more than CPython, and [ARCHITECTURE.md](ARCHITECTURE.md) for the layouts it
+traces.
 
 ## How it works
 
@@ -53,15 +57,15 @@ so that lookup is the mark phase's inner loop. Two things make it cheap.
 
 An **envelope** records the lowest and highest address any range covers, and a
 candidate outside it is rejected by two compares. Most candidates are not
-pointers at all — a tagged small int is odd and tiny, a `float` bit-cast into a
-list slot is enormous — and a `list[int]` of N elements offers N of them on
+pointers at all, a tagged small int is odd and tiny, a `float` bit-cast into a
+list slot is enormous, and a `list[int]` of N elements offers N of them on
 every pass. Contiguous slot runs are handed to the collector in bulk rather
 than one at a time, so those bounds stay in registers across the run.
 
 Ranges are then filed under **every 256-byte granule they cover**, in an
 open-addressed table built in one linear pass; a lookup hashes the candidate's
-granule and scans to the first empty slot. Ranges too wide to file that way —
-typically the large slot arrays owned by a program's lists — go to a small
+granule and scans to the first empty slot. Ranges too wide to file that way,
+typically the large slot arrays owned by a program's lists, go to a small
 sorted tier that is binary-searched. Marking retains *every* range containing
 the candidate rather than only the nearest, which is what covers an address
 that is simultaneously one allocation's one-past-the-end and the next one's
@@ -160,7 +164,7 @@ time and locality:
   list**, which is the measured bottleneck rather than a theoretical one: the
   collector walks a cache-cold pointer chain twice per pass and records one
   range per live object. On the `objects` benchmark that is the whole gap
-  against CPython — 47 ms with `PYRS_GC=none` against 111 ms with the collector
+  against CPython, 47 ms with `PYRS_GC=none` against 111 ms with the collector
   on. Size-classed blocks, aligned so a candidate's owner is a mask and a
   divide, would retire the range array and the granule index along with it;
 - conservative native roots and erased payload slots may delay reclamation;
@@ -175,7 +179,7 @@ time and locality:
 
 A moving generational/Immix successor must not simply move the objects managed
 by this backend. It first needs precise compiler-emitted stack maps and
-safepoints, typed global/root metadata, write barriers and remembered sets,
+safepoints, typed global/root metadata; write barriers and remembered sets,
 Immix block/line metadata, and an explicit policy for raw pointers passed to C
 (handles or pinning). Those prerequisites let a nursery collect short-lived
 objects cheaply while an Immix mature space provides locality and bounded

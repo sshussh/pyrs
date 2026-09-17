@@ -1,13 +1,19 @@
-# Primitives, builtins, and the standard library
+# Primitives, builtins and the standard library
 
-How PyRs should grow core operations, builtins/methods, and (later) a
-standard library. **Strategy: primitives first** — a finite, optimized
-native kit — then stdlib modules mostly in PyRs on top of that kit.
+How PyRs grows core operations, builtins and methods, and later a standard
+library. The strategy is primitives first: a finite, optimized native kit, then
+standard library modules written mostly in PyRs on top of that kit.
 
-Companion docs: [SPECIFICATIONS.md](SPECIFICATIONS.md) (architecture),
-[EXTENDING.md](EXTENDING.md) (full contributor guide for adding features),
-[GUIDE.md](GUIDE.md) (language reference), [ROADMAP.md](ROADMAP.md)
-(path to 1.0).
+The policy in this document decides one question repeatedly: when a new symbol
+is added, does its body belong in inline LLVM IR, in `runtime.c`, or in a PyRs
+module. Getting that wrong is expensive in both directions. An operation in C
+that should have been IR blocks optimization around every call site; a
+high-level library grown inside `runtime.c` can never be optimized or replaced.
+
+Companion documents: [ARCHITECTURE.md](ARCHITECTURE.md) for the phases,
+[EXTENDING.md](EXTENDING.md) for the contributor workflow,
+[GUIDE.md](GUIDE.md) for the language, [PERFORMANCE.md](PERFORMANCE.md) for the
+measurements behind the performance policy below.
 
 ---
 
@@ -22,7 +28,7 @@ Companion docs: [SPECIFICATIONS.md](SPECIFICATIONS.md) (architecture),
 **Explanation:** Builtins and type methods define the *language runtime*.
 The stdlib is *product surface* that should not force every algorithm into
 C. Special-casing `sys` was fine once; do not special-case every future
-module the same way — use real package imports for new stdlib modules.
+module the same way; use real package imports for new stdlib modules.
 
 ---
 
@@ -85,7 +91,7 @@ Work top to bottom; stop at the first matching row.
 ## 5. Performance policy
 
 Primitives-first **is** the right performance structure for an AOT
-compiler — with the rule that **fastest ≠ always C**.
+compiler, with the rule that **fastest ≠ always C**.
 
 ### 5.1 Speed ranking
 
@@ -194,8 +200,8 @@ optional model).
 
 | Phase | Stdlib stance | Explanation |
 |-------|---------------|-------------|
-| **Now (core-first)** | Freeze stdlib *surface*; convert stubs to pure PyRs as the language allows | No new modules. Replacing a stub with a real PyRs body is not growth and is encouraged — it is the exit criterion arriving, module by module. `json` made that move over v0.139 and v0.140, and is now wholly PyRs |
-| **Interim (shipped)** | Small `stdlib/` + some special cases | `os.path` and `json` pure; `math` / `getcwd` may use kit stubs — rewrite pure later |
+| **Now (core-first)** | Freeze stdlib *surface*; convert stubs to pure PyRs as the language allows | No new modules. Replacing a stub with a real PyRs body is not growth and is encouraged, it is the exit criterion arriving, module by module. `json` made that move over v0.139 and v0.140, and is now wholly PyRs |
+| **Interim (shipped)** | Small `stdlib/` + some special cases | `os.path` and `json` pure; `math` / `getcwd` may use kit stubs, rewrite pure later |
 | **Steady state** | Most modules in **PyRs** | Call builtins/methods + thin `_pyrs` / `_posix` for leftovers |
 | **New C for stdlib?** | Only new **primitive families** | e.g. regex engine, not `pathlib` or JSON grammar in C |
 
@@ -206,7 +212,7 @@ optional model).
 | `os.path.join` / `dirname` / `basename` | **Pure PyRs** in `stdlib/os/path.py` | Model for later libs; `join(a, *parts)` |
 | `math.sin` / `sqrt` | LLVM / libm via kit (interim) | True primitive; thin pure wrappers later if desired |
 | `json.loads` (dynamic) + typed `loads_*` | **Pure PyRs** in `stdlib/json.py` (v0.139) | The condition below was met: `object`/`Any`, `isinstance` narrowing and classes carry a recursive-descent parser. The C parser and its IR node were deleted rather than kept alongside |
-| `json.dumps` | **Pure PyRs** in `stdlib/json.py` (v0.140) | It used to dispatch on the argument's **static** type, because nothing could read a container inside `object` without first naming its element encoding. v0.140 added those reads — `len`, `[]`, `.keys()` and iteration, through the value's own tag — so a body taking `object` works, and gained `None`, tuples, non-`str` keys and dynamic values with it |
+| `json.dumps` | **Pure PyRs** in `stdlib/json.py` (v0.140) | It used to dispatch on the argument's **static** type, because nothing could read a container inside `object` without first naming its element encoding. v0.140 added those reads, `len`, `[]`, `.keys()` and iteration, through the value's own tag, so a body taking `object` works, and gained `None`, tuples, non-`str` keys and dynamic values with it |
 | `os.getcwd` | C primitive (interim) | OS family is a legitimate thin C edge |
 | `sys.argv` | Kit special-case today | Migrate toward real module when ready |
 
@@ -227,8 +233,8 @@ binary.
 | **3. Control plane** | Exceptions; closures/*args growth | Catchable traps; nested functions usable |
 | **4. Core language** | Typing/dynamism, narrowing, kit, generators, … | Can write real libraries without compiler stubs |
 | **5. Modules path** | Already: multi-root + embed | `import` loads stdlib `.py` |
-| **6. Stdlib growth** | **Pure PyRs** modules on the kit | C only for primitive families — after phase 4 (may overlap late core) |
-| **7. Final core** | **Nonmoving mark–sweep GC shipped** (classes shipped v0.19 subset) | Validate the default collector; investigate a moving generational/Immix successor — see [GC architecture and roadmap](GC.md) |
+| **6. Stdlib growth** | **Pure PyRs** modules on the kit | C only for primitive families, after phase 4 (may overlap late core) |
+| **7. Final core** | **Nonmoving mark–sweep GC shipped** (classes shipped v0.19 subset) | Validate the default collector; investigate a moving generational/Immix successor, see [GC architecture and roadmap](GC.md) |
 | **8. 1.0** | Real-world readiness | GC stress/performance + surface/stability bar |
 
 **Explanation:** Do not grow a large stdlib (especially in C) before the

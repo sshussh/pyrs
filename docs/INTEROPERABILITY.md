@@ -1,7 +1,15 @@
-# Native libraries and CPython interoperability
+# CPython interoperability
 
-Status: experimental, landed on `main` in 0.86.0. This is a design contract
-and incremental implementation plan, not a stable ABI or a 1.0 release.
+Two ways PyRs and CPython meet: compatibility mode, which runs a whole program
+under an interpreter, and the extension bridge, which compiles PyRs functions
+into a module that ordinary CPython can import.
+
+Status: experimental, first landed in 0.86.0. This is a design contract and an
+incremental plan, not a stable ABI.
+
+See [CLI.md](CLI.md) for `--compat` and `build-extension`, and
+[INFERENCE.md](INFERENCE.md) for why an unannotated kernel parameter is
+reported rather than guessed at.
 
 ## Product direction
 
